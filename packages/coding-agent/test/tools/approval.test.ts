@@ -530,40 +530,90 @@ describe("tool-owned dynamic approval declarations", () => {
 		).toEqual({ tier: "write", policy: "allow" });
 	});
 
-	it("requires every compound segment to resolve to an explicit allow", () => {
+	it("inherits standalone approval fallback when any literal && segment is unmatched", () => {
 		const bash = createBashTool({
 			"bash.allowCompoundCommands": true,
-			"bash.patterns": [{ match: "cmp *", approval: "allow" }],
+			"bash.patterns": [
+				{ match: "cmp *", approval: "allow" },
+				{ match: "rm -f tmp/result.json", approval: "allow" },
+				{ match: "rm *", approval: "prompt" },
+			],
 		});
-		const args = { command: "cmp tmp/result.json artifacts/result.json && rm -f tmp/result.json" };
+		const commands = ["cmp before after && pwd", "pwd && whoami"];
+		const cases: Array<[ApprovalMode, Record<string, "allow" | "prompt" | "deny">, "allow" | "prompt" | "deny"]> = [
+			["always-ask", {}, "prompt"],
+			["write", {}, "prompt"],
+			["yolo", {}, "allow"],
+			["always-ask", { bash: "allow" }, "allow"],
+			["yolo", { bash: "prompt" }, "prompt"],
+			["yolo", { bash: "deny" }, "deny"],
+		];
 
-		expect(resolveApproval(bash, args, "yolo", { bash: "allow" })).toMatchObject({
-			policy: "prompt",
-			source: "tool",
-		});
+		for (const command of commands) {
+			for (const [mode, userPolicy, policy] of cases) {
+				const args = { command };
+				expect(resolveApproval(bash, args, mode, userPolicy).policy).toBe(policy);
+				expect(resolveApproval(bash, args, mode, userPolicy).policy).toBe(
+					resolveApproval(bash, { command: "pwd" }, mode, userPolicy).policy,
+				);
+				if (policy === "deny") {
+					expect(() => requiresApproval(bash, args, mode, userPolicy)).toThrow();
+				} else {
+					expect(requiresApproval(bash, args, mode, userPolicy).required).toBe(policy === "prompt");
+				}
+			}
+		}
+
+		expect(
+			resolveApproval(bash, { command: "cmp before after && rm -f tmp/result.json" }, "always-ask"),
+		).toMatchObject({ policy: "allow", source: "tool" });
 	});
 
-	it("resolves ordered rules per segment, then applies deny over prompt", () => {
-		const settingsOverrides = {
+	it("honors a narrow deletion allow without requiring a comparison allow", () => {
+		const bash = createBashTool({
+			"bash.allowCompoundCommands": true,
+			"bash.patterns": [
+				{ match: "rm -f tmp/*", approval: "allow" },
+				{ match: "rm *", approval: "prompt" },
+			],
+		});
+		const command = "cmp tmp/result.json artifacts/result.json && rm -f tmp/result.json";
+		expect(requiresApproval(bash, { command }, "write", { bash: "allow" }).required).toBe(false);
+		expect(requiresApproval(bash, { command }, "write", { bash: "prompt" }).required).toBe(true);
+		expect(resolveApproval(bash, { command }, "write", { bash: "deny" }).policy).toBe("deny");
+	});
+
+	it("resolves ordered rules per segment, then applies deny over prompt despite unmatched segments", () => {
+		const bash = createBashTool({
 			"bash.allowCompoundCommands": true,
 			"bash.patterns": [
 				{ match: "cmp *", approval: "allow" },
 				{ match: "rm -f protected", approval: "prompt" },
 				{ match: "rm -f *", approval: "allow" },
 				{ match: "echo *", approval: "deny" },
-				{ match: "*", approval: "prompt" },
 			],
+		});
+		const promptArgs = { command: "unmatched-command && cmp before after && rm -f protected" };
+		const denyArgs = {
+			command: "unmatched-command && cmp before after && rm -f protected && echo done",
 		};
+		const allowArgs = { command: "cmp before after && rm -f scratch" };
 
-		expect(bashApproval("cmp before after && rm -f protected", settingsOverrides)).toMatchObject({
+		expect(resolveApproval(bash, promptArgs, "write", { bash: "allow" })).toMatchObject({
 			policy: "prompt",
+			source: "tool",
 		});
-		expect(bashApproval("cmp before after && rm -f protected && echo done", settingsOverrides)).toMatchObject({
+		expect(requiresApproval(bash, promptArgs, "write", { bash: "allow" }).required).toBe(true);
+		expect(resolveApproval(bash, denyArgs, "yolo", { bash: "allow" })).toMatchObject({
 			policy: "deny",
+			source: "tool",
 		});
-		expect(bashApproval("cmp before after && rm -f scratch", settingsOverrides)).toMatchObject({
+		expect(() => requiresApproval(bash, denyArgs, "yolo", { bash: "allow" })).toThrow();
+		expect(resolveApproval(bash, allowArgs, "always-ask")).toMatchObject({
 			policy: "allow",
+			source: "tool",
 		});
+		expect(requiresApproval(bash, allowArgs, "always-ask").required).toBe(false);
 	});
 
 	it("does not let later segment denies override an earlier explicit allow", () => {
@@ -593,7 +643,7 @@ describe("tool-owned dynamic approval declarations", () => {
 		}
 	});
 
-	it("does not downgrade an explicit segment deny to an ignored yolo critical override", () => {
+	it("does not downgrade an explicit segment deny when another segment is unmatched", () => {
 		const bash = createBashTool({
 			"bash.allowCompoundCommands": true,
 			"bash.patterns": [
@@ -602,32 +652,40 @@ describe("tool-owned dynamic approval declarations", () => {
 			],
 		});
 		expect(
-			resolveApproval(bash, { command: "cmp before after && rm -rf /" }, "yolo", { bash: "allow" }),
-		).toMatchObject({ policy: "deny" });
+			resolveApproval(bash, { command: "pwd && cmp before after && rm -rf /" }, "yolo", { bash: "allow" }),
+		).toMatchObject({ policy: "deny", source: "tool" });
 	});
 
-	it("does not let compound allows conceal a critical later segment", () => {
-		const decision = bashApproval("cmp before after && rm -rf /", {
+	it("does not let an unmatched segment conceal a critical later segment", () => {
+		const bash = createBashTool({
 			"bash.allowCompoundCommands": true,
 			"bash.patterns": [
 				{ match: "cmp *", approval: "allow" },
 				{ match: "rm *", approval: "allow" },
-				{ match: "*", approval: "prompt" },
 			],
 		});
+		const args = { command: "pwd && cmp before after && rm -rf /" };
 
-		expect(decision).toMatchObject({ tier: "exec", override: true });
-		expect(typeof decision === "object" ? decision.policy : undefined).not.toBe("allow");
+		expect(resolveApproval(bash, args, "write", { bash: "allow" })).toMatchObject({
+			policy: "prompt",
+			source: "tool",
+			tier: "exec",
+			override: true,
+		});
 	});
 
-	it("retains critical checks after removing literal shell quotes and escapes", () => {
-		const settingsOverrides = {
+	it("retains critical checks after removing literal shell quotes and escapes with an unmatched segment", () => {
+		const bash = createBashTool({
 			"bash.allowCompoundCommands": true,
-			"bash.patterns": [{ match: "*", approval: "allow" }],
-		};
-		for (const command of ["true && rm -rf '/'", "true && r\\m -rf /"]) {
-			expect(resolveApproval(createBashTool(settingsOverrides), { command }, "write")).toMatchObject({
+			"bash.patterns": [
+				{ match: "true", approval: "allow" },
+				{ match: "rm *", approval: "allow" },
+			],
+		});
+		for (const command of ["pwd && true && rm -rf '/'", "pwd && true && r\\m -rf /"]) {
+			expect(resolveApproval(bash, { command }, "write", { bash: "allow" })).toMatchObject({
 				policy: "prompt",
+				source: "tool",
 				override: true,
 			});
 		}

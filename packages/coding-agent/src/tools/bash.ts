@@ -646,21 +646,14 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 					reason: `Prompt required by bash pattern: ${promptRule.match}`,
 				};
 			}
-			if (hasUnmatchedSegment) {
-				return {
-					tier: "exec",
-					override: true,
-					policy: "prompt",
-					reason: "Compound command requires an explicit allow pattern for every segment",
-				};
-			}
 			for (const segment of compoundSegments) {
 				const literalCommand = segment.argv.join(" ");
 				if (criticalCommand || CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(literalCommand))) {
 					return { tier: "exec", override: true, reason: "Critical pattern detected" };
 				}
 			}
-			return { tier: "write", policy: "allow" };
+			// Unmatched segments retain the standalone tool-policy and mode fallback.
+			return hasUnmatchedSegment ? "exec" : { tier: "write", policy: "allow" };
 		}
 		if (patternRule?.approval === "allow") return { tier: "write", policy: "allow" };
 		if (patternRule?.approval === "prompt") {

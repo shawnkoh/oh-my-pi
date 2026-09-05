@@ -3893,7 +3893,7 @@ export const SETTINGS_SCHEMA = {
 			group: "Bash",
 			label: "Allow Compound Commands",
 			description:
-				"Allow literal commands joined by && when every command is explicitly allowed by an approval pattern",
+				"Evaluate literal && chains per command; unmatched commands use normal bash approval policy and mode",
 		},
 	},
 
