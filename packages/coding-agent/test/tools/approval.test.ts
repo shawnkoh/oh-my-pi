@@ -508,6 +508,186 @@ describe("tool-owned dynamic approval declarations", () => {
 		expect(bashApproval(command, settingsOverrides)).toEqual({ tier: "write", policy: "allow" });
 	});
 
+	it("opts into per-segment allows for literal && chains, including quoted arguments", () => {
+		const patterns = [
+			{ match: "cmp *", approval: "allow" },
+			{ match: "rm -f *", approval: "allow" },
+			{ match: "*", approval: "prompt" },
+		];
+		const settingsOverrides = {
+			"bash.allowCompoundCommands": true,
+			"bash.patterns": patterns,
+		};
+		const command = "cmp tmp/result.json artifacts/result.json && rm -f tmp/result.json";
+
+		expect(bashApproval(command, { "bash.patterns": patterns })).toMatchObject({ policy: "prompt" });
+		expect(bashApproval(command, settingsOverrides)).toEqual({ tier: "write", policy: "allow" });
+		expect(
+			bashApproval(
+				'cmp "tmp/draft result.json" artifacts/result.json && rm -f "tmp/draft result.json"',
+				settingsOverrides,
+			),
+		).toEqual({ tier: "write", policy: "allow" });
+	});
+
+	it("requires every compound segment to resolve to an explicit allow", () => {
+		const bash = createBashTool({
+			"bash.allowCompoundCommands": true,
+			"bash.patterns": [{ match: "cmp *", approval: "allow" }],
+		});
+		const args = { command: "cmp tmp/result.json artifacts/result.json && rm -f tmp/result.json" };
+
+		expect(resolveApproval(bash, args, "yolo", { bash: "allow" })).toMatchObject({
+			policy: "prompt",
+			source: "tool",
+		});
+	});
+
+	it("resolves ordered rules per segment, then applies deny over prompt", () => {
+		const settingsOverrides = {
+			"bash.allowCompoundCommands": true,
+			"bash.patterns": [
+				{ match: "cmp *", approval: "allow" },
+				{ match: "rm -f protected", approval: "prompt" },
+				{ match: "rm -f *", approval: "allow" },
+				{ match: "echo *", approval: "deny" },
+				{ match: "*", approval: "prompt" },
+			],
+		};
+
+		expect(bashApproval("cmp before after && rm -f protected", settingsOverrides)).toMatchObject({
+			policy: "prompt",
+		});
+		expect(bashApproval("cmp before after && rm -f protected && echo done", settingsOverrides)).toMatchObject({
+			policy: "deny",
+		});
+		expect(bashApproval("cmp before after && rm -f scratch", settingsOverrides)).toMatchObject({
+			policy: "allow",
+		});
+	});
+
+	it("does not let later segment denies override an earlier explicit allow", () => {
+		expect(
+			bashApproval("git status && git status", {
+				"bash.allowCompoundCommands": true,
+				"bash.patterns": [
+					{ match: "git status", approval: "allow" },
+					{ match: "git *", approval: "deny" },
+				],
+			}),
+		).toMatchObject({ policy: "allow" });
+	});
+
+	it("preserves restrictions that match only the complete chain", () => {
+		for (const approval of ["deny", "prompt"]) {
+			expect(
+				bashApproval("cmp before after && rm -f scratch", {
+					"bash.allowCompoundCommands": true,
+					"bash.patterns": [
+						{ match: "cmp *", approval: "allow" },
+						{ match: "rm *", approval: "allow" },
+						{ match: "cmp * && rm *", approval },
+					],
+				}),
+			).toMatchObject({ policy: approval });
+		}
+	});
+
+	it("does not downgrade an explicit segment deny to an ignored yolo critical override", () => {
+		const bash = createBashTool({
+			"bash.allowCompoundCommands": true,
+			"bash.patterns": [
+				{ match: "cmp *", approval: "allow" },
+				{ match: "rm *", approval: "deny" },
+			],
+		});
+		expect(
+			resolveApproval(bash, { command: "cmp before after && rm -rf /" }, "yolo", { bash: "allow" }),
+		).toMatchObject({ policy: "deny" });
+	});
+
+	it("does not let compound allows conceal a critical later segment", () => {
+		const decision = bashApproval("cmp before after && rm -rf /", {
+			"bash.allowCompoundCommands": true,
+			"bash.patterns": [
+				{ match: "cmp *", approval: "allow" },
+				{ match: "rm *", approval: "allow" },
+				{ match: "*", approval: "prompt" },
+			],
+		});
+
+		expect(decision).toMatchObject({ tier: "exec", override: true });
+		expect(typeof decision === "object" ? decision.policy : undefined).not.toBe("allow");
+	});
+
+	it("retains critical checks after removing literal shell quotes and escapes", () => {
+		const settingsOverrides = {
+			"bash.allowCompoundCommands": true,
+			"bash.patterns": [{ match: "*", approval: "allow" }],
+		};
+		for (const command of ["true && rm -rf '/'", "true && r\\m -rf /"]) {
+			expect(resolveApproval(createBashTool(settingsOverrides), { command }, "write")).toMatchObject({
+				policy: "prompt",
+				override: true,
+			});
+		}
+	});
+
+	it("rejects non-literal, malformed, unsupported, and stateful compound forms", () => {
+		const settingsOverrides = {
+			"bash.allowCompoundCommands": true,
+			"bash.patterns": [{ match: "*", approval: "allow" }],
+		};
+		const commands = [
+			"cmp before after &&",
+			"cmp before after || rm -f before after",
+			'cmp "$BEFORE" after && rm -f before after',
+			"MODE=quiet cmp before after && rm -f before after",
+			"cmp before after > result && rm -f before after",
+			"cmp *.old after && rm -f before after",
+			"cmp before after\nrm -f before after",
+			"cd /tmp && cmp before after",
+			"chdir /tmp && cmp before after",
+			"noglob cd /tmp && cmp before after",
+			"test -v 'BASH_VERSINFO[$(id >&2)0]' && echo approved",
+			"print -v PATH /untrusted && cmp before after",
+			"cmp before after && 'cd' /tmp",
+			"cmp before after && env sh script",
+			"cmp before after && echo $(id)",
+			"cmp before after && echo 'unterminated",
+			"cmp before after && echo 'literal\nnewline'",
+			"cmp before after && ''",
+			"cmp before after && echo ~/file",
+			"cmp before after && echo {one,two}",
+			"cmp before after && echo ok # comment",
+		];
+
+		for (const command of commands) {
+			expect(bashApproval(command, settingsOverrides)).toBe("exec");
+		}
+	});
+
+	it("does not compose printf variable writes with a retargeted executable", () => {
+		const bash = createBashTool({
+			"bash.allowCompoundCommands": true,
+			"bash.patterns": [
+				{ match: "printf *", approval: "allow" },
+				{ match: "whoami", approval: "allow" },
+				{ match: "*", approval: "prompt" },
+			],
+		});
+		expect(
+			resolveApproval(
+				bash,
+				{
+					command: "printf -v 'BASH_CMDS[whoami]' /usr/bin/id && whoami",
+				},
+				"write",
+				{ bash: "allow" },
+			),
+		).toMatchObject({ policy: "prompt" });
+	});
+
 	it("honors bash pattern rules in yolo mode", () => {
 		const tool = createBashTool({
 			"bash.patterns": [

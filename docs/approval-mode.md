@@ -61,9 +61,13 @@ A tool can force a prompt with object-form approval:
 approval: { tier: "exec", override: true, reason: "Critical pattern detected" }
 ```
 
-`bash` uses this for critical destructive patterns such as `rm -rf /`, fork bombs, remote-fetch-then-execute, writes to `/etc/passwd`, and host shutdown commands. It also supports configured `bash.patterns` rules: `deny` is absolute, `prompt` forces a prompt, and `allow` explicitly allows the matching call at the `write` tier. Reasons appear in the approval prompt. In `yolo`, a bare critical override is ignored, but an explicit tool/user `prompt` or `deny` policy is still enforced.
+`bash` uses this for critical destructive patterns such as `rm -rf /`, fork bombs, remote-fetch-then-execute, writes to `/etc/passwd`, and host shutdown commands. It also supports configured `bash.patterns` rules: `deny` is absolute, `prompt` forces a prompt, and `allow` explicitly allows a matching simple command at the `write` tier. Reasons appear in the approval prompt. In `yolo`, a bare critical override is ignored, but an explicit tool/user `prompt` or `deny` policy is still enforced.
 
-`bash.patterns` only feeds the `bash` tool's approval decision. The `eval` tool declares the `exec` tier and can spawn a shell via subprocess, so a `bash.patterns` `deny` rule does not apply to the same command run through `eval` — under `yolo`, that `exec` call resolves to `allow`. To gate the shell `eval` can reach, add a `tools.approval.eval` policy (`prompt` or `deny`) alongside `bash.patterns`.
+`bash.allowCompoundCommands` is off by default. When enabled, a flat chain joined only by `&&` can be allowed if every segment consists of literal arguments and independently resolves to an explicit `allow` rule. Rules remain ordered within each segment: the first matching rule wins for that segment. Across the chain, any `deny` wins, otherwise any `prompt` or unmatched segment prompts; a broad `tools.approval.bash: allow` does not fill in an unmatched segment. Expansions, assignments, control flow, redirections, globbing, newlines, malformed syntax, and shell-state-changing builtins do not qualify. Critical checks still inspect the whole input and its segments.
+
+Restrictions matching the complete chain but no individual segment remain whole-chain vetoes. Other rules resolve in order per segment, so a later broad deny does not override an earlier allow for that segment. Explicit segment denies and prompts are resolved before critical-command overrides, including in `yolo` mode.
+
+This pattern policy controls approval for the `bash` tool; it is not process or filesystem containment. An approved command retains the shell's ambient filesystem, network, and subprocess access. The `eval` tool also declares the `exec` tier and can spawn a shell via subprocess, so a `bash.patterns` `deny` rule does not apply to the same command run through `eval` — under `yolo`, that `exec` call resolves to `allow`. To gate the shell `eval` can reach, add a `tools.approval.eval` policy (`prompt` or `deny`) alongside `bash.patterns`.
 
 ### Computer safety
 

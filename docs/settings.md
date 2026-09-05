@@ -152,6 +152,8 @@ tools:
 
 `tools.approval` is a record keyed by tool name; dotted forms such as `tools.approval.eval` and `tools.approval.computer` identify entries in that record, not separate settings-schema paths. Each entry sets that tool's default policy. For bash, you can add ordered command rules with `bash.patterns`; the first matching rule wins. Patterns support literal text plus `*` as a wildcard.
 
+By default, an `allow` rule must match the entire command and cannot approve a compound line. Set `bash.allowCompoundCommands: true` to also allow conservative chains of two or more literal commands joined only by `&&`:
+
 ```yaml
 tools:
   approvalMode: write
@@ -159,20 +161,25 @@ tools:
     bash: allow
 
 bash:
+  allowCompoundCommands: true
   patterns:
-    - match: "git *"
+    - match: "cmp *"
       approval: allow
-    - match: "rm -rf *"
-      approval: deny
+    - match: "rm -f *"
+      approval: allow
     - match: "*"
-      approval: allow
+      approval: prompt
 ```
 
-Valid rule approvals are `allow`, `prompt`, and `deny`. Critical bash commands still require confirmation unless a matching rule explicitly denies them; broad allow rules such as `match: "*"` do not bypass the critical-command guard.
+With this configuration, `cmp tmp/result.json artifacts/result.json && rm -f tmp/result.json` can run without a prompt. OMP resolves the ordered rules independently for each original segment, so the catchall `prompt` does not override the earlier `allow` matches. Every segment must explicitly resolve to `allow`; an unmatched segment prompts even when `tools.approval.bash` is `allow`. A resolved `deny` wins over the chain, otherwise a resolved `prompt` wins.
 
-Matching is asymmetric so that rules mean what they appear to: `deny` and `prompt` rules fire when the glob matches the whole command **or any single segment** of a compound line (split on `&&`, `||`, `;`, `|`, a single `&`, subshells, and newlines), so `match: "rm -rf *"` still denies `cd /tmp && rm -rf build` and `sleep 1 & rm -rf build`. `allow` rules must match the **entire** command and never apply to a compound line, so a narrow allow such as `match: "git *"` cannot vouch for `git status && rm -rf /`.
+A `deny` or `prompt` rule that matches the complete chain but no individual segment remains a whole-chain restriction (for example, `cmp * && rm *`). Otherwise, segment rules retain first-match ordering: an earlier `git status` allow is not overridden by a later `git *` deny when evaluating `git status && git status`.
 
-`bash.patterns` gates the `bash` tool only. It does not cover shells started through `eval`, which can spawn one via subprocess, so a `deny` rule here is bypassed when the same command runs through `eval`. To close that path, add a `tools.approval.eval` policy (`prompt` or `deny`) as well; see [Tool approval mode](./approval-mode.md).
+The opt-in accepts only a flat `&&` chain with literal arguments, including quoted literal arguments. It rejects expansions, variable assignments, control flow, redirections, globbing, newlines, malformed syntax, and shell-state-changing commands such as `cd`, `source`, and `eval`. Rejected forms keep the legacy approval behavior; enabling the setting never broadens which non-chain commands an `allow` pattern can approve. Critical-command checks still apply to the whole command and every segment, so a broad allow cannot hide a critical later segment.
+
+Valid rule approvals are `allow`, `prompt`, and `deny`. Regardless of the opt-in, `deny` and `prompt` rules can match the whole command or a tokenized segment of other compound forms (split on `&&`, `||`, `;`, `|`, a single `&`, subshells, and newlines). This lets `match: "rm -rf *"` deny `cd /tmp && rm -rf build` and `sleep 1 & rm -rf build`.
+
+`bash.patterns` is an approval policy, not containment. An allowed program still has the bash process's filesystem, network, and subprocess access, and a seemingly narrow program can perform broader actions through its own options or configuration. The rules govern the `bash` tool only; they do not cover shells started through `eval`. To close that path, add a `tools.approval.eval` policy (`prompt` or `deny`) as well; see [Tool approval mode](./approval-mode.md).
 
 ### Bash interceptor patterns
 
@@ -539,6 +546,7 @@ Computer settings and the active model's coordinate-safe image limits are read f
 ```yaml
 bash:
   enabled: true
+  allowCompoundCommands: false
   autoBackground:
     enabled: true
     thresholdMs: 60000
@@ -562,6 +570,7 @@ lsp:
 | Key                               | Type    | Default   | Notes                                                                                                                                                       |
 | --------------------------------- | ------- | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `bash.enabled`                    | boolean | `true`    | Enable the bash tool.                                                                                                                                       |
+| `bash.allowCompoundCommands`      | boolean | `false`   | Allow only flat, literal `&&` chains when every segment is explicitly allowed by `bash.patterns`.                                                            |
 | `launch.enabled`                  | boolean | `true`    | Enable the launch tool for shared long-running project processes.                                                                                           |
 | `bash.autoBackground.enabled`     | boolean | `true`   | Auto-background long-running commands.                                                                                                                      |
 | `bash.autoBackground.thresholdMs` | number  | `60000`   | Threshold before auto-backgrounding.                                                                                                                        |
