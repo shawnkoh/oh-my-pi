@@ -3885,6 +3885,18 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"bash.allowCompoundCommands": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "shell",
+			group: "Bash",
+			label: "Allow Compound Commands",
+			description:
+				"Allow literal commands joined by && when every command is explicitly allowed by an approval pattern",
+		},
+	},
+
 	"bash.autoBackground.enabled": {
 		type: "boolean",
 		default: true,

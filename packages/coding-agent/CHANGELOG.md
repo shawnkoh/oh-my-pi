@@ -5,6 +5,7 @@
 ### Added
 
 - Added the `retry.waitForUsageReset` setting: when a provider reports usage-limit exhaustion with a reset time (5-hour or weekly quota windows on any provider), the session sleeps until the reset instead of failing fast past `retry.maxDelayMs`.
+- Added opt-in `bash.allowCompoundCommands` approval for conservative literal `&&` chains whose every segment is explicitly allowed by `bash.patterns`.
 
 ### Fixed
 

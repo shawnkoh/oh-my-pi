@@ -59,7 +59,7 @@ import {
 	previewWindowRows,
 	replaceTabs,
 } from "./render-utils";
-import { extractLeadingCdTarget, tokenizeShellSegments } from "./shell-tokenize";
+import { extractLeadingCdTarget, extractLiteralAndChainSegments, tokenizeShellSegments } from "./shell-tokenize";
 import { ToolAbortError, ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout, TOOL_TIMEOUTS } from "./tool-timeouts";
@@ -596,7 +596,20 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		const rawCommand = (args as Partial<BashToolInput>).command;
 		const command = typeof rawCommand === "string" ? rawCommand : "";
 		const patternRules = getBashApprovalPatternRules(this.session.settings.get("bash.patterns"));
-		const patternRule = findBashApprovalPatternRule(command, patternRules);
+		const compoundSegments = this.session.settings.get("bash.allowCompoundCommands")
+			? extractLiteralAndChainSegments(command)
+			: null;
+		// Segment rules keep their ordered first-match semantics. Only a restriction
+		// that matches the complete chain but no individual segment is a separate
+		// whole-chain veto (for example, `cmp * && rm *`).
+		const patternRule = compoundSegments
+			? patternRules.find(
+					rule =>
+						rule.approval !== "allow" &&
+						commandMatchesBashApprovalPattern(command, rule.match) &&
+						!compoundSegments.some(segment => commandSegmentMatchesBashApprovalPattern(segment.text, rule.match)),
+				)
+			: findBashApprovalPatternRule(command, patternRules);
 		if (patternRule?.approval === "deny") {
 			return {
 				tier: "exec",
@@ -605,8 +618,49 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 				reason: `Blocked by bash pattern: ${patternRule.match}`,
 			};
 		}
-		if (command !== "" && CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(command))) {
+		const criticalCommand = command !== "" && CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(command));
+		if (!compoundSegments && criticalCommand) {
 			return { tier: "exec", override: true, reason: "Critical pattern detected" };
+		}
+		if (compoundSegments) {
+			let promptRule: BashApprovalPatternRule | undefined = patternRule;
+			let hasUnmatchedSegment = false;
+			for (const segment of compoundSegments) {
+				const segmentRule = findBashApprovalPatternRule(segment.text, patternRules);
+				if (segmentRule?.approval === "deny") {
+					return {
+						tier: "exec",
+						override: true,
+						policy: "deny",
+						reason: `Blocked by bash pattern: ${segmentRule.match}`,
+					};
+				}
+				if (segmentRule?.approval === "prompt") promptRule ??= segmentRule;
+				if (!segmentRule) hasUnmatchedSegment = true;
+			}
+			if (promptRule) {
+				return {
+					tier: "exec",
+					override: true,
+					policy: "prompt",
+					reason: `Prompt required by bash pattern: ${promptRule.match}`,
+				};
+			}
+			if (hasUnmatchedSegment) {
+				return {
+					tier: "exec",
+					override: true,
+					policy: "prompt",
+					reason: "Compound command requires an explicit allow pattern for every segment",
+				};
+			}
+			for (const segment of compoundSegments) {
+				const literalCommand = segment.argv.join(" ");
+				if (criticalCommand || CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(literalCommand))) {
+					return { tier: "exec", override: true, reason: "Critical pattern detected" };
+				}
+			}
+			return { tier: "write", policy: "allow" };
 		}
 		if (patternRule?.approval === "allow") return { tier: "write", policy: "allow" };
 		if (patternRule?.approval === "prompt") {
