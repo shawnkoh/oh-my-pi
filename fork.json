@@ -1,0 +1,48 @@
+{
+	"schemaVersion": 1,
+	"buildId": "fork-v18.1.10-1",
+	"upstream": {
+		"repository": "https://github.com/can1357/oh-my-pi.git",
+		"commit": "5964a0f7649275bcde818f20073193fd032451f2",
+		"release": "v18.1.10"
+	},
+	"patches": [
+		{
+			"name": "literal-compound-bash-approvals",
+			"repository": "https://github.com/shawnkoh/oh-my-pi.git",
+			"branch": "feat/literal-compound-bash-approvals",
+			"commits": ["abbd706991b1662a9ddacee2de261c68233a2f09"],
+			"upstreamPR": "https://github.com/can1357/oh-my-pi/pull/10919"
+		}
+	],
+	"build": {
+		"bun": "1.3.14",
+		"target": "darwin-arm64",
+		"dependencies": "bun install --frozen-lockfile --ignore-scripts",
+		"native": {
+			"version": "18.1.10",
+			"filename": "pi_natives.darwin-arm64.node",
+			"sha256": "9460e541ba036b4fdaa00751d32fc2fa783163de2e7eb274a51ef79cb1a8b5c8",
+			"provenance": "Version-matched cached runtime; selected patches do not modify native code",
+			"sourceBuild": "bun run --cwd packages/natives build"
+		},
+		"compile": "bun run --cwd packages/coding-agent build",
+		"output": "packages/coding-agent/dist/omp",
+		"verification": [
+			"bun test packages/coding-agent/test/tools/approval.test.ts packages/coding-agent/test/tools/bash-interceptor.test.ts packages/coding-agent/test/tools/bash-worktree-rewrite.test.ts",
+			"bun run --cwd packages/coding-agent check",
+			"Exercise the compiled binary in a separate session using synthetic files and an explicitly authorized per-launch approval overlay"
+		]
+	},
+	"maintenance": {
+		"main": "Upstream mirror only; no fork customizations",
+		"contributions": "Independent topic branches and upstream PRs; never base an independent feature on the aggregate build",
+		"integration": "Create a fresh candidate from the pinned upstream commit, cherry-pick selected commits in patches order, then add this manifest; never develop features directly in the candidate",
+		"publication": "After verification, publish a fresh fork/build-* branch and immutable fork-* build tag; never force-update a published build tag",
+		"distribution": "Install versioned artifacts and point the separate omp-fork launcher at the selected verified build; retain prior builds for rollback",
+		"acceptedUpstream": "Omit a patch from the next candidate only once its behavior is included in the pinned upstream baseline; reconcile squash or rewritten merges explicitly",
+		"rejectedUpstream": "Retain desired rejected changes as fork-only patches without coupling unrelated PRs",
+		"updates": "Rebuild through this queue; do not use the official updater to replace a fork artifact",
+		"policy": "Building or selecting a fork artifact does not itself change approval configuration"
+	}
+}
