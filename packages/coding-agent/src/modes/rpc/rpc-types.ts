@@ -233,7 +233,10 @@ export interface RpcReadyFrame {
  * (`name/major`). Features that change behavior for a host also require the
  * host to opt in; the entry here only says the engine supports them.
  */
-export const RPC_ENGINE_CAPABILITIES: readonly string[] = [LITERAL_INPUT_CAPABILITY];
+/** Ready-frame capability: tool-approval selects carry an `approval` binding and interrupts cancel them. */
+export const TOOL_APPROVAL_BINDING_CAPABILITY = "tool-approval-binding/1";
+
+export const RPC_ENGINE_CAPABILITIES: readonly string[] = [LITERAL_INPUT_CAPABILITY, TOOL_APPROVAL_BINDING_CAPABILITY];
 
 export interface RpcChunkFrame {
 	type: "rpc_chunk";
@@ -530,6 +533,8 @@ export type RpcExtensionUIRequest =
 			title: string;
 			options: string[];
 			optionDetails?: RpcExtensionUISelectOptionDetail[];
+			/** Tool-approval selects only (capability `tool-approval-binding/1`): the exact call being decided. */
+			approval?: { toolCallId: string; toolName: string; arguments: unknown; reason?: string };
 			timeout?: number;
 	  }
 	| { type: "extension_ui_request"; id: string; method: "confirm"; title: string; message: string; timeout?: number }

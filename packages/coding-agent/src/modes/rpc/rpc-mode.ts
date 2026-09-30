@@ -610,6 +610,7 @@ export function requestRpcSelect(
 			title,
 			options: labels,
 			...(optionDetails ? { optionDetails } : {}),
+			...(dialogOptions?.approval ? { approval: dialogOptions.approval } : {}),
 			timeout: dialogOptions?.timeout,
 		},
 		response => parseValueDialogResponse(response, dialogOptions),
