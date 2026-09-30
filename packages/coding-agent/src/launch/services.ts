@@ -241,35 +241,49 @@ export async function startService(
 			{ op: "start", spec, owner: serviceOwner(session) ?? undefined, replace: true },
 			signal,
 		);
-		if (result.op === "start" && registry) {
-			const daemon = result.daemon;
-			if (daemon.pid !== undefined) {
-				registry.registerProcess({
-					kind: "service",
-					jobId: `service:${daemon.id}:${daemon.startedAt}`,
-					pid: daemon.pid,
-					command: params.command,
-					cwd: spec.cwd,
-					sleepable: params.sleepable === true,
-				});
-			} else if (!TERMINAL_STATES[daemon.state]) {
-				registry.markIncomplete("service started without a reported pid");
-			}
-		}
+		if (result.op !== "start") throw new Error("Unexpected daemon start response");
+		recordServiceProcess(registry, result.daemon, {
+			command: params.command,
+			cwd: spec.cwd ?? null,
+			sleepable: params.sleepable === true,
+		});
 	} catch (error) {
-		// Aborted, timed out or failed in transit: the broker may still have started the
-		// service, and its pid was never reported.
+		// Aborted, timed out, failed in transit or answered unexpectedly: the broker may still
+		// have started the service, and its pid was never reported.
 		registry?.markIncomplete("a service start ended without reporting its process");
 		throw error;
 	} finally {
 		if (pendingId) registry?.end(pendingId, "settled");
 	}
-	if (result.op !== "start") throw new Error("Unexpected daemon start response");
 	return {
 		daemon: result.daemon,
 		readyTimedOut: result.readyTimedOut,
 		log: await serviceLogs(session, params.name, signal),
 	};
+}
+
+/**
+ * Record the process a service runs as. `sleepable` is the value given when the service was
+ * started; a restart (e.g. a mode change) keeps it rather than deciding it again.
+ */
+function recordServiceProcess(
+	registry: OwnedJobRegistry | undefined,
+	daemon: DaemonSnapshot,
+	spawn: { command: string; cwd: string | null; sleepable: boolean },
+): void {
+	if (!registry) return;
+	if (daemon.pid !== undefined) {
+		registry.registerProcess({
+			kind: "service",
+			jobId: `service:${daemon.id}:${daemon.startedAt}`,
+			pid: daemon.pid,
+			command: spawn.command,
+			cwd: spawn.cwd,
+			sleepable: spawn.sleepable,
+		});
+	} else if (!TERMINAL_STATES[daemon.state]) {
+		registry.markIncomplete("service started without a reported pid");
+	}
 }
 
 export async function sendService(
@@ -296,9 +310,28 @@ export async function modeService(
 	mode: "persist" | "session" | "detached",
 	signal?: AbortSignal,
 ): Promise<DaemonSnapshot> {
-	const result = await request(session, { op: "mode", name, mode }, signal);
-	if (result.op !== "mode") throw new Error("Unexpected daemon mode response");
-	return result.daemon;
+	const registry = OwnedJobRegistry.instance();
+	let result: DaemonRpcResult;
+	try {
+		result = await request(session, { op: "mode", name, mode }, signal);
+		if (result.op !== "mode") throw new Error("Unexpected daemon mode response");
+	} catch (error) {
+		// A mode change can restart the service under a new pid that was never reported.
+		registry?.markIncomplete("a service mode change ended without reporting its process");
+		throw error;
+	}
+	// Switching to or from `detached` restarts the service: record the new process, keeping
+	// what was recorded when it was first started.
+	const daemon = result.daemon;
+	const previous = registry
+		?.openJobs()
+		.find(record => record.kind === "service" && record.jobId.startsWith(`service:${daemon.id}:`));
+	recordServiceProcess(registry, daemon, {
+		command: previous?.command ?? daemon.name,
+		cwd: previous?.cwd ?? null,
+		sleepable: previous?.sleepable ?? false,
+	});
+	return daemon;
 }
 
 export function serviceStatus(daemon: DaemonSnapshot): string {

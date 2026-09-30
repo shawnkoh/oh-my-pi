@@ -2,19 +2,22 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { executeBash } from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
+import { execCommand } from "@oh-my-pi/pi-coding-agent/exec/exec";
 import {
 	OWNER_SCAN_COVERS_PLATFORM,
 	type OwnedJobRecord,
 	OwnedJobRegistry,
 	ownedJobRegistryPath,
 	ownedProcessState,
+	ownerToken,
 	verifyOwnedJobRegistry,
 } from "@oh-my-pi/pi-coding-agent/session/owned-job-registry";
 import { processIdentity } from "@oh-my-pi/pi-natives";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as brokerClients from "@oh-my-pi/pi-coding-agent/launch/client";
-import { startService } from "@oh-my-pi/pi-coding-agent/launch/services";
+import { modeService, startService } from "@oh-my-pi/pi-coding-agent/launch/services";
+import type { DaemonSnapshot } from "@oh-my-pi/pi-tui/tools/daemon";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { DAEMON_BROKER_WORKER_ARG } from "@oh-my-pi/pi-coding-agent/launch/protocol";
 
@@ -216,11 +219,10 @@ describe.skipIf(process.platform === "win32")("owned-job registry", () => {
 		sessionFile = path.join(tempDir.path(), "2026-01-02_writable.jsonl");
 		registry.ensureHeader();
 		const records = readRecords(ownedJobRegistryPath(sessionFile));
-		expect(records[0]).toMatchObject({
-			type: "invocation",
-			complete: false,
-			incompleteReasons: ["registry write failed"],
-		});
+		expect(records[0]).toMatchObject({ type: "invocation", complete: false });
+		const header = records[0];
+		if (header?.type !== "invocation") throw new Error("expected a header");
+		expect(header.incompleteReasons).toContain("registry write failed");
 		// The job whose start never reached disk is not carried as if it had been recorded.
 		expect(records.some(record => record.type === "start")).toBe(false);
 	});
@@ -402,4 +404,242 @@ describe.skipIf(process.platform === "win32")("owned-job registry", () => {
 		// meanwhile (common on macOS) must read as unknown, never clear.
 		expect(after.status).toBe(after.reasons.length === 0 ? "clear" : "unknown");
 	});
+
+	/** Seconds for a probe sleep: unique per run, so it is never confused with another process. */
+	function uniqueSleep(): string {
+		return String(4000 + Math.floor(Math.random() * 5000));
+	}
+
+	/**
+	 * Run a throwaway agent on this test's session file that registers a live detached sleep,
+	 * starts a marked-but-unregistered daemon, marks itself incomplete, then crashes. Returns
+	 * both pids.
+	 */
+	async function crashEarlierInvocation(): Promise<{ recordedPid: number; markedPid: number }> {
+		const script = path.join(tempDir.path(), "crash-resume.ts");
+		const registryModule = path.join(import.meta.dir, "../src/session/owned-job-registry.ts");
+		await Bun.write(
+			script,
+			[
+				`import { OwnedJobRegistry, ownerMarkerEnv } from ${JSON.stringify(registryModule)};`,
+				`const registry = new OwnedJobRegistry({ getSessionFile: () => ${JSON.stringify(sessionFile)}, getSessionId: () => "crashed", pollIntervalMs: 0 });`,
+				`const recorded = Bun.spawn(["/bin/sleep", ${JSON.stringify(uniqueSleep())}], { stdout: "ignore", stderr: "ignore", detached: true });`,
+				"recorded.unref();",
+				`registry.registerProcess({ kind: "process", pid: recorded.pid, command: "sleep" });`,
+				`const marked = Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1 << 30)"], { env: { ...process.env, ...ownerMarkerEnv() }, detached: true, stdin: "ignore", stdout: "ignore", stderr: "ignore" });`,
+				"marked.unref();",
+				`registry.markIncomplete("crashed invocation could not vouch");`,
+				"console.log(JSON.stringify({ recordedPid: recorded.pid, markedPid: marked.pid }));",
+				`process.kill(process.pid, "SIGKILL");`,
+			].join("\n"),
+		);
+		const agent = Bun.spawn([process.execPath, script], { stdout: "pipe", stderr: "inherit" });
+		const pids = JSON.parse((await new Response(agent.stdout).text()).trim()) as {
+			recordedPid: number;
+			markedPid: number;
+		};
+		spawned.push(pids.recordedPid, pids.markedPid);
+		expect(await agent.exited).not.toBe(0);
+		return pids;
+	}
+
+	it("adopts a crashed earlier invocation's live processes and incompleteness when it resumes the file", async () => {
+		const { recordedPid } = await crashEarlierInvocation();
+		// This registry is a new invocation binding the same session file: a resume.
+		registry.ensureHeader();
+		expect(registry.liveProcessCount()).toBeGreaterThanOrEqual(1);
+		expect(registry.openJobs()).toContainEqual(
+			expect.objectContaining({
+				pid: recordedPid,
+				adoptedFrom: expect.objectContaining({ pid: expect.any(Number) }),
+			}),
+		);
+		expect(registry.complete).toBe(false);
+		expect(registry.incompleteReasons).toContain("inherited: crashed invocation could not vouch");
+		// The file says so too: the resumed header is incomplete and the adopted record is ours.
+		const records = readRecords(ownedJobRegistryPath(sessionFile));
+		const headers = records.filter(record => record.type === "invocation");
+		expect(headers.at(-1)).toMatchObject({ complete: false, invocation: { pid: process.pid } });
+		expect(records).toContainEqual(
+			expect.objectContaining({ type: "start", pid: recordedPid, invocationPid: process.pid }),
+		);
+	});
+
+	it("scans the owner tokens of earlier invocations after a resume", async () => {
+		const { markedPid } = await crashEarlierInvocation();
+		registry.ensureHeader();
+		const header = readRecords(ownedJobRegistryPath(sessionFile))
+			.filter(record => record.type === "invocation")
+			.at(-1);
+		if (header?.type !== "invocation") throw new Error("expected a header");
+		expect(header.inheritedOwnerMarkers).toHaveLength(1);
+		// Only the crashed invocation's token marks this daemon; this invocation now finds it.
+		expect(registry.scanOwnedProcesses().discovered).toBeGreaterThanOrEqual(1);
+		expect(registry.openJobs()).toContainEqual(expect.objectContaining({ pid: markedPid, discovered: true }));
+	});
+
+	it("carries records into a file it already headered when switching back to it", () => {
+		const first = sessionFile;
+		const other = path.join(tempDir.path(), "2026-01-02_other.jsonl");
+		registry.ensureHeader();
+		sessionFile = other;
+		registry.ensureHeader();
+		registry.registerInProcessJob({ jobId: "job-on-other", kind: "async-job", command: "x" });
+		sessionFile = first;
+		registry.ensureHeader();
+		expect(readRecords(ownedJobRegistryPath(first))).toContainEqual(
+			expect.objectContaining({ type: "start", jobId: "job-on-other", carriedFrom: ownedJobRegistryPath(other) }),
+		);
+	});
+
+	it("answers unknown when the invocation a consumer observed never reached the file", () => {
+		// Only an ended invocation wrote this file; the one the consumer attested never did.
+		const file = path.join(tempDir.path(), "ended.jobs.jsonl");
+		fs.writeFileSync(file, `${JSON.stringify(header(0x7ffffff1, "5"))}\n`);
+		const expectedInvocation = { pid: 0x7ffffff0, startId: "1" };
+		const verdict = verifyOwnedJobRegistry(file, { expectedInvocation });
+		expect(verdict.status).toBe("unknown");
+		expect(verdict.reasons).toContain(`invocation ${expectedInvocation.pid} has no header in the registry`);
+	});
+
+	/** A header for a dead invocation (pids near the maximum never exist in tests). */
+	function header(pid: number, startId: string): OwnedJobRecord {
+		return {
+			type: "invocation",
+			version: 1,
+			invocation: { pid, startId, startTime: 0 },
+			sessionId: "s",
+			complete: true,
+			ownerMarker: { env: "OMP_OWNER", token: `omp1:${pid}:${startId}` },
+			at: "2026-01-01T00:00:00.000Z",
+		};
+	}
+
+	function inProcessStart(pid: number, jobId: string): OwnedJobRecord {
+		return {
+			type: "start",
+			jobId,
+			kind: "shell-run",
+			pid,
+			pgid: null,
+			startTime: 0,
+			startId: "5",
+			command: "x",
+			cwd: null,
+			sleepable: false,
+			inProcess: true,
+			invocationPid: pid,
+			registeredAt: "2026-01-01T00:00:00.000Z",
+		};
+	}
+
+	it("never lets a later invocation with a reused pid close an earlier invocation's job", () => {
+		const pid = 0x7ffffff2;
+		const file = path.join(tempDir.path(), "reuse.jobs.jsonl");
+		const end: OwnedJobRecord = {
+			type: "end",
+			jobId: "shell-run:1",
+			how: "settled",
+			invocationPid: pid,
+			endedAt: "x",
+		};
+		fs.writeFileSync(
+			file,
+			[
+				header(pid, "5"),
+				inProcessStart(pid, "shell-run:1"),
+				header(pid, "9"),
+				inProcessStart(pid, "shell-run:1"),
+				end,
+			]
+				.map(record => JSON.stringify(record))
+				.join("\n"),
+		);
+		const verdict = verifyOwnedJobRegistry(file);
+		expect(verdict.status).toBe("unknown");
+		expect(verdict.reasons).toContain("shell-run shell-run:1 never ended");
+	});
+
+	it("treats unknown record types and malformed lines as unknown instead of guessing", () => {
+		const pid = 0x7ffffff3;
+		const file = path.join(tempDir.path(), "odd.jobs.jsonl");
+		for (const odd of ['{"type":"heartbeat","jobId":"j","invocationPid":1}', "null", '{"type":"invocation"}']) {
+			fs.writeFileSync(file, `${JSON.stringify(header(pid, "5"))}\n${odd}\n`);
+			const verdict = verifyOwnedJobRegistry(file);
+			expect(verdict.status).toBe("unknown");
+		}
+	});
+
+	it("marks the registry incomplete for every PTY run, on every platform", () => {
+		expect(registry.complete).toBe(true);
+		const end = registry.beginPtyRun({ command: "vim notes.txt", cwd: tempDir.path() });
+		expect(registry.complete).toBe(false);
+		expect(registry.openJobs()).toContainEqual(
+			expect.objectContaining({ kind: "shell-run", command: "vim notes.txt" }),
+		);
+		end();
+		expect(registry.openJobs().some(record => record.kind === "shell-run")).toBe(false);
+		expect(registry.complete).toBe(false);
+	});
+
+	it("gives extension, hook and custom-tool commands the owner marker", async () => {
+		const result = await execCommand("/bin/sh", ["-c", 'printf %s "$OMP_OWNER"'], tempDir.path());
+		expect(result.stdout.split(",")).toContain(ownerToken());
+	});
+
+	it("records the new process when a mode change restarts a service, keeping its sleepable mark", async () => {
+		const first = Bun.spawn(["/bin/sleep", uniqueSleep()], { stdout: "ignore", stderr: "ignore" });
+		const second = Bun.spawn(["/bin/sleep", uniqueSleep()], { stdout: "ignore", stderr: "ignore" });
+		spawned.push(first.pid, second.pid);
+		registry.registerProcess({
+			kind: "service",
+			jobId: "service:d1:1",
+			pid: first.pid,
+			command: "npm run dev",
+			sleepable: true,
+		});
+		const daemon: DaemonSnapshot = {
+			name: "web",
+			id: "d1",
+			state: "running",
+			pid: second.pid,
+			createdAt: 0,
+			startedAt: 2,
+			restartCount: 1,
+			outputBytes: 0,
+			persist: false,
+			detached: true,
+		};
+		const client = await brokerClients.createDaemonBrokerClient(path.join(tempDir.path(), "project"), {
+			runtimeDir: path.join(tempDir.path(), "runtime"),
+			idleGraceMs: 100,
+		});
+		vi.spyOn(client, "request").mockResolvedValue({ op: "mode", daemon });
+		vi.spyOn(brokerClients, "daemonClientForProject").mockResolvedValue(client);
+		try {
+			await modeService(toolSession(), "web", "detached");
+			expect(registry.openJobs()).toContainEqual(
+				expect.objectContaining({
+					jobId: "service:d1:2",
+					pid: second.pid,
+					sleepable: true,
+					command: "npm run dev",
+				}),
+			);
+		} finally {
+			vi.restoreAllMocks();
+			client.close();
+		}
+	});
+
+	function toolSession(): ToolSession {
+		return {
+			cwd: tempDir.path(),
+			hasUI: false,
+			settings: Settings.isolated(),
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			getSessionId: () => "session",
+		};
+	}
 });

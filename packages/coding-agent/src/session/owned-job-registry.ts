@@ -24,7 +24,7 @@ import {
 	type ShellRunResult,
 	scanProcessesByEnv,
 } from "@oh-my-pi/pi-natives";
-import { logger } from "@oh-my-pi/pi-utils";
+import { isEnoent, logger } from "@oh-my-pi/pi-utils";
 
 export const OWNED_JOB_REGISTRY_VERSION = 1;
 /** Longest command text stored in a registry record. */
@@ -89,6 +89,12 @@ export interface OwnedJobStartRecord {
 	 * file the job was first recorded in. Its end is written to both files.
 	 */
 	carriedFrom?: string;
+	/**
+	 * Set when this invocation took over an earlier invocation's open record on binding the
+	 * file (a resume): that invocation's identity. The process is counted as this
+	 * invocation's work from then on.
+	 */
+	adoptedFrom?: InvocationIdentity;
 	invocationPid: number;
 	/** ISO-8601 timestamp. */
 	registeredAt: string;
@@ -113,7 +119,19 @@ export interface OwnedJobInvocationRecord {
 	incompleteReasons?: string[];
 	/** Environment marker inherited by processes this invocation spawns (see {@link OWNER_MARKER_ENV}). */
 	ownerMarker?: { env: string; token: string };
+	/**
+	 * Owner tokens of earlier invocations this invocation took over (their processes carry
+	 * those tokens, not this one's), each with its invocation's start identity. Scanned
+	 * alongside `ownerMarker`.
+	 */
+	inheritedOwnerMarkers?: InheritedOwnerMarker[];
 	at: string;
+}
+
+export interface InheritedOwnerMarker {
+	token: string;
+	/** Start identity of the invocation that issued the token; `null` when it was unknown. */
+	startId: string | null;
 }
 
 export interface OwnedJobIncompleteRecord {
@@ -218,6 +236,8 @@ export function ownerMarkerEnv(): Record<string, string> {
  */
 export const OWNER_SCAN_COVERS_PLATFORM = process.platform === "linux";
 
+const PTY_RUN_UNTRACKED = "pty shell runs do not report spawned processes";
+
 /** Outcome of one owner-marker scan. */
 export interface OwnerScanSummary {
 	/** False when the platform has no scan. */
@@ -278,6 +298,111 @@ function truncateCommand(command: string): string {
 	return command.length > REGISTRY_COMMAND_MAX_CHARS ? command.slice(0, REGISTRY_COMMAND_MAX_CHARS) : command;
 }
 
+const INHERITED_PREFIX = "inherited: ";
+
+/** An earlier invocation's incomplete reason as this invocation's (never nested). */
+function inheritedReason(reason: string): string {
+	return reason.startsWith(INHERITED_PREFIX) ? reason : `${INHERITED_PREFIX}${reason}`;
+}
+
+/** Records one invocation wrote to a registry file, in file order. */
+export interface RegistrySegment {
+	header: OwnedJobInvocationRecord;
+	/** Start records with no matching end (keyed by job id; ids restart per invocation). */
+	open: Map<string, OwnedJobStartRecord>;
+	/** Reasons from `incomplete` records. */
+	incomplete: string[];
+}
+
+export interface ParsedRegistry {
+	segments: RegistrySegment[];
+	/** Lines that could not be attributed or understood; each makes the file unable to vouch. */
+	problems: string[];
+}
+
+function isRecordObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isHeader(value: Record<string, unknown>): value is Record<string, unknown> & OwnedJobInvocationRecord {
+	const invocation = value.invocation;
+	return value.type === "invocation" && isRecordObject(invocation) && typeof invocation.pid === "number";
+}
+
+/**
+ * Parse a registry file. A record belongs to the latest preceding header whose invocation
+ * has its `invocationPid`, so a pid reused by a later invocation never ends or reopens an
+ * earlier invocation's jobs. Malformed lines, unknown record types and records with no
+ * owning header are reported as problems rather than guessed at.
+ */
+export function parseOwnedJobRegistry(text: string): ParsedRegistry {
+	const segments: RegistrySegment[] = [];
+	const problems: string[] = [];
+	const latestByPid = new Map<number, RegistrySegment>();
+	for (const line of text.split("\n")) {
+		if (!line.trim()) continue;
+		let value: unknown;
+		try {
+			value = JSON.parse(line);
+		} catch {
+			problems.push("registry has a malformed record");
+			continue;
+		}
+		if (!isRecordObject(value)) {
+			problems.push("registry has a malformed record");
+			continue;
+		}
+		if (value.type === "invocation") {
+			if (!isHeader(value)) {
+				problems.push("registry has a malformed invocation header");
+				continue;
+			}
+			const segment: RegistrySegment = { header: value, open: new Map(), incomplete: [] };
+			segments.push(segment);
+			latestByPid.set(value.invocation.pid, segment);
+			continue;
+		}
+		if (value.type !== "start" && value.type !== "end" && value.type !== "incomplete") {
+			problems.push(`registry has a record of unknown type ${JSON.stringify(value.type)}`);
+			continue;
+		}
+		const segment = typeof value.invocationPid === "number" ? latestByPid.get(value.invocationPid) : undefined;
+		if (!segment) {
+			problems.push(`registry has a ${value.type} record with no invocation header`);
+			continue;
+		}
+		if (value.type === "incomplete") {
+			segment.incomplete.push(typeof value.reason === "string" ? value.reason : "incomplete");
+		} else if (typeof value.jobId !== "string") {
+			problems.push(`registry has a ${value.type} record without a job id`);
+		} else if (value.type === "start") {
+			segment.open.set(value.jobId, value as unknown as OwnedJobStartRecord);
+		} else {
+			segment.open.delete(value.jobId);
+		}
+	}
+	return { segments, problems };
+}
+
+/** Numerically smallest start identity; `"0"` (everything counts as recent) when any is unknown. */
+function earliestStartId(startIds: Iterable<string | null>): string {
+	let earliest: bigint | undefined;
+	for (const startId of startIds) {
+		if (startId === null || !/^\d+$/.test(startId)) return "0";
+		const value = BigInt(startId);
+		if (earliest === undefined || value < earliest) earliest = value;
+	}
+	return (earliest ?? 0n).toString();
+}
+
+/** Every owner token a header asks consumers to scan for, with its issuing invocation's start id. */
+function headerMarkers(header: OwnedJobInvocationRecord): InheritedOwnerMarker[] {
+	const markers: InheritedOwnerMarker[] = [];
+	if (header.ownerMarker) markers.push({ token: header.ownerMarker.token, startId: header.invocation.startId });
+	for (const marker of header.inheritedOwnerMarkers ?? []) markers.push(marker);
+	return markers;
+}
+
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
 
 export class OwnedJobRegistry {
@@ -300,8 +425,13 @@ export class OwnedJobRegistry {
 	readonly #incompleteReasons: string[] = [];
 	/** Incomplete reasons already persisted per file (in its header or an `incomplete` record). */
 	readonly #persistedReasons = new Map<string, Set<string>>();
+	/** Owner tokens of earlier invocations adopted from bound files, by token. */
+	readonly #inheritedMarkers = new Map<string, InheritedOwnerMarker>();
+	/** Files whose earlier invocations were already examined for adoption. */
+	readonly #adoptedFiles = new Set<string>();
 	#monitor: NodeJS.Timeout | undefined;
 	#closed = false;
+	#ptyRuns = 0;
 
 	constructor(options: OwnedJobRegistryOptions) {
 		this.#options = options;
@@ -369,6 +499,18 @@ export class OwnedJobRegistry {
 			registeredAt: new Date().toISOString(),
 		});
 		return input.jobId;
+	}
+
+	/**
+	 * Record a PTY shell run for its duration. A PTY reports none of the processes it starts,
+	 * and a survivor that replaces its environment carries no owner marker, so the registry
+	 * can no longer vouch for every process — on every platform, even where the owner-marker
+	 * scan is sound. Returns the function that ends the run record.
+	 */
+	beginPtyRun(input: { command: string; cwd: string }): () => void {
+		this.markIncomplete(PTY_RUN_UNTRACKED);
+		const jobId = this.registerInProcessJob({ jobId: `pty-run:${++this.#ptyRuns}`, kind: "shell-run", ...input });
+		return () => this.end(jobId, "settled");
 	}
 
 	/**
@@ -472,15 +614,19 @@ export class OwnedJobRegistry {
 	}
 
 	/**
-	 * Scan same-user processes for this invocation's owner marker. Every live marked process
-	 * the registry does not already track is recorded as a discovered `process` (and is then
+	 * Scan same-user processes for this invocation's owner marker and every marker it
+	 * inherited from earlier invocations of a bound file. Every live marked process the
+	 * registry does not already track is recorded as a discovered `process` (and is then
 	 * counted by {@link liveProcessCount}). Synchronous; a few tens of milliseconds.
 	 */
 	scanOwnedProcesses(): OwnerScanSummary {
 		const invocation = currentInvocation();
+		const inherited = [...this.#inheritedMarkers.values()];
+		const tokens = [ownerToken(), ...inherited.map(marker => marker.token)];
+		const since = earliestStartId([invocation.startId, ...inherited.map(marker => marker.startId)]);
 		let scan: MarkedProcessScan;
 		try {
-			scan = scanProcessesByEnv(OWNER_MARKER_ENV, ownerToken(), invocation.startId ?? undefined);
+			scan = scanProcessesByEnv(OWNER_MARKER_ENV, tokens, since);
 		} catch (error) {
 			logger.warn("Owner-marker scan failed", { error: String(error) });
 			return { supported: false, sound: false, scanned: 0, discovered: 0, opaque: [] };
@@ -504,7 +650,7 @@ export class OwnedJobRegistry {
 			.map(proc => ({ pid: proc.pid, command: proc.command }));
 		return {
 			supported: scan.supported,
-			sound: scan.supported && opaque.length === 0,
+			sound: scan.supported && !scan.hidden && opaque.length === 0,
 			scanned: scan.scanned,
 			discovered,
 			opaque,
@@ -548,13 +694,17 @@ export class OwnedJobRegistry {
 	}
 
 	/**
-	 * Make `file` a faithful registry of this invocation: header (retried until written),
-	 * every open record not yet in it (carried over from an earlier session file), and every
+	 * Make `file` a faithful registry of this invocation. On first binding, take over what
+	 * earlier invocations of the file left behind (see {@link #adoptEarlierInvocations});
+	 * then the header (retried until written), every open record not yet in it (carried
+	 * over from another session file, on every bind — including a switch back), and every
 	 * incomplete reason not yet persisted to it.
 	 */
 	#prepare(file: string): void {
+		const adopted = this.#adoptedFiles.has(file) ? [] : this.#adoptEarlierInvocations(file);
 		if (!this.#headered.has(file)) {
 			const reasons = [...this.#incompleteReasons];
+			const inherited = [...this.#inheritedMarkers.values()];
 			const header: OwnedJobInvocationRecord = {
 				type: "invocation",
 				version: OWNED_JOB_REGISTRY_VERSION,
@@ -563,16 +713,27 @@ export class OwnedJobRegistry {
 				complete: reasons.length === 0,
 				...(reasons.length === 0 ? {} : { incompleteReasons: reasons }),
 				ownerMarker: { env: OWNER_MARKER_ENV, token: ownerToken() },
+				...(inherited.length === 0 ? {} : { inheritedOwnerMarkers: inherited }),
 				at: new Date().toISOString(),
 			};
-			if (!this.#write(file, header)) return;
-			this.#headered.add(file);
-			this.#persistedReasons.set(file, new Set(reasons));
-			for (const open of this.#open.values()) {
-				const origin = open.files[0];
-				if (origin === undefined || open.files.includes(file)) continue;
-				if (this.#write(file, { ...open.record, carriedFrom: origin })) open.files.push(file);
+			if (this.#write(file, header)) {
+				this.#headered.add(file);
+				this.#persistedReasons.set(file, new Set(reasons));
 			}
+		}
+		const headered = this.#headered.has(file);
+		for (const record of adopted) {
+			if (this.#open.has(record.jobId)) continue;
+			const open: OpenJob = { record, files: [] };
+			if (headered && this.#write(file, record)) open.files.push(file);
+			this.#open.set(record.jobId, open);
+			this.#ensureMonitor();
+		}
+		if (!headered) return;
+		for (const open of this.#open.values()) {
+			const origin = open.files[0];
+			if (origin === undefined || open.files.includes(file)) continue;
+			if (this.#write(file, { ...open.record, carriedFrom: origin })) open.files.push(file);
 		}
 		const persisted = this.#persistedReasons.get(file);
 		if (!persisted) return;
@@ -586,6 +747,67 @@ export class OwnedJobRegistry {
 			};
 			if (this.#write(file, record)) persisted.add(reason);
 		}
+	}
+
+	/**
+	 * First binding of `file` (resume, or a switch to an existing session): whoever wrote it
+	 * before — an earlier invocation, or an earlier session object in this process — may have
+	 * left processes running, or could not vouch for everything it started. This registry
+	 * inherits both, so its own counts and completeness never read clearer than the file:
+	 * - their incomplete state (header `complete:false`, `incomplete` records, in-process jobs
+	 *   never ended, unparseable lines) becomes this registry's incomplete state;
+	 * - their owner tokens are scanned from now on;
+	 * - every open OS-process record that is not provably gone is returned for adoption
+	 *   (re-appended under this invocation with `adoptedFrom`).
+	 */
+	#adoptEarlierInvocations(file: string): OwnedJobStartRecord[] {
+		this.#adoptedFiles.add(file);
+		let text: string;
+		try {
+			text = fs.readFileSync(file, "utf8");
+		} catch (error) {
+			if (isEnoent(error)) return [];
+			this.#noteIncomplete("an earlier registry could not be read");
+			return [];
+		}
+		const parsed = parseOwnedJobRegistry(text);
+		for (const problem of parsed.problems) this.#noteIncomplete(inheritedReason(problem));
+		const me = currentInvocation();
+		const ownToken = ownerToken();
+		const adopted: OwnedJobStartRecord[] = [];
+		for (const segment of parsed.segments) {
+			const earlier = segment.header.invocation;
+			for (const marker of headerMarkers(segment.header)) {
+				if (marker.token !== ownToken) this.#inheritedMarkers.set(marker.token, marker);
+			}
+			if (!segment.header.complete) {
+				for (const reason of segment.header.incompleteReasons ?? ["invocation incomplete"]) {
+					this.#noteIncomplete(inheritedReason(reason));
+				}
+			}
+			for (const reason of segment.incomplete) this.#noteIncomplete(inheritedReason(reason));
+			for (const record of segment.open.values()) {
+				if (record.kind === "internal") continue;
+				if (record.inProcess) {
+					this.#noteIncomplete(`an earlier invocation (pid ${earlier.pid}) left ${record.kind} work unfinished`);
+					continue;
+				}
+				if (ownedProcessState(record.pid, record.startId) === "gone") continue;
+				const { carriedFrom: _carried, ...rest } = record;
+				adopted.push({
+					...rest,
+					adoptedFrom: record.adoptedFrom ?? earlier,
+					invocationPid: me.pid,
+					registeredAt: new Date().toISOString(),
+				});
+			}
+		}
+		return adopted;
+	}
+
+	/** Add an incomplete reason without writing (the caller persists it with the header). */
+	#noteIncomplete(reason: string): void {
+		if (!this.#incompleteReasons.includes(reason)) this.#incompleteReasons.push(reason);
 	}
 
 	#append(file: string, record: OwnedJobRecord): boolean {
@@ -650,22 +872,36 @@ export interface OwnedJobVerdict {
 	reasons: string[];
 }
 
+export interface VerifyOwnedJobRegistryOptions {
+	/**
+	 * The invocation the consumer last observed (from `attest`, `get_state` or a terminal
+	 * attestation). When the file has no header for it, that invocation's records may never
+	 * have reached the file (every write failed), so the answer is at best `unknown`.
+	 */
+	expectedInvocation?: { pid: number; startId: string | null };
+}
+
 /**
  * Evaluate a registry file the way a supervisor must after the agent exited. `internal`
  * helpers never block. Consumers in other languages reimplement exactly this rule:
  *
- * 1. Records are keyed by `(invocationPid, jobId)`; job ids restart in every invocation.
+ * 1. A record belongs to the latest preceding header whose invocation has its
+ *    `invocationPid`; job ids restart in every invocation. A malformed line, a record of
+ *    unknown type, or one with no owning header makes the answer at best `unknown`.
  * 2. Header `complete:false` and `incomplete` records make the answer at best `unknown`.
+ *    With `expectedInvocation`, a missing header for it does too.
  * 3. A process is identified by pid plus `startId` (clock-independent; compare for equality
  *    only). It is gone when no process has the pid, it is a zombie, or its `startId` differs;
  *    a process whose identity cannot be read is neither gone nor proven alive (`unknown`).
  * 4. An invocation still running means the registry is not final (`live`); one that cannot
  *    be examined makes the answer `unknown`.
  * 5. Open in-process records (runs, retained shells, jobs) that never ended mean `unknown`.
- * 6. An owner-marker scan per invocation token: marked processes block; unexaminable ones
- *    (see {@link OwnerScanSummary}) make the answer `unknown`.
+ * 6. One owner-marker scan for every token any header names (`ownerMarker` and
+ *    `inheritedOwnerMarkers`), counting processes started since the earliest of their
+ *    invocations: marked processes block; unexaminable or hidden ones (see
+ *    {@link OwnerScanSummary}) make the answer `unknown`.
  */
-export function verifyOwnedJobRegistry(file: string): OwnedJobVerdict {
+export function verifyOwnedJobRegistry(file: string, options: VerifyOwnedJobRegistryOptions = {}): OwnedJobVerdict {
 	const reasons: string[] = [];
 	const live: OwnedJobVerdict["live"] = [];
 	let text: string;
@@ -674,56 +910,71 @@ export function verifyOwnedJobRegistry(file: string): OwnedJobVerdict {
 	} catch (error) {
 		return { status: "unknown", live, reasons: [`registry unreadable: ${String(error)}`] };
 	}
-	const invocations = new Map<number, OwnedJobInvocationRecord>();
-	const open = new Map<string, OwnedJobStartRecord>();
-	for (const line of text.split("\n")) {
-		if (!line.trim()) continue;
-		let record: OwnedJobRecord;
-		try {
-			record = JSON.parse(line) as OwnedJobRecord;
-		} catch {
-			reasons.push("registry has a malformed record");
-			continue;
-		}
-		if (record.type === "invocation") {
-			invocations.set(record.invocation.pid, record);
-			if (!record.complete) reasons.push(...(record.incompleteReasons ?? ["invocation incomplete"]));
-		} else if (record.type === "incomplete") reasons.push(record.reason);
-		else if (record.type === "start") open.set(`${record.invocationPid}:${record.jobId}`, record);
-		else open.delete(`${record.invocationPid}:${record.jobId}`);
+	const { segments, problems } = parseOwnedJobRegistry(text);
+	reasons.push(...problems);
+	if (segments.length === 0) reasons.push("registry has no invocation header");
+	const expected = options.expectedInvocation;
+	if (
+		expected &&
+		!segments.some(
+			segment =>
+				segment.header.invocation.pid === expected.pid && segment.header.invocation.startId === expected.startId,
+		)
+	) {
+		reasons.push(`invocation ${expected.pid} has no header in the registry`);
 	}
-	if (invocations.size === 0) reasons.push("registry has no invocation header");
-	for (const { invocation } of invocations.values()) {
+	for (const { header, incomplete } of segments) {
+		if (!header.complete) reasons.push(...(header.incompleteReasons ?? ["invocation incomplete"]));
+		reasons.push(...incomplete);
+	}
+	for (const { header } of segments) {
+		const { invocation } = header;
 		const state = ownedProcessState(invocation.pid, invocation.startId);
 		if (state === "alive") {
 			return { status: "live", live, reasons: [`invocation ${invocation.pid} is still running`] };
 		}
 		if (state === "unreadable") reasons.push(`invocation ${invocation.pid} cannot be examined`);
 	}
-	for (const record of open.values()) {
-		if (record.kind === "internal") continue;
-		if (record.inProcess) {
-			reasons.push(`${record.kind} ${record.jobId} never ended`);
-			continue;
-		}
-		const state = ownedProcessState(record.pid, record.startId);
-		if (state === "alive") {
-			live.push({ jobId: record.jobId, kind: record.kind, pid: record.pid, command: record.command });
-		} else if (state === "unreadable") {
-			reasons.push(`${record.kind} ${record.jobId} (pid ${record.pid}) cannot be examined`);
+	for (const segment of segments) {
+		for (const record of segment.open.values()) {
+			if (record.kind === "internal") continue;
+			if (record.inProcess) {
+				reasons.push(`${record.kind} ${record.jobId} never ended`);
+				continue;
+			}
+			const state = ownedProcessState(record.pid, record.startId);
+			if (state === "alive") {
+				if (live.some(entry => entry.pid === record.pid)) continue;
+				live.push({ jobId: record.jobId, kind: record.kind, pid: record.pid, command: record.command });
+			} else if (state === "unreadable") {
+				reasons.push(`${record.kind} ${record.jobId} (pid ${record.pid}) cannot be examined`);
+			}
 		}
 	}
-	for (const { invocation, ownerMarker } of invocations.values()) {
-		if (!ownerMarker) {
-			reasons.push(`invocation ${invocation.pid} recorded no owner marker`);
-			continue;
+	const markers = new Map<string, InheritedOwnerMarker>();
+	let env: string | undefined;
+	for (const { header } of segments) {
+		if (!header.ownerMarker) {
+			reasons.push(`invocation ${header.invocation.pid} recorded no owner marker`);
+		} else {
+			env ??= header.ownerMarker.env;
+			if (header.ownerMarker.env !== env) reasons.push("registry uses more than one owner-marker variable");
 		}
-		const scan = scanProcessesByEnv(ownerMarker.env, ownerMarker.token, invocation.startId ?? undefined);
-		if (!scan.supported) reasons.push("owner-marker scan unsupported on this platform");
-		for (const proc of scan.opaque) reasons.push(`process ${proc.pid} (${proc.command}) environment unexaminable`);
-		for (const proc of scan.processes) {
-			if (live.some(entry => entry.pid === proc.pid)) continue;
-			live.push({ jobId: `marked:${proc.pid}`, kind: "process", pid: proc.pid, command: proc.command });
+		for (const marker of headerMarkers(header)) markers.set(marker.token, marker);
+	}
+	if (env !== undefined) {
+		try {
+			const since = earliestStartId([...markers.values()].map(marker => marker.startId));
+			const scan = scanProcessesByEnv(env, [...markers.keys()], since);
+			if (!scan.supported) reasons.push("owner-marker scan unsupported on this platform");
+			if (scan.hidden) reasons.push("owner-marker scan cannot see every process (hidepid)");
+			for (const proc of scan.opaque) reasons.push(`process ${proc.pid} (${proc.command}) environment unexaminable`);
+			for (const proc of scan.processes) {
+				if (live.some(entry => entry.pid === proc.pid)) continue;
+				live.push({ jobId: `marked:${proc.pid}`, kind: "process", pid: proc.pid, command: proc.command });
+			}
+		} catch (error) {
+			reasons.push(`owner-marker scan failed: ${String(error)}`);
 		}
 	}
 	if (live.length > 0) return { status: "blocked", live, reasons };

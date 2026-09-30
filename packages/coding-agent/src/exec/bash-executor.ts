@@ -22,7 +22,7 @@ import { getOrCreateSnapshot } from "../utils/shell-snapshot";
 import { TerminalGraphicsDecoder } from "../utils/terminal-graphics";
 import { loadDirenvEnv } from "./direnv";
 import { buildNonInteractiveEnv } from "./non-interactive-env";
-import { OWNER_SCAN_COVERS_PLATFORM, OwnedJobRegistry, ownerMarkerEnv } from "../session/owned-job-registry";
+import { OwnedJobRegistry, ownerMarkerEnv } from "../session/owned-job-registry";
 
 import {
 	cfgBashDirenv,
@@ -622,19 +622,9 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 
 	if (usePty && ptyRequest) {
 		const requestedMs = options?.timeout;
-		// A PTY shell's descendants are not reported back; only the owner-marker scan can find
-		// them, and it cannot see platform shells' environments outside Linux. The run itself
-		// is recorded so a crash mid-run leaves an open record.
-		const registry = OwnedJobRegistry.instance();
-		if (!OWNER_SCAN_COVERS_PLATFORM) {
-			registry?.markIncomplete("pty shell runs do not report spawned processes");
-		}
-		const runJobId = registry?.registerInProcessJob({
-			jobId: `pty-run:${++shellRunSequence}`,
-			kind: "shell-run",
-			command,
-			cwd: commandCwd ?? process.cwd(),
-		});
+		// A PTY shell's descendants are not reported back, so the registry can no longer vouch
+		// for every process; the run itself is recorded so a crash mid-run leaves an open record.
+		const endPtyRun = OwnedJobRegistry.instance()?.beginPtyRun({ command, cwd: commandCwd ?? process.cwd() });
 		try {
 			return await executeUserShellPty({
 				shell,
@@ -650,7 +640,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 				dump,
 			});
 		} finally {
-			if (runJobId) registry?.end(runJobId, "settled");
+			endPtyRun?.();
 			await sink.dispose();
 		}
 	}
