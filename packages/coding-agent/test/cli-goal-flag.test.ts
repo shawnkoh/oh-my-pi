@@ -24,6 +24,11 @@ describe("--goal launch option", () => {
 		expect(args.messages).toEqual([]);
 	});
 
+	it("accepts a leading hyphen with equals syntax and preserves internal newlines", () => {
+		expect(parseArgs(["--goal=-inspect"]).goal).toBe("-inspect");
+		expect(parseArgs(["--goal", "Inspect\nthen fix"]).goal).toBe("Inspect\nthen fix");
+	});
+
 	it("does not consume a following option as the objective", () => {
 		const args = parseArgs(["--goal", "-p", "hello"]);
 		expect(args.invalidFlagValues).toContain("--goal requires an objective.");
