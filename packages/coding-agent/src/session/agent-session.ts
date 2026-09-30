@@ -4141,7 +4141,9 @@ export class AgentSession implements SettingsScope {
 				// Quiet completions still count toward the context budget: run the
 				// ordinary compaction check so repeated quiet deliveries cannot grow
 				// the context unchecked until a non-quiet turn.
-				const quietCompaction = this.#maintenance.checkCompaction(msg);
+				// `msg` was just discarded, so the terminal-answer probe would read the
+				// previous evaluation's stop: never let this check auto-continue.
+				const quietCompaction = this.#maintenance.checkCompaction(msg, true, true, false);
 				this.#trackPostPromptTask(quietCompaction);
 				const quietResult = await quietCompaction;
 				await emitAgentEndNotification(quietResult.continuationScheduled ? { willContinue: true } : undefined);
