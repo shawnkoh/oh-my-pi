@@ -36,4 +36,5 @@ const session = new AgentSession({
 	ownedAsyncJobManager: new AsyncJobManager({ maxRunningJobs: 4 }),
 	agentId: "Main",
 });
-await runRpcMode(session);
+// `QUIESCE_FIXTURE_MODE=rpc-ui` wires the tool UI context exactly as `--mode rpc-ui` does.
+await runRpcMode(session, process.env.QUIESCE_FIXTURE_MODE === "rpc-ui" ? { setToolUIContext: () => {} } : {});

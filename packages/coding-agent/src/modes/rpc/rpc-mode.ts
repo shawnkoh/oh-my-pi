@@ -1812,10 +1812,22 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		return success(command.id, "quiesce_and_exit", result);
 	};
 
-	/** Exit after a passed quiesce: the response is queued first, and dispose drains the writer. */
+	/**
+	 * Exit after a passed quiesce. The response is queued first; every command already read
+	 * (the input reader yields between lines, so wait one macrotask for the rest of the
+	 * current read) is still answered — input commands with `admission_closed` — before
+	 * dispose drains the writer.
+	 */
 	const exitAfterQuiesce = (): void => {
-		shutdownState.requested = true;
-		queueMicrotask(() => void shutdownCoordinator.checkShutdownRequested());
+		// Not `shutdownState.requested` yet: that would let the next serial command's completion
+		// exit before the commands queued behind it were answered.
+		setImmediate(
+			() =>
+				void inputDispatcher.drain().then(() => {
+					shutdownState.requested = true;
+					return shutdownCoordinator.checkShutdownRequested();
+				}),
+		);
 	};
 
 	// Deferred shutdown (pi.shutdown() from an extension) must not kill the
