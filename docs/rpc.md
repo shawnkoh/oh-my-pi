@@ -443,6 +443,16 @@ with that `pid` has that OS start time; an open `inProcess` record after its
 invocation ended, or any incomplete marker, means the registry cannot vouch for
 every process.
 
+`kind: "internal"` records are engine helper daemons this invocation started (the
+daemon broker `__omp_worker_daemon_broker`, text prediction
+`__omp_worker_text_predict`). They are shared by every agent process in their scope,
+run no Thread work, and exit on their own idle timer (broker: a few seconds after the
+last agent process in its scope disconnects, stopping non-persistent children such as
+text prediction) — so they never count as outstanding work, alive or not. Services a
+broker hosts, including persistent or detached ones that outlive it, have their own
+`service` records. A helper started by a different agent process has no record here;
+consumers identify it by that worker selector in its argv.
+
 ### `set_fast_mode` payload
 
 `set_fast_mode` changes whether fast mode is enabled for the session. The

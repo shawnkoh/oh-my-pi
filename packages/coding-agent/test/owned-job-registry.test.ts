@@ -10,6 +10,8 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/owned-job-registry";
 import { processStartTime } from "@oh-my-pi/pi-natives";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createDaemonBrokerClient } from "@oh-my-pi/pi-coding-agent/launch/client";
+import { DAEMON_BROKER_WORKER_ARG } from "@oh-my-pi/pi-coding-agent/launch/protocol";
 
 function readRecords(file: string): OwnedJobRecord[] {
 	return fs
@@ -98,6 +100,28 @@ describe.skipIf(process.platform === "win32")("owned-job registry", () => {
 		const records = readRecords(ownedJobRegistryPath(sessionFile));
 		expect(records[0]).toMatchObject({ type: "invocation", complete: false });
 		expect(records.some(record => record.type === "incomplete")).toBe(true);
+	});
+
+	it("records a daemon broker it spawns as an internal helper that is never counted as work", async () => {
+		const projectDir = path.join(tempDir.path(), "project");
+		fs.mkdirSync(projectDir);
+		const client = await createDaemonBrokerClient(projectDir, {
+			runtimeDir: path.join(tempDir.path(), "runtime"),
+			idleGraceMs: 100,
+		});
+		try {
+			await client.request({ op: "ping" });
+			const record = readRecords(ownedJobRegistryPath(sessionFile)).find(
+				entry => entry.type === "start" && entry.kind === "internal",
+			);
+			if (record?.type !== "start") throw new Error("expected an internal start record");
+			expect(record.command).toBe(DAEMON_BROKER_WORKER_ARG);
+			expect(isOwnedProcessAlive(record.pid, record.startTime)).toBe(true);
+			expect(registry.liveProcessCount()).toBe(0);
+		} finally {
+			// With no client left the broker exits on its own idle timer.
+			client.close();
+		}
 	});
 
 	it("leaves a crashed agent's live job detectable from the registry file alone", async () => {

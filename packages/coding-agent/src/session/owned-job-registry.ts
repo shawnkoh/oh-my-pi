@@ -28,10 +28,21 @@ export const OWNED_JOB_REGISTRY_VERSION = 1;
  *   external children live in their own sessions, so an unfinished run at a crash may
  *   have left processes that were never enumerated.
  * - `process`: an OS process a shell command left running (background or reparented).
+ * - `internal`: an engine helper daemon this invocation started (daemon broker, text
+ *   prediction). Shared by every agent process in its scope and not Thread work: it exits on
+ *   its own idle timer once no agent process in that scope is connected. Never counted as
+ *   outstanding work; services it hosts are recorded separately as `service`.
  * - `service`: a named long-running service started through the launch broker.
  * - `service-start`: a service launch request whose process id is not known yet.
  */
-export type OwnedJobKind = "async-job" | "subagent" | "shell-run" | "service-start" | "process" | "service";
+export type OwnedJobKind =
+	| "async-job"
+	| "subagent"
+	| "shell-run"
+	| "service-start"
+	| "process"
+	| "service"
+	| "internal";
 export type InProcessJobKind = "async-job" | "subagent" | "shell-run" | "service-start";
 
 export interface OwnedJobStartRecord {
@@ -90,7 +101,7 @@ export type OwnedJobRecord =
 	| OwnedJobIncompleteRecord;
 
 export interface OwnedProcessInput {
-	kind: "process" | "service";
+	kind: "process" | "service" | "internal";
 	pid: number;
 	pgid?: number | null;
 	startTime?: number | null;
@@ -329,15 +340,16 @@ export class OwnedJobRegistry {
 	}
 
 	/**
-	 * Synchronously check every open OS-process record, record the ones that
-	 * exited, and return how many are still alive.
+	 * Synchronously check every open OS-process record, record the ones that exited, and
+	 * return how many owned processes are still alive. `internal` helpers are tracked (their
+	 * exit is recorded) but never counted.
 	 */
 	liveProcessCount(): number {
 		let alive = 0;
 		for (const [jobId, open] of this.#open) {
 			if (open.record.inProcess) continue;
-			if (isOwnedProcessAlive(open.record.pid, open.record.startTime)) alive++;
-			else this.end(jobId, "exited");
+			if (!isOwnedProcessAlive(open.record.pid, open.record.startTime)) this.end(jobId, "exited");
+			else if (open.record.kind !== "internal") alive++;
 		}
 		return alive;
 	}

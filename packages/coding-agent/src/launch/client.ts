@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { getGlobalDaemonRuntimeDir, isEexist, isEnoent, logger, postmortem } from "@oh-my-pi/pi-utils";
 import { hostHasInheritableConsole } from "../eval/py/spawn-options";
 import { resolveWorkerSpawnCmd, workerEnvFromParent } from "../subprocess/worker-client";
+import { OwnedJobRegistry } from "../session/owned-job-registry";
 import { canonicalProjectDir, daemonBrokerEndpoint, daemonRuntimeDir } from "./paths";
 import {
 	DAEMON_BROKER_WORKER_ARG,
@@ -329,6 +330,13 @@ class SocketDaemonClient implements DaemonBrokerClient {
 			...BROKER_SPAWN_OPTIONS,
 		});
 		child.unref();
+		// A shared engine helper, not Thread work: recorded so a consumer can identify it.
+		OwnedJobRegistry.instance()?.registerProcess({
+			kind: "internal",
+			pid: child.pid,
+			command: DAEMON_BROKER_WORKER_ARG,
+			cwd: spawn.cwd ?? null,
+		});
 	}
 
 	#bindSocket(socket: net.Socket): void {
