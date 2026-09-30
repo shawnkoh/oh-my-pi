@@ -236,30 +236,41 @@ pub struct MarkedProcessScan {
 	/// `/bin/sleep`, …), so a marker on such a process is not visible and it
 	/// is counted here instead.
 	pub redacted:   u32,
+	/// The unreadable and redacted processes started at or after `opaqueSince`
+	/// (empty when it was not given): the only ones that could hide a marker set
+	/// no earlier than that instant.
+	pub opaque:     Vec<MarkedProcess>,
+}
+
+fn to_napi(entry: core_process::MarkedProcess) -> MarkedProcess {
+	MarkedProcess {
+		pid:        entry.pid,
+		ppid:       entry.ppid,
+		pgid:       entry.pgid,
+		start_time: entry.start_time.and_then(|secs| i64::try_from(secs).ok()),
+		command:    entry.command,
+	}
 }
 
 /// Every live process owned by the calling user (excluding the caller itself)
 /// whose environment variable `name` is set and whose value, split on ',',
-/// contains `token` exactly.
+/// contains `token` exactly. `opaqueSince` (Unix epoch seconds) selects which
+/// processes with an unexaminable environment are listed in `opaque`.
 #[napi]
-pub fn scan_processes_by_env(name: String, token: String) -> MarkedProcessScan {
-	let scan = core_process::scan_processes_by_env(&name, &token);
+pub fn scan_processes_by_env(
+	name: String,
+	token: String,
+	opaque_since: Option<i64>,
+) -> MarkedProcessScan {
+	let since = opaque_since.and_then(|secs| u64::try_from(secs).ok());
+	let scan = core_process::scan_processes_by_env(&name, &token, since);
 	MarkedProcessScan {
 		supported:  scan.supported,
-		processes:  scan
-			.processes
-			.into_iter()
-			.map(|entry| MarkedProcess {
-				pid:        entry.pid,
-				ppid:       entry.ppid,
-				pgid:       entry.pgid,
-				start_time: entry.start_time.and_then(|secs| i64::try_from(secs).ok()),
-				command:    entry.command,
-			})
-			.collect(),
+		processes:  scan.processes.into_iter().map(to_napi).collect(),
 		scanned:    scan.scanned,
 		unreadable: scan.unreadable,
 		redacted:   scan.redacted,
+		opaque:     scan.opaque.into_iter().map(to_napi).collect(),
 	}
 }
 

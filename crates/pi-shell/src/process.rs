@@ -322,7 +322,11 @@ mod platform {
 		ids.split_whitespace().nth(1)?.parse().ok()
 	}
 
-	pub fn scan_processes_by_env(name: &str, token: &str) -> super::MarkedProcessScan {
+	pub fn scan_processes_by_env(
+		name: &str,
+		token: &str,
+		opaque_since: Option<u64>,
+	) -> super::MarkedProcessScan {
 		let Ok(entries) = fs::read_dir("/proc") else {
 			return super::MarkedProcessScan::default();
 		};
@@ -360,6 +364,16 @@ mod platform {
 				continue;
 			}
 			scan.scanned += 1;
+			let Ok(pid) = i32::try_from(pid) else {
+				continue;
+			};
+			let entry = super::MarkedProcess {
+				pid,
+				ppid: stat.ppid,
+				pgid: Some(stat.pgrp).filter(|pgrp| *pgrp > 0),
+				start_time: start_ticks_to_unix_secs(stat.start_ticks),
+				command: stat.comm.to_owned(),
+			};
 			let environ = match fs::read(format!("/proc/{pid}/environ")) {
 				Ok(environ) => environ,
 				Err(_) => {
@@ -367,6 +381,7 @@ mod platform {
 					// deny the read; a vanished directory means it simply exited.
 					if fs::exists(format!("/proc/{pid}")).unwrap_or(true) {
 						scan.unreadable += 1;
+						scan.push_opaque(entry, opaque_since);
 					}
 					continue;
 				},
@@ -376,21 +391,13 @@ mod platform {
 				.filter(|entry| !entry.is_empty());
 			let Some(first) = env.next() else {
 				scan.redacted += 1;
+				scan.push_opaque(entry, opaque_since);
 				continue;
 			};
 			if !super::env_has_token(std::iter::once(first).chain(env), name, token) {
 				continue;
 			}
-			let Ok(pid) = i32::try_from(pid) else {
-				continue;
-			};
-			scan.processes.push(super::MarkedProcess {
-				pid,
-				ppid: stat.ppid,
-				pgid: Some(stat.pgrp).filter(|pgrp| *pgrp > 0),
-				start_time: start_ticks_to_unix_secs(stat.start_ticks),
-				command: stat.comm.to_owned(),
-			});
+			scan.processes.push(entry);
 		}
 		scan
 	}
@@ -871,7 +878,11 @@ mod platform {
 		}
 	}
 
-	pub fn scan_processes_by_env(name: &str, token: &str) -> super::MarkedProcessScan {
+	pub fn scan_processes_by_env(
+		name: &str,
+		token: &str,
+		opaque_since: Option<u64>,
+	) -> super::MarkedProcessScan {
 		let mut scan = super::MarkedProcessScan { supported: true, ..Default::default() };
 		// SAFETY: `geteuid`/`getpid` take no arguments and cannot fail.
 		let (euid, self_pid) = unsafe { (libc::geteuid(), libc::getpid()) };
@@ -889,6 +900,13 @@ mod platform {
 				continue;
 			}
 			scan.scanned += 1;
+			let entry = super::MarkedProcess {
+				pid,
+				ppid: i32::try_from(info.pbi_ppid).unwrap_or(0),
+				pgid: i32::try_from(info.pbi_pgid).ok().filter(|pgid| *pgid > 0),
+				start_time: Some(info.pbi_start_tvsec),
+				command: bsdinfo_command(&info),
+			};
 			let Ok(len) = read_procargs(pid, &mut buffer) else {
 				let still_live = read_bsdinfo(pid).is_some_and(|now| {
 					now.pbi_start_tvsec == info.pbi_start_tvsec
@@ -896,11 +914,13 @@ mod platform {
 				});
 				if still_live {
 					scan.unreadable += 1;
+					scan.push_opaque(entry, opaque_since);
 				}
 				continue;
 			};
 			let Some((_, env_region)) = split_procargs(&buffer[..len]) else {
 				scan.unreadable += 1;
+				scan.push_opaque(entry, opaque_since);
 				continue;
 			};
 			// The kernel withholds the environment of Apple platform binaries
@@ -911,18 +931,13 @@ mod platform {
 				.filter(|entry| !entry.is_empty());
 			let Some(first) = env.next() else {
 				scan.redacted += 1;
+				scan.push_opaque(entry, opaque_since);
 				continue;
 			};
 			if !super::env_has_token(std::iter::once(first).chain(env), name, token) {
 				continue;
 			}
-			scan.processes.push(super::MarkedProcess {
-				pid,
-				ppid: i32::try_from(info.pbi_ppid).unwrap_or(0),
-				pgid: i32::try_from(info.pbi_pgid).ok().filter(|pgid| *pgid > 0),
-				start_time: Some(info.pbi_start_tvsec),
-				command: bsdinfo_command(&info),
-			});
+			scan.processes.push(entry);
 		}
 		scan
 	}
@@ -1476,7 +1491,11 @@ mod platform {
 	}
 
 	/// Reading another process's environment needs its PEB; not implemented.
-	pub fn scan_processes_by_env(_name: &str, _token: &str) -> super::MarkedProcessScan {
+	pub fn scan_processes_by_env(
+		_name: &str,
+		_token: &str,
+		_opaque_since: Option<u64>,
+	) -> super::MarkedProcessScan {
 		super::MarkedProcessScan::default()
 	}
 
@@ -1573,6 +1592,21 @@ pub struct MarkedProcessScan {
 	/// `zsh`, `sleep`, …), so a marker on such a process is invisible and lands
 	/// here; a process started with an empty environment is counted too.
 	pub redacted:   u32,
+	/// The unreadable and redacted processes started at or after the caller's
+	/// `opaque_since` (empty when none was given): the ones that could carry a
+	/// marker set no earlier than that instant without the scan seeing it.
+	pub opaque:     Vec<MarkedProcess>,
+}
+
+impl MarkedProcessScan {
+	#[cfg(unix)]
+	fn push_opaque(&mut self, entry: MarkedProcess, since: Option<u64>) {
+		if let Some(since) = since
+			&& entry.start_time.is_none_or(|start| start >= since)
+		{
+			self.opaque.push(entry);
+		}
+	}
 }
 
 /// Every live process owned by the calling user (effective uid), except the
@@ -1581,9 +1615,19 @@ pub struct MarkedProcessScan {
 ///
 /// Environments are read as the kernel exposes them: the block the process
 /// was exec'd with, not later `setenv` changes.
+///
+/// `opaque_since` (Unix epoch seconds) selects which processes whose
+/// environment could not be examined are listed in
+/// [`MarkedProcessScan::opaque`]: those started at or after it (or with an
+/// unknown start time). A marker set at that instant cannot be inherited by an
+/// older process, so only these can hide one.
 #[must_use]
-pub fn scan_processes_by_env(name: &str, token: &str) -> MarkedProcessScan {
-	platform::scan_processes_by_env(name, token)
+pub fn scan_processes_by_env(
+	name: &str,
+	token: &str,
+	opaque_since: Option<u64>,
+) -> MarkedProcessScan {
+	platform::scan_processes_by_env(name, token, opaque_since)
 }
 
 /// True when the first `name=` entry of `env` (getenv semantics) has `token`
@@ -2798,7 +2842,7 @@ mod tests {
 		}
 
 		fn find(token: &str, pid: i32) -> Option<MarkedProcess> {
-			let scan = scan_processes_by_env("OMP_OWNER", token);
+			let scan = scan_processes_by_env("OMP_OWNER", token, None);
 			assert!(scan.supported);
 			scan.processes.into_iter().find(|entry| entry.pid == pid)
 		}
@@ -2868,7 +2912,7 @@ mod tests {
 			let pid = child_pid(&child);
 			reaper.children.push(child);
 
-			let scan = scan_processes_by_env("PATH", &path);
+			let scan = scan_processes_by_env("PATH", &path, None);
 			let self_pid = i32::try_from(std::process::id()).expect("pid fits in i32");
 			assert!(scan.processes.iter().any(|entry| entry.pid == pid));
 			assert!(scan.processes.iter().all(|entry| entry.pid != self_pid));
@@ -2908,7 +2952,7 @@ mod tests {
 
 			let deadline = Instant::now() + Duration::from_secs(10);
 			let daemon = loop {
-				let scan = scan_processes_by_env("OMP_OWNER", &token);
+				let scan = scan_processes_by_env("OMP_OWNER", &token, None);
 				if let Some(entry) = scan.processes.into_iter().next() {
 					break entry;
 				}

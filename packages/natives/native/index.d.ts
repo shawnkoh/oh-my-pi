@@ -2218,6 +2218,12 @@ export interface MarkedProcessScan {
    * is counted here instead.
    */
   redacted: number
+  /**
+   * The unreadable and redacted processes started at or after `opaqueSince`
+   * (empty when it was not given): the only ones that could hide a marker set
+   * no earlier than that instant.
+   */
+  opaque: Array<MarkedProcess>
 }
 
 /** A single match in the content. */
@@ -2671,9 +2677,10 @@ export declare function renderSnapcompactPng(text: string, options: SnapcompactR
 /**
  * Every live process owned by the calling user (excluding the caller itself)
  * whose environment variable `name` is set and whose value, split on ',',
- * contains `token` exactly.
+ * contains `token` exactly. `opaqueSince` (Unix epoch seconds) selects which
+ * processes with an unexaminable environment are listed in `opaque`.
  */
-export declare function scanProcessesByEnv(name: string, token: string): MarkedProcessScan
+export declare function scanProcessesByEnv(name: string, token: string, opaqueSince?: number | undefined | null): MarkedProcessScan
 
 /**
  * Search content for a pattern (one-shot, compiles pattern each time).
