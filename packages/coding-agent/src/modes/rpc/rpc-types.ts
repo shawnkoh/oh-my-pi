@@ -211,7 +211,8 @@ export interface RpcPromptResultFrame {
 	 * Empty when the prompt's message could not be identified: a non-literal
 	 * prompt in a run that delivered several messages, identical literal texts
 	 * answered together, or a session or branch change during the run. Any
-	 * persisted user message (including host steers and extension messages)
+	 * persisted user message (including host steers and extension messages),
+	 * external delivery or goal-mode context
 	 * ends the preceding reply.
 	 */
 	replyEntryIds?: string[];
