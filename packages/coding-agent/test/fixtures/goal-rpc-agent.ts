@@ -27,7 +27,8 @@ cfgGoalContinuationModes.set(settings, Bun.env.GOAL_RPC_CONTINUATION === "1" ? [
 const { session } = await createAgentSession({
 	cwd,
 	agentDir: cwd,
-	sessionManager: SessionManager.inMemory(cwd),
+	// GOAL_RPC_PERSIST=1: a file-backed session, so /goaltest-reload really reopens it.
+	sessionManager: Bun.env.GOAL_RPC_PERSIST === "1" ? SessionManager.create(cwd) : SessionManager.inMemory(cwd),
 	authStorage,
 	modelRegistry,
 	settings,
@@ -48,6 +49,12 @@ const { session } = await createAgentSession({
 				handler: async (args, ctx) => {
 					await ctx.newSession();
 					if (args.trim()) pi.sendUserMessage(args.trim());
+				},
+			});
+			pi.registerCommand("goaltest-reload", {
+				description: "reload the session from disk",
+				handler: async (_args, ctx) => {
+					await ctx.reload();
 				},
 			});
 			pi.registerCommand("goaltest-navigate-here", {

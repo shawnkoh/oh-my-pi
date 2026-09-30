@@ -37,6 +37,7 @@ describe("RPC goal command", () => {
 		continuation: boolean;
 		script?: "complete" | "idle" | "slow";
 		plan?: boolean;
+		persist?: boolean;
 	}): Promise<RpcClient> {
 		directory = await fs.mkdtemp(path.join(os.tmpdir(), "omp-rpc-goal-"));
 		client = new RpcClient({
@@ -48,6 +49,7 @@ describe("RPC goal command", () => {
 				GOAL_RPC_CONTINUATION: options.continuation ? "1" : "0",
 				GOAL_RPC_SCRIPT: options.script ?? "complete",
 				GOAL_RPC_PLAN: options.plan ? "1" : "0",
+				GOAL_RPC_PERSIST: options.persist ? "1" : "0",
 			},
 		});
 		await client.start();
@@ -293,6 +295,35 @@ describe("RPC goal command", () => {
 			unsubscribeEvents();
 		}
 	}, 40_000);
+
+	test("an extension reload detaches the live run and closes its prompt as aborted", async () => {
+		const rpc = await start({ continuation: false, script: "slow", persist: true });
+		const results = new Map<string, string>();
+		const unsubscribe = rpc.onPromptResult(result => {
+			if (result.id) results.set(result.id, result.status);
+		});
+		const started = Promise.withResolvers<void>();
+		const unsubscribeEvents = rpc.onEvent(event => {
+			if (event.type === "agent_start") started.resolve();
+		});
+		try {
+			const first = await rpc.prompt("first, stalls");
+			await withTimeout(started.promise, 10_000, "First run never started");
+			await rpc.promptAndWait("/goaltest-reload");
+			await withTimeout(
+				(async () => {
+					while (!results.has(first)) await Bun.sleep(20);
+				})(),
+				5_000,
+				"The detached run's prompt was never reported",
+			);
+			expect(results.get(first)).toBe("aborted");
+			expect((await rpc.getState()).isSettled).toBe(true);
+		} finally {
+			unsubscribe();
+			unsubscribeEvents();
+		}
+	}, 30_000);
 
 	test("prompt_result reports the session unsettled when a goal continuation follows the prompt", async () => {
 		const rpc = await start({ continuation: true, script: "idle" });

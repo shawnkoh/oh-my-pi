@@ -36,7 +36,7 @@ export interface InitializeExtensionsOptions {
 	filterActiveTools?: (toolNames: string[]) => string[];
 	/**
 	 * Optional wrapper around extension-initiated session changes (new, branch,
-	 * navigate, switch), so the host can quiesce and reattach its own per-session
+	 * navigate, switch, reload), so the host can quiesce and reattach its own per-session
 	 * state exactly as it does for its own session-change commands.
 	 * `detachesRun` is true for changes that stop the running agent (new, switch);
 	 * branch and navigation leave a live run streaming to its normal end.
@@ -188,8 +188,18 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 					},
 					{ detachesRun: true },
 				),
+			// Reload reopens the session file (switchSession), detaching a live run; it throws
+			// when cancelled, and the wrapper's cleanup still runs.
 			reload: async () => {
-				await session.reload();
+				await wrapSessionChange(
+					async () => {
+						// Without a session file reload is a no-op and nothing is detached.
+						if (!session.sessionFile) return { cancelled: true };
+						await session.reload();
+						return { cancelled: false };
+					},
+					{ detachesRun: true },
+				);
 			},
 			compact: instructionsOrOptions => runExtensionCompact(session, instructionsOrOptions),
 		},

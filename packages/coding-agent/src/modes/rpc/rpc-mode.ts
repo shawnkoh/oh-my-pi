@@ -1318,6 +1318,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			}
 
 			case "open_session": {
+				const transcriptBeforeOpen = session.sessionManager.getSessionId();
 				await goalController.beginSessionChange();
 				let result: RpcOpenSessionResult | undefined;
 				try {
@@ -1328,7 +1329,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					await goalController.settled();
 				}
 				if (!result.cancelled) {
-					promptResults.abortOpen();
+					// Opening the session that is already open switches nothing and leaves a live run going.
+					if (session.sessionManager.getSessionId() !== transcriptBeforeOpen) promptResults.abortOpen();
 					void settleWatcher.check();
 					await emitAvailableCommandsUpdate();
 				}
