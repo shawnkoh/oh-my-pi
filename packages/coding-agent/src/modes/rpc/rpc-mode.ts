@@ -255,7 +255,11 @@ export interface RpcInputFrameDeps {
 /** Commands answered on receipt, ahead of the serialized command queue. */
 const IMMEDIATE_RPC_COMMANDS: ReadonlySet<string> = new Set(["attest", "quiesce_and_exit"]);
 
-/** Commands that hand the session new input or work; refused once admission is closed for exit. */
+/**
+ * Commands that hand the session new input or work; refused once admission is closed for exit.
+ * `goal` is gated only for ops that can start a continuation turn; `deliver` is the external
+ * delivery command (when present).
+ */
 const ADMISSION_GATED_RPC_COMMANDS: ReadonlySet<string> = new Set([
 	"prompt",
 	"steer",
@@ -264,7 +268,14 @@ const ADMISSION_GATED_RPC_COMMANDS: ReadonlySet<string> = new Set([
 	"bash",
 	"compact",
 	"handoff",
+	"deliver",
 ]);
+const ADMISSION_GATED_GOAL_OPS: ReadonlySet<string> = new Set(["create", "resume"]);
+
+export function isAdmissionGatedRpcCommand(command: { type: string; op?: unknown }): boolean {
+	if (command.type === "goal") return ADMISSION_GATED_GOAL_OPS.has(String(command.op));
+	return ADMISSION_GATED_RPC_COMMANDS.has(command.type);
+}
 
 /**
  * Structural guard for a well-formed extension UI response frame. Mirrors the
@@ -1156,7 +1167,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		const id = command.id;
 		// Admission closes only on the way out (passed quiesce or hang-up); answer with a
 		// machine-readable code rather than letting the session reject deep in dispatch.
-		if (session.isAdmissionClosed() && ADMISSION_GATED_RPC_COMMANDS.has(command.type)) {
+		if (session.isAdmissionClosed() && isAdmissionGatedRpcCommand(command)) {
 			return error(id, command.type, "Session is exiting; input is no longer admitted", "admission_closed");
 		}
 

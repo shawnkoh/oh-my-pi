@@ -409,10 +409,15 @@ read-only snapshot, then asks the process to exit only if nothing changed:
    every input path, then requires all counts zero, `epoch` unchanged and the
    deadline not reached — all without yielding, so no input can interleave.
    - Pass → `data: { status: "quiesced", operationId, attempt, attestation, path }`.
+     Before the attestation is written the transcript is made final (the exit record
+     is appended, flushed and the file sealed), and `attestation.session` carries its
+     `size` and `sha256`; nothing is appended to the session file afterwards.
      `attestation` (`kind: "quiesce"`) was already fsync'd to `path`
      (`<session file without .jsonl>.terminal.json`) before the response is
-     written; the process then disposes the session and exits with code 0. Commands
-     received afterwards fail with `code: "admission_closed"`.
+     written; the process then disposes the session and exits with code 0. Input
+     commands received afterwards (`prompt`, `steer`, `follow_up`, `abort_and_prompt`,
+     `bash`, `compact`, `handoff`, and where present `deliver` and `goal`
+     `create`/`resume`) fail with `code: "admission_closed"`.
    - Refusal → `data: { status: "refused", operationId, attempt, reason, snapshot:
      { epoch, counts, observedAt } }`. Admission is reopened and nothing is cancelled.
      `reason` is one of `work_active`, `epoch_mismatch`, `deadline_expired`,

@@ -131,6 +131,7 @@ import { HistoryStorage } from "../session/history-storage";
 import { syncTextPrediction, textPredictionBackend } from "../predict/client";
 import { setWordPredictionHost } from "@oh-my-pi/pi-tui/prompt/word-completion";
 import { USER_INTERRUPT_LABEL } from "../session/messages";
+import type { GoalContinuationReservation } from "../session/quiescence";
 import { resolveMarkdownLinkTargets } from "../internal-urls/hyperlink-targets";
 import { modelMentionDisplayName } from "@oh-my-pi/pi-tui/prompt/model-mention-syntax";
 import { modelMentionChipLabel, shiftImageMarkers } from "@oh-my-pi/pi-tui/prompt/composer-attachments";
@@ -1521,6 +1522,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	#vibeSkillInFlight = 0;
 	#vibeScopeSuspendedForSwitch = false;
 	#goalContinuationTimer: NodeJS.Timeout | undefined;
+	/** Counts the scheduled continuation as pending session work until it is submitted or dropped. */
+	#goalContinuationReservation: GoalContinuationReservation | undefined;
 	/** Submitted continuation turns awaiting their asynchronously delivered `agent_end`. */
 	#pendingGoalContinuationTurns = 0;
 	#previousGoalContinuationActivity: string | undefined;
@@ -2041,12 +2044,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		// FIRST and its dispose() would otherwise persist the generic "dispose".
 		this.#cleanupUnsubscribe = postmortem.register("session-teardown", reason => this.#signalTeardown!(reason));
 		// Host-owned pending work the session cannot see: a submitted editor input not yet
-		// dispatched, and a scheduled goal continuation.
+		// dispatched. (A scheduled goal continuation holds a session reservation instead.)
 		this.session.registerWorkSource({ kind: "queuedInput", count: () => (this.hasPendingSubmission() ? 1 : 0) });
-		this.session.registerWorkSource({
-			kind: "goalContinuationScheduled",
-			count: () => (this.#goalContinuationTimer ? 1 : 0),
-		});
 
 		// Wire the report_tool_issue consent gate to the Yes/No dialog popup.
 		// The handler is process-global — subagent tools (which can't reach
@@ -2811,7 +2810,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#cancelGoalContinuation();
 		if (this.loopModeEnabled) return;
 		if (!this.onInputCallback) return;
-		if (this.session.isAdmissionClosed()) return;
 		if (!cfgGoalContinuationModes.get(this.session.settings).includes("interactive")) return;
 		if (this.planModeEnabled || this.planModePaused) return;
 		if (!this.goalModeEnabled || this.goalModePaused) return;
@@ -2824,8 +2822,15 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (!state?.enabled || state.goal.status !== "active") return;
 		const prompt = this.session.goalRuntime.buildContinuationPrompt();
 		if (!prompt) return;
+		// Refused while admission is closed (the session is exiting).
+		const reservation = this.session.reserveGoalContinuation();
+		if (!reservation) return;
+		this.#goalContinuationReservation = reservation;
 		this.#goalContinuationTimer = setTimeout(() => {
 			this.#goalContinuationTimer = undefined;
+			this.#goalContinuationReservation = undefined;
+			// Released in the same step as the submission below admits it (or the tick drops).
+			reservation.release();
 			if (!this.onInputCallback) return;
 			if (!this.goalModeEnabled || this.goalModePaused) return;
 			// The 800ms timer can outlive the idle window that scheduled it: a
@@ -2851,8 +2856,6 @@ export class InteractiveMode implements InteractiveModeContext {
 				}),
 			);
 		}, 800);
-		// A scheduled continuation is pending work: invalidate earlier attestations.
-		this.session.noteActivity();
 	}
 
 	/** A blocked-only todo list has no work the agent can advance without another turn. */
@@ -2872,6 +2875,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			clearTimeout(this.#goalContinuationTimer);
 			this.#goalContinuationTimer = undefined;
 		}
+		this.#goalContinuationReservation?.release();
+		this.#goalContinuationReservation = undefined;
 	}
 
 	cancelGoalContinuation(): void {

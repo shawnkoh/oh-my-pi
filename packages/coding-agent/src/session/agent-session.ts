@@ -427,6 +427,7 @@ import {
 	AdmissionClosedError,
 	assertAttestationWritable,
 	emptyWorkCounts,
+	type GoalContinuationReservation,
 	hasOutstandingWork,
 	type QuiesceRequest,
 	type QuiesceResult,
@@ -1003,6 +1004,8 @@ export class AgentSession implements SettingsScope {
 	/** steer()/followUp()/queued sendUserMessage() calls still preprocessing before they reach a queue. */
 	#queuedInputsInFlight = 0;
 	readonly #workSources = new Set<SessionWorkSource>();
+	/** Goal continuations a host has decided to start but not yet submitted. */
+	#goalContinuationReservations = 0;
 	/** Highest quiesce attempt answered per operation id. */
 	readonly #answeredQuiesceAttempts = new Map<string, number>();
 	#terminalAttestation: TerminalAttestation | undefined;
@@ -2835,9 +2838,36 @@ export class AgentSession implements SettingsScope {
 		return this.#activityEpoch;
 	}
 
-	/** Report host-owned activity (e.g. a scheduled goal continuation) that invalidates earlier attestations. */
+	/** Report host-owned activity that invalidates earlier attestations. */
 	noteActivity(): void {
 		this.#activityEpoch++;
+	}
+
+	/**
+	 * Reserve a goal continuation a host has decided to start (for example at a terminal
+	 * `agent_end`, before it submits the hidden `goal-continuation` prompt in a later
+	 * macrotask). Returns `undefined` while input admission is closed: the host must not
+	 * schedule a continuation then. Otherwise advances {@link activityEpoch} and counts as
+	 * `goalContinuationScheduled` work until released, so a quiesce can never pass between the
+	 * decision and the submission.
+	 *
+	 * The host calls `release()` exactly when the continuation stops being pending: when it
+	 * drops the continuation, or in the same synchronous step as it submits the prompt through
+	 * {@link promptCustomMessage} (which admits synchronously, before its first await).
+	 * `release()` is idempotent.
+	 */
+	reserveGoalContinuation(): GoalContinuationReservation | undefined {
+		if (this.#admissionClosedBy) return undefined;
+		this.#activityEpoch++;
+		this.#goalContinuationReservations++;
+		let released = false;
+		return {
+			release: () => {
+				if (released) return;
+				released = true;
+				this.#goalContinuationReservations--;
+			},
+		};
 	}
 
 	/**
@@ -2890,6 +2920,7 @@ export class AgentSession implements SettingsScope {
 		counts.handoff = this.isGeneratingHandoff ? 1 : 0;
 		counts.scheduledTurns =
 			this.#postPromptTasks.size + (this.#activeAgentContinue ? 1 : 0) + (this.isRetrying ? 1 : 0);
+		counts.goalContinuationScheduled = this.#goalContinuationReservations;
 		for (const source of this.#workSources) counts[source.kind] += Math.max(0, source.count());
 		return counts;
 	}

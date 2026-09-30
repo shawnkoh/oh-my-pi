@@ -88,6 +88,12 @@ export interface SessionWorkSource {
 	count(): number;
 }
 
+/** A pending goal continuation (see {@link AgentSession.reserveGoalContinuation}). */
+export interface GoalContinuationReservation {
+	/** Stop counting the continuation as pending. Idempotent. */
+	release(): void;
+}
+
 export function emptyWorkCounts(): WorkCounts {
 	return {
 		streaming: 0,
