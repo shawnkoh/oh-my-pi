@@ -10,7 +10,7 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { fsyncDirectory, type InvocationIdentity, stripJsonl } from "./owned-job-registry";
+import { fsyncDirectory, type InvocationIdentity, type OwnerScanSummary, stripJsonl } from "./owned-job-registry";
 
 /** Capability: `attest` + `quiesce_and_exit` with a terminal attestation file. */
 export const QUIESCE_EXIT_CAPABILITY = "quiesce-exit/1";
@@ -130,8 +130,13 @@ export interface SessionIdentity {
 export interface OwnedJobRegistryState {
 	/** Registry JSONL path, or `null` when the session has no registry. */
 	path: string | null;
-	/** False when some owned process may be missing from the registry. */
+	/**
+	 * False when some owned process may be missing: a registry `incomplete` marker, or an
+	 * owner-marker scan that could not examine every candidate process (`ownerScan.sound`).
+	 */
 	complete: boolean;
+	/** The owner-marker scan behind `detachedJobs`; `null` without a registry. */
+	ownerScan: OwnerScanSummary | null;
 }
 
 /** Read-only snapshot answering an `attest` request. */
@@ -182,8 +187,10 @@ export interface TerminalAttestation {
 	counts: WorkCounts;
 	/** True when any work was outstanding at capture (always false for `quiesce`). */
 	interrupted: boolean;
+	/** Registry complete and the owner-marker scan sound (see {@link OwnedJobRegistryState}). */
 	registryComplete: boolean;
 	registryPath: string | null;
+	ownerScan: OwnerScanSummary | null;
 	/** Signal that triggered a `hangup` capture. */
 	signal?: string;
 	/** ISO-8601 timestamp. */

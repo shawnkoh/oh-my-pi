@@ -7,6 +7,7 @@ import { Settings } from "../config/settings";
 import { OutputSink, type OutputSummary } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { TerminalGraphicsDecoder } from "../utils/terminal-graphics";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "./output-meta";
+import { OWNER_SCAN_COVERS_PLATFORM, OwnedJobRegistry, ownerMarkerEnv } from "../session/owned-job-registry";
 
 export interface BashInteractiveResult extends OutputSummary {
 	exitCode: number | undefined;
@@ -28,6 +29,11 @@ export async function runInteractiveBashPty(
 		artifactId?: string;
 	},
 ): Promise<BashInteractiveResult> {
+	// A PTY run reports no spawned processes; only the owner-marker scan can find what it leaves
+	// behind, and outside Linux it cannot see platform shells' environments.
+	if (!OWNER_SCAN_COVERS_PLATFORM) {
+		OwnedJobRegistry.instance()?.markIncomplete("pty shell runs do not report spawned processes");
+	}
 	const settings = await Settings.init();
 	// Load the xterm Terminal ctor here (async boundary) — the ui.custom factory below is sync.
 	const XtermTerminal = await loadXtermTerminal();
@@ -107,6 +113,8 @@ export async function runInteractiveBashPty(
 							env: {
 								TERM: "xterm-256color",
 								...options.env,
+								// Lets the owned-job registry find what the command leaves running.
+								...ownerMarkerEnv(),
 							},
 							signal: options.signal,
 							cols,

@@ -11,7 +11,7 @@ import type { DaemonOperation, DaemonRpcResult } from "./protocol";
 import { renderTerminalOutputIsolated } from "./terminal-output-worker-client";
 import type { ToolSession } from "../tools";
 import { resolveToCwd } from "../tools/path-utils";
-import { OwnedJobRegistry } from "../session/owned-job-registry";
+import { OwnedJobRegistry, ownerMarkerEnv } from "../session/owned-job-registry";
 
 import { cfgLaunchEnabled } from "../tools/settings";
 
@@ -210,7 +210,8 @@ export async function startService(
 		name: params.name,
 		application: shell.shell,
 		args: [...shell.args, `${shell.prefix ? `${shell.prefix} ` : ""}${params.command}`],
-		env: shell.env,
+		// The broker is shared, so the owner marker travels in the service's own environment.
+		env: { ...shell.env, ...ownerMarkerEnv() },
 		cwd: resolveToCwd(params.cwd ?? session.cwd, session.cwd),
 		pty: params.pty ?? true,
 		ready: ready

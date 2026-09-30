@@ -421,7 +421,7 @@ import { ToolChoiceQueue } from "./tool-choice-queue";
 import { planTurnPersistence, sameMessageContent, sessionMessagePersistenceKey } from "./turn-persistence";
 import { TurnRecovery, type TurnRecoveryHost } from "./turn-recovery";
 import { YieldQueue } from "./yield-queue";
-import { currentInvocation, OwnedJobRegistry } from "./owned-job-registry";
+import { currentInvocation, OwnedJobRegistry, type OwnerScanSummary } from "./owned-job-registry";
 import {
 	type AdmissionCloser,
 	AdmissionClosedError,
@@ -1006,6 +1006,8 @@ export class AgentSession implements SettingsScope {
 	readonly #workSources = new Set<SessionWorkSource>();
 	/** Goal continuations a host has decided to start but not yet submitted. */
 	#goalContinuationReservations = 0;
+	/** The owner-marker scan taken by the latest {@link getWorkCounts}. */
+	#lastOwnerScan: OwnerScanSummary | null = null;
 	/** Highest quiesce attempt answered per operation id. */
 	readonly #answeredQuiesceAttempts = new Map<string, number>();
 	#terminalAttestation: TerminalAttestation | undefined;
@@ -2915,7 +2917,10 @@ export class AgentSession implements SettingsScope {
 			counts.queuedInput += delivery.queued + (delivery.delivering ? 1 : 0);
 		}
 		counts.retainedJobs = retainedShellWorkCount();
-		counts.detachedJobs = this.ownedJobRegistry?.liveProcessCount() ?? 0;
+		// Scan first: marked processes nobody tracked yet are recorded, then counted below.
+		const registry = this.ownedJobRegistry;
+		this.#lastOwnerScan = registry?.scanOwnedProcesses() ?? null;
+		counts.detachedJobs = registry?.liveProcessCount() ?? 0;
 		counts.compacting = this.isCompacting ? 1 : 0;
 		counts.handoff = this.isGeneratingHandoff ? 1 : 0;
 		counts.scheduledTurns =
@@ -2941,7 +2946,8 @@ export class AgentSession implements SettingsScope {
 			admission: this.#admissionClosedBy ? "closed" : "open",
 			registry: {
 				path: registry?.path ?? null,
-				complete: registry !== undefined && registry.complete && registry.path !== null,
+				complete: this.#registryComplete(registry),
+				ownerScan: this.#lastOwnerScan,
 			},
 			observedAt: new Date().toISOString(),
 		};
@@ -3025,8 +3031,9 @@ export class AgentSession implements SettingsScope {
 			epoch,
 			counts,
 			interrupted: false,
-			registryComplete: registry !== undefined && registry.complete && registry.path !== null,
+			registryComplete: this.#registryComplete(registry),
 			registryPath: registry?.path ?? null,
+			ownerScan: this.#lastOwnerScan,
 			writtenAt: new Date().toISOString(),
 		};
 		try {
@@ -3065,8 +3072,9 @@ export class AgentSession implements SettingsScope {
 			epoch: this.#activityEpoch,
 			counts,
 			interrupted: hasOutstandingWork(counts),
-			registryComplete: registry !== undefined && registry.complete && registry.path !== null,
+			registryComplete: this.#registryComplete(registry),
 			registryPath: registry?.path ?? null,
+			ownerScan: this.#lastOwnerScan,
 			signal,
 			writtenAt: new Date().toISOString(),
 		};
@@ -3085,6 +3093,13 @@ export class AgentSession implements SettingsScope {
 
 	#sessionIdentity(): SessionIdentity {
 		return { id: this.sessionManager.getSessionId(), file: this.sessionManager.getSessionFile() ?? null };
+	}
+
+	/** The registry can vouch for every owned process: complete, persisted, and the last scan sound. */
+	#registryComplete(registry: OwnedJobRegistry | undefined): boolean {
+		return (
+			registry !== undefined && registry.complete && registry.path !== null && this.#lastOwnerScan?.sound === true
+		);
 	}
 
 	/**

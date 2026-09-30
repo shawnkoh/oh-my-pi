@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { getGlobalDaemonRuntimeDir, isEexist, isEnoent, logger, postmortem } from "@oh-my-pi/pi-utils";
 import { hostHasInheritableConsole } from "../eval/py/spawn-options";
 import { resolveWorkerSpawnCmd, workerEnvFromParent } from "../subprocess/worker-client";
-import { OwnedJobRegistry } from "../session/owned-job-registry";
+import { OWNER_MARKER_ENV, OwnedJobRegistry } from "../session/owned-job-registry";
 import { canonicalProjectDir, daemonBrokerEndpoint, daemonRuntimeDir } from "./paths";
 import {
 	DAEMON_BROKER_WORKER_ARG,
@@ -321,9 +321,13 @@ class SocketDaemonClient implements DaemonBrokerClient {
 			[DAEMON_RUNTIME_DIR_ENV]: this.#runtimeDir,
 		};
 		if (this.#idleGraceMs !== undefined) overlay[DAEMON_IDLE_GRACE_ENV] = String(this.#idleGraceMs);
+		const env = workerEnvFromParent(overlay);
+		// The broker is shared by every agent process in its scope and outlives any one of them:
+		// it must not carry an owner marker an enclosing agent handed to this process.
+		delete env[OWNER_MARKER_ENV];
 		const child = Bun.spawn(spawn.cmd, {
 			cwd: spawn.cwd,
-			env: workerEnvFromParent(overlay),
+			env,
 			stdin: "ignore",
 			stdout: "ignore",
 			stderr: "ignore",

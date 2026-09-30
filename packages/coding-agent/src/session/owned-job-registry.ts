@@ -17,7 +17,12 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { processStartTime, type SpawnedProcess } from "@oh-my-pi/pi-natives";
+import {
+	type MarkedProcessScan,
+	processStartTime,
+	type SpawnedProcess,
+	scanProcessesByEnv,
+} from "@oh-my-pi/pi-natives";
 import { logger } from "@oh-my-pi/pi-utils";
 
 export const OWNED_JOB_REGISTRY_VERSION = 1;
@@ -62,6 +67,8 @@ export interface OwnedJobStartRecord {
 	inProcess: boolean;
 	/** True for a process that escaped the shell's process tree (e.g. `nohup cmd &`). */
 	reparented?: boolean;
+	/** True for a process found by the owner-marker scan rather than registered at spawn. */
+	discovered?: boolean;
 	invocationPid: number;
 	/** ISO-8601 timestamp. */
 	registeredAt: string;
@@ -84,6 +91,8 @@ export interface OwnedJobInvocationRecord {
 	/** False when this invocation cannot enumerate every process it owns. */
 	complete: boolean;
 	incompleteReasons?: string[];
+	/** Environment marker inherited by processes this invocation spawns (see {@link OWNER_MARKER_ENV}). */
+	ownerMarker?: { env: string; token: string };
 	at: string;
 }
 
@@ -109,6 +118,7 @@ export interface OwnedProcessInput {
 	cwd?: string | null;
 	sleepable?: boolean;
 	reparented?: boolean;
+	discovered?: boolean;
 	/** Stable id; defaults to `<kind>:<pid>:<startTime>`. */
 	jobId?: string;
 }
@@ -153,6 +163,54 @@ export function currentInvocation(): InvocationIdentity {
 	}
 	cachedInvocation = { pid: process.pid, startTime };
 	return cachedInvocation;
+}
+
+/**
+ * Environment variable every process the agent spawns for work inherits (shell runs, PTY
+ * shells, services). Its value lists owner tokens separated by `,`: an agent started from
+ * another agent's shell appends its own token to the one it inherited. A process that
+ * double-forks, calls setsid or reparents keeps its environment, so a scan for the token
+ * finds it even though no pid was ever reported. A process that clears its environment
+ * (`env -i`, some daemonizers) is not found.
+ */
+export const OWNER_MARKER_ENV = "OMP_OWNER";
+
+/** This invocation's owner token: `omp1:<pid>:<OS start time>`. */
+export function ownerToken(): string {
+	const invocation = currentInvocation();
+	return `omp1:${invocation.pid}:${invocation.startTime ?? "unknown"}`;
+}
+
+/** Environment overlay that marks a spawned process as owned by this invocation. */
+export function ownerMarkerEnv(): Record<string, string> {
+	const token = ownerToken();
+	const inherited = process.env[OWNER_MARKER_ENV];
+	const tokens = inherited ? inherited.split(",").filter(entry => entry.length > 0 && entry !== token) : [];
+	return { [OWNER_MARKER_ENV]: [...tokens, token].join(",") };
+}
+
+/**
+ * True where the owner-marker scan can see the environment of every same-user process a
+ * shell may start. macOS withholds the environment of its own platform binaries (`sh`,
+ * `zsh`, `sleep`, …) from the scan; Windows has no scan.
+ */
+export const OWNER_SCAN_COVERS_PLATFORM = process.platform === "linux";
+
+/** Outcome of one owner-marker scan. */
+export interface OwnerScanSummary {
+	/** False when the platform has no scan. */
+	supported: boolean;
+	/**
+	 * True when every same-user process that could carry this invocation's marker was
+	 * examined: none started since this invocation began had an unreadable or empty
+	 * environment (other than processes the registry already tracks by pid).
+	 */
+	sound: boolean;
+	scanned: number;
+	/** Marked processes the registry did not track until this scan (now recorded). */
+	discovered: number;
+	/** Unexaminable processes started since this invocation began that the registry does not track. */
+	opaque: Array<{ pid: number; command: string }>;
 }
 
 export function stripJsonl(sessionFile: string): string {
@@ -295,6 +353,7 @@ export class OwnedJobRegistry {
 			sleepable: input.sleepable === true,
 			inProcess: false,
 			...(input.reparented ? { reparented: true } : {}),
+			...(input.discovered ? { discovered: true } : {}),
 			invocationPid: process.pid,
 			registeredAt: new Date().toISOString(),
 		});
@@ -354,6 +413,55 @@ export class OwnedJobRegistry {
 		return alive;
 	}
 
+	/**
+	 * Scan same-user processes for this invocation's owner marker. Every live marked process
+	 * the registry does not already track is recorded as a discovered `process` (and is then
+	 * counted by {@link liveProcessCount}). Synchronous; a few tens of milliseconds.
+	 */
+	scanOwnedProcesses(): OwnerScanSummary {
+		const invocation = currentInvocation();
+		let scan: MarkedProcessScan;
+		try {
+			scan = scanProcessesByEnv(OWNER_MARKER_ENV, ownerToken(), invocation.startTime ?? undefined);
+		} catch (error) {
+			logger.warn("Owner-marker scan failed", { error: String(error) });
+			return { supported: false, sound: false, scanned: 0, discovered: 0, opaque: [] };
+		}
+		let discovered = 0;
+		for (const proc of scan.processes) {
+			if (this.#tracks(proc.pid, proc.startTime ?? null)) continue;
+			this.registerProcess({
+				kind: "process",
+				pid: proc.pid,
+				pgid: proc.pgid ?? null,
+				startTime: proc.startTime ?? null,
+				command: proc.command,
+				discovered: true,
+			});
+			discovered++;
+		}
+		const opaque = scan.opaque
+			.filter(proc => !this.#tracks(proc.pid, proc.startTime ?? null))
+			.map(proc => ({ pid: proc.pid, command: proc.command }));
+		return {
+			supported: scan.supported,
+			sound: scan.supported && opaque.length === 0,
+			scanned: scan.scanned,
+			discovered,
+			opaque,
+		};
+	}
+
+	#tracks(pid: number, startTime: number | null): boolean {
+		for (const open of this.#open.values()) {
+			const record = open.record;
+			if (!record.inProcess && record.pid === pid && (startTime === null || record.startTime === startTime)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	/** Open records (both in-process and OS processes), for diagnostics and tests. */
 	openJobs(): OwnedJobStartRecord[] {
 		return Array.from(this.#open.values(), open => open.record);
@@ -388,6 +496,7 @@ export class OwnedJobRegistry {
 			sessionId: this.#options.getSessionId(),
 			complete: this.complete,
 			...(this.complete ? {} : { incompleteReasons: [...this.#incompleteReasons] }),
+			ownerMarker: { env: OWNER_MARKER_ENV, token: ownerToken() },
 			at: new Date().toISOString(),
 		};
 		this.#write(file, header);
@@ -442,4 +551,86 @@ function readStartTime(pid: number): number | null {
 	} catch {
 		return null;
 	}
+}
+
+/** A consumer's verdict on a registry after its agent process may have exited. */
+export interface OwnedJobVerdict {
+	/**
+	 * - `clear`: every invocation ended, every recorded process ended, and a sound owner-marker
+	 *   scan found no live marked process.
+	 * - `blocked`: a recorded or marked process is alive (listed in `live`).
+	 * - `unknown`: the registry or scan cannot vouch for every process (see `reasons`).
+	 * - `live`: an invocation that wrote the registry is still running; ask it (`attest`).
+	 */
+	status: "clear" | "blocked" | "unknown" | "live";
+	live: Array<{ jobId: string; kind: OwnedJobKind; pid: number; command: string }>;
+	reasons: string[];
+}
+
+/**
+ * Evaluate a registry file the way a supervisor must after the agent exited. `internal`
+ * helpers never block. Consumers in other languages reimplement exactly this rule:
+ * header/incomplete markers, open records checked by pid + start time, then an owner-marker
+ * scan per invocation token whose unexaminable processes (see {@link OwnerScanSummary}) make
+ * the answer `unknown` unless something is already known to be alive.
+ */
+export function verifyOwnedJobRegistry(file: string): OwnedJobVerdict {
+	const reasons: string[] = [];
+	const live: OwnedJobVerdict["live"] = [];
+	let text: string;
+	try {
+		text = fs.readFileSync(file, "utf8");
+	} catch (error) {
+		return { status: "unknown", live, reasons: [`registry unreadable: ${String(error)}`] };
+	}
+	const invocations = new Map<number, OwnedJobInvocationRecord>();
+	const open = new Map<string, OwnedJobStartRecord>();
+	for (const line of text.split("\n")) {
+		if (!line.trim()) continue;
+		let record: OwnedJobRecord;
+		try {
+			record = JSON.parse(line) as OwnedJobRecord;
+		} catch {
+			reasons.push("registry has a malformed record");
+			continue;
+		}
+		if (record.type === "invocation") {
+			invocations.set(record.invocation.pid, record);
+			if (!record.complete) reasons.push(...(record.incompleteReasons ?? ["invocation incomplete"]));
+		} else if (record.type === "incomplete") reasons.push(record.reason);
+		else if (record.type === "start") open.set(record.jobId, record);
+		else open.delete(record.jobId);
+	}
+	if (invocations.size === 0) reasons.push("registry has no invocation header");
+	for (const invocation of invocations.values()) {
+		if (isOwnedProcessAlive(invocation.invocation.pid, invocation.invocation.startTime)) {
+			return { status: "live", live, reasons: [`invocation ${invocation.invocation.pid} is still running`] };
+		}
+	}
+	for (const record of open.values()) {
+		if (record.kind === "internal") continue;
+		if (record.inProcess) {
+			reasons.push(`${record.kind} ${record.jobId} never ended`);
+			continue;
+		}
+		if (isOwnedProcessAlive(record.pid, record.startTime)) {
+			live.push({ jobId: record.jobId, kind: record.kind, pid: record.pid, command: record.command });
+		}
+	}
+	for (const invocation of invocations.values()) {
+		const marker = invocation.ownerMarker;
+		if (!marker) {
+			reasons.push(`invocation ${invocation.invocation.pid} recorded no owner marker`);
+			continue;
+		}
+		const scan = scanProcessesByEnv(marker.env, marker.token, invocation.invocation.startTime ?? undefined);
+		if (!scan.supported) reasons.push("owner-marker scan unsupported on this platform");
+		for (const proc of scan.opaque) reasons.push(`process ${proc.pid} (${proc.command}) environment unexaminable`);
+		for (const proc of scan.processes) {
+			if (live.some(entry => entry.pid === proc.pid)) continue;
+			live.push({ jobId: `marked:${proc.pid}`, kind: "process", pid: proc.pid, command: proc.command });
+		}
+	}
+	if (live.length > 0) return { status: "blocked", live, reasons };
+	return { status: reasons.length > 0 ? "unknown" : "clear", live, reasons };
 }

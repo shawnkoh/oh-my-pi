@@ -399,12 +399,14 @@ read-only snapshot, then asks the process to exit only if nothing changed:
 
 1. `attest` → `data`: `{ version: 1, operationId, nonce, epoch, session: { id, file },
    invocation: { pid, startTime }, counts, admission: "open" | "closed",
-   registry: { path, complete }, observedAt }`. `counts` has `streaming`,
+   registry: { path, complete, ownerScan }, observedAt }`. `counts` has `streaming`,
    `queuedInput`, `asyncJobs`, `subagents`, `retainedJobs`, `detachedJobs`,
    `compacting`, `handoff`, `goalContinuationScheduled`, `scheduledTurns`; any
    non-zero value means work is outstanding. `queuedInput` includes commands this
    process has read but not yet answered. `epoch` increases whenever input is
-   admitted or work starts.
+   admitted or work starts. `detachedJobs` counts live owned processes, including
+   ones found by the owner-marker scan below; `registry.complete` is false unless
+   that scan was `sound`.
 2. `quiesce_and_exit` (`deadline` is Unix epoch milliseconds). The process closes
    every input path, then requires all counts zero, `epoch` unchanged and the
    deadline not reached — all without yielding, so no input can interleave.
@@ -452,6 +454,39 @@ text prediction) — so they never count as outstanding work, alive or not. Serv
 broker hosts, including persistent or detached ones that outlive it, have their own
 `service` records. A helper started by a different agent process has no record here;
 consumers identify it by that worker selector in its argv.
+
+**Owner marker.** Every process the agent starts for work — embedded shell runs,
+PTY shells, named services — inherits `OMP_OWNER`, a comma-separated list of
+owner tokens `omp1:<pid>:<OS start time>` (an agent started from another agent's
+shell appends its token to the inherited list; the shared daemon broker gets none).
+Each `invocation` header records `ownerMarker: { env: "OMP_OWNER", token }`. A process
+that double-forks, calls `setsid` or otherwise escapes the shell keeps its
+environment, so `attest`, `quiesce_and_exit` and a hang-up capture scan same-user
+processes for the token, record every live marked process the registry did not
+track as a `start` record with `discovered: true`, and count it in `detachedJobs`.
+`ownerScan` is `{ supported, sound, scanned, discovered, opaque }`: `opaque` lists
+same-user processes started since the invocation began whose environment could not
+be examined, which could hide the marker; `sound` is false if any exist.
+
+Limits: a process that clears or replaces its environment (`env -i`, some
+daemonizers) is not found — keep a host process census as a cross-check. On Linux
+every same-user environment is readable except non-dumpable processes. On macOS the
+kernel withholds the environment of Apple platform binaries (`sh`, `zsh`, `sleep`,
+…), so the scan is almost never `sound` there, PTY shell runs mark the registry
+incomplete, and consumers get `unknown` rather than a false clear. Eval code runs in
+long-lived kernels that are not marked, so an eval run still marks the registry
+incomplete. Windows has no scan.
+
+**Consumer rule after the agent exited** (`verifyOwnedJobRegistry(path)` in
+`@oh-my-pi/pi-coding-agent/session/owned-job-registry` implements it):
+1. Any invocation still alive (pid + start time) → `live`: use `attest` instead.
+2. Any `complete: false` header or `incomplete` record → at best `unknown`.
+3. Open records, ignoring `internal`: `inProcess` → `unknown`; otherwise alive by pid +
+   start time → `blocked`.
+4. For each header's `ownerMarker`, scan same-user processes for the token: any live
+   match → `blocked`; an unexaminable process started since the invocation began, or
+   no scan on the platform → at best `unknown`.
+5. Otherwise `clear`.
 
 ### `set_fast_mode` payload
 

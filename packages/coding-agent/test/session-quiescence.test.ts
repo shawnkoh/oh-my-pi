@@ -332,4 +332,33 @@ describe("AgentSession quiesce-and-exit", () => {
 		expect(onDisk.kind).toBe("hangup");
 		expect(onDisk.session.sha256).toBe(sha256OfFile(s.sessionFile!));
 	});
+
+	it.skipIf(process.platform === "win32")(
+		"refuses to quiesce while a self-daemonized descendant of a shell run is alive",
+		async () => {
+			const s = createSession();
+			const launcher = path.join(tempDir.path(), "daemonize.ts");
+			await Bun.write(
+				launcher,
+				[
+					'const child = Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1 << 30)"], { detached: true, stdin: "ignore", stdout: "ignore", stderr: "ignore" });',
+					"child.unref();",
+					"console.log(child.pid);",
+					"process.exit(0);",
+				].join("\n"),
+			);
+			const run = await s.executeBash(`${process.execPath} ${launcher}`);
+			const daemonPid = Number(run.output.trim());
+			try {
+				const result = s.quiesceForExit(request(s));
+				expect(result).toMatchObject({ status: "refused", reason: "work_active" });
+				if (result.status !== "refused") throw new Error("unreachable");
+				expect(result.snapshot.counts.detachedJobs).toBe(1);
+				expect(s.attest("op", "n").registry.ownerScan?.discovered).toBe(0);
+			} finally {
+				process.kill(daemonPid, "SIGKILL");
+			}
+		},
+		30_000,
+	);
 });

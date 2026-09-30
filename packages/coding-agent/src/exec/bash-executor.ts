@@ -21,7 +21,7 @@ import { getOrCreateSnapshot } from "../utils/shell-snapshot";
 import { TerminalGraphicsDecoder } from "../utils/terminal-graphics";
 import { loadDirenvEnv } from "./direnv";
 import { buildNonInteractiveEnv } from "./non-interactive-env";
-import { OwnedJobRegistry } from "../session/owned-job-registry";
+import { OWNER_SCAN_COVERS_PLATFORM, OwnedJobRegistry, ownerMarkerEnv } from "../session/owned-job-registry";
 
 import {
 	cfgBashDirenv,
@@ -539,7 +539,9 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		direnvSetting: virtualCwd ? "off" : cfgBashDirenv.get(settings),
 		commandPrefix: prefix,
 	});
-	const commandEnv = buildNonInteractiveEnv(preflight.env);
+	// Every process the command starts inherits the owner marker, so the owned-job registry
+	// can find it even if it double-forks away from the shell.
+	const commandEnv = { ...buildNonInteractiveEnv(preflight.env), ...ownerMarkerEnv() };
 	const runCdInPersistentShell = options?.useUserShell === true && !prefix && isPersistentShellCdCommand(command);
 	// Never wrap in cmd.exe: it is only the Windows no-bash fallback for spawn
 	// paths, and the embedded brush shell runs the POSIX line better directly.
@@ -593,8 +595,11 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 
 	if (usePty && ptyRequest) {
 		const requestedMs = options?.timeout;
-		// A PTY shell's descendants are not reported back, so owned-process coverage is incomplete.
-		OwnedJobRegistry.instance()?.markIncomplete("pty shell runs do not report spawned processes");
+		// A PTY shell's descendants are not reported back; only the owner-marker scan can find
+		// them, and it cannot see platform shells' environments outside Linux.
+		if (!OWNER_SCAN_COVERS_PLATFORM) {
+			OwnedJobRegistry.instance()?.markIncomplete("pty shell runs do not report spawned processes");
+		}
 		try {
 			return await executeUserShellPty({
 				shell,

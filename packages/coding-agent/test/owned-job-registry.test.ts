@@ -4,9 +4,11 @@ import * as path from "node:path";
 import { executeBash } from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
 import {
 	isOwnedProcessAlive,
+	OWNER_SCAN_COVERS_PLATFORM,
 	type OwnedJobRecord,
 	OwnedJobRegistry,
 	ownedJobRegistryPath,
+	verifyOwnedJobRegistry,
 } from "@oh-my-pi/pi-coding-agent/session/owned-job-registry";
 import { processStartTime } from "@oh-my-pi/pi-natives";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -150,5 +152,95 @@ describe.skipIf(process.platform === "win32")("owned-job registry", () => {
 		expect(isOwnedProcessAlive(invocation.invocation.pid, invocation.invocation.startTime)).toBe(false);
 		expect(records.some(record => record.type === "end")).toBe(false);
 		expect(isOwnedProcessAlive(proc.pid, proc.startTime)).toBe(true);
+		expect(verifyOwnedJobRegistry(ownedJobRegistryPath(sessionFile))).toMatchObject({
+			status: "blocked",
+			live: [expect.objectContaining({ pid: proc.pid })],
+		});
+	});
+
+	/** A program that daemonizes itself: spawns a setsid'd grandchild, prints its pid, exits. */
+	async function writeDaemonizer(program: string[]): Promise<string> {
+		const launcher = path.join(tempDir.path(), "daemonize.ts");
+		await Bun.write(
+			launcher,
+			[
+				`const child = Bun.spawn(${JSON.stringify(program)}, { detached: true, stdin: "ignore", stdout: "ignore", stderr: "ignore" });`,
+				"child.unref();",
+				"console.log(child.pid);",
+				"process.exit(0);",
+			].join("\n"),
+		);
+		return launcher;
+	}
+
+	it("finds a self-daemonizing descendant no pid report covered, through the inherited owner marker", async () => {
+		const launcher = await writeDaemonizer([process.execPath, "-e", "setInterval(() => {}, 1 << 30)"]);
+		const result = await executeBash(`${process.execPath} ${launcher}`, { cwd: tempDir.path() });
+		const daemonPid = Number(result.output.trim());
+		spawned.push(daemonPid);
+		// Brush saw only the launcher, which exited: nothing reported the daemon.
+		expect(registry.openJobs().some(job => job.pid === daemonPid)).toBe(false);
+
+		const scan = registry.scanOwnedProcesses();
+		expect(scan.discovered).toBe(1);
+		const record = registry.openJobs().find(job => job.pid === daemonPid);
+		expect(record).toMatchObject({ kind: "process", discovered: true, startTime: processStartTime(daemonPid) });
+		expect(registry.liveProcessCount()).toBe(1);
+		// Durable: the discovery is in the file, and a second scan does not duplicate it.
+		expect(registry.scanOwnedProcesses().discovered).toBe(0);
+		expect(
+			readRecords(ownedJobRegistryPath(sessionFile)).filter(
+				entry => entry.type === "start" && entry.pid === daemonPid,
+			),
+		).toHaveLength(1);
+	});
+
+	it("reports the scan unsound where a daemon's environment is hidden, and finds it where it is not", async () => {
+		const launcher = await writeDaemonizer(["/bin/sleep", "30"]);
+		const result = await executeBash(`${process.execPath} ${launcher}`, { cwd: tempDir.path() });
+		const daemonPid = Number(result.output.trim());
+		spawned.push(daemonPid);
+		const scan = registry.scanOwnedProcesses();
+		if (OWNER_SCAN_COVERS_PLATFORM) {
+			expect(scan.discovered).toBe(1);
+		} else {
+			// macOS withholds a platform binary's environment: the daemon is not found, and the
+			// scan says it cannot vouch for it instead of reading as clear.
+			expect(scan.discovered).toBe(0);
+			expect(scan.sound).toBe(false);
+			expect(scan.opaque.some(entry => entry.pid === daemonPid)).toBe(true);
+		}
+	});
+
+	it("verifies a crashed agent's escaped daemon as blocked, and never as clear while it runs", async () => {
+		const script = path.join(tempDir.path(), "crash-escape.ts");
+		const registryModule = path.join(import.meta.dir, "../src/session/owned-job-registry.ts");
+		await Bun.write(
+			script,
+			[
+				`import { OwnedJobRegistry, ownerMarkerEnv } from ${JSON.stringify(registryModule)};`,
+				`const registry = new OwnedJobRegistry({ getSessionFile: () => ${JSON.stringify(sessionFile)}, getSessionId: () => "crashed", pollIntervalMs: 0 });`,
+				"registry.ensureHeader();",
+				// Marked like any shell run, but never registered: only the marker can find it.
+				`const child = Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1 << 30)"], { env: { ...process.env, ...ownerMarkerEnv() }, detached: true, stdin: "ignore", stdout: "ignore", stderr: "ignore" });`,
+				"child.unref();",
+				"console.log(child.pid);",
+				`process.kill(process.pid, "SIGKILL");`,
+			].join("\n"),
+		);
+		const agent = Bun.spawn([process.execPath, script], { stdout: "pipe", stderr: "inherit" });
+		const daemonPid = Number((await new Response(agent.stdout).text()).trim());
+		spawned.push(daemonPid);
+		expect(await agent.exited).not.toBe(0);
+
+		const verdict = verifyOwnedJobRegistry(ownedJobRegistryPath(sessionFile));
+		expect(verdict.status).toBe("blocked");
+		expect(verdict.live).toEqual([expect.objectContaining({ pid: daemonPid, jobId: `marked:${daemonPid}` })]);
+
+		const daemon = Bun.spawn(["/bin/kill", "-9", String(daemonPid)]);
+		await daemon.exited;
+		const after = verifyOwnedJobRegistry(ownedJobRegistryPath(sessionFile));
+		expect(after.live).toEqual([]);
+		expect(after.status).toBe(OWNER_SCAN_COVERS_PLATFORM && after.reasons.length === 0 ? "clear" : "unknown");
 	});
 });
