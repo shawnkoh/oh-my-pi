@@ -132,6 +132,7 @@ Important edge behavior from runtime:
 
 - `{ id?, type: "get_state" }`
 - `{ id?, type: "set_fast_mode", enabled: boolean }`
+- `{ id?, type: "goal", op: "get" | "create" | "resume" | "pause" | "drop", objective?: string, token_budget?: number }`
 - `{ id?, type: "get_available_commands" }`
 - `{ id?, type: "get_entries", since?: string }`
 - `{ id?, type: "get_tree" }`
@@ -379,6 +380,31 @@ will match against that queue. Clients should render the pending-message queue
 from these snapshots instead of tracking chips independently, and treat
 `remove_queued_message` responses as confirmation of the change rather than a
 second source of truth.
+
+### `goal` payload
+
+`goal` manages goal mode with the same lifecycle as the interactive `/goal` command.
+Every op answers `{ goal: Goal | null, state: GoalModeState | null }`; `get_state`
+carries the same state as `goal`. `goal_updated` events report every change,
+including those made by the agent's `goal` tool.
+
+- `get` only reads. It never starts a turn.
+- `create` needs `goal.enabled`, a non-empty `objective`, and no active or paused
+  goal. It is refused in plan mode, and `token_budget` must be a positive integer.
+  It adds the `goal` tool to the active tools.
+- `resume` resumes a paused goal (refused in plan mode). `pause` and `drop` restore
+  the active tools from before the goal started.
+- Failures are ordinary `success: false` responses.
+
+Goals do not continue on their own over RPC unless `goal.continuationModes`
+contains `"rpc"`; this covers both `--mode rpc` and `--mode rpc-ui`. When enabled,
+`create`/`resume` on an idle session and each terminal `agent_end` start the next
+goal turn as a hidden `goal-continuation` message. This happens only while the goal is active, the
+session is idle with nothing queued, plan mode is off, and open todos are not all
+blocked. The continuation is admitted before `session_settled` is evaluated. It
+stops after a continuation turn with no new tool activity, and the next host prompt
+re-arms it. When the agent completes the goal, the goal tool is removed again and
+`get_state.goal` becomes `null`.
 
 ### `set_fast_mode` payload
 

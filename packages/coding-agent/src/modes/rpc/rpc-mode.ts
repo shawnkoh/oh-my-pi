@@ -49,6 +49,7 @@ import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameEncoder } from "./rpc-frame";
 import { claimRpcInput, readRpcInputFrames } from "./rpc-input";
 import { pageRpcMessages, RPC_MESSAGES_PAGE_BUSY_ERROR, RpcMessagesPageError } from "./rpc-messages";
+import { RpcGoalController } from "./rpc-goal";
 import { RpcOutputWriter } from "./rpc-output";
 import {
 	RpcExtensionUserMessageTracker,
@@ -818,6 +819,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	const promptResults = new RpcPromptResults(session, output);
 	const sessionEvents = new RpcSessionEventForwarder(output);
 	const settleWatcher = new RpcSessionSettleWatcher(session, output);
+	const goalController = new RpcGoalController(session);
 
 	const pendingExtensionRequests = new RpcPendingExtensionRequests();
 	const hostToolBridge = new RpcHostToolBridge(output);
@@ -1043,8 +1045,11 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	session.subscribe(event => {
 		sessionEvents.forward(event);
 		promptResults.observe(event);
+		// Before the settle watcher: a goal continuation is admitted ahead of the settle check.
+		goalController.observe(event);
 		settleWatcher.observe(event);
 	});
+	await goalController.reconcile();
 
 	// Discriminates a store failure from any other dispose rejection below.
 	let persistenceFailure: Error | undefined;
@@ -1263,6 +1268,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				const result = await handleRpcSessionChange(session, command, subagentRegistry);
 				if (!result.data.cancelled) {
 					promptResults.abortOpen();
+					await goalController.reconcile();
 					// The detached run publishes no terminal agent_end to settle on.
 					void settleWatcher.check();
 					await emitAvailableCommandsUpdate();
@@ -1274,6 +1280,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				const result = await openRpcSession(session, command.sessionDir, subagentRegistry);
 				if (!result.cancelled) {
 					promptResults.abortOpen();
+					await goalController.reconcile();
 					void settleWatcher.check();
 					await emitAvailableCommandsUpdate();
 				}
@@ -1285,6 +1292,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			// =================================================================
 
 			case "get_state": {
+				// A goal exit triggered by the last turn restores tools asynchronously; report after it.
+				await goalController.settled();
 				const queuedMessages = session.getQueuedMessages();
 				const state: RpcSessionState = {
 					model: session.model,
@@ -1315,6 +1324,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 						examples: tool.examples,
 					})),
 					contextUsage: session.getContextUsage(),
+					goal: session.getGoalModeState() ?? null,
 				};
 				return success(id, "get_state", state);
 			}
@@ -1328,6 +1338,14 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					enabled: session.isFastModeEnabled(),
 					active: session.isFastModeActive(),
 				});
+			}
+
+			case "goal": {
+				try {
+					return success(id, "goal", await goalController.handle(command));
+				} catch (goalError) {
+					return error(id, "goal", goalError instanceof Error ? goalError.message : String(goalError));
+				}
 			}
 
 			case "get_available_commands": {
