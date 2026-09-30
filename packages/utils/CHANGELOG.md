@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a `first` option to `postmortem.register` for cleanup callbacks that must run before every other callback in a pass, such as a capture of pending work that other cleanups tear down
+
 ## [18.4.4] - 2026-09-29
 
 ### Added

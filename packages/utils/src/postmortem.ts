@@ -27,6 +27,7 @@ interface CleanupRegistration {
 	id: string;
 	callback: (reason: Reason) => Promise<void> | void;
 	exitOnly: boolean;
+	first: boolean;
 	cancelled: boolean;
 	lastPass: number;
 }
@@ -181,7 +182,10 @@ function runCleanup(reason: Reason, keepAlive = false): Promise<void> {
 
 	// Snapshot the pass. Registrations added while a keep-alive cleanup runs are
 	// invoked by register() when appropriate and remain active for later passes.
-	const promises = callbackList.toReversed().map(registration => {
+	// Callbacks registered `first` run before every other one (each group newest first).
+	const snapshot = callbackList.toReversed();
+	const ordered = [...snapshot.filter(entry => entry.first), ...snapshot.filter(entry => !entry.first)];
+	const promises = ordered.map(registration => {
 		return Promise.try(() => invokeCleanup(registration, reason, keepAlive, pass));
 	});
 
@@ -659,6 +663,12 @@ export interface CleanupRegistrationOptions {
 	 * The registration remains armed when a keep-alive pass skips it.
 	 */
 	exitOnly?: boolean;
+	/**
+	 * Run before every callback registered without it, in each pass. For callbacks that
+	 * must observe state other cleanups tear down (e.g. a hang-up capture that counts
+	 * pending work other cleanups would cancel).
+	 */
+	first?: boolean;
 }
 
 /**
@@ -685,6 +695,7 @@ export function register(
 		id,
 		callback,
 		exitOnly: options.exitOnly ?? false,
+		first: options.first ?? false,
 		cancelled: false,
 		lastPass: 0,
 	};
