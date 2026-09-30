@@ -1107,6 +1107,9 @@ export class AgentSession implements SettingsScope {
 	 *  agent-core queue still owns the message, but no loop is left to poll it.
 	 *  Runs whenever the session settles; the guard makes it a no-op when the
 	 *  queue was consumed normally or a new turn already started. */
+	/** One pending re-offer of stranded records scheduled behind a prompt's dispatch window. */
+	#strandedResumeAfterAdmission = false;
+
 	#drainStrandedQueuedMessages(): void {
 		if (this.#abortInProgress) return;
 		// Session transitions (newSession/`/new`, compact, model-switch, session-switch,
@@ -1141,9 +1144,6 @@ export class AgentSession implements SettingsScope {
 	 *  gate (agent.hasQueuedMessages()) does not count peer IRC interrupts. Once idle, wake a turn so
 	 *  the agent responds to the peer. Skip only when a queued steer/follow-up will itself drive a
 	 *  resume turn whose aside poll already consumes these (no double-wake). */
-	/** One pending re-offer of stranded asides scheduled behind an admitted submission. */
-	#strandedResumeAfterAdmission = false;
-
 	#resumeStrandedIrcAsides(): void {
 		if (this.#modeExitDrainSuppressionDepth > 0 || this.#isDisposed || this.isStreaming || !this.#irc.hasPending()) {
 			return;
@@ -1162,14 +1162,17 @@ export class AgentSession implements SettingsScope {
 		// and race the transition's own reset — same rationale as #drainStrandedQueuedMessages.
 		if (this.#unsubscribeAgent === undefined) return;
 		if (this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages()) return;
-		// An admitted submission that has not started yet owns the next turn; the
-		// parked owned records fold into it (or resume once it dispatches).
-		if (this.hasAdmittedSubmission) {
+		// A prompt in its dispatch window owns the next turn; the parked owned
+		// records fold into it (or resume once the window closes). The re-offer
+		// goes through the queued-message drain so records the window left in the
+		// agent queues (a parked steer re-steered by a provider poll that saw no
+		// turn) are drained too, not only the bridge.
+		if (this.hasPendingTurnDispatch) {
 			if (!this.#strandedResumeAfterAdmission) {
 				this.#strandedResumeAfterAdmission = true;
-				void this.waitForAdmittedSubmissions().finally(() => {
+				void this.waitForPendingTurnDispatch().finally(() => {
 					this.#strandedResumeAfterAdmission = false;
-					this.#resumeStrandedIrcAsides();
+					this.#drainStrandedQueuedMessages();
 				});
 			}
 			return;
@@ -2839,6 +2842,38 @@ export class AgentSession implements SettingsScope {
 	/** True while a submission has been admitted but has not yet started a turn, queued, or bailed. */
 	get hasAdmittedSubmission(): boolean {
 		return this.#admittedSubmissionCount > 0;
+	}
+
+	/** Prompts past command handling that are waiting on manual-compaction cleanup
+	 *  or setting up their turn: narrower than {@link hasAdmittedSubmission}, which
+	 *  also spans an extension command handler's whole run. External deliveries
+	 *  hold behind this window only. */
+	#turnDispatchPendingCount = 0;
+	#turnDispatchSettled: PromiseWithResolvers<void> | undefined;
+
+	get hasPendingTurnDispatch(): boolean {
+		return this.#turnDispatchPendingCount > 0;
+	}
+
+	/** Resolves once every prompt currently in its dispatch window has dispatched, queued, or bailed. */
+	waitForPendingTurnDispatch(): Promise<void> {
+		if (this.#turnDispatchPendingCount === 0) return Promise.resolve();
+		this.#turnDispatchSettled ??= Promise.withResolvers<void>();
+		return this.#turnDispatchSettled.promise;
+	}
+
+	#enterTurnDispatch(): () => void {
+		this.#turnDispatchPendingCount++;
+		let left = false;
+		return () => {
+			if (left) return;
+			left = true;
+			if (--this.#turnDispatchPendingCount === 0 && this.#turnDispatchSettled) {
+				const settled = this.#turnDispatchSettled;
+				this.#turnDispatchSettled = undefined;
+				settled.resolve();
+			}
+		};
 	}
 
 	/** Resolves once every currently admitted submission has dispatched, queued, or bailed. */
@@ -7037,7 +7072,13 @@ export class AgentSession implements SettingsScope {
 		// abort/preflight race hands the resume back via `release(false)`. A prompt
 		// arriving after the cleanup while an earlier parked prompt is still settling
 		// takes part in the same decision. No-op otherwise.
-		const release = await this.#maintenance.waitForManualCompactionCleanup();
+		const leaveWait = this.#enterTurnDispatch();
+		let release: Awaited<ReturnType<SessionMaintenance["waitForManualCompactionCleanup"]>>;
+		try {
+			release = await this.#maintenance.waitForManualCompactionCleanup();
+		} finally {
+			leaveWait();
+		}
 		const outcome: PromptDispatchOutcome = { sessionClaimed: false };
 		if (!release) return this.#dispatchPrompt(text, options, submittedAt, outcome);
 		try {
@@ -7081,7 +7122,24 @@ export class AgentSession implements SettingsScope {
 				text = expandSlashCommand(text, this.#slashCommands);
 			}
 		}
+		// Command handlers above may run for a long time (dialogs, deliveries of
+		// their own); only the turn setup below counts as a pending dispatch.
+		const leave = this.#enterTurnDispatch();
+		try {
+			return await this.#dispatchPromptTurn(text, options, submittedAt, outcome, typedText, expandPromptTemplates);
+		} finally {
+			leave();
+		}
+	}
 
+	async #dispatchPromptTurn(
+		text: string,
+		options: PromptOptions | undefined,
+		submittedAt: number,
+		outcome: PromptDispatchOutcome,
+		typedText: string,
+		expandPromptTemplates: boolean,
+	): Promise<boolean> {
 		// Expand file-based prompt templates if requested
 		const templated = expandPromptTemplates ? expandPromptTemplate(text, [...this.#promptTemplates]) : text;
 		const expandedText = options?.synthetic ? templated : this.#modelMentions.expandMentions(templated);
@@ -7281,13 +7339,19 @@ export class AgentSession implements SettingsScope {
 		// prompts and the CLI initial message arrive here and must neither start a
 		// turn against the disconnected session nor lose the session to the
 		// interrupted-turn resume once compaction ends.
-		const release = await this.#maintenance.waitForManualCompactionCleanup();
-		const outcome: PromptDispatchOutcome = { sessionClaimed: false };
-		if (!release) return this.#dispatchCustomPrompt(message, options, outcome);
+		// No command handling on this path: the whole call is a pending dispatch.
+		const leave = this.#enterTurnDispatch();
 		try {
-			return await this.#dispatchCustomPrompt(message, options, outcome);
+			const release = await this.#maintenance.waitForManualCompactionCleanup();
+			const outcome: PromptDispatchOutcome = { sessionClaimed: false };
+			if (!release) return await this.#dispatchCustomPrompt(message, options, outcome);
+			try {
+				return await this.#dispatchCustomPrompt(message, options, outcome);
+			} finally {
+				release(outcome.sessionClaimed);
+			}
 		} finally {
-			release(outcome.sessionClaimed);
+			leave();
 		}
 	}
 
@@ -8365,19 +8429,15 @@ export class AgentSession implements SettingsScope {
 			this.#resumeStrandedIrcAsides();
 			return;
 		}
-		// A submission admitted but not yet streaming (e.g. a continuation waiting
-		// on manual-compaction cleanup) owns the next turn: waking now would race it
-		// into AgentBusyError. Park the record; it folds into that turn or is
-		// re-offered when the run settles.
-		if (this.hasAdmittedSubmission) {
+		// A prompt past command handling that is still waiting on manual-compaction
+		// cleanup or setting up its turn owns the next turn: waking now would race
+		// it into AgentBusyError. Park the record in the bridge (a parked steer is
+		// re-steered by the aside provider if that turn starts, and always woken by
+		// the stranded resume if it does not); #resumeStrandedIrcAsides waits for
+		// the window to close.
+		if (this.hasPendingTurnDispatch) {
 			owner.mechanism = owner.mode === "steer" ? "steer-boundary" : "aside";
-			if (owner.mode === "steer") {
-				this.#allowQueuedMessageDrainRetry();
-				this.agent.steer(record);
-			} else {
-				this.#irc.queueAside([record]);
-			}
-			// #resumeStrandedIrcAsides re-checks the gate and waits for the submission.
+			this.#irc.queueAside([record]);
 			this.#resumeStrandedIrcAsides();
 			return;
 		}
