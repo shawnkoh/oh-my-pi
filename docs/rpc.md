@@ -466,17 +466,26 @@ the same read-only allowlist applies.
 
 **Which attestation describes an exit.** When a session is opened, resumed or
 switched to, the agent renames any `<base>.terminal.json` an earlier invocation left to
-`<base>.terminal.<pid>-<startId>.json` (its writer's identity, directory fsync'd) and
-writes its own registry header. A terminal attestation is valid for a request only
-if its `operationId`/`attempt` match the request and its `invocation` equals the
-invocation the consumer last observed through `attest` (or `get_state`). Pass that
-invocation to `verifyOwnedJobRegistry(path, { expectedInvocation })`: a registry with
-no header for it may be missing that invocation's records, and answers `unknown`.
+`<base>.terminal.<pid>-<startId>.json` (its writer's identity, directory fsync'd),
+removes unpublished `<base>.terminal.json.<pid>.tmp` files whose writer is gone, and
+writes its own registry header. A terminal attestation is valid for a request only if
+its `operationId`/`attempt` match the request and its `invocation` equals the invocation
+the consumer last observed through `attest` (or `get_state`).
+
+**Decide from both.** A clean terminal attestation is necessary, not sufficient: after
+observing that the process exited, a consumer must also run
+`verifyOwnedJobRegistry(path, { expectedInvocation })` with that invocation and treat
+the session as clear only if the attestation is clean **and** the verdict is `clear`.
+The attestation describes what this invocation could see when it decided; the registry
+check also covers what happened afterwards or elsewhere (another invocation writing the
+same session file, a process that outlived the exit). A registry with no header for the
+expected invocation may be missing that invocation's records, and answers `unknown`.
 
 The owned-job registry (`<session file without .jsonl>.jobs.jsonl`, append-only,
-fsync'd per record) lists processes and in-process jobs the agent started:
-`invocation` headers (`complete: false` when some process may be untracked;
-`inheritedOwnerMarkers` when it took over earlier invocations, below), `start` records
+fsync'd per record; a writer that finds a torn last line starts a new line first) lists
+processes and in-process jobs the agent started: `invocation` headers (`complete:
+false` when some process may be untracked; `writer`, a random id of the registry object;
+`inheritedOwnerMarkers` when it took over other invocations, below), `start` records
 (`jobId`, `kind`, `pid`, `pgid`, `startId`, `startTime` in Unix seconds for display,
 `command` (at most 4096 characters), `cwd`, `sleepable`, `inProcess`, `reparented?`,
 `groupMember?`, `discovered?`, `carriedFrom?`, `adoptedFrom?`), `end` records, and
@@ -493,13 +502,22 @@ reports. Every time the agent binds a session file (a switch, including a switch
 it re-appends every open start record not yet in that file with `carriedFrom` naming
 the first file; the end record then goes to every file holding the start.
 
-**Resume.** When an invocation binds a file that earlier invocations wrote, it takes over
-what they left: every open process record that is not provably gone is re-appended
-under the new invocation with `adoptedFrom` (and counted in `detachedJobs`); their
-owner tokens go into `inheritedOwnerMarkers` and are scanned from then on, counting
-unexaminable processes started since the earliest of those invocations; and their
-incomplete state — a `complete: false` header, an `incomplete` record, an in-process job
-that never ended — makes the new invocation incomplete too (`inherited: <reason>`).
+**Other invocations of the same session file.** OMP does not lock a session file: a
+resume can bind a file earlier invocations wrote, and a second OMP can have it open at
+the same time. The agent reads what other writers append — on first binding the file and
+again, incrementally, before every owner scan (so on every `attest`, `quiesce_and_exit`
+and hang-up capture) — and takes it over:
+- every open process record that is not provably gone is re-appended under this
+  invocation with `adoptedFrom` and counted in `detachedJobs`;
+- another invocation still running (or one whose identity cannot be read) counts as one
+  live process in `detachedJobs`, so no quiesce passes while it can still start work;
+- their owner tokens go into `inheritedOwnerMarkers` and are scanned from then on,
+  counting unexaminable processes started since the earliest of those invocations; a
+  token stops being copied into new headers once its invocation is gone and a sound scan
+  finds no process carrying it (the header that issued it still names it);
+- their incomplete state — a header that is not exactly `complete: true` with no reasons,
+  an `incomplete` record, an in-process job still open once its invocation is gone, an
+  unparseable line — makes this invocation incomplete too (`inherited: <reason>`).
 Incompleteness therefore sticks to a session file: once an invocation could not vouch
 for everything it started, no later invocation of that file claims `complete`.
 
@@ -515,28 +533,34 @@ the `sleepable` value given at start. A helper started by a different agent proc
 has no record here; consumers identify it by that worker selector in its argv.
 
 **Owner marker.** Every process the agent starts for work — embedded shell runs,
-PTY shells, named services, and commands run by extensions (`pi.exec`), hooks and
-custom tools — inherits `OMP_OWNER`, a comma-separated list of owner tokens
-`omp1:<pid>:<startId>` (an agent started from another agent's shell appends its token
-to the inherited list; the shared daemon broker gets none). Each `invocation` header
-records `ownerMarker: { env: "OMP_OWNER", token }`. A process that double-forks, calls
-`setsid` or otherwise escapes the shell keeps its environment, so `attest`,
-`quiesce_and_exit` and a hang-up capture scan processes that run as (or were started
-by) this user — real, effective or saved uid — for the token, record every live marked
-process the registry did not track as a `start` record with `discovered: true`, and
-count it in `detachedJobs`. `ownerScan` is `{ supported, sound, scanned, discovered,
-opaque }`: `opaque` lists candidate processes started since the invocation began whose
-environment could not be examined (including setuid descendants), which could hide the
-marker; `sound` is false if any exist, or if the OS hides processes from the scan
-(Linux `/proc` mounted with `hidepid`).
+PTY shells, named services, apps the browser tool launches (`app.path`, also recorded as
+`process`), and commands run by extensions (`pi.exec`), hooks and custom tools — inherits
+`OMP_OWNER`, a comma-separated list of owner tokens `omp1:<pid>:<startId>` (an agent
+started from another agent's shell appends its token to the inherited list; the shared
+daemon broker gets none). Each `invocation` header records `ownerMarker: { env:
+"OMP_OWNER", token }`. A process that double-forks, calls `setsid` or otherwise escapes
+the shell keeps its environment, so `attest`, `quiesce_and_exit` and a hang-up capture
+scan processes that run as (or were started by) this user — real, effective or saved uid
+— for the token, record every live marked process the registry did not track as a
+`start` record with `discovered: true`, and count it in `detachedJobs`. `ownerScan` is
+`{ supported, sound, scanned, discovered, opaque }`: `opaque` lists candidate processes
+started since the invocation began whose environment could not be examined (including
+setuid descendants), which could hide the marker; `sound` is false if any exist, or if
+the OS hides processes from the scan (Linux `/proc` mounted with `hidepid`).
 
-Limits — the classes that can still read as clear on Linux, where the scan is otherwise
-sound, so a consumer must keep its own host process census as a cross-check:
+Limits — the classes that can read as clear on Linux, where the scan is otherwise sound,
+so a consumer must keep its own host process census as a required cross-check:
 - a process that clears or replaces its environment (`env -i`, `sudo` with `env_reset`,
-  some daemonizers) is not found by the scan, and embedded shell runs report spawned
-  processes only while the run is in flight or retained;
+  some daemonizers) carries no marker, so the scan cannot find it — whether it escapes
+  while a shell run is still in flight (`sh -c 'setsid env -i cmd &'` leaves all counts
+  zero) or later; embedded shell runs report only the processes they themselves spawned
+  and were still alive when the run ended;
 - processes started through the extension `user_bash` hook (the extension runs them
-  itself) or on an ACP client terminal (they run in the client) are not registered.
+  itself) or on an ACP client terminal (they run in the client) are not registered;
+- engine infrastructure is neither marked nor registered: MCP stdio servers, language
+  servers (including the shared LSP mux daemon), the IDA worker, the tiny-model title
+  worker and the blob broker. They run no Thread work; the LSP mux, blob broker and title
+  worker are shared helpers that can outlive one agent process.
 
 Paths that mark the registry incomplete instead: every PTY shell run (on every
 platform), eval runs (their long-lived kernels are not marked), a shell run whose spawn
@@ -551,11 +575,15 @@ and consumers get `unknown` rather than a false clear. Windows has no scan.
 expectedInvocation })` in `@oh-my-pi/pi-coding-agent/session/owned-job-registry`
 implements it):
 1. Attribute each record to the latest preceding header with its `invocationPid`. A
-   malformed line, an unknown record type, or a record with no such header → at best
-   `unknown`. With `expectedInvocation`, no header for it → at best `unknown`.
+   malformed line, an unknown record type, a header whose fields do not have the types
+   above (`complete` a boolean, `incompleteReasons` strings, `ownerMarker` and every
+   `inheritedOwnerMarkers` entry with string `token`/`env` and a decimal-string or null
+   `startId`), or a record with no such header → at best `unknown`. With
+   `expectedInvocation`, no header for it → at best `unknown`.
 2. Any invocation still alive (pid + `startId`) → `live`: use `attest` instead; one
    whose identity cannot be read → at best `unknown`.
-3. Any `complete: false` header or `incomplete` record → at best `unknown`.
+3. A header counts as complete only when `complete` is exactly `true` and it lists no
+   `incompleteReasons`; any other header, or any `incomplete` record → at best `unknown`.
 4. Open records, ignoring `internal`: `inProcess` → `unknown`; otherwise alive by pid +
    `startId` → `blocked`; identity unreadable → at best `unknown`.
 5. One scan for every token in any header's `ownerMarker` and

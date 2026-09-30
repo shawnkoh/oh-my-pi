@@ -4,12 +4,12 @@ import * as path from "node:path";
 import { executeBash } from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
 import { execCommand } from "@oh-my-pi/pi-coding-agent/exec/exec";
 import {
-	OWNER_SCAN_COVERS_PLATFORM,
 	type OwnedJobRecord,
 	OwnedJobRegistry,
 	ownedJobRegistryPath,
 	ownedProcessState,
 	ownerToken,
+	parseOwnedJobRegistry,
 	verifyOwnedJobRegistry,
 } from "@oh-my-pi/pi-coding-agent/session/owned-job-registry";
 import { processIdentity } from "@oh-my-pi/pi-natives";
@@ -20,6 +20,9 @@ import { modeService, startService } from "@oh-my-pi/pi-coding-agent/launch/serv
 import type { DaemonSnapshot } from "@oh-my-pi/pi-tui/tools/daemon";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { DAEMON_BROKER_WORKER_ARG } from "@oh-my-pi/pi-coding-agent/launch/protocol";
+
+/** Where the owner-marker scan can see every same-user process a shell may start. */
+const OWNER_SCAN_COVERS_PLATFORM = process.platform === "linux";
 
 function readRecords(file: string): OwnedJobRecord[] {
 	return fs
@@ -642,4 +645,155 @@ describe.skipIf(process.platform === "win32")("owned-job registry", () => {
 			getSessionId: () => "session",
 		};
 	}
+
+	/**
+	 * Start another invocation on this test's session file while this registry already has it
+	 * bound (a second OMP resuming the same session). It records a detached sleep and an
+	 * in-process job it never ends, prints its pid, and then either exits normally or stays up.
+	 */
+	async function startConcurrentInvocation(stayAlive: boolean): Promise<{ agentPid: number; recordedPid: number }> {
+		const script = path.join(tempDir.path(), `concurrent-${stayAlive ? "alive" : "exit"}.ts`);
+		const registryModule = path.join(import.meta.dir, "../src/session/owned-job-registry.ts");
+		await Bun.write(
+			script,
+			[
+				`import { OwnedJobRegistry } from ${JSON.stringify(registryModule)};`,
+				`const registry = new OwnedJobRegistry({ getSessionFile: () => ${JSON.stringify(sessionFile)}, getSessionId: () => "concurrent", pollIntervalMs: 0 });`,
+				`const recorded = Bun.spawn(["/bin/sleep", ${JSON.stringify(uniqueSleep())}], { stdout: "ignore", stderr: "ignore", detached: true });`,
+				"recorded.unref();",
+				`registry.registerProcess({ kind: "process", pid: recorded.pid, command: "sleep" });`,
+				`registry.registerInProcessJob({ jobId: "shell-run:1", kind: "shell-run", command: "long run" });`,
+				"console.log(JSON.stringify({ agentPid: process.pid, recordedPid: recorded.pid }));",
+				stayAlive ? "setInterval(() => {}, 1 << 30);" : "process.exit(0);",
+			].join("\n"),
+		);
+		const agent = Bun.spawn([process.execPath, script], { stdout: "pipe", stderr: "inherit" });
+		const reader = agent.stdout.getReader();
+		let text = "";
+		while (!text.includes("\n")) {
+			const chunk = await reader.read();
+			if (chunk.done) break;
+			text += new TextDecoder().decode(chunk.value);
+		}
+		reader.releaseLock();
+		const pids = JSON.parse(text.trim()) as { agentPid: number; recordedPid: number };
+		spawned.push(pids.recordedPid);
+		if (stayAlive) spawned.push(pids.agentPid);
+		else expect(await agent.exited).toBe(0);
+		return pids;
+	}
+
+	it("sees work another invocation started on the same session file after this one bound it", async () => {
+		registry.ensureHeader();
+		expect(registry.liveProcessCount()).toBe(0);
+		const { recordedPid } = await startConcurrentInvocation(false);
+		// Every attest, quiesce and hang-up count runs the owner scan, which reads the new tail.
+		registry.scanOwnedProcesses();
+		expect(registry.liveProcessCount()).toBe(1);
+		expect(registry.openJobs()).toContainEqual(
+			expect.objectContaining({ pid: recordedPid, adoptedFrom: expect.any(Object) }),
+		);
+		// Its run never ended and it is gone: this registry cannot vouch for what that run started.
+		expect(registry.complete).toBe(false);
+		expect(registry.incompleteReasons.some(reason => reason.endsWith("left shell-run work unfinished"))).toBe(true);
+	});
+
+	it("counts another invocation still running on the same session file as live work", async () => {
+		registry.ensureHeader();
+		const { agentPid } = await startConcurrentInvocation(true);
+		registry.scanOwnedProcesses();
+		// Its own process and its recorded sleep.
+		expect(registry.liveProcessCount()).toBe(2);
+		expect(registry.complete).toBe(true);
+		// Once it is gone, its unfinished run makes this registry incomplete.
+		const agent = Bun.spawn(["/bin/kill", "-9", String(agentPid)]);
+		await agent.exited;
+		await eventually(() => ownedProcessState(agentPid, null) === "gone", "the other invocation to exit");
+		expect(registry.liveProcessCount()).toBe(1);
+		expect(registry.complete).toBe(false);
+	});
+
+	it("flags a crashed earlier invocation's unfinished in-process run on resume", async () => {
+		const script = path.join(tempDir.path(), "crash-run.ts");
+		const registryModule = path.join(import.meta.dir, "../src/session/owned-job-registry.ts");
+		await Bun.write(
+			script,
+			[
+				`import { OwnedJobRegistry } from ${JSON.stringify(registryModule)};`,
+				`const registry = new OwnedJobRegistry({ getSessionFile: () => ${JSON.stringify(sessionFile)}, getSessionId: () => "crashed", pollIntervalMs: 0 });`,
+				`registry.registerInProcessJob({ jobId: "shell-run:1", kind: "shell-run", command: "long run" });`,
+				`process.kill(process.pid, "SIGKILL");`,
+			].join("\n"),
+		);
+		const agent = Bun.spawn([process.execPath, script], { stdout: "ignore", stderr: "inherit" });
+		expect(await agent.exited).not.toBe(0);
+		// Nothing else is wrong with the file: only the open run can make the resume incomplete.
+		registry.ensureHeader();
+		expect(registry.complete).toBe(false);
+		expect(registry.incompleteReasons.some(reason => reason.endsWith("left shell-run work unfinished"))).toBe(true);
+	});
+
+	it("never reads a header as complete unless `complete` is exactly true with no reasons", () => {
+		const pid = 0x7ffffff4;
+		for (const override of [{ complete: false, incompleteReasons: [] }, { complete: "false" }, { complete: 1 }]) {
+			const file = path.join(tempDir.path(), "crafted.jobs.jsonl");
+			fs.writeFileSync(file, `${JSON.stringify({ ...header(pid, "5"), ...override })}\n`);
+			expect(verifyOwnedJobRegistry(file).status).toBe("unknown");
+		}
+		// A resume over such a file does not claim completeness either.
+		fs.writeFileSync(
+			ownedJobRegistryPath(sessionFile),
+			`${JSON.stringify({ ...header(pid, "5"), complete: false, incompleteReasons: [] })}\n`,
+		);
+		registry.ensureHeader();
+		expect(registry.complete).toBe(false);
+	});
+
+	it("treats malformed owner markers as a malformed header and never copies them", () => {
+		const pid = 0x7ffffff5;
+		for (const markers of [{}, [{}], [{ token: 7, startId: "1" }]]) {
+			const file = ownedJobRegistryPath(sessionFile);
+			fs.writeFileSync(file, `${JSON.stringify({ ...header(pid, "5"), inheritedOwnerMarkers: markers })}\n`);
+			expect(verifyOwnedJobRegistry(file).status).toBe("unknown");
+		}
+		registry.ensureHeader();
+		expect(registry.complete).toBe(false);
+		const ours = readRecords(ownedJobRegistryPath(sessionFile))
+			.filter(record => record.type === "invocation")
+			.at(-1);
+		if (ours?.type !== "invocation") throw new Error("expected this invocation's header");
+		expect(ours.inheritedOwnerMarkers).toBeUndefined();
+		// Every later scan still works.
+		expect(registry.scanOwnedProcesses().supported).toBe(process.platform !== "win32");
+	});
+
+	it("starts a new line after a torn record so the next header is not swallowed", () => {
+		const file = ownedJobRegistryPath(sessionFile);
+		fs.writeFileSync(file, `${JSON.stringify(header(0x7ffffff6, "5"))}\n{"type":"start","jobId":"torn`);
+		registry.ensureHeader();
+		const parsed = parseOwnedJobRegistry(fs.readFileSync(file, "utf8"));
+		expect(parsed.segments.map(segment => segment.header.invocation.pid)).toEqual([0x7ffffff6, process.pid]);
+		expect(parsed.problems).toEqual(["registry has a malformed record"]);
+	});
+
+	it.skipIf(process.platform !== "linux")(
+		"stops copying a taken-over owner token once nothing can carry it",
+		async () => {
+			const { markedPid, recordedPid } = await crashEarlierInvocation();
+			registry.ensureHeader();
+			for (const pid of [markedPid, recordedPid]) {
+				const kill = Bun.spawn(["/bin/kill", "-9", String(pid)]);
+				await kill.exited;
+				await eventually(() => ownedProcessState(pid, null) === "gone", `pid ${pid} to exit`);
+			}
+			registry.liveProcessCount();
+			expect(registry.scanOwnedProcesses().sound).toBe(true);
+			// The next file this invocation binds no longer lists the dead token.
+			sessionFile = path.join(tempDir.path(), "2026-01-03_next.jsonl");
+			registry.ensureHeader();
+			const next = readRecords(ownedJobRegistryPath(sessionFile)).find(record => record.type === "invocation");
+			if (next?.type !== "invocation") throw new Error("expected a header");
+			expect(next.inheritedOwnerMarkers).toBeUndefined();
+		},
+	);
 });
