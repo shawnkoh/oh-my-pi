@@ -246,13 +246,15 @@ impl Shell {
 		self.abort_state.abort().await;
 	}
 
-	/// Number of live background jobs (running `&`/`nohup` children) tracked by
-	/// the persistent session. Completed jobs are reaped first via a silent
-	/// `JobManager::poll()` (no job-control notifications), so the count
-	/// reflects only processes still alive. Returns 0 when no session core is
-	/// materialized. The host uses this to decide whether to retain a per-call
-	/// shell whose background children are still running instead of dropping it
-	/// (which would SIGKILL them on kill-on-drop).
+	/// Number of live background jobs tracked by the persistent session: running
+	/// `&`/`nohup` children, and jobs running in-process (a backgrounded
+	/// subshell or brace group, which can start external processes at any later
+	/// time). Completed jobs are reaped first via a silent `JobManager::poll()`
+	/// (no job-control notifications), so the count reflects only jobs still
+	/// running. Returns 0 when no session core is materialized. The host uses
+	/// this to decide whether to retain a per-call shell whose background jobs
+	/// are still running instead of dropping it (which would SIGKILL them on
+	/// kill-on-drop).
 	pub async fn live_background_job_count(&self) -> u32 {
 		let mut guard = self.session.lock().await;
 		let Some(core) = guard.as_mut() else {
@@ -269,7 +271,7 @@ impl Shell {
 			jobs
 				.jobs
 				.iter()
-				.filter(|job| job.representative_pid().is_some())
+				.filter(|job| job.representative_pid().is_some() || job.has_internal_task())
 				.count(),
 		)
 		.unwrap_or(u32::MAX)
@@ -5564,14 +5566,15 @@ replace = [{ pattern = "hello", replacement = "HI" }]
 	}
 
 	/// `live_background_job_count` reports 0 when the session has no live
-	/// external background jobs and 1 while one is running. The host relies on
-	/// this to retain a per-call shell whose `&`/`nohup` child is still alive
-	/// instead of dropping it (which would SIGKILL the child via kill-on-drop).
-	/// `sh -c` forces an external process because the bare `sleep` builtin runs
-	/// in-process and is intentionally not counted.
+	/// background jobs and counts each one while it runs: an external `&` child,
+	/// and an in-process job (a backgrounded brace group) that starts its
+	/// external process only later. The host relies on this to retain a
+	/// per-call shell whose background job is still running instead of dropping
+	/// it (which would SIGKILL the child via kill-on-drop and abort the
+	/// in-process job).
 	#[cfg(unix)]
 	#[tokio::test(flavor = "multi_thread")]
-	async fn live_background_job_count_tracks_external_background_jobs() {
+	async fn live_background_job_count_tracks_background_jobs() {
 		let _guard = shell_test_lock().lock().await;
 		let shell = Shell::new(None);
 
@@ -5600,7 +5603,22 @@ replace = [{ pattern = "hello", replacement = "HI" }]
 			.expect("run sleep");
 		assert_eq!(shell.live_background_job_count().await, 1);
 
-		// Dropping the shell at scope end reaps the child via kill-on-drop.
+		// An in-process job that has not started its external process yet is tracked
+		// too.
+		shell
+			.run(
+				ShellRunOptions {
+					command: "{ sleep 30; sh -c 'sleep 30'; } &".into(),
+					..Default::default()
+				},
+				None,
+				CancelToken::default(),
+			)
+			.await
+			.expect("run brace group");
+		assert_eq!(shell.live_background_job_count().await, 2);
+
+		// Dropping the shell at scope end reaps the children via kill-on-drop.
 		shell.abort().await;
 	}
 
