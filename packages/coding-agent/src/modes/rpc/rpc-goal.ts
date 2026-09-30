@@ -44,6 +44,7 @@ export type RpcGoalSession = Pick<
 	| "sendGoalModeContext"
 	| "getTodoPhases"
 	| "promptCustomMessage"
+	| "waitForIdle"
 	| "isStreaming"
 	| "isDisposed"
 	| "hasAdmittedSubmission"
@@ -59,13 +60,21 @@ export class RpcGoalController {
 	#previousContinuationActivity: string | undefined;
 	/** A continuation turn made no new progress; wait for the host before continuing. */
 	#suppressContinuation = false;
-	/** A continuation is scheduled for the next macrotask and not yet admitted. */
+	/** A continuation has been decided and is waiting for the session to go idle. */
 	#continuationScheduled = false;
+	/** Bumped by a host abort or session change; a waiting continuation from before is void. */
+	#continuationGeneration = 0;
 	/** Tool-set restoration triggered by session events; commands and reads wait for it. */
 	#exitTask: Promise<void> = Promise.resolve();
+	readonly #onContinuationDropped: (() => void) | undefined;
 
-	constructor(session: RpcGoalSession) {
+	/**
+	 * @param onContinuationDropped called when a pending continuation is abandoned
+	 *   (a gate closed while it waited), so settle reporting can re-check.
+	 */
+	constructor(session: RpcGoalSession, onContinuationDropped?: () => void) {
 		this.#session = session;
+		this.#onContinuationDropped = onContinuationDropped;
 	}
 
 	/**
@@ -85,6 +94,7 @@ export class RpcGoalController {
 	stopForHostAbort(): void {
 		this.#suppressContinuation = true;
 		this.#continuationScheduled = false;
+		this.#continuationGeneration++;
 	}
 
 	get #state(): RpcGoalResult {
@@ -162,10 +172,12 @@ export class RpcGoalController {
 	}
 
 	async #enter(start: () => Promise<GoalModeState>): Promise<void> {
-		// Record the exact active set (a `goal` tool the host already enabled stays enabled afterwards).
-		const previousTools = this.#session.getEnabledToolNames();
-		this.#previousTools = previousTools;
+		// The pre-goal tool set is captured once, when this controller first adds `goal`
+		// (a reattached paused goal already holds it). A `goal` tool the host enabled
+		// before the goal stays enabled afterwards.
+		const previousTools = this.#previousTools ?? this.#session.getEnabledToolNames();
 		const state = await start();
+		this.#previousTools = previousTools;
 		await this.#session.setActiveToolsByName([...new Set([...previousTools, "goal"])]);
 		this.#session.setGoalModeState(state);
 		this.#resetContinuation();
@@ -204,12 +216,16 @@ export class RpcGoalController {
 	}
 
 	/**
-	 * Restore a goal journaled in the current session (startup, new/switch/branch/open),
-	 * mirroring the TUI's reattach. Controller state from the previous session is discarded.
+	 * Leave the previous session's goal behind and restore a goal journaled in the
+	 * current session (startup, new/switch/branch/open), mirroring the TUI's reattach.
 	 */
 	async reconcile(): Promise<void> {
-		this.#previousTools = undefined;
-		this.#resetContinuation();
+		// Goal state and the goal tool belong to the session that set them; the
+		// session itself keeps both across a switch, so clear them here first.
+		this.#continuationScheduled = false;
+		this.#continuationGeneration++;
+		await this.#exit();
+		this.#session.setGoalModeState(undefined);
 		const context = this.#session.sessionManager.buildSessionContext();
 		const runtime = this.#session.goalRuntime;
 		if (context.mode !== "goal" && context.mode !== "goal_paused") {
@@ -265,47 +281,69 @@ export class RpcGoalController {
 	}
 
 	/**
-	 * The continuation turn to start now, or undefined when any gate is closed.
-	 * Every gate is read from the live session at submission time; there is no
-	 * cached "idle" inference. A disposed session never admits a continuation.
+	 * Whether goal continuation is wanted at all, independent of whether the session
+	 * is momentarily busy. Every gate is read from the live session.
 	 */
-	#continuationPrompt(): string | undefined {
+	#continuationWanted(): boolean {
 		const session = this.#session;
-		if (!cfgGoalContinuationModes.get(session.settings).includes(RPC_GOAL_CONTINUATION_MODE)) return undefined;
-		if (this.#suppressContinuation || session.isDisposed) return undefined;
-		if (session.getPlanModeState()?.enabled) return undefined;
+		if (!cfgGoalContinuationModes.get(session.settings).includes(RPC_GOAL_CONTINUATION_MODE)) return false;
+		if (this.#suppressContinuation || session.isDisposed) return false;
+		if (session.getPlanModeState()?.enabled) return false;
 		const state = session.getGoalModeState();
-		if (!state?.enabled || state.goal.status !== "active") return undefined;
-		if (session.isStreaming || session.hasAdmittedSubmission || session.queuedMessageCount > 0) return undefined;
+		if (!state?.enabled || state.goal.status !== "active") return false;
 		const phases = session.getTodoPhases();
-		if (!nextActionableTask(phases) && phases.some(phase => phase.tasks.some(task => task.status === "blocked"))) {
-			return undefined;
-		}
-		return session.goalRuntime.buildContinuationPrompt();
+		return !(
+			!nextActionableTask(phases) && phases.some(phase => phase.tasks.some(task => task.status === "blocked"))
+		);
 	}
 
 	/**
-	 * Start the next goal turn one macrotask after the triggering event: after the
-	 * run has fully yielded, and before the settle watcher's check, so the session
-	 * never reports settled while a continuation is about to be admitted.
+	 * Decide at a yield to continue the goal; admit the continuation once the yielding
+	 * run has fully unwound. While waiting, {@link continuationPending} is true, so no
+	 * settle report calls the session settled. At admission every gate is re-read:
+	 * an abort, disposal, pause, plan mode, or another turn starting meanwhile drops it.
 	 */
 	#scheduleContinuation(): void {
-		if (this.#continuationScheduled || !this.#continuationPrompt()) return;
+		if (this.#continuationScheduled || !this.#continuationWanted()) return;
 		this.#continuationScheduled = true;
-		setImmediate(() => {
-			if (!this.#continuationScheduled) return;
+		const generation = this.#continuationGeneration;
+		void (async () => {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			setImmediate(resolve);
+			await promise;
+			await this.#session.waitForIdle();
+			if (!this.#continuationScheduled || generation !== this.#continuationGeneration) {
+				this.#onContinuationDropped?.();
+				return;
+			}
 			this.#continuationScheduled = false;
-			// Re-check every gate: an abort, disposal, pause or host input may have landed meanwhile.
-			const prompt = this.#continuationPrompt();
-			if (!prompt) return;
+			const session = this.#session;
+			const idle = !session.isStreaming && !session.hasAdmittedSubmission && session.queuedMessageCount === 0;
+			const prompt = idle && this.#continuationWanted() ? session.goalRuntime.buildContinuationPrompt() : undefined;
+			if (!prompt) {
+				this.#onContinuationDropped?.();
+				return;
+			}
 			this.#pendingContinuationTurns++;
-			// Admission is synchronous inside promptCustomMessage, so the gate check and
-			// the admitted submission cannot be separated by another event.
-			this.#session
-				.promptCustomMessage({ customType: "goal-continuation", content: prompt, display: false })
-				.then(dispatched => {
-					if (!dispatched) this.#pendingContinuationTurns = Math.max(0, this.#pendingContinuationTurns - 1);
-				}, reportControllerError);
+			const unclaim = () => {
+				this.#pendingContinuationTurns = Math.max(0, this.#pendingContinuationTurns - 1);
+			};
+			// promptCustomMessage counts the submission as admitted synchronously, so every
+			// settle report sees it from here on. A rejection (for example a turn another
+			// source started meanwhile) must not leave the continuation counted.
+			session.promptCustomMessage({ customType: "goal-continuation", content: prompt, display: false }).then(
+				dispatched => {
+					if (!dispatched) unclaim();
+				},
+				error => {
+					unclaim();
+					reportControllerError(error);
+				},
+			);
+		})().catch(error => {
+			this.#continuationScheduled = false;
+			this.#onContinuationDropped?.();
+			reportControllerError(error);
 		});
 	}
 }

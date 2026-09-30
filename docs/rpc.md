@@ -398,12 +398,23 @@ including those made by the agent's `goal` tool.
 
 Goals do not continue on their own over RPC unless `goal.continuationModes`
 contains `"rpc"`; this covers both `--mode rpc` and `--mode rpc-ui`. When enabled,
-`create`/`resume` on an idle session and each terminal `agent_end` start the next
-goal turn as a hidden `goal-continuation` message. This happens only while the goal is active, the
-session is idle with nothing queued, plan mode is off, and open todos are not all
-blocked. The continuation is admitted before `session_settled` is evaluated. It
-stops after a continuation turn with no new tool activity, and the next host prompt
-re-arms it. When the agent completes the goal, the goal tool is removed again and
+`create`/`resume` and each terminal `agent_end` decide whether to start another goal
+turn, sent as a hidden `goal-continuation` message.
+
+- The turn starts once the yielding run has fully unwound. At that moment the goal
+  must still be active, the session idle with nothing queued, plan mode off, open
+  todos not all blocked, and the session not being disposed.
+- While the turn is decided but not yet started, `get_state.isSettled`,
+  `prompt_result.sessionSettled` and `session_settled` treat the session as busy.
+  `session_settled` follows if the continuation is abandoned.
+- `abort` stops continuation before the abort takes effect; the interrupted goal is
+  paused. Continuation also stops after a goal turn with no new tool activity.
+  Either way, the next host prompt, steer or follow-up (or `goal resume`) re-arms it.
+- A session change (`new_session`, `switch_session`, `branch`, `open_session`)
+  leaves the previous goal and its tool behind and restores a goal journaled in the
+  target session.
+
+When the agent completes the goal, the goal tool is removed again and
 `get_state.goal` becomes `null`.
 
 ### `set_fast_mode` payload

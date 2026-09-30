@@ -816,10 +816,13 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	};
 
 	const extensionUserMessageTracker = new RpcExtensionUserMessageTracker();
-	const promptResults = new RpcPromptResults(session, output);
+	// A continuation abandoned while waiting leaves nothing to end the activity stretch: re-check settlement.
+	const goalController = new RpcGoalController(session, () => void settleWatcher.check());
+	// A scheduled goal continuation will start a turn: every settle report treats it as busy.
+	const goalTurnScheduled = () => goalController.continuationPending;
+	const promptResults = new RpcPromptResults(session, output, goalTurnScheduled);
 	const sessionEvents = new RpcSessionEventForwarder(output);
-	const settleWatcher = new RpcSessionSettleWatcher(session, output);
-	const goalController = new RpcGoalController(session);
+	const settleWatcher = new RpcSessionSettleWatcher(session, output, goalTurnScheduled);
 
 	const pendingExtensionRequests = new RpcPendingExtensionRequests();
 	const hostToolBridge = new RpcHostToolBridge(output);
@@ -1044,9 +1047,10 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	// Output all agent events as JSON; prompt results follow the frame that settled them.
 	session.subscribe(event => {
 		sessionEvents.forward(event);
-		promptResults.observe(event);
-		// Before the settle watcher: a goal continuation is admitted ahead of the settle check.
+		// Before the prompt-result and settle reports: a goal continuation decided at this
+		// agent_end is scheduled (and reported as pending) before either reads settlement.
 		goalController.observe(event);
+		promptResults.observe(event);
 		settleWatcher.observe(event);
 	});
 	await goalController.reconcile();
@@ -1312,7 +1316,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					queuedMessageCount: session.queuedMessageCount,
 					hasPendingAsyncWork: session.hasPendingAsyncWork(),
 					// A scheduled goal continuation will start a turn: not settled.
-					isSettled: isRpcSessionSettled(session) && !goalController.continuationPending,
+					isSettled: isRpcSessionSettled(session, goalTurnScheduled),
 					queuedMessages: { steering: [...queuedMessages.steering], followUp: [...queuedMessages.followUp] },
 					todoPhases: session.getTodoPhases(),
 					fastModeEnabled: session.isFastModeEnabled(),

@@ -13,7 +13,8 @@ import { cfgAsyncEnabled } from "@oh-my-pi/pi-coding-agent/tools/settings";
 // Real SDK session (goal tool registered as in production), RPC dispatch and goal
 // runtime; only the model is scripted.
 // GOAL_RPC_CONTINUATION="1" opts into `goal.continuationModes: ["rpc"]`.
-// GOAL_RPC_SCRIPT="complete" (default): the agent works, then completes the goal with the goal tool.
+// GOAL_RPC_SCRIPT="complete" (default): the first goal turn does some work and ends; only
+// the next (continuation) turn completes the goal with the goal tool.
 // GOAL_RPC_SCRIPT="idle": every turn replies with text only (no progress).
 // GOAL_RPC_PLAN="1": the session starts in plan mode.
 const cwd = process.cwd();
@@ -48,6 +49,7 @@ const turns: MockResponse[] =
 			? [{ content: [{ type: "toolCall", id: "s1", name: "goal", arguments: { op: "get" } }], delayMs: 10_000 }]
 			: [
 					{ content: [{ type: "toolCall", id: "t1", name: "goal", arguments: { op: "get" } }] },
+					{ content: ["Step one done."] },
 					{ content: [{ type: "toolCall", id: "t2", name: "goal", arguments: { op: "complete" } }] },
 					{ content: ["Goal complete."] },
 				];

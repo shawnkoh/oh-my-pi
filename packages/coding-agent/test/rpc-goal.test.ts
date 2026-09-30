@@ -144,7 +144,8 @@ describe("RPC goal command", () => {
 		const continuations = messages.filter(
 			message => message.role === "custom" && message.customType === "goal-continuation",
 		);
-		expect(continuations.length).toBeGreaterThanOrEqual(1);
+		// One continuation after create, and a second after that turn yielded unfinished.
+		expect(continuations).toHaveLength(2);
 		// The goal tool, not a text prompt, completed it.
 		expect(
 			messages.some(
@@ -182,11 +183,48 @@ describe("RPC goal command", () => {
 		expect(state.isStreaming).toBe(false);
 		expect(state.isSettled).toBe(true);
 	}, 30_000);
+
+	test("a new session leaves the previous session's goal, goal tool and continuation behind", async () => {
+		const rpc = await start({ continuation: false });
+		const toolsBefore = (await rpc.getState()).dumpTools?.map(tool => tool.name) ?? [];
+		await rpc.goal("create", { objective: "belongs to the first session" });
+		expect((await rpc.newSession()).cancelled).toBe(false);
+		const state = await rpc.getState();
+		expect(state.goal).toBeNull();
+		expect(state.dumpTools?.map(tool => tool.name)).toEqual(toolsBefore);
+		expect(await rpc.goal("get")).toEqual({ goal: null, state: null });
+		expect((await rpc.goal("create", { objective: "second session goal" })).goal?.status).toBe("active");
+	}, 30_000);
+
+	test("prompt_result reports the session unsettled when a goal continuation follows the prompt", async () => {
+		const rpc = await start({ continuation: true, script: "idle" });
+		const firstSettle = Promise.withResolvers<void>();
+		const unsubscribeSettled = rpc.onSessionSettled(() => firstSettle.resolve());
+		const results = new Map<string, boolean>();
+		const unsubscribeResults = rpc.onPromptResult(result => {
+			if (result.id) results.set(result.id, result.sessionSettled);
+		});
+		try {
+			await rpc.goal("create", { objective: "keep going" });
+			// The first continuation makes no progress, so the loop stops and the session settles.
+			await withTimeout(firstSettle.promise, 15_000, "Initial continuation never settled");
+			const events = await rpc.promptAndWait("host input re-arms the goal");
+			expect(events.some(event => event.type === "agent_end")).toBe(true);
+		} finally {
+			unsubscribeSettled();
+			unsubscribeResults();
+		}
+		// The host prompt re-armed continuation; a goal turn follows it, so the prompt's
+		// own result must not claim the session settled.
+		expect([...results.values()]).toEqual([false]);
+	}, 30_000);
 });
 
 describe("RpcGoalController continuation gate", () => {
-	test("a continuation decided before the session closes is never admitted after it", async () => {
-		const settings = Settings.isolated({ "goal.continuationModes": ["rpc"] });
+	const agentEnd = { type: "agent_end", messages: [], isTerminal: true } as unknown as AgentSessionEvent;
+	const hostInput = { type: "message_start", message: { role: "user", content: [] } } as unknown as AgentSessionEvent;
+
+	function fakeSession(admit: (customType: string) => Promise<boolean>) {
 		const goal: Goal = {
 			id: "g1",
 			objective: "o",
@@ -196,13 +234,9 @@ describe("RpcGoalController continuation gate", () => {
 			createdAt: 0,
 			updatedAt: 0,
 		};
-		let disposed = false;
-		const admitted: string[] = [];
 		const session = {
-			settings,
-			get isDisposed() {
-				return disposed;
-			},
+			settings: Settings.isolated({ "goal.continuationModes": ["rpc"] }),
+			isDisposed: false,
 			isStreaming: false,
 			hasAdmittedSubmission: false,
 			queuedMessageCount: 0,
@@ -210,36 +244,57 @@ describe("RpcGoalController continuation gate", () => {
 			getGoalModeState: () => ({ enabled: true, mode: "active" as const, goal }),
 			getTodoPhases: () => [],
 			goalRuntime: { buildContinuationPrompt: () => "continue" },
-			promptCustomMessage: async (message: { customType: string }) => {
-				admitted.push(message.customType);
-				return true;
-			},
+			promptCustomMessage: (message: { customType: string }) => admit(message.customType),
+			waitForIdle: async () => {},
 		};
-		const controller = new RpcGoalController(session as unknown as RpcGoalSession);
-		const agentEnd = { type: "agent_end", messages: [], isTerminal: true } as unknown as AgentSessionEvent;
+		return { session, controller: new RpcGoalController(session as unknown as RpcGoalSession) };
+	}
+
+	test("a continuation decided before the session closes is never admitted after it", async () => {
+		const admitted: string[] = [];
+		const { session, controller } = fakeSession(async customType => {
+			admitted.push(customType);
+			return true;
+		});
 
 		controller.observe(agentEnd);
 		expect(controller.continuationPending).toBe(true);
-		disposed = true;
+		session.isDisposed = true;
 		await nextMacrotask();
 		expect(admitted).toEqual([]);
 		expect(controller.continuationPending).toBe(false);
 
 		// A host abort closes the gate before the aborted run's agent_end arrives.
-		disposed = false;
+		session.isDisposed = false;
 		controller.stopForHostAbort();
 		controller.observe(agentEnd);
 		await nextMacrotask();
 		expect(admitted).toEqual([]);
 
 		// Host input re-arms it; the next yield continues exactly once.
-		controller.observe({
-			type: "message_start",
-			message: { role: "user", content: [] },
-		} as unknown as AgentSessionEvent);
+		controller.observe(hostInput);
 		controller.observe(agentEnd);
 		controller.observe(agentEnd);
 		await nextMacrotask();
 		expect(admitted).toEqual(["goal-continuation"]);
+	});
+
+	test("a rejected continuation does not claim the next run as its own", async () => {
+		let calls = 0;
+		const { controller } = fakeSession(async () => {
+			calls++;
+			if (calls === 1) throw new Error("Agent is busy");
+			return true;
+		});
+
+		controller.observe(agentEnd);
+		await nextMacrotask();
+		await nextMacrotask();
+		expect(calls).toBe(1);
+		// Another source's run ends without tool activity. It is not a continuation turn,
+		// so it must not count as "no progress" and stop the goal loop.
+		controller.observe(agentEnd);
+		await nextMacrotask();
+		expect(calls).toBe(2);
 	});
 });
