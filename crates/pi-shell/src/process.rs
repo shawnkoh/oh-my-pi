@@ -245,12 +245,18 @@ mod platform {
 		/// Start time pinned at open, in Unix epoch seconds (floor): boot time
 		/// plus the `/proc/<pid>/stat` start tick count, as `ps -o lstart` does.
 		pub fn start_time_unix_secs(&self) -> Option<u64> {
-			// SAFETY: `sysconf` takes a scalar name and touches no caller memory.
-			let ticks_per_sec = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) })
-				.ok()
-				.filter(|ticks| *ticks > 0)?;
-			Some(read_boot_time()? + self.start_time / ticks_per_sec)
+			start_ticks_to_unix_secs(self.start_time)
 		}
+	}
+
+	/// Convert a `/proc/<pid>/stat` start tick count to Unix epoch seconds
+	/// (floor).
+	fn start_ticks_to_unix_secs(start_ticks: u64) -> Option<u64> {
+		// SAFETY: `sysconf` takes a scalar name and touches no caller memory.
+		let ticks_per_sec = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) })
+			.ok()
+			.filter(|ticks| *ticks > 0)?;
+		Some(read_boot_time()? + start_ticks / ticks_per_sec)
 	}
 
 	/// System boot time in Unix epoch seconds (`btime` in `/proc/stat`).
@@ -280,16 +286,113 @@ mod platform {
 		})
 	}
 
-	fn read_start_time(pid: i32) -> Option<u64> {
-		// `/proc/[pid]/stat` field 22 is the process start time in clock ticks
-		// since boot. The comm field (between parens) may itself contain spaces
-		// and parens, so locate the *last* `)` and split the trailing
-		// whitespace-separated fields.
-		let stat_path = format!("/proc/{pid}/stat");
-		let content = fs::read_to_string(stat_path).ok()?;
+	/// The `/proc/<pid>/stat` fields the process scans need.
+	struct Stat<'a> {
+		comm:        &'a str,
+		state:       char,
+		ppid:        i32,
+		pgrp:        i32,
+		start_ticks: u64,
+	}
+
+	fn parse_stat(content: &str) -> Option<Stat<'_>> {
+		// The comm field (between parens) may itself contain spaces and parens,
+		// so locate the *last* `)` and split the trailing whitespace-separated
+		// fields: state, ppid, pgrp, … and field 22 (index 19 after comm), the
+		// start time in clock ticks since boot.
+		let first_paren = content.find('(')?;
 		let last_paren = content.rfind(')')?;
-		let rest = &content[last_paren + 1..];
-		rest.split_whitespace().nth(19)?.parse().ok()
+		let comm = content.get(first_paren + 1..last_paren)?;
+		let mut fields = content[last_paren + 1..].split_whitespace();
+		let state = fields.next()?.chars().next()?;
+		let ppid = fields.next()?.parse().ok()?;
+		let pgrp = fields.next()?.parse().ok()?;
+		let start_ticks = fields.nth(16)?.parse().ok()?;
+		Some(Stat { comm, state, ppid, pgrp, start_ticks })
+	}
+
+	fn read_start_time(pid: i32) -> Option<u64> {
+		let content = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+		parse_stat(&content).map(|stat| stat.start_ticks)
+	}
+
+	/// Effective uid from the `Uid:` line of `/proc/<pid>/status`.
+	fn status_effective_uid(status: &str) -> Option<libc::uid_t> {
+		let ids = status.lines().find_map(|line| line.strip_prefix("Uid:"))?;
+		ids.split_whitespace().nth(1)?.parse().ok()
+	}
+
+	pub fn scan_processes_by_env(name: &str, token: &str) -> super::MarkedProcessScan {
+		let Ok(entries) = fs::read_dir("/proc") else {
+			return super::MarkedProcessScan::default();
+		};
+		let mut scan = super::MarkedProcessScan { supported: true, ..Default::default() };
+		// SAFETY: `geteuid` takes no arguments and cannot fail.
+		let euid = unsafe { libc::geteuid() };
+		let self_pid = std::process::id();
+		for entry in entries.flatten() {
+			let Some(pid) = entry
+				.file_name()
+				.to_str()
+				.and_then(|name| name.parse::<u32>().ok())
+			else {
+				continue;
+			};
+			if pid == self_pid {
+				continue;
+			}
+			// `status` and `stat` are world-readable; failing to read them
+			// means the process exited.
+			let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else {
+				continue;
+			};
+			if status_effective_uid(&status) != Some(euid) {
+				continue;
+			}
+			let Ok(stat_content) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+				continue;
+			};
+			let Some(stat) = parse_stat(&stat_content) else {
+				continue;
+			};
+			// Zombies have released their memory, so no environment remains.
+			if matches!(stat.state, 'Z' | 'X') {
+				continue;
+			}
+			scan.scanned += 1;
+			let environ = match fs::read(format!("/proc/{pid}/environ")) {
+				Ok(environ) => environ,
+				Err(_) => {
+					// Non-dumpable processes (setuid launches, `PR_SET_DUMPABLE 0`)
+					// deny the read; a vanished directory means it simply exited.
+					if fs::exists(format!("/proc/{pid}")).unwrap_or(true) {
+						scan.unreadable += 1;
+					}
+					continue;
+				},
+			};
+			let mut env = environ
+				.split(|byte| *byte == 0)
+				.filter(|entry| !entry.is_empty());
+			let Some(first) = env.next() else {
+				scan.redacted += 1;
+				continue;
+			};
+			if !super::env_has_token(std::iter::once(first).chain(env), name, token) {
+				continue;
+			}
+			let Ok(pid) = i32::try_from(pid) else {
+				continue;
+			};
+			scan.processes.push(super::MarkedProcess {
+				pid,
+				ppid: stat.ppid,
+				pgid: Some(stat.pgrp).filter(|pgrp| *pgrp > 0),
+				start_time: start_ticks_to_unix_secs(stat.start_ticks),
+				command: stat.comm.to_owned(),
+			});
+		}
+		scan
 	}
 
 	fn open_pidfd(pid: i32) -> Option<Arc<OwnedFd>> {
@@ -648,6 +751,22 @@ mod platform {
 	}
 
 	fn process_args(pid: i32) -> Vec<String> {
+		let mut buffer = Vec::new();
+		let Ok(len) = read_procargs(pid, &mut buffer) else {
+			return Vec::new();
+		};
+		split_procargs(&buffer[..len]).map_or_else(Vec::new, |(args, _)| {
+			args
+				.into_iter()
+				.map(|arg| String::from_utf8_lossy(arg).into_owned())
+				.collect()
+		})
+	}
+
+	/// Read the raw `KERN_PROCARGS2` block of `pid` into the front of `buffer`
+	/// (grown as needed, never shrunk, so a scan reuses one allocation) and
+	/// return its length. Errors carry the `sysctl` errno.
+	fn read_procargs(pid: i32, buffer: &mut Vec<u8>) -> Result<usize, i32> {
 		let mut mib = [libc::CTL_KERN, KERN_PROCARGS2, pid];
 		let mut size = 0usize;
 		// SAFETY: `mib` points to three initialized integers and the old-value
@@ -664,11 +783,16 @@ mod platform {
 				0,
 			)
 		} == 0;
-		if !sizing_ok || size <= size_of::<libc::c_int>() {
-			return Vec::new();
+		if !sizing_ok {
+			return Err(last_errno());
+		}
+		if size <= size_of::<libc::c_int>() {
+			return Err(libc::EINVAL);
 		}
 
-		let mut buffer = vec![0u8; size];
+		if buffer.len() < size {
+			buffer.resize(size, 0);
+		}
 		// SAFETY: `mib` still points to three initialized integers. `buffer` is
 		// writable for `size` bytes, and `size` is provided as the in/out byte
 		// count.
@@ -683,31 +807,28 @@ mod platform {
 			)
 		} == 0;
 		if !read_ok {
-			return Vec::new();
+			return Err(last_errno());
 		}
-		buffer.truncate(size);
-		parse_macos_procargs(&buffer)
+		Ok(size)
 	}
 
-	fn parse_macos_procargs(buffer: &[u8]) -> Vec<String> {
+	fn last_errno() -> i32 {
+		std::io::Error::last_os_error()
+			.raw_os_error()
+			.unwrap_or(libc::EIO)
+	}
+
+	/// Split a `KERN_PROCARGS2` block into its argv entries and the trailing
+	/// environment region (NUL-separated `KEY=value` strings).
+	fn split_procargs(buffer: &[u8]) -> Option<(Vec<&[u8]>, &[u8])> {
 		// KERN_PROCARGS2 layout: `argc: i32 | exec_path: NUL-padded |
 		// argv[0..argc] | env[..]`. argc covers only argv, so we must skip the
 		// exec_path NUL padding and stop after exactly argc entries — otherwise
 		// environment variables leak into the arg list (each NUL-terminated
 		// env=value is indistinguishable from an arg).
 		let argc_size = size_of::<libc::c_int>();
-		if buffer.len() <= argc_size {
-			return Vec::new();
-		}
-
-		let argc_bytes: [u8; 4] = match buffer[..argc_size].try_into() {
-			Ok(bytes) => bytes,
-			Err(_) => return Vec::new(),
-		};
-		let argc = libc::c_int::from_ne_bytes(argc_bytes);
-		if argc <= 0 {
-			return Vec::new();
-		}
+		let argc_bytes: [u8; 4] = buffer.get(..argc_size)?.try_into().ok()?;
+		let argc = usize::try_from(libc::c_int::from_ne_bytes(argc_bytes)).ok()?;
 
 		let mut offset = argc_size;
 		while offset < buffer.len() && buffer[offset] != 0 {
@@ -717,8 +838,8 @@ mod platform {
 			offset += 1;
 		}
 
-		let mut args = Vec::with_capacity(argc as usize);
-		while offset < buffer.len() && args.len() < argc as usize {
+		let mut args = Vec::with_capacity(argc);
+		while offset < buffer.len() && args.len() < argc {
 			let end = buffer[offset..]
 				.iter()
 				.position(|byte| *byte == 0)
@@ -726,10 +847,84 @@ mod platform {
 			if end == offset {
 				break;
 			}
-			args.push(String::from_utf8_lossy(&buffer[offset..end]).into_owned());
+			args.push(&buffer[offset..end]);
 			offset = end + 1;
 		}
-		args
+		Some((args, &buffer[offset.min(buffer.len())..]))
+	}
+
+	/// `pbi_name` (up to 32 bytes) when set, else the 16-byte `pbi_comm`.
+	fn bsdinfo_command(info: &libc::proc_bsdinfo) -> String {
+		fn c_chars(chars: &[libc::c_char]) -> String {
+			let bytes: Vec<u8> = chars
+				.iter()
+				.map(|&c| c as u8)
+				.take_while(|&byte| byte != 0)
+				.collect();
+			String::from_utf8_lossy(&bytes).into_owned()
+		}
+		let name = c_chars(&info.pbi_name);
+		if name.is_empty() {
+			c_chars(&info.pbi_comm)
+		} else {
+			name
+		}
+	}
+
+	pub fn scan_processes_by_env(name: &str, token: &str) -> super::MarkedProcessScan {
+		let mut scan = super::MarkedProcessScan { supported: true, ..Default::default() };
+		// SAFETY: `geteuid`/`getpid` take no arguments and cannot fail.
+		let (euid, self_pid) = unsafe { (libc::geteuid(), libc::getpid()) };
+		let mut buffer = Vec::new();
+		for pid in snapshot_all_pids() {
+			if pid <= 0 || pid == self_pid {
+				continue;
+			}
+			// Fails for exited processes and zombies (and for some other users'
+			// processes, which are filtered out anyway).
+			let Some(info) = read_bsdinfo(pid) else {
+				continue;
+			};
+			if info.pbi_uid != euid {
+				continue;
+			}
+			scan.scanned += 1;
+			let Ok(len) = read_procargs(pid, &mut buffer) else {
+				let still_live = read_bsdinfo(pid).is_some_and(|now| {
+					now.pbi_start_tvsec == info.pbi_start_tvsec
+						&& now.pbi_start_tvusec == info.pbi_start_tvusec
+				});
+				if still_live {
+					scan.unreadable += 1;
+				}
+				continue;
+			};
+			let Some((_, env_region)) = split_procargs(&buffer[..len]) else {
+				scan.unreadable += 1;
+				continue;
+			};
+			// The kernel withholds the environment of Apple platform binaries
+			// (`/bin/sh`, `zsh`, `sleep`, …) from non-root callers: the block
+			// ends after argv, indistinguishable from an empty environment.
+			let mut env = env_region
+				.split(|byte| *byte == 0)
+				.filter(|entry| !entry.is_empty());
+			let Some(first) = env.next() else {
+				scan.redacted += 1;
+				continue;
+			};
+			if !super::env_has_token(std::iter::once(first).chain(env), name, token) {
+				continue;
+			}
+			scan.processes.push(super::MarkedProcess {
+				pid,
+				ppid: i32::try_from(info.pbi_ppid).unwrap_or(0),
+				pgid: i32::try_from(info.pbi_pgid).ok().filter(|pgid| *pgid > 0),
+				start_time: Some(info.pbi_start_tvsec),
+				command: bsdinfo_command(&info),
+			});
+		}
+		scan
 	}
 }
 #[cfg(target_os = "windows")]
@@ -1280,6 +1475,11 @@ mod platform {
 		false
 	}
 
+	/// Reading another process's environment needs its PEB; not implemented.
+	pub fn scan_processes_by_env(_name: &str, _token: &str) -> super::MarkedProcessScan {
+		super::MarkedProcessScan::default()
+	}
+
 	/// Find processes whose `QueryFullProcessImageNameW` result equals `target`.
 	pub fn find_by_path(target: &str) -> Vec<Process> {
 		use std::{ffi::OsString, os::windows::ffi::OsStringExt};
@@ -1339,6 +1539,65 @@ mod platform {
 #[must_use]
 pub fn process_start_time(pid: i32) -> Option<u64> {
 	Process::from_pid(pid)?.start_time_unix_secs()
+}
+
+/// A live process whose environment carries a marker token; see
+/// [`scan_processes_by_env`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkedProcess {
+	pub pid:        i32,
+	pub ppid:       i32,
+	/// Process group id when readable.
+	pub pgid:       Option<i32>,
+	/// OS start time, Unix epoch seconds (floor) — the value
+	/// [`process_start_time`] returns for the same process.
+	pub start_time: Option<u64>,
+	/// Executable name (best effort, may be truncated by the OS).
+	pub command:    String,
+}
+
+/// Result of [`scan_processes_by_env`].
+#[derive(Debug, Default)]
+pub struct MarkedProcessScan {
+	/// False on platforms without an implementation (Windows): the result is
+	/// unknown, not empty.
+	pub supported:  bool,
+	pub processes:  Vec<MarkedProcess>,
+	/// Live same-user processes examined (zombies excluded).
+	pub scanned:    u32,
+	/// Live same-user processes whose environment could not be read (processes
+	/// that exited mid-scan are not counted).
+	pub unreadable: u32,
+	/// Live same-user processes whose environment came back empty. On macOS the
+	/// kernel returns no environment for Apple platform binaries (`/bin/sh`,
+	/// `zsh`, `sleep`, …), so a marker on such a process is invisible and lands
+	/// here; a process started with an empty environment is counted too.
+	pub redacted:   u32,
+}
+
+/// Every live process owned by the calling user (effective uid), except the
+/// caller itself, whose environment variable `name` is set and whose value,
+/// split on `,`, contains `token` as an exact element.
+///
+/// Environments are read as the kernel exposes them: the block the process
+/// was exec'd with, not later `setenv` changes.
+#[must_use]
+pub fn scan_processes_by_env(name: &str, token: &str) -> MarkedProcessScan {
+	platform::scan_processes_by_env(name, token)
+}
+
+/// True when the first `name=` entry of `env` (getenv semantics) has `token`
+/// among its comma-separated elements.
+#[cfg(any(unix, test))]
+fn env_has_token<'a>(env: impl IntoIterator<Item = &'a [u8]>, name: &str, token: &str) -> bool {
+	let name = name.as_bytes();
+	env.into_iter()
+		.find_map(|entry| entry.strip_prefix(name)?.strip_prefix(b"="))
+		.is_some_and(|value| {
+			value
+				.split(|byte| *byte == b',')
+				.any(|element| element == token.as_bytes())
+		})
 }
 
 /// Stable process reference.
@@ -2451,5 +2710,219 @@ mod tests {
 			watermark_after_fill,
 			"watermark must not advance while the vec stays below it — otherwise a sweep ran"
 		);
+	}
+
+	#[test]
+	fn env_has_token_matches_whole_elements_of_the_first_named_entry() {
+		let env = |entries: &'static [&'static str]| entries.iter().map(|entry| entry.as_bytes());
+		let has = |entries, token| env_has_token(env(entries), "OMP_OWNER", token);
+
+		assert!(has(&["OMP_OWNER=a,omp1:1:2"], "omp1:1:2"));
+		assert!(has(&["OMP_OWNER=omp1:1:2,b"], "omp1:1:2"));
+		assert!(!has(&["OMP_OWNER=omp1:1:22"], "omp1:1:2"), "no prefix match");
+		assert!(!has(&["OMP_OWNER=xomp1:1:2"], "omp1:1:2"), "no suffix match");
+		assert!(
+			!has(&["OMP_OWNERX=omp1:1:2", "X_OMP_OWNER=omp1:1:2"], "omp1:1:2"),
+			"exact name only"
+		);
+		assert!(!has(&["OMP_OWNER"], "omp1:1:2"));
+		// getenv returns the first entry; later duplicates are shadowed.
+		assert!(!has(&["OMP_OWNER=other", "OMP_OWNER=omp1:1:2"], "omp1:1:2"));
+	}
+
+	#[cfg(unix)]
+	mod marker_scan {
+		use std::{
+			os::unix::process::CommandExt as _,
+			process::{Child, Command, Stdio},
+			time::{Duration, Instant},
+		};
+
+		use super::super::{MarkedProcess, process_start_time, scan_processes_by_env};
+
+		const SLEEPER_TEST: &str = "process::tests::marker_scan::marker_scan_sleeper";
+		const SLEEPER_ENV: &str = "PI_SHELL_MARKER_SCAN_SLEEPER";
+
+		/// Long-lived marked process for the scan tests. It re-executes this test
+		/// binary — a non-platform executable — because macOS withholds the
+		/// environment of Apple platform binaries such as `/bin/sleep`.
+		#[test]
+		#[ignore = "helper process for the marker scan tests"]
+		fn marker_scan_sleeper() {
+			if std::env::var_os(SLEEPER_ENV).is_some() {
+				std::thread::sleep(Duration::from_secs(30));
+			}
+		}
+
+		fn sleeper_args() -> [&'static str; 4] {
+			["--exact", SLEEPER_TEST, "--ignored", "--test-threads=1"]
+		}
+
+		fn sleeper(owner: Option<&str>) -> Command {
+			let mut command = Command::new(std::env::current_exe().expect("test binary path"));
+			command
+				.args(sleeper_args())
+				.env(SLEEPER_ENV, "1")
+				.env_remove("OMP_OWNER")
+				.stdin(Stdio::null())
+				.stdout(Stdio::null())
+				.stderr(Stdio::null());
+			if let Some(owner) = owner {
+				command.env("OMP_OWNER", owner);
+			}
+			command
+		}
+
+		/// Kills every tracked pid on drop, so a failed assertion leaks nothing.
+		#[derive(Default)]
+		struct Reaper {
+			children: Vec<Child>,
+			pids:     Vec<i32>,
+		}
+
+		impl Drop for Reaper {
+			fn drop(&mut self) {
+				for child in &mut self.children {
+					let _ = child.kill();
+					let _ = child.wait();
+				}
+				for pid in &self.pids {
+					// SAFETY: `kill` takes scalars and touches no caller memory.
+					unsafe { libc::kill(*pid, libc::SIGKILL) };
+				}
+			}
+		}
+
+		fn token(tag: &str) -> String {
+			format!("omp1:{}:{tag}", std::process::id())
+		}
+
+		fn find(token: &str, pid: i32) -> Option<MarkedProcess> {
+			let scan = scan_processes_by_env("OMP_OWNER", token);
+			assert!(scan.supported);
+			scan.processes.into_iter().find(|entry| entry.pid == pid)
+		}
+
+		fn child_pid(child: &Child) -> i32 {
+			i32::try_from(child.id()).expect("pid fits in i32")
+		}
+
+		#[test]
+		fn finds_marked_child_with_its_identity() {
+			let token = token("child");
+			let mut reaper = Reaper::default();
+			let child = sleeper(Some(&format!("a,{token}")))
+				.spawn()
+				.expect("spawn sleeper");
+			let pid = child_pid(&child);
+			reaper.children.push(child);
+
+			let entry = find(&token, pid).expect("marked child is found");
+			let self_pid = i32::try_from(std::process::id()).expect("pid fits in i32");
+			assert_eq!(entry.ppid, self_pid);
+			assert!(entry.start_time.is_some());
+			assert_eq!(entry.start_time, process_start_time(pid));
+			// SAFETY: `getpgid` takes a scalar and touches no caller memory.
+			assert_eq!(entry.pgid, Some(unsafe { libc::getpgid(pid) }));
+			assert!(!entry.command.is_empty());
+		}
+
+		#[test]
+		fn token_match_is_exact_per_element() {
+			let mut reaper = Reaper::default();
+			let child = sleeper(Some(&format!("x,{},y", token("22"))))
+				.spawn()
+				.expect("spawn sleeper");
+			let pid = child_pid(&child);
+			reaper.children.push(child);
+
+			assert!(find(&token("2"), pid).is_none(), "`…:2` must not match `…:22`");
+			assert!(find(&token("22"), pid).is_some());
+		}
+
+		#[test]
+		fn ignores_token_outside_the_named_variable() {
+			let token = token("unmarked");
+			let mut reaper = Reaper::default();
+			let child = sleeper(None)
+				// The token in argv and in look-alike variables only.
+				.arg(format!("OMP_OWNER={token}"))
+				.env("OMP_OWNERX", &token)
+				.env("X_OMP_OWNER", &token)
+				.spawn()
+				.expect("spawn sleeper");
+			let pid = child_pid(&child);
+			reaper.children.push(child);
+
+			assert!(find(&token, pid).is_none());
+		}
+
+		#[test]
+		fn excludes_the_caller() {
+			// A variable this process was exec'd with; a child inheriting it
+			// matches, the caller itself must not.
+			let path = std::env::var("PATH").expect("PATH is set");
+			assert!(!path.contains(','));
+			let mut reaper = Reaper::default();
+			let child = sleeper(None).spawn().expect("spawn sleeper");
+			let pid = child_pid(&child);
+			reaper.children.push(child);
+
+			let scan = scan_processes_by_env("PATH", &path);
+			let self_pid = i32::try_from(std::process::id()).expect("pid fits in i32");
+			assert!(scan.processes.iter().any(|entry| entry.pid == pid));
+			assert!(scan.processes.iter().all(|entry| entry.pid != self_pid));
+		}
+
+		#[test]
+		fn finds_double_forked_daemon_by_marker() {
+			let token = token("daemon");
+			let mut reaper = Reaper::default();
+			let exe = std::env::current_exe().expect("test binary path");
+			// `sh` becomes a session leader, backgrounds the sleeper and exits:
+			// the sleeper is orphaned into a new session and its pid is never
+			// returned to us.
+			let mut launcher = Command::new("/bin/sh");
+			launcher
+				.arg("-c")
+				.arg(r#""$0" "$@" </dev/null >/dev/null 2>&1 & exit 0"#)
+				.arg(&exe)
+				.args(sleeper_args())
+				.env(SLEEPER_ENV, "1")
+				.env("OMP_OWNER", format!("{token},b"))
+				.stdin(Stdio::null())
+				.stdout(Stdio::null())
+				.stderr(Stdio::null());
+			// SAFETY: `setsid` is async-signal-safe and touches no caller memory.
+			unsafe {
+				launcher.pre_exec(|| {
+					if libc::setsid() < 0 {
+						return Err(std::io::Error::last_os_error());
+					}
+					Ok(())
+				});
+			}
+			let mut launcher = launcher.spawn().expect("spawn launcher");
+			let launcher_pid = child_pid(&launcher);
+			assert!(launcher.wait().expect("launcher exits").success());
+
+			let deadline = Instant::now() + Duration::from_secs(10);
+			let daemon = loop {
+				let scan = scan_processes_by_env("OMP_OWNER", &token);
+				if let Some(entry) = scan.processes.into_iter().next() {
+					break entry;
+				}
+				assert!(Instant::now() < deadline, "daemon never appeared in the scan");
+				std::thread::sleep(Duration::from_millis(50));
+			};
+			reaper.pids.push(daemon.pid);
+
+			assert_ne!(daemon.pid, launcher_pid);
+			assert_ne!(daemon.ppid, launcher_pid, "the daemon was reparented");
+			// SAFETY: `getsid` takes a scalar and touches no caller memory.
+			let daemon_sid = unsafe { libc::getsid(daemon.pid) };
+			assert_eq!(daemon_sid, launcher_pid, "the daemon left our session");
+			assert_eq!(daemon.start_time, process_start_time(daemon.pid));
+		}
 	}
 }

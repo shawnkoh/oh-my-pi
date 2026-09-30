@@ -117,6 +117,7 @@ export const rasterizeSvg = nativeBindings.rasterizeSvg ?? missingNativeExport("
 export const readImageFromClipboard = nativeBindings.readImageFromClipboard ?? missingNativeExport("readImageFromClipboard");
 export const renderMermaidAscii = nativeBindings.renderMermaidAscii ?? missingNativeExport("renderMermaidAscii");
 export const renderSnapcompactPng = nativeBindings.renderSnapcompactPng ?? missingNativeExport("renderSnapcompactPng");
+export const scanProcessesByEnv = nativeBindings.scanProcessesByEnv ?? missingNativeExport("scanProcessesByEnv");
 export const search = nativeBindings.search ?? missingNativeExport("search");
 export const setHangulCompatJamoWidthOverride = nativeBindings.setHangulCompatJamoWidthOverride ?? missingNativeExport("setHangulCompatJamoWidthOverride");
 export const sliceWithWidth = nativeBindings.sliceWithWidth ?? missingNativeExport("sliceWithWidth");

@@ -205,6 +205,64 @@ pub fn process_start_time(pid: i32) -> Option<i64> {
 	core_process::process_start_time(pid).and_then(|secs| i64::try_from(secs).ok())
 }
 
+/// A live process whose environment carries a marker token.
+#[napi(object)]
+pub struct MarkedProcess {
+	pub pid:        i32,
+	pub ppid:       i32,
+	/// Process group id when readable.
+	pub pgid:       Option<i32>,
+	/// OS start time, Unix epoch seconds (floor) — the same value as
+	/// `processStartTime(pid)`.
+	pub start_time: Option<i64>,
+	/// Executable name (best effort, may be truncated).
+	pub command:    String,
+}
+
+/// Result of `scanProcessesByEnv`.
+#[napi(object)]
+pub struct MarkedProcessScan {
+	/// False on platforms without an implementation (Windows): callers must
+	/// treat the result as unknown.
+	pub supported:  bool,
+	pub processes:  Vec<MarkedProcess>,
+	/// Same-user processes examined.
+	pub scanned:    u32,
+	/// Same-user processes that were alive but whose environment could not be
+	/// read (not counting ones that exited mid-scan).
+	pub unreadable: u32,
+	/// Same-user processes whose environment came back empty. macOS withholds
+	/// the environment of Apple platform binaries (`/bin/sh`, `zsh`,
+	/// `/bin/sleep`, …), so a marker on such a process is not visible and it
+	/// is counted here instead.
+	pub redacted:   u32,
+}
+
+/// Every live process owned by the calling user (excluding the caller itself)
+/// whose environment variable `name` is set and whose value, split on ',',
+/// contains `token` exactly.
+#[napi]
+pub fn scan_processes_by_env(name: String, token: String) -> MarkedProcessScan {
+	let scan = core_process::scan_processes_by_env(&name, &token);
+	MarkedProcessScan {
+		supported:  scan.supported,
+		processes:  scan
+			.processes
+			.into_iter()
+			.map(|entry| MarkedProcess {
+				pid:        entry.pid,
+				ppid:       entry.ppid,
+				pgid:       entry.pgid,
+				start_time: entry.start_time.and_then(|secs| i64::try_from(secs).ok()),
+				command:    entry.command,
+			})
+			.collect(),
+		scanned:    scan.scanned,
+		unreadable: scan.unreadable,
+		redacted:   scan.redacted,
+	}
+}
+
 /// Replace the current process image via `execvp(3)`.
 ///
 /// On success this never returns: the kernel tears down every other thread and

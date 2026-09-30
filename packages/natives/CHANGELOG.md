@@ -5,6 +5,7 @@
 ### Added
 
 - Added `spawnedProcesses` to `Shell.run`/`executeShell` results — each process the command launched that is still alive when it resolves, with pid, process group and OS start time, including the real process behind `nohup cmd &` (`reparented: true`) — and `processStartTime(pid)`, so callers can tell later whether that exact process is still running.
+- Added `scanProcessesByEnv(name, token)`, which finds every live process of the current user whose environment variable `name` lists `token` among its comma-separated values — including double-forked daemons whose pid the caller never saw — with pid, parent pid, process group and OS start time. The result also reports how many processes were scanned, how many had an environment that could not be read, and how many had an empty one: macOS hides the environment of its own system programs (`/bin/sh`, `zsh`, `/bin/sleep`, …), so a marker on those processes is not found. Windows returns `supported: false`.
 
 ### Fixed
 

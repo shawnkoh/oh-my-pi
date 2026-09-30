@@ -2181,6 +2181,45 @@ export declare function macOSSpellCheckerAvailable(): boolean
  */
 export declare function macOSSpellingGuesses(text: string, start: number, length: number): Promise<Array<string>>
 
+/** A live process whose environment carries a marker token. */
+export interface MarkedProcess {
+  pid: number
+  ppid: number
+  /** Process group id when readable. */
+  pgid?: number
+  /**
+   * OS start time, Unix epoch seconds (floor) — the same value as
+   * `processStartTime(pid)`.
+   */
+  startTime?: number
+  /** Executable name (best effort, may be truncated). */
+  command: string
+}
+
+/** Result of `scanProcessesByEnv`. */
+export interface MarkedProcessScan {
+  /**
+   * False on platforms without an implementation (Windows): callers must
+   * treat the result as unknown.
+   */
+  supported: boolean
+  processes: Array<MarkedProcess>
+  /** Same-user processes examined. */
+  scanned: number
+  /**
+   * Same-user processes that were alive but whose environment could not be
+   * read (not counting ones that exited mid-scan).
+   */
+  unreadable: number
+  /**
+   * Same-user processes whose environment came back empty. macOS withholds
+   * the environment of Apple platform binaries (`/bin/sh`, `zsh`,
+   * `/bin/sleep`, …), so a marker on such a process is not visible and it
+   * is counted here instead.
+   */
+  redacted: number
+}
+
 /** A single match in the content. */
 export interface Match {
   /** 1-indexed line number. */
@@ -2628,6 +2667,13 @@ export declare function renderMermaidAscii(text: string, options?: MermaidRender
  * JS-side re-encode.
  */
 export declare function renderSnapcompactPng(text: string, options: SnapcompactRenderOptions): Promise<string>
+
+/**
+ * Every live process owned by the calling user (excluding the caller itself)
+ * whose environment variable `name` is set and whose value, split on ',',
+ * contains `token` exactly.
+ */
+export declare function scanProcessesByEnv(name: string, token: string): MarkedProcessScan
 
 /**
  * Search content for a pattern (one-shot, compiles pattern each time).
