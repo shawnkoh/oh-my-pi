@@ -359,6 +359,8 @@ describe.skipIf(process.platform === "win32")("owned-job registry", () => {
 		await daemon.exited;
 		const after = verifyOwnedJobRegistry(ownedJobRegistryPath(sessionFile));
 		expect(after.live).toEqual([]);
-		expect(after.status).toBe(OWNER_SCAN_COVERS_PLATFORM && after.reasons.length === 0 ? "clear" : "unknown");
+		// Clear only when nothing stood in the way: an unexaminable same-user process started
+		// meanwhile (common on macOS) must read as unknown, never clear.
+		expect(after.status).toBe(after.reasons.length === 0 ? "clear" : "unknown");
 	});
 });
