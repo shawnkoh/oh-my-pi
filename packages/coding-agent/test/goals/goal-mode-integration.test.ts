@@ -192,6 +192,17 @@ describe("InteractiveMode goal mode integration", () => {
 		expect(harness.session.getGoalModeState()?.goal.status).toBe("active");
 	});
 
+	it("never submits a startup objective when plan mode blocks goal activation", async () => {
+		harness.mode.planModeEnabled = true;
+		const prompt = vi.spyOn(harness.session, "prompt").mockResolvedValue(true);
+
+		await harness.mode.startGoalAtStartup("Inspect the importer");
+
+		expect(harness.mode.goalModeEnabled).toBe(false);
+		expect(harness.session.getGoalModeState()).toBeUndefined();
+		expect(prompt).not.toHaveBeenCalled();
+	});
+
 	it("toggles goal tool exposure when goal mode enters and pauses", async () => {
 		expect(await toolNamesFor(harness)).not.toContain("goal");
 

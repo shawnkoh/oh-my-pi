@@ -136,6 +136,7 @@ import { EventBus } from "./utils/event-bus";
 import { resolveFirstLaunchPythonEvalWarning } from "./eval/startup-warning";
 import { CliUsageError } from "./cli/usage-error";
 import { cfgGoalEnabled } from "./goals/settings";
+import { cfgPlanDefaultOnStartup, cfgPlanEnabled } from "./plan-mode/settings";
 
 import { cfgAdvisorEnabled } from "./advisor/settings";
 import { cfgToolsApprovalMode } from "./tools/settings";
@@ -1254,7 +1255,8 @@ export async function createSessionManager(
 	// session exists. When a prior session is resumed, mark parsed.continue so
 	// buildSessionOptions restores the session's model/thinking instead of
 	// overriding them with CLI defaults.
-	if (cfgAutoResume.get(activeSettings)) {
+	// An explicit startup goal starts fresh even when implicit auto-resume is configured.
+	if (parsed.goal === undefined && cfgAutoResume.get(activeSettings)) {
 		const manager = await SessionManager.continueRecent(cwd, parsed.sessionDir);
 		if (manager.getEntries().length > 0) {
 			parsed.continue = true;
@@ -2303,7 +2305,12 @@ export async function runRootCommand(
 				throw new CliUsageError("--goal requires an interactive terminal (not --print or --mode).");
 			}
 			if (initialArgs.goal !== undefined) {
-				validateGoalStartup(initialArgs, cfgGoalEnabled.get(settingsInstance), pipedInput);
+				validateGoalStartup(
+					initialArgs,
+					cfgGoalEnabled.get(settingsInstance),
+					pipedInput,
+					cfgPlanDefaultOnStartup.get(settingsInstance) && cfgPlanEnabled.get(settingsInstance),
+				);
 			}
 			if (autoPrintNeedsArgPrompt && initialArgs.messages.length === 0 && initialArgs.fileArgs.length === 0) {
 				exitWithoutTerminal();

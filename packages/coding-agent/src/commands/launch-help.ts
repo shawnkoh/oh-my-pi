@@ -23,7 +23,7 @@ export const launchHelp = {
 		plan: Flags.string({ description: "Plan model for architectural planning (or PI_PLAN_MODEL env)" }),
 		goal: Flags.string({
 			description:
-				"Start in goal mode (fresh interactive only; no positional prompt, --plan-yolo, or resumed session)",
+				"Start fresh in goal mode (interactive only; bypasses autoResume; no positional prompt, startup plan mode, or explicit resume)",
 		}),
 		prewalk: Flags.boolean({
 			description:

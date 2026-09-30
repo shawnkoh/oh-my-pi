@@ -115,13 +115,21 @@ export interface Args {
 }
 
 /** Reject conflicting startup inputs before constructing an interactive session. */
-export function validateGoalStartup(args: Args, goalEnabled: boolean, pipedInput?: string): void {
+export function validateGoalStartup(
+	args: Args,
+	goalEnabled: boolean,
+	pipedInput?: string,
+	planStartsOnStartup = false,
+): void {
 	if (args.goal === undefined) return;
 	if (args.messages.length > 0 || args.fileArgs.length > 0 || pipedInput !== undefined) {
 		throw new CliUsageError("--goal cannot be combined with a positional message, @file, or stdin prompt.");
 	}
 	if (args.planYolo || args.noTools) {
 		throw new CliUsageError("--goal cannot be combined with --plan-yolo or --no-tools.");
+	}
+	if (planStartsOnStartup) {
+		throw new CliUsageError("--goal cannot be combined with plan.defaultOnStartup; disable startup plan mode first.");
 	}
 	if (args.continue || args.resume || args.fork || args.fromClaude || args.fromCodex) {
 		throw new CliUsageError("--goal requires a fresh session (no resume, continue, fork, or import).");
