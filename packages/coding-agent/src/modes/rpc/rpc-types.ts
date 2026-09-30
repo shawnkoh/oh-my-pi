@@ -111,6 +111,7 @@ export type RpcCommand =
 			attempt: number;
 			epoch: number;
 			instanceId: string;
+			sessionId: string;
 			deadline: number;
 	  };
 

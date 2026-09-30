@@ -171,6 +171,11 @@ export interface QuiesceRequest {
 	/** The `instanceId` from that attestation. */
 	instanceId: string;
 	/**
+	 * The `session.id` from that attestation. After `new_session`/`switch_session` the
+	 * request is refused (`session_mismatch`): it would attest a different transcript.
+	 */
+	sessionId: string;
+	/**
 	 * Absolute deadline, Unix epoch milliseconds, compared against the agent host's clock
 	 * (`Date.now()` in the agent process). The attempt never executes at or after it. A
 	 * supervisor on another host should derive it from the attestation's `observedAt` plus a
@@ -182,6 +187,7 @@ export interface QuiesceRequest {
 export type QuiesceRefusalReason =
 	| "invalid_request"
 	| "invocation_mismatch"
+	| "session_mismatch"
 	| "stale_attempt"
 	| "admission_closed"
 	| "deadline_expired"
@@ -229,7 +235,36 @@ export type QuiesceResult =
 			reason: QuiesceRefusalReason;
 			/** Work observed while deciding (admission was closed at that instant). */
 			snapshot: { epoch: number; counts: WorkCounts; observedAt: string };
+	  }
+	| {
+			/**
+			 * The session was idle and its transcript was made final, but the terminal
+			 * attestation could not be written. The host exits anyway (exit code 1); no
+			 * attestation exists, so consumers take the registry path.
+			 */
+			status: "exit_unattested";
+			operationId: string;
+			attempt: number;
+			reason: "attestation_unavailable";
+			error: string;
+			snapshot: { epoch: number; counts: WorkCounts; observedAt: string };
 	  };
+
+/** True when the host must exit after answering this result. */
+export function quiesceEndsProcess(result: QuiesceResult): boolean {
+	return result.status === "quiesced" || result.status === "exit_unattested";
+}
+
+/** Process exit code after a result that ends the process. */
+export function quiesceExitCode(result: QuiesceResult): number {
+	return result.status === "quiesced" ? 0 : 1;
+}
+
+/**
+ * After a quiesce result ends the process, the longest the host lets teardown run before it
+ * ends the process anyway (the attestation, if any, is already written).
+ */
+export const QUIESCE_EXIT_DEADLINE_MS = 30_000;
 
 /** `<session file without .jsonl>.terminal.json` */
 export function terminalAttestationPath(sessionFile: string): string {

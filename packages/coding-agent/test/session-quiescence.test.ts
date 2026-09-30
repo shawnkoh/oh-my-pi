@@ -17,6 +17,8 @@ import { type OwnedJobRecord, ownedJobRegistryPath } from "@oh-my-pi/pi-coding-a
 import {
 	AdmissionClosedError,
 	type QuiesceRequest,
+	quiesceEndsProcess,
+	quiesceExitCode,
 	type TerminalAttestation,
 	terminalAttestationPath,
 } from "@oh-my-pi/pi-coding-agent/session/quiescence";
@@ -110,7 +112,7 @@ describe("AgentSession quiesce-and-exit", () => {
 		return createSession(parts);
 	}
 
-	/** A quiesce request built from a fresh attestation (its epoch and instance id). */
+	/** A quiesce request built from a fresh attestation (its epoch, instance id and session). */
 	function request(s: AgentSession, overrides: Partial<QuiesceRequest> = {}): QuiesceRequest {
 		const attested = s.attest("op-1", "nonce");
 		return {
@@ -118,6 +120,7 @@ describe("AgentSession quiesce-and-exit", () => {
 			attempt: 1,
 			epoch: attested.epoch,
 			instanceId: attested.instanceId,
+			sessionId: attested.session.id,
 			deadline: Date.now() + 60_000,
 			...overrides,
 		};
@@ -334,6 +337,46 @@ describe("AgentSession quiesce-and-exit", () => {
 		expect(result).toMatchObject({ status: "refused", reason: "invocation_mismatch" });
 		expect(s.isAdmissionClosed()).toBe(false);
 		expect(fs.existsSync(terminalAttestationPath(s.sessionFile!))).toBe(false);
+		// A foreign request does not use up the attempt number of this session's operation.
+		expect(s.quiesceForExit(request(s))).toMatchObject({ status: "quiesced", attempt: 1 });
+	});
+
+	it("refuses a request attested for a different session after a session switch", async () => {
+		const s = createSession();
+		await s.prompt("materialize the first session");
+		const before = request(s);
+		await s.newSession();
+		// The switch moves the epoch as well, so the stale request is refused either way.
+		expect(s.activityEpoch).toBeGreaterThan(before.epoch);
+		const result = s.quiesceForExit({ ...before, epoch: s.activityEpoch });
+		expect(result).toMatchObject({ status: "refused", reason: "session_mismatch" });
+		expect(s.isAdmissionClosed()).toBe(false);
+		expect(s.quiesceForExit(request(s))).toMatchObject({ status: "quiesced", attempt: 1 });
+	});
+
+	it("exits unattested instead of wedging when the attestation cannot be written after the seal", async () => {
+		const s = createSession();
+		await s.prompt("materialize the transcript");
+		// A non-empty directory where the attestation goes: the atomic rename fails after the seal.
+		const target = terminalAttestationPath(s.sessionFile!);
+		fs.mkdirSync(path.join(target, "occupied"), { recursive: true });
+		const result = s.quiesceForExit(request(s));
+		expect(result).toMatchObject({ status: "exit_unattested", reason: "attestation_unavailable" });
+		expect(quiesceEndsProcess(result)).toBe(true);
+		expect(quiesceExitCode(result)).toBe(1);
+		// The transcript is final and no input is taken; a retry learns the same outcome.
+		expect(s.isAdmissionClosed()).toBe(true);
+		expect(s.quiesceForExit(request(s))).toBe(result);
+	});
+
+	it("starts no scheduled continuation after a pass", async () => {
+		const s = createSession();
+		// A transcript an agent.continue() could resume from.
+		s.agent.appendMessage({ role: "user", content: "resume from here", timestamp: Date.now() });
+		expect(s.quiesceForExit(request(s))).toMatchObject({ status: "quiesced" });
+		s.resumeAfterAskReanswer();
+		await s.waitForIdle();
+		expect(mock.calls.length).toBe(0);
 	});
 
 	it("retires a previous invocation's terminal attestation when the session is opened again", async () => {

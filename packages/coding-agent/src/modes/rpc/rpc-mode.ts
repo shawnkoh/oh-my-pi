@@ -15,7 +15,7 @@ import * as path from "node:path";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
-import { $env, isRecord, logger, Snowflake } from "@oh-my-pi/pi-utils";
+import { $env, isRecord, logger, postmortem, Snowflake } from "@oh-my-pi/pi-utils";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
 	type ExtensionUIContext,
@@ -58,7 +58,12 @@ import {
 } from "./rpc-prompt-results";
 import { RpcSessionEventForwarder } from "./rpc-session-events";
 import { isRpcSessionSettled, RpcSessionSettleWatcher } from "./rpc-session-settle";
-import { SESSION_CAPABILITIES } from "../../session/quiescence";
+import {
+	QUIESCE_EXIT_DEADLINE_MS,
+	quiesceEndsProcess,
+	quiesceExitCode,
+	SESSION_CAPABILITIES,
+} from "../../session/quiescence";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
 import type {
 	RpcCommand,
@@ -884,6 +889,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 
 	// Shutdown request flag (wrapped in object to allow mutation with const)
 	const shutdownState = { requested: false };
+	/** Set once a quiesce result ended the process: its exit code and hard-deadline timer. */
+	let quiesceExit: { code: number; deadline: NodeJS.Timeout } | undefined;
 
 	/**
 	 * Extension UI context that uses the RPC protocol.
@@ -1090,7 +1097,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		onShutdown: () => {
 			shutdownState.requested = true;
 		},
-		onQuiesced: () => exitAfterQuiesce(),
+		onQuiesced: code => exitAfterQuiesce(code),
 		trackAgentInvokingMessage: task => {
 			extensionUserMessageTracker.trackAgentMessageTask(task);
 		},
@@ -1155,7 +1162,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		// A failure that already reported and then recovered still leaves its notice
 		// queued here, so the success path drains the same queue before it exits.
 		await outputWriter.close();
-		process.exit(0);
+		process.exit(quiesceExit?.code ?? 0);
 	};
 
 	const getAvailableCommands = async () => buildAvailableSlashCommands(session);
@@ -1820,19 +1827,27 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			attempt: command.attempt,
 			epoch: command.epoch,
 			instanceId: command.instanceId,
+			sessionId: command.sessionId,
 			deadline: command.deadline,
 		});
-		if (result.status === "quiesced") exitAfterQuiesce();
+		if (quiesceEndsProcess(result)) exitAfterQuiesce(quiesceExitCode(result));
 		return success(command.id, "quiesce_and_exit", result);
 	};
 
 	/**
-	 * Exit after a passed quiesce. The response is queued first; every command already read
-	 * (the input reader yields between lines, so wait one macrotask for the rest of the
-	 * current read) is still answered — input commands with `admission_closed` — before
-	 * dispose drains the writer.
+	 * Exit after a quiesce that ends the process. The response is queued first; every command
+	 * already read (the input reader yields between lines, so wait one macrotask for the rest
+	 * of the current read) is still answered — mutators with `admission_closed` — before
+	 * dispose drains the writer. A hard deadline ends the process even if teardown or a
+	 * stream of read-only commands never lets it finish.
 	 */
-	const exitAfterQuiesce = (): void => {
+	const exitAfterQuiesce = (code: number): void => {
+		if (quiesceExit) return;
+		const deadline = setTimeout(() => {
+			logger.error("Exit after quiesce exceeded its deadline; exiting now", { code });
+			postmortem.exitProcess(code);
+		}, QUIESCE_EXIT_DEADLINE_MS);
+		quiesceExit = { code, deadline };
 		// Not `shutdownState.requested` yet: that would let the next serial command's completion
 		// exit before the commands queued behind it were answered.
 		setImmediate(

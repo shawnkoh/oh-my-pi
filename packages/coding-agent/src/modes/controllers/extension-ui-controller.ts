@@ -37,7 +37,7 @@ import { HookSelectorComponent, type HookSelectorSlider } from "@oh-my-pi/pi-tui
 import { getAvailableThemesWithPaths, getThemeByName, setTheme, type Theme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext, InteractiveSelectorDialogOptions } from "../../modes/types";
 import { normalizeCustomMessagePayload, USER_INTERRUPT_LABEL } from "../../session/messages";
-import type { QuiesceRequest, QuiesceResult } from "../../session/quiescence";
+import { type QuiesceRequest, type QuiesceResult, quiesceEndsProcess, quiesceExitCode } from "../../session/quiescence";
 import { disambiguateDisplayLabels, sanitizeCarriageReturns } from "@oh-my-pi/pi-tui/render/render-utils";
 import { setExtensionTerminalTitle, setSessionTerminalTitle } from "../../utils/title-generator";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
@@ -1267,10 +1267,13 @@ export class ExtensionUiController {
 		await this.ctx.executeCompaction(instructionsOrOptions, false);
 	}
 
-	/** A passed quiesce leaves admission closed; the process exits after returning, whatever teardown does. */
+	/** A quiesce that ends the process leaves admission closed; the process exits after returning, whatever teardown does. */
 	#quiesceAndExit(request: QuiesceRequest): QuiesceResult {
 		const result = this.ctx.session.quiesceForExit(request);
-		if (result.status === "quiesced") queueMicrotask(() => void this.ctx.exitAfterQuiesce());
+		if (quiesceEndsProcess(result)) {
+			const code = quiesceExitCode(result);
+			queueMicrotask(() => void this.ctx.exitAfterQuiesce(code));
+		}
 		return result;
 	}
 

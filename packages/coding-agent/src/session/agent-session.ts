@@ -427,6 +427,8 @@ import {
 	type QuiesceRefusalReason,
 	type QuiesceRequest,
 	type QuiesceResult,
+	quiesceEndsProcess,
+	quiesceExitCode,
 	retireTerminalAttestationSync,
 	SESSION_CAPABILITIES,
 	type SessionIdentity,
@@ -779,6 +781,7 @@ export class AgentSession implements SettingsScope {
 	#unsubscribeAgent?: () => void;
 	#unsubscribeQueueChange?: () => void;
 	#cancelExitRecorder?: () => void;
+	#cancelHangupCapture?: () => void;
 	#cancelFatalRecoveryHint?: () => void;
 	#exitRecorded = false;
 	/** Last observed `workspace.additionalDirectories`, diffed on change to add/remove only settings-seeded roots. */
@@ -2070,11 +2073,22 @@ export class AgentSession implements SettingsScope {
 				);
 			},
 		});
+		// Hang-up capture runs before every other cleanup: those tear down work the capture
+		// must count (MCP debounce timers, queued deliveries). Hosts whose own teardown runs
+		// first route the reason through beginDispose(); this covers hosts with no signal
+		// teardown of their own (RPC mode).
+		this.#cancelHangupCapture = postmortem.register(
+			`agent-session-hangup:${this.sessionManager.getSessionId()}`,
+			reason => {
+				if (HANGUP_REASONS.has(reason)) this.captureHangup(reason);
+			},
+			{ first: true },
+		);
 		this.#cancelExitRecorder = postmortem.register(`agent-session:${this.sessionManager.getSessionId()}`, reason => {
-			// Hosts whose own teardown runs first route the reason through beginDispose(); this
-			// covers hosts with no signal teardown of their own (RPC mode).
-			if (HANGUP_REASONS.has(reason)) this.captureHangup(reason);
 			this.#recordSessionExit(reason);
+			// Without a host teardown nothing else makes the transcript final: seal it now and
+			// add its digest, so the hang-up attestation matches the file after exit.
+			if (HANGUP_REASONS.has(reason)) this.#sealHangupTranscript();
 		});
 		this.#cancelFatalRecoveryHint = postmortem.registerFatalRecoveryHint(() => {
 			const sessionId = this.sessionManager.getSessionId();
@@ -2920,6 +2934,15 @@ export class AgentSession implements SettingsScope {
 
 	/** Synchronously count all outstanding work. Never awaits; safe to call with admission closed. */
 	getWorkCounts(): WorkCounts {
+		return this.#countWork(true);
+	}
+
+	/**
+	 * Count outstanding work. `scan` runs the owner-marker scan first (which can record newly
+	 * found processes); without it, `detachedJobs` counts only processes already recorded —
+	 * enough for answers that decide nothing (malformed, stale or foreign requests).
+	 */
+	#countWork(scan: boolean): WorkCounts {
 		const counts = emptyWorkCounts();
 		counts.streaming = this.isStreaming || this.isBashRunning || this.isEvalRunning ? 1 : 0;
 		counts.queuedInput =
@@ -2944,7 +2967,7 @@ export class AgentSession implements SettingsScope {
 		counts.retainedJobs = retainedShellWorkCount();
 		// Scan first: marked processes nobody tracked yet are recorded, then counted below.
 		const registry = this.ownedJobRegistry;
-		this.#lastOwnerScan = registry?.scanOwnedProcesses() ?? null;
+		if (scan) this.#lastOwnerScan = registry?.scanOwnedProcesses() ?? null;
 		counts.detachedJobs = registry?.liveProcessCount() ?? 0;
 		counts.compacting = this.isCompacting ? 1 : 0;
 		counts.handoff = this.isGeneratingHandoff ? 1 : 0;
@@ -2997,32 +3020,30 @@ export class AgentSession implements SettingsScope {
 	 * Decide, synchronously and without awaiting, whether this session may exit now.
 	 *
 	 * Closes every input-admission path first, then requires: the request bound to this
-	 * session object (`instanceId`), no outstanding work, the caller's epoch still current,
-	 * and the deadline (agent host clock) not reached. On success it durably writes the
-	 * terminal attestation next to the session file and leaves admission closed; the host
-	 * must then exit. On refusal it reopens admission exactly as before and changes nothing
-	 * else — no work is cancelled. Each `(operationId, attempt)` is evaluated once: repeating
-	 * it returns the original answer unchanged, and an older attempt is refused.
+	 * session object (`instanceId`) and to the session it attested (`sessionId`), no
+	 * outstanding work, the caller's epoch still current, and the deadline (agent host clock)
+	 * not reached. On success it durably writes the terminal attestation next to the session
+	 * file and leaves admission closed; the host must then exit. On refusal it reopens
+	 * admission exactly as before and changes nothing else — no work is cancelled. If the
+	 * attestation cannot be written after the transcript was made final, the answer is
+	 * `exit_unattested`: the host exits anyway and consumers fall back to the registry.
+	 * Each `(operationId, attempt)` of this session is evaluated once: repeating it returns
+	 * the original answer unchanged, and an older attempt is refused. Malformed requests and
+	 * requests for another session object or session never use up an attempt.
 	 */
 	quiesceForExit(request: QuiesceRequest): QuiesceResult {
 		const { operationId, attempt } = request;
-		const refuse = (reason: QuiesceRefusalReason, counts?: WorkCounts): QuiesceResult => {
-			let snapshotCounts = counts;
-			if (!snapshotCounts) {
-				try {
-					snapshotCounts = this.getWorkCounts();
-				} catch {
-					snapshotCounts = emptyWorkCounts();
-				}
-			}
-			return {
-				status: "refused",
-				operationId,
-				attempt,
-				reason,
-				snapshot: { epoch: this.#activityEpoch, counts: snapshotCounts, observedAt: new Date().toISOString() },
-			};
-		};
+		const refuse = (reason: QuiesceRefusalReason, counts?: WorkCounts): QuiesceResult => ({
+			status: "refused",
+			operationId,
+			attempt,
+			reason,
+			snapshot: {
+				epoch: this.#activityEpoch,
+				counts: counts ?? this.#safeCounts(),
+				observedAt: new Date().toISOString(),
+			},
+		});
 		if (
 			typeof operationId !== "string" ||
 			operationId.length === 0 ||
@@ -3030,10 +3051,13 @@ export class AgentSession implements SettingsScope {
 			attempt < 0 ||
 			!Number.isSafeInteger(request.epoch) ||
 			!Number.isFinite(request.deadline) ||
-			typeof request.instanceId !== "string"
+			typeof request.instanceId !== "string" ||
+			typeof request.sessionId !== "string"
 		) {
 			return refuse("invalid_request");
 		}
+		if (request.instanceId !== this.#instanceId) return refuse("invocation_mismatch");
+		if (request.sessionId !== this.sessionManager.getSessionId()) return refuse("session_mismatch");
 		const answered = this.#answeredQuiesceAttempts.get(operationId);
 		if (answered !== undefined && attempt <= answered.attempt) {
 			return attempt === answered.attempt ? answered.result : refuse("stale_attempt");
@@ -3043,12 +3067,20 @@ export class AgentSession implements SettingsScope {
 		return result;
 	}
 
+	/** Counts for an answer that decides nothing: no owner scan, never throws. */
+	#safeCounts(): WorkCounts {
+		try {
+			return this.#countWork(false);
+		} catch {
+			return emptyWorkCounts();
+		}
+	}
+
 	#evaluateQuiesce(
 		request: QuiesceRequest,
 		refuse: (reason: QuiesceRefusalReason, counts?: WorkCounts) => QuiesceResult,
 	): QuiesceResult {
 		const { operationId, attempt } = request;
-		if (request.instanceId !== this.#instanceId) return refuse("invocation_mismatch");
 		if (this.#admissionClosedBy || this.#isDisposed) return refuse("admission_closed");
 
 		// Close admission before looking at anything. Nothing below awaits, so no input can
@@ -3077,6 +3109,8 @@ export class AgentSession implements SettingsScope {
 			assertAttestationWritable(file);
 			this.#recordSessionExit("quiesce");
 			sealed = true;
+			// An armed warm would still pay for a provider call after the decision.
+			this.#cacheWarmer?.cancel();
 			const transcript = this.sessionManager.finalizeForExit();
 			const registry = this.ownedJobRegistry;
 			registry?.ensureHeader();
@@ -3100,12 +3134,26 @@ export class AgentSession implements SettingsScope {
 			this.#terminalAttestation = attestation;
 			return { status: "quiesced", operationId, attempt, attestation, path: file };
 		} catch (error) {
-			// Once the exit record is written the transcript is final, so the session cannot
-			// safely take more input: admission stays closed and no attestation exists
-			// (consumers answer `unknown`). Before that, the refusal reopens admission.
 			logger.error("Quiesce could not produce a terminal attestation", { sealed, error: String(error) });
-			if (!sealed) this.#admissionClosedBy = undefined;
-			return refuse("attestation_unavailable", counts);
+			if (!sealed) {
+				this.#admissionClosedBy = undefined;
+				return refuse("attestation_unavailable", counts);
+			}
+			// The exit record is written and the transcript is final: the session cannot take
+			// more input, so it must not stay up with admission closed. The host exits; with no
+			// terminal attestation, consumers take the registry path.
+			return {
+				status: "exit_unattested",
+				operationId,
+				attempt,
+				reason: "attestation_unavailable",
+				error: String(error),
+				snapshot: {
+					epoch: this.#activityEpoch,
+					counts: counts ?? this.#safeCounts(),
+					observedAt: new Date().toISOString(),
+				},
+			};
 		}
 	}
 
@@ -3147,6 +3195,8 @@ export class AgentSession implements SettingsScope {
 				logger.warn("Failed to write hang-up attestation", { file, error: String(error) });
 			}
 		}
+		// Counts are captured: stop an armed warm from paying for a provider call on the way out.
+		this.#cacheWarmer?.cancel();
 		return attestation;
 	}
 
@@ -3181,6 +3231,21 @@ export class AgentSession implements SettingsScope {
 		} catch (error) {
 			logger.warn("Failed to add the transcript digest to the hang-up attestation", { error: String(error) });
 		}
+	}
+
+	/**
+	 * Signal exit with no host teardown (RPC): make the transcript final, then add its digest
+	 * to the hang-up attestation. Nothing is appended after the seal, so the digest holds.
+	 */
+	#sealHangupTranscript(): void {
+		if (this.#terminalAttestation?.kind !== "hangup") return;
+		try {
+			this.sessionManager.finalizeForExit();
+		} catch (error) {
+			logger.warn("Failed to make the transcript final at hang-up", { error: String(error) });
+			return;
+		}
+		this.#completeHangupAttestation();
 	}
 
 	#initOwnedJobRegistry(manager: AsyncJobManager): void {
@@ -5612,6 +5677,8 @@ export class AgentSession implements SettingsScope {
 			this.#observedSessionId = currentSessionId;
 		} else if (this.#observedSessionId !== currentSessionId) {
 			this.#observedSessionId = currentSessionId;
+			// A different transcript: every attestation of the previous session is stale.
+			this.#activityEpoch++;
 			this.#bindSessionForExit();
 			if (notifyChange) this.#notifySessionChangeCallbacks();
 		}
@@ -5888,6 +5955,8 @@ export class AgentSession implements SettingsScope {
 			this.#cacheWarmer.cancel();
 		}
 		this.#recordSessionExit(options.reason ?? "dispose");
+		this.#cancelHangupCapture?.();
+		this.#cancelHangupCapture = undefined;
 		this.#cancelExitRecorder?.();
 		this.#cancelExitRecorder = undefined;
 		this.#cancelFatalRecoveryHint?.();
@@ -8217,7 +8286,9 @@ export class AgentSession implements SettingsScope {
 			attest: (operationId, nonce) => this.attest(operationId, nonce),
 			quiesceAndExit: request => {
 				const result = this.quiesceForExit(request);
-				if (result.status === "quiesced") void this.dispose().finally(() => process.exit(0));
+				if (quiesceEndsProcess(result)) {
+					void this.dispose().finally(() => process.exit(quiesceExitCode(result)));
+				}
 				return result;
 			},
 			getContextUsage: () => this.getContextUsage(),

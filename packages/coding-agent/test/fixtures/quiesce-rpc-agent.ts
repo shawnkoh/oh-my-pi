@@ -9,6 +9,7 @@ import { runRpcMode } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { postmortem } from "@oh-my-pi/pi-utils";
 
 // Real RPC dispatch, session and on-disk session files; only the model is scripted.
 // A prompt containing "hold" blocks in the provider until the process is signalled.
@@ -36,5 +37,14 @@ const session = new AgentSession({
 	ownedAsyncJobManager: new AsyncJobManager({ maxRunningJobs: 4 }),
 	agentId: "Main",
 });
+// `QUIESCE_FIXTURE_PENDING=1`: one unit of queued input that a cleanup registered after the
+// session tears down, like the MCP notification debounce timers do.
+if (process.env.QUIESCE_FIXTURE_PENDING === "1") {
+	let pending = 1;
+	session.registerWorkSource({ kind: "queuedInput", count: () => pending });
+	postmortem.register("fixture-pending-cleanup", () => {
+		pending = 0;
+	});
+}
 // `QUIESCE_FIXTURE_MODE=rpc-ui` wires the tool UI context exactly as `--mode rpc-ui` does.
 await runRpcMode(session, process.env.QUIESCE_FIXTURE_MODE === "rpc-ui" ? { setToolUIContext: () => {} } : {});

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { type QuiesceResult, terminalAttestationPath } from "@oh-my-pi/pi-coding-agent/session/quiescence";
-import { TempDir, withTimeout } from "@oh-my-pi/pi-utils";
+import { isRecord, TempDir, withTimeout } from "@oh-my-pi/pi-utils";
 
 type Frame = Record<string, unknown> & { type?: string; id?: string; data?: Record<string, unknown> };
 
@@ -70,6 +70,17 @@ function sha256OfFile(file: string): string {
 	return new Bun.CryptoHasher("sha256").update(fs.readFileSync(file)).digest("hex");
 }
 
+/** The request fields that bind a quiesce to the attestation it was built from. */
+function boundTo(attest: Frame): Record<string, unknown> {
+	const data = attest.data ?? {};
+	const session = data.session;
+	return {
+		epoch: data.epoch,
+		instanceId: data.instanceId,
+		sessionId: isRecord(session) ? session.id : undefined,
+	};
+}
+
 describe.skipIf(process.platform === "win32").each(MODES)("RPC quiesce_and_exit (%s)", mode => {
 	let tempDir: TempDir;
 	let rpc: RpcProcess;
@@ -108,8 +119,7 @@ describe.skipIf(process.platform === "win32").each(MODES)("RPC quiesce_and_exit 
 			type: "quiesce_and_exit",
 			operationId: "op-1",
 			attempt: 1,
-			epoch,
-			instanceId: attest.data?.instanceId,
+			...boundTo(attest),
 			deadline: Date.now() + 30_000,
 		});
 		expect(quiesce).toMatchObject({
@@ -133,8 +143,7 @@ describe.skipIf(process.platform === "win32").each(MODES)("RPC quiesce_and_exit 
 				type: "quiesce_and_exit",
 				operationId: "op-3",
 				attempt: 1,
-				epoch: attest.data?.epoch,
-				instanceId: attest.data?.instanceId,
+				...boundTo(attest),
 				deadline: Date.now() + 30_000,
 			},
 			{ id: "p1", type: "prompt", message: "too late" },
@@ -172,8 +181,7 @@ describe.skipIf(process.platform === "win32").each(MODES)("RPC quiesce_and_exit 
 				type: "quiesce_and_exit",
 				operationId: "op-2",
 				attempt: 1,
-				epoch: attest.data?.epoch,
-				instanceId: attest.data?.instanceId,
+				...boundTo(attest),
 				deadline: Date.now() + 30_000,
 			},
 		);
@@ -188,8 +196,7 @@ describe.skipIf(process.platform === "win32").each(MODES)("RPC quiesce_and_exit 
 			type: "quiesce_and_exit",
 			operationId: "op-2",
 			attempt: 2,
-			epoch: reattest.data?.epoch,
-			instanceId: reattest.data?.instanceId,
+			...boundTo(reattest),
 			deadline: Date.now() + 30_000,
 		});
 		expect(quiesce.data).toMatchObject({ status: "quiesced", attempt: 2 });
@@ -205,6 +212,61 @@ describe.skipIf(process.platform === "win32").each(MODES)("RPC quiesce_and_exit 
 		const onDisk = JSON.parse(fs.readFileSync(terminalAttestationPath(file), "utf8"));
 		expect(onDisk).toMatchObject({ kind: "hangup", signal: "sighup", interrupted: true });
 		expect(onDisk.counts.streaming).toBe(1);
+	}, 30_000);
+
+	it("attests the final transcript on a SIGTERM hang-up: the file after exit matches the digest", async () => {
+		const file = await sessionFile();
+		await rpc.request({ id: "p0", type: "prompt", message: "materialize the transcript" });
+		await rpc.waitFor(frame => frame.type === "agent_end", "agent_end");
+		await rpc.request({ id: "p1", type: "prompt", message: "hold this turn" });
+		await rpc.waitFor(frame => frame.type === "agent_start", "agent_start");
+		rpc.child.kill("SIGTERM");
+		expect(await withTimeout(rpc.child.exited, 15_000, "RPC process did not exit")).toBe(143);
+		const onDisk = JSON.parse(fs.readFileSync(terminalAttestationPath(file), "utf8"));
+		expect(onDisk).toMatchObject({ kind: "hangup", signal: "sigterm", interrupted: true });
+		expect(onDisk.session.sha256).toBe(sha256OfFile(file));
+		expect(onDisk.session.size).toBe(fs.statSync(file).size);
+	}, 30_000);
+
+	it("exits with code 1 and no attestation when it cannot be written after the transcript is final", async () => {
+		const file = await sessionFile();
+		await rpc.request({ id: "p0", type: "prompt", message: "materialize the transcript" });
+		await rpc.waitFor(frame => frame.type === "agent_end", "agent_end");
+		fs.mkdirSync(path.join(terminalAttestationPath(file), "occupied"), { recursive: true });
+		const attest = await rpc.request({ id: "a1", type: "attest", operationId: "op-u", nonce: "n" });
+		const quiesce = await rpc.request({
+			id: "q1",
+			type: "quiesce_and_exit",
+			operationId: "op-u",
+			attempt: 1,
+			...boundTo(attest),
+			deadline: Date.now() + 30_000,
+		});
+		expect(quiesce.data).toMatchObject({ status: "exit_unattested", reason: "attestation_unavailable" });
+		expect(await withTimeout(rpc.child.exited, 15_000, "RPC process did not exit")).toBe(1);
+	}, 30_000);
+});
+
+describe.skipIf(process.platform === "win32")("RPC hang-up capture order", () => {
+	it("counts work that another exit cleanup tears down, because the capture runs first", async () => {
+		using tempDir = TempDir.createSync("@omp-rpc-hangup-order-");
+		const rpc = new RpcProcess([process.execPath, path.join(import.meta.dir, "fixtures", "quiesce-rpc-agent.ts")], {
+			cwd: tempDir.path(),
+			env: { ...process.env, PI_CODING_AGENT_DIR: tempDir.path(), PI_NO_TITLE: "1", QUIESCE_FIXTURE_PENDING: "1" },
+		});
+		try {
+			await rpc.waitFor(frame => frame.type === "ready", "ready");
+			const state = await rpc.request({ id: "s1", type: "get_state" });
+			const file = String(state.data?.sessionFile);
+			rpc.child.kill("SIGHUP");
+			expect(await withTimeout(rpc.child.exited, 15_000, "RPC process did not exit")).toBe(129);
+			const onDisk = JSON.parse(fs.readFileSync(terminalAttestationPath(file), "utf8"));
+			expect(onDisk).toMatchObject({ kind: "hangup", interrupted: true });
+			expect(onDisk.counts.queuedInput).toBe(1);
+		} finally {
+			rpc.child.kill("SIGKILL");
+			await rpc.child.exited;
+		}
 	}, 30_000);
 });
 
@@ -263,8 +325,7 @@ describe.skipIf(process.platform === "win32").each(MODES)("CLI --mode %s quiesce
 				type: "quiesce_and_exit",
 				operationId: "cli",
 				attempt: 1,
-				epoch: attest.data?.epoch,
-				instanceId: attest.data?.instanceId,
+				...boundTo(attest),
 				deadline: Date.now() + 30_000,
 			},
 			{ id: "p1", type: "prompt", message: "too late" },

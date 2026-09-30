@@ -111,6 +111,8 @@ import { recordSessionRecap, recordSessionTitle } from "./session-index";
 const JSONL_SUFFIX_LENGTH = ".jsonl".length;
 const DRAFT_ONLY_SESSION_MARKER = ".draft-only-session";
 const DISCARDED_ENTRY_BRANCH_MARKER = "discarded-entry-branch";
+/** Read size when hashing a transcript for an exit attestation. */
+const DIGEST_CHUNK_BYTES = 1 << 20;
 
 function mintSessionId(): string {
 	return Bun.randomUUIDv7();
@@ -2454,14 +2456,28 @@ export class SessionManager {
 	transcriptDigest(): TranscriptDigest | null {
 		const file = this.#sessionFile;
 		if (!this.#persist || !file || this.#storage.defersSyncPublish) return null;
-		let bytes: Buffer;
+		let fd: number;
 		try {
-			bytes = fs.readFileSync(file);
+			fd = fs.openSync(file, "r");
 		} catch (error) {
 			if (isEnoent(error)) return { size: null, sha256: null };
 			throw error;
 		}
-		return { size: bytes.byteLength, sha256: new Bun.CryptoHasher("sha256").update(bytes).digest("hex") };
+		// Hash in fixed chunks so a large transcript never has to fit in memory at exit.
+		const hasher = new Bun.CryptoHasher("sha256");
+		const chunk = Buffer.allocUnsafe(DIGEST_CHUNK_BYTES);
+		let size = 0;
+		try {
+			for (;;) {
+				const read = fs.readSync(fd, chunk, 0, chunk.byteLength, null);
+				if (read === 0) break;
+				hasher.update(chunk.subarray(0, read));
+				size += read;
+			}
+		} finally {
+			fs.closeSync(fd);
+		}
+		return { size, sha256: hasher.digest("hex") };
 	}
 
 	/**
