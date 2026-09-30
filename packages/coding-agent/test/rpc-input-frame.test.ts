@@ -300,6 +300,8 @@ describe("RpcInputDispatcher", () => {
 						queuedMessages: { steering: [], followUp: [] },
 						todoPhases: [],
 						goal: null,
+						capabilities: [],
+						externalDeliveries: [],
 					},
 				};
 			}
