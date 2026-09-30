@@ -196,7 +196,29 @@ export interface RpcPromptResultFrame {
 	 * When false, a {@link RpcSessionSettledFrame} follows once that work is done.
 	 */
 	sessionSettled: boolean;
+	/**
+	 * Engine-local ordinal of the run whose yield answered this prompt (capability
+	 * `reply-attribution/1`). A run spans retries and continuations up to its
+	 * yield. Prompts reported with the same `run` were answered together, e.g. a
+	 * follow-up folded into a live turn. Absent when no run answered.
+	 */
+	run?: number;
+	/** Session entry id of this prompt's persisted user message, when it could be identified. */
+	promptEntryId?: string;
+	/**
+	 * Session entry ids of the assistant messages that followed this prompt's
+	 * user message up to the next user message, in order; the last is the reply.
+	 * Empty when the prompt's message could not be identified: a non-literal
+	 * prompt in a run that delivered several messages, identical literal texts
+	 * answered together, or a session or branch change during the run. Any
+	 * persisted user message (including host steers and extension messages)
+	 * ends the preceding reply.
+	 */
+	replyEntryIds?: string[];
 }
+
+/** Ready-frame capability: `prompt_result` carries `run`, `promptEntryId` and `replyEntryIds`. */
+export const REPLY_ATTRIBUTION_CAPABILITY = "reply-attribution/1";
 
 /**
  * Emitted when the session goes quiet after agent activity: the last run yielded
@@ -245,7 +267,11 @@ export const RICH_ASK_CAPABILITY = "rich-ask/1";
  * (`name/major`). Features that change what a host receives also require the
  * host to opt in; the entry only says the engine supports them.
  */
-export const RPC_ENGINE_CAPABILITIES: readonly string[] = [LITERAL_INPUT_CAPABILITY, TOOL_APPROVAL_BINDING_CAPABILITY];
+export const RPC_ENGINE_CAPABILITIES: readonly string[] = [
+	LITERAL_INPUT_CAPABILITY,
+	TOOL_APPROVAL_BINDING_CAPABILITY,
+	REPLY_ATTRIBUTION_CAPABILITY,
+];
 
 export interface RpcChunkFrame {
 	type: "rpc_chunk";

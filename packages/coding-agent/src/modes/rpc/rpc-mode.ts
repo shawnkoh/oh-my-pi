@@ -1314,7 +1314,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			case "prompt": {
 				// Taken before any dispatch so a builtin that schedules a turn (e.g. `/retry`)
 				// cannot start its run ahead of the prompt's event-stream position.
-				const ticket = promptResults.begin(id);
+				// Literal text is the persisted user message verbatim, so it identifies the reply.
+				const ticket = promptResults.begin(id, command.literal === true ? command.message : undefined);
 				try {
 					if (command.literal === true) {
 						// Literal input never reaches skill, builtin, extension, custom or
@@ -1446,7 +1447,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				await session.abort({ reason: USER_INTERRUPT_LABEL });
 				// After the abort so the aborted run's terminal agent_end cannot settle this prompt.
 				watchAndReportPromptResult({
-					ticket: promptResults.begin(id),
+					ticket: promptResults.begin(id, command.literal === true ? command.message : undefined),
 					startPrompt: () =>
 						session.prompt(command.message, { images: command.images, literal: command.literal === true }),
 					results: promptResults,
