@@ -39,6 +39,7 @@ import {
 } from "../../extensibility/skills";
 import { type Theme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { AgentSession } from "../../session/agent-session";
+import { EXTERNAL_DELIVERY_CAPABILITY } from "../../session/external-delivery";
 import { CACHE_WARMING_MODES } from "../../session/cache-warmer";
 import { findMostRecentNonEmptySession } from "../../session/session-listing";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
@@ -68,6 +69,7 @@ import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents"
 import { RICH_ASK_CAPABILITY, RPC_ENGINE_CAPABILITIES } from "./rpc-types";
 import type {
 	RpcCommand,
+	RpcDeliveryEventFrame,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
 	RpcExtensionUISelectOptionDetail,
@@ -931,6 +933,13 @@ export interface RpcModeOptions {
  */
 export async function runRpcMode(session: AgentSession, options: RpcModeOptions = {}): Promise<never> {
 	const { setToolUIContext, headless = false, subagentEventBus, input = claimRpcInput() } = options;
+	// One list for the ready frame and get_state: RPC protocol features, the engine's
+	// external delivery, and rich ask, which reaches a host only through the tool UI context.
+	const engineCapabilities: readonly string[] = [
+		...RPC_ENGINE_CAPABILITIES,
+		EXTERNAL_DELIVERY_CAPABILITY,
+		...(setToolUIContext ? [RICH_ASK_CAPABILITY] : []),
+	];
 	// Signal to RPC clients that the server is ready to accept commands
 	// Suppress terminal notifications: they write \x07 (BEL) or OSC sequences directly to
 	// process.stdout with no newline, which the reader merges with the next JSON line and
@@ -950,8 +959,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			supportedProtocolVersions: [1, 2],
 			maxFrameBytes: MAX_RPC_FRAME_BYTES,
 			maxReassembledFrameBytes: MAX_RPC_REASSEMBLED_BYTES,
-			// Rich ask reaches a host only through the tool UI context.
-			capabilities: [...RPC_ENGINE_CAPABILITIES, ...(setToolUIContext ? [RICH_ASK_CAPABILITY] : [])],
+			capabilities: [...engineCapabilities],
 		}),
 	);
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
@@ -1481,6 +1489,62 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			}
 
 			// =================================================================
+			// External delivery (external-delivery/1)
+			// =================================================================
+
+			case "deliver": {
+				// Never routed through prompt parsing: no slash/extension command interpretation.
+				const deliveryOptions = command.options;
+				if (!isRecord(deliveryOptions) || (deliveryOptions.mode !== "aside" && deliveryOptions.mode !== "steer")) {
+					return error(id, "deliver", 'options.mode must be "aside" or "steer"');
+				}
+				const deliveryRecord = command.record;
+				if (
+					!isRecord(deliveryRecord) ||
+					typeof deliveryRecord.customType !== "string" ||
+					!("content" in deliveryRecord) ||
+					!isRecord(deliveryRecord.details)
+				) {
+					return error(
+						id,
+						"deliver",
+						"record must be a custom message payload with customType, content and details",
+					);
+				}
+				const handle = session.deliverExternalMessage(command.record, deliveryOptions);
+				const deliveryId = handle.id;
+				const emit = (frame: RpcDeliveryEventFrame) => output(frame);
+				void handle.accepted.then(acceptance => emit({ type: "delivery_accepted", deliveryId, ...acceptance }));
+				void handle.settled.then(settlement => emit({ type: "delivery_settled", deliveryId, ...settlement }));
+				void handle.discarded.then(({ reason }) => emit({ type: "delivery_discarded", deliveryId, reason }));
+				return {
+					id,
+					type: "response",
+					command: "deliver",
+					success: true,
+					deliveryId,
+					data: { deliveryId },
+				};
+			}
+
+			case "cancel_delivery": {
+				if (typeof command.deliveryId !== "string") {
+					return error(id, "cancel_delivery", "deliveryId must be a string");
+				}
+				const cancelled = session.cancelExternalDelivery(command.deliveryId);
+				if (cancelled)
+					output({ type: "delivery_cancelled", deliveryId: command.deliveryId } satisfies RpcDeliveryEventFrame);
+				return {
+					id,
+					type: "response",
+					command: "cancel_delivery",
+					success: true,
+					cancelled,
+					data: { cancelled },
+				};
+			}
+
+			// =================================================================
 			// State
 			// =================================================================
 
@@ -1503,6 +1567,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					isSettled: isRpcSessionSettled(session),
 					queuedMessages: { steering: [...queuedMessages.steering], followUp: [...queuedMessages.followUp] },
 					todoPhases: session.getTodoPhases(),
+					capabilities: [...engineCapabilities],
+					externalDeliveries: session.listExternalDeliveries(),
 					fastModeEnabled: session.isFastModeEnabled(),
 					tokensPerSecond: calculateTokensPerSecond(session.messages, session.isStreaming),
 					fastModeActive: session.isFastModeActive(),

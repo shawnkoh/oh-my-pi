@@ -299,6 +299,8 @@ describe("RpcInputDispatcher", () => {
 						isSettled: true,
 						queuedMessages: { steering: [], followUp: [] },
 						todoPhases: [],
+						capabilities: [],
+						externalDeliveries: [],
 					},
 				};
 			}

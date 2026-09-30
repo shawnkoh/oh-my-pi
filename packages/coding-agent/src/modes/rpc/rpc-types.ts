@@ -10,6 +10,13 @@ import type { AssistantMessageEvent, Effort, ImageContent, Model, ToolExample } 
 import type { BashResult } from "../../exec/bash-executor";
 import type { ContextUsage } from "../../extensibility/extensions/types";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
+import type {
+	DeliveryAcceptance,
+	DeliveryOptions,
+	DeliverySettlement,
+	ExternalDeliveryListing,
+} from "../../session/external-delivery";
+import type { CustomMessagePayload } from "../../session/messages";
 import type { CacheWarmingMode } from "../../session/cache-warmer";
 import type { FileEntry, SessionEntry, SessionTreeNode } from "../../session/session-entries";
 import type { AvailableSlashCommandSource } from "../../slash-commands/available-commands";
@@ -47,6 +54,10 @@ export type RpcCommand =
 	| { id?: string; type: "abort_and_prompt"; message: string; images?: ImageContent[]; literal?: boolean }
 	| { id?: string; type: "new_session"; parentSession?: string }
 	| { id?: string; type: "open_session"; sessionDir: string }
+
+	// External delivery (`external-delivery/1`): never parsed as a prompt (no slash/extension commands)
+	| { id?: string; type: "deliver"; record: CustomMessagePayload; options: DeliveryOptions }
+	| { id?: string; type: "cancel_delivery"; deliveryId: string }
 
 	// State
 	| { id?: string; type: "get_state" }
@@ -141,6 +152,10 @@ export interface RpcSessionState {
 	 *  (and the `queue_update` event) instead of tracking chips independently. */
 	queuedMessages: { steering: string[]; followUp: string[] };
 	todoPhases: TodoPhase[];
+	/** Engine capabilities a host may negotiate on before issuing an effectful command; same list as the ready frame. */
+	capabilities: string[];
+	/** External records held by the session (`external-delivery/1`), queued or accepted but unsettled. */
+	externalDeliveries: ExternalDeliveryListing[];
 	/** For session dump / export (plain-text parity with /dump). */
 	systemPrompt?: string[];
 	dumpTools?: Array<{ name: string; description: string; parameters: unknown; examples?: readonly ToolExample[] }>;
@@ -246,7 +261,7 @@ export interface RpcReadyFrame {
 	supportedProtocolVersions: [1, 2];
 	maxFrameBytes: number;
 	maxReassembledFrameBytes: number;
-	/** Engine features a host may rely on (see {@link RPC_ENGINE_CAPABILITIES}). Absent on older engines. */
+	/** Engine features a host may rely on (see {@link RPC_ENGINE_CAPABILITIES}); the same list as `get_state.capabilities`. Absent on older engines. */
 	capabilities?: string[];
 }
 
@@ -263,9 +278,11 @@ export const TOOL_APPROVAL_BINDING_CAPABILITY = "tool-approval-binding/1";
 export const RICH_ASK_CAPABILITY = "rich-ask/1";
 
 /**
- * Capabilities the engine always supports, one versioned name per feature
- * (`name/major`). Features that change what a host receives also require the
- * host to opt in; the entry only says the engine supports them.
+ * RPC protocol capabilities the engine always supports, one versioned name per
+ * feature (`name/major`). Features that change what a host receives also require
+ * the host to opt in; the entry only says the engine supports them. The advertised
+ * list (ready frame and `get_state`) adds `external-delivery/1` and, with a tool
+ * UI context, `rich-ask/1`.
  */
 export const RPC_ENGINE_CAPABILITIES: readonly string[] = [
 	LITERAL_INPUT_CAPABILITY,
@@ -336,6 +353,23 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "abort_and_prompt"; success: true }
 	| { id?: string; type: "response"; command: "new_session"; success: true; data: { cancelled: boolean } }
 	| { id?: string; type: "response"; command: "open_session"; success: true; data: RpcOpenSessionResult }
+	// External delivery: the engine-minted id rides at the top level (contract shape) and in `data`.
+	| {
+			id?: string;
+			type: "response";
+			command: "deliver";
+			success: true;
+			deliveryId: string;
+			data: { deliveryId: string };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "cancel_delivery";
+			success: true;
+			cancelled: boolean;
+			data: { cancelled: boolean };
+	  }
 
 	// State
 	| { id?: string; type: "response"; command: "get_state"; success: true; data: RpcSessionState }
@@ -518,6 +552,17 @@ export interface RpcSubagentEventFrame {
 }
 
 export type RpcSubagentFrame = RpcSubagentLifecycleFrame | RpcSubagentProgressFrame | RpcSubagentEventFrame;
+
+// ============================================================================
+// External delivery events (stdout)
+// ============================================================================
+
+/** Receipts for `deliver`, correlated by the engine-minted `deliveryId` (never by the command `id`). */
+export type RpcDeliveryEventFrame =
+	| ({ type: "delivery_accepted"; deliveryId: string } & DeliveryAcceptance)
+	| ({ type: "delivery_settled"; deliveryId: string } & DeliverySettlement)
+	| { type: "delivery_discarded"; deliveryId: string; reason: string }
+	| { type: "delivery_cancelled"; deliveryId: string };
 
 /** Message lifecycle event kinds that RPC mode stamps with a `messageId`. */
 export type RpcMessageEventType = "message_start" | "message_update" | "message_end";
