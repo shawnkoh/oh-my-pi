@@ -49,6 +49,7 @@ import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameEncoder } from "./rpc-frame";
 import { claimRpcInput, readRpcInputFrames } from "./rpc-input";
 import { pageRpcMessages, RPC_MESSAGES_PAGE_BUSY_ERROR, RpcMessagesPageError } from "./rpc-messages";
+import { RpcGoalController } from "./rpc-goal";
 import { RpcOutputWriter } from "./rpc-output";
 import {
 	RpcExtensionUserMessageTracker,
@@ -815,9 +816,13 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	};
 
 	const extensionUserMessageTracker = new RpcExtensionUserMessageTracker();
-	const promptResults = new RpcPromptResults(session, output);
+	// A continuation abandoned while waiting leaves nothing to end the activity stretch: re-check settlement.
+	const goalController = new RpcGoalController(session, () => void settleWatcher.check());
+	// A scheduled goal continuation will start a turn: every settle report treats it as busy.
+	const goalTurnScheduled = () => goalController.continuationPending;
+	const promptResults = new RpcPromptResults(session, output, goalTurnScheduled);
 	const sessionEvents = new RpcSessionEventForwarder(output);
-	const settleWatcher = new RpcSessionSettleWatcher(session, output);
+	const settleWatcher = new RpcSessionSettleWatcher(session, output, goalTurnScheduled);
 
 	const pendingExtensionRequests = new RpcPendingExtensionRequests();
 	const hostToolBridge = new RpcHostToolBridge(output);
@@ -1042,9 +1047,13 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	// Output all agent events as JSON; prompt results follow the frame that settled them.
 	session.subscribe(event => {
 		sessionEvents.forward(event);
+		// Before the prompt-result and settle reports: a goal continuation decided at this
+		// agent_end is scheduled (and reported as pending) before either reads settlement.
+		goalController.observe(event);
 		promptResults.observe(event);
 		settleWatcher.observe(event);
 	});
+	await goalController.reconcile();
 
 	// Discriminates a store failure from any other dispose rejection below.
 	let persistenceFailure: Error | undefined;
@@ -1240,11 +1249,13 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			}
 
 			case "abort": {
+				goalController.stopForHostAbort();
 				await session.abort({ reason: USER_INTERRUPT_LABEL });
 				return success(id, "abort");
 			}
 
 			case "abort_and_prompt": {
+				goalController.stopForHostAbort();
 				await session.abort({ reason: USER_INTERRUPT_LABEL });
 				// After the abort so the aborted run's terminal agent_end cannot settle this prompt.
 				watchAndReportPromptResult({
@@ -1263,6 +1274,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				const result = await handleRpcSessionChange(session, command, subagentRegistry);
 				if (!result.data.cancelled) {
 					promptResults.abortOpen();
+					await goalController.reconcile();
 					// The detached run publishes no terminal agent_end to settle on.
 					void settleWatcher.check();
 					await emitAvailableCommandsUpdate();
@@ -1274,6 +1286,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				const result = await openRpcSession(session, command.sessionDir, subagentRegistry);
 				if (!result.cancelled) {
 					promptResults.abortOpen();
+					await goalController.reconcile();
 					void settleWatcher.check();
 					await emitAvailableCommandsUpdate();
 				}
@@ -1285,6 +1298,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			// =================================================================
 
 			case "get_state": {
+				// A goal exit triggered by the last turn restores tools asynchronously; report after it.
+				await goalController.settled();
 				const queuedMessages = session.getQueuedMessages();
 				const state: RpcSessionState = {
 					model: session.model,
@@ -1300,7 +1315,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					autoCompactionEnabled: session.autoCompactionEnabled,
 					queuedMessageCount: session.queuedMessageCount,
 					hasPendingAsyncWork: session.hasPendingAsyncWork(),
-					isSettled: isRpcSessionSettled(session),
+					// A scheduled goal continuation will start a turn: not settled.
+					isSettled: isRpcSessionSettled(session, goalTurnScheduled),
 					queuedMessages: { steering: [...queuedMessages.steering], followUp: [...queuedMessages.followUp] },
 					todoPhases: session.getTodoPhases(),
 					fastModeEnabled: session.isFastModeEnabled(),
@@ -1315,6 +1331,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 						examples: tool.examples,
 					})),
 					contextUsage: session.getContextUsage(),
+					goal: session.getGoalModeState() ?? null,
 				};
 				return success(id, "get_state", state);
 			}
@@ -1328,6 +1345,14 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					enabled: session.isFastModeEnabled(),
 					active: session.isFastModeActive(),
 				});
+			}
+
+			case "goal": {
+				try {
+					return success(id, "goal", await goalController.handle(command));
+				} catch (goalError) {
+					return error(id, "goal", goalError instanceof Error ? goalError.message : String(goalError));
+				}
 			}
 
 			case "get_available_commands": {

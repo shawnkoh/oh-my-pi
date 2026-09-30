@@ -4,6 +4,7 @@
 
 ### Added
 
+- RPC hosts (`--mode rpc` and `rpc-ui`) can create, read, pause, resume and drop goals with a `goal` command, see the goal in `get_state`, and opt into automatic goal continuation with `goal.continuationModes: ["rpc"]`.
 - Added `HELMCODE_API_KEY` to the environment variables listed in `omp --help` ([#13630](https://github.com/can1357/oh-my-pi/pull/13630) by [@alexcerezo](https://github.com/alexcerezo)).
 - Interactive launches can use `--goal <objective>` to activate goal mode and begin working immediately without typing `/goal` ([#13879](https://github.com/can1357/oh-my-pi/pull/13879) by [@shawnkoh](https://github.com/shawnkoh))
 - Set `goal.toolDefault: true` to let agents start goal mode themselves in ordinary sessions; `--tools=...,goal` also exposes the tool explicitly while the default stays hidden ([#13877](https://github.com/can1357/oh-my-pi/pull/13877) by [@shawnkoh](https://github.com/shawnkoh))

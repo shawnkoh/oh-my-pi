@@ -132,6 +132,7 @@ Important edge behavior from runtime:
 
 - `{ id?, type: "get_state" }`
 - `{ id?, type: "set_fast_mode", enabled: boolean }`
+- `{ id?, type: "goal", op: "get" | "create" | "resume" | "pause" | "drop", objective?: string, token_budget?: number }`
 - `{ id?, type: "get_available_commands" }`
 - `{ id?, type: "get_entries", since?: string }`
 - `{ id?, type: "get_tree" }`
@@ -379,6 +380,42 @@ will match against that queue. Clients should render the pending-message queue
 from these snapshots instead of tracking chips independently, and treat
 `remove_queued_message` responses as confirmation of the change rather than a
 second source of truth.
+
+### `goal` payload
+
+`goal` manages goal mode with the same lifecycle as the interactive `/goal` command.
+Every op answers `{ goal: Goal | null, state: GoalModeState | null }`; `get_state`
+carries the same state as `goal`. `goal_updated` events report every change,
+including those made by the agent's `goal` tool.
+
+- `get` only reads. It never starts a turn.
+- `create` needs `goal.enabled`, a non-empty `objective`, and no active or paused
+  goal. It is refused in plan mode, and `token_budget` must be a positive integer.
+  It adds the `goal` tool to the active tools.
+- `resume` resumes a paused goal (refused in plan mode). `pause` and `drop` restore
+  the active tools from before the goal started.
+- Failures are ordinary `success: false` responses.
+
+Goals do not continue on their own over RPC unless `goal.continuationModes`
+contains `"rpc"`; this covers both `--mode rpc` and `--mode rpc-ui`. When enabled,
+`create`/`resume` and each terminal `agent_end` decide whether to start another goal
+turn, sent as a hidden `goal-continuation` message.
+
+- The turn starts once the yielding run has fully unwound. At that moment the goal
+  must still be active, the session idle with nothing queued, plan mode off, open
+  todos not all blocked, and the session not being disposed.
+- While the turn is decided but not yet started, `get_state.isSettled`,
+  `prompt_result.sessionSettled` and `session_settled` treat the session as busy.
+  `session_settled` follows if the continuation is abandoned.
+- `abort` stops continuation before the abort takes effect; the interrupted goal is
+  paused. Continuation also stops after a goal turn with no new tool activity.
+  Either way, the next host prompt, steer or follow-up (or `goal resume`) re-arms it.
+- A session change (`new_session`, `switch_session`, `branch`, `open_session`)
+  leaves the previous goal and its tool behind and restores a goal journaled in the
+  target session.
+
+When the agent completes the goal, the goal tool is removed again and
+`get_state.goal` becomes `null`.
 
 ### `set_fast_mode` payload
 
