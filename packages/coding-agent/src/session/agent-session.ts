@@ -1140,6 +1140,9 @@ export class AgentSession implements SettingsScope {
 	 *  gate (agent.hasQueuedMessages()) does not count peer IRC interrupts. Once idle, wake a turn so
 	 *  the agent responds to the peer. Skip only when a queued steer/follow-up will itself drive a
 	 *  resume turn whose aside poll already consumes these (no double-wake). */
+	/** One pending re-offer of stranded asides scheduled behind an admitted submission. */
+	#strandedResumeAfterAdmission = false;
+
 	#resumeStrandedIrcAsides(): void {
 		if (this.#modeExitDrainSuppressionDepth > 0 || this.#isDisposed || this.isStreaming || !this.#irc.hasPending()) {
 			return;
@@ -1158,6 +1161,18 @@ export class AgentSession implements SettingsScope {
 		// and race the transition's own reset — same rationale as #drainStrandedQueuedMessages.
 		if (this.#unsubscribeAgent === undefined) return;
 		if (this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages()) return;
+		// An admitted submission that has not started yet owns the next turn; the
+		// parked owned records fold into it (or resume once it dispatches).
+		if (this.hasAdmittedSubmission) {
+			if (!this.#strandedResumeAfterAdmission) {
+				this.#strandedResumeAfterAdmission = true;
+				void this.waitForAdmittedSubmissions().finally(() => {
+					this.#strandedResumeAfterAdmission = false;
+					this.#resumeStrandedIrcAsides();
+				});
+			}
+			return;
+		}
 		// Parked wake records resume alongside ordinary stranded asides; they were
 		// already decided wake-intended at deferral time.
 		let records = [...this.#irc.drainDeferredWakes(), ...this.#irc.drainPending()];
@@ -1901,7 +1916,12 @@ export class AgentSession implements SettingsScope {
 			// Owned external records drain mid-work into any run, but at a stop
 			// boundary only into a delivery-owned one — otherwise they wait for a
 			// separately owned wake once this run settles (#resumeStrandedIrcAsides).
-			const holdOwned = boundary?.atStopBoundary === true && !this.#externalDeliveries.drainsOwnedAtStopBoundary();
+			// While a session transition is open, admission would only defer and
+			// re-queue them (a hot loop at the boundary); the transition-settle hook
+			// re-offers held records through #resumeStrandedIrcAsides.
+			const holdOwned =
+				this.#sessionTransitionDepth > 0 ||
+				(boundary?.atStopBoundary === true && !this.#externalDeliveries.drainsOwnedAtStopBoundary());
 			const keep = holdOwned ? isOwnedAsideMessage : undefined;
 			const thunks: AsideMessage[] = [];
 			for (const record of this.#irc.drainPending(keep)) {
@@ -4077,7 +4097,13 @@ export class AgentSession implements SettingsScope {
 				maintenanceRoute("delivery-quiet-stop");
 				await this.#recovery.discardQuietDeliveryStop(msg);
 				this.#recovery.resolveRetry();
-				await emitAgentEndNotification();
+				// Quiet completions still count toward the context budget: run the
+				// ordinary compaction check so repeated quiet deliveries cannot grow
+				// the context unchecked until a non-quiet turn.
+				const quietCompaction = this.#maintenance.checkCompaction(msg);
+				this.#trackPostPromptTask(quietCompaction);
+				const quietResult = await quietCompaction;
+				await emitAgentEndNotification(quietResult.continuationScheduled ? { willContinue: true } : undefined);
 				return;
 			}
 
@@ -8333,6 +8359,22 @@ export class AgentSession implements SettingsScope {
 			this.#resumeStrandedIrcAsides();
 			return;
 		}
+		// A submission admitted but not yet streaming (e.g. a continuation waiting
+		// on manual-compaction cleanup) owns the next turn: waking now would race it
+		// into AgentBusyError. Park the record; it folds into that turn or is
+		// re-offered when the run settles.
+		if (this.hasAdmittedSubmission) {
+			owner.mechanism = owner.mode === "steer" ? "steer-boundary" : "aside";
+			if (owner.mode === "steer") {
+				this.#allowQueuedMessageDrainRetry();
+				this.agent.steer(record);
+			} else {
+				this.#irc.queueAside([record]);
+			}
+			// #resumeStrandedIrcAsides re-checks the gate and waits for the submission.
+			this.#resumeStrandedIrcAsides();
+			return;
+		}
 		const gated =
 			(this.#planModeState?.enabled === true && owner.options.wakeInPlanMode !== true) ||
 			(this.#advisors.autoResumeSuppressed && owner.options.wakeAfterInterrupt !== true);
@@ -8705,12 +8747,23 @@ export class AgentSession implements SettingsScope {
 		const keep: (m: AgentMessage) => boolean = options?.forInterrupt
 			? isAdvisorCard
 			: m => !isUserAuthoredQueuedMessage(m) && !isHiddenUserCompanion(m);
+		// An owned external record is never silently dropped: on an interrupt it
+		// moves to the IRC bridge, where the `wakeAfterInterrupt` gating and the
+		// stranded-aside resume decide when it is re-offered, and its owner keeps
+		// its receipts.
+		const parked: AgentMessage[] = [];
 		for (const message of [...steeringAll, ...followUpAll]) {
-			if (!keep(message) && message.role === "custom" && message.customType === "ttsr-injection") {
+			if (keep(message)) continue;
+			if (isOwnedAsideMessage(message)) {
+				parked.push(message);
+				continue;
+			}
+			if (message.role === "custom" && message.customType === "ttsr-injection") {
 				this.#ttsr.releaseDeferredReservationFromDetails(message.details);
 			}
 		}
 		this.agent.replaceQueues(steeringAll.filter(keep), followUpAll.filter(keep));
+		if (parked.length > 0) this.#irc.queueAside(parked);
 		this.#reconcileQueuedMessageDrain();
 		return { steering, followUp };
 	}
