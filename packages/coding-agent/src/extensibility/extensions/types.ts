@@ -85,6 +85,7 @@ import type { NativeToolView } from "@oh-my-pi/pi-tui/tools/renderer";
 import type { AsyncJobSnapshot, SendUserMessageOptions } from "../../session/agent-session";
 import type { EphemeralTurnOptions, EphemeralTurnResult } from "../../session/agent-session-types";
 import type { CompactMode } from "../../session/compact-modes";
+import type { DeliveryHandle, DeliveryOptions } from "../../session/external-delivery";
 import type { CustomMessagePayload } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
 import type { BashToolInput, GlobToolInput, GrepToolInput, ReadToolInput, WriteToolInput } from "../../tools";
@@ -1571,6 +1572,22 @@ export interface ExtensionAPI {
 	 *  batch while streaming; idle still starts a turn. */
 	sendUserMessage(content: string | (TextContent | ImageContent)[], options?: SendUserMessageOptions): void;
 
+	/**
+	 * Host capability ids (e.g. `"external-delivery/1"`). Populated when the host
+	 * binds its runtime actions (before `session_start`); empty while the
+	 * extension factory itself runs.
+	 */
+	readonly capabilities: ReadonlySet<string>;
+
+	/**
+	 * Admit a directed external record with honest receipts (`external-delivery/1`).
+	 * The record is a `custom` message (`attribution: "agent"`) that only enters
+	 * context through the loop's own admission; the returned handle reports
+	 * acceptance (`mode`/`mechanism`), settlement, discard or cancellation.
+	 * Throws when the host lacks the capability — check `capabilities` first.
+	 */
+	deliverMessage<T = unknown>(record: CustomMessagePayload<T>, options: DeliveryOptions): DeliveryHandle;
+
 	/** Append a custom entry to the session for state persistence (not sent to LLM). */
 	appendEntry<T = unknown>(customType: string, data?: T): void;
 
@@ -1806,6 +1823,12 @@ export type SendUserMessageHandler = (
 	options?: SendUserMessageOptions,
 ) => void;
 
+/** `external-delivery/1`: bound only by hosts that own an `AgentSession`. */
+export type DeliverMessageHandler = <T = unknown>(
+	record: CustomMessagePayload<T>,
+	options: DeliveryOptions,
+) => DeliveryHandle;
+
 export type AppendEntryHandler = <T = unknown>(customType: string, data?: T) => void;
 
 export type GetActiveToolsHandler = () => string[];
@@ -1831,6 +1854,8 @@ export interface ExtensionRuntimeState {
 	flagValues: Map<string, boolean | string>;
 	/** Provider registrations queued during extension loading, processed during session initialization */
 	pendingProviderRegistrations: Array<{ name: string; config: ProviderConfig; sourceId: string }>;
+	/** Host capability ids; the host adds `"external-delivery/1"` when it binds `deliverMessage`. */
+	readonly capabilities: Set<string>;
 	/** Queue a provider registration until initialization, then apply it immediately. */
 	registerProvider(name: string, config: ProviderConfig, sourceId: string): void;
 	/** Remove a queued or initialized provider registration. */
@@ -1841,6 +1866,8 @@ export interface ExtensionRuntimeState {
 export interface ExtensionActions {
 	sendMessage: SendMessageHandler;
 	sendUserMessage: SendUserMessageHandler;
+	/** Absent ⇒ `capabilities` lacks `"external-delivery/1"` and `deliverMessage` throws. */
+	deliverMessage?: DeliverMessageHandler;
 	appendEntry: AppendEntryHandler;
 	setLabel: (targetId: string, label: string | undefined) => void;
 	getActiveTools: GetActiveToolsHandler;
