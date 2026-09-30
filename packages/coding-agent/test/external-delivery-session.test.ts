@@ -100,6 +100,7 @@ describe("external delivery (session)", () => {
 		convert?: (messages: AgentMessage[]) => Message[];
 		sessionManager?: SessionManager;
 		extensionRunner?: ExtensionRunner;
+		compaction?: boolean;
 	}): { mock: MockModel; agent: Agent; session: AgentSession } {
 		// Exhaustion falls back to a plain reply: an unscripted call must never
 		// become a provider error whose retry backoff would outlive the test.
@@ -111,7 +112,11 @@ describe("external delivery (session)", () => {
 			convertToLlm: options?.convert ?? convertToLlm,
 			streamFn: mock.stream,
 		});
-		const settings = Settings.isolated({ "compaction.enabled": false, "todo.enabled": false });
+		const settings = Settings.isolated({
+			"compaction.enabled": options?.compaction === true,
+			"compaction.keepRecentTokens": 1,
+			"todo.enabled": false,
+		});
 		settings.setModelRole("default", `${mock.provider}/${mock.id}`);
 		session = new AgentSession({
 			agent,
@@ -622,6 +627,158 @@ describe("external delivery (session)", () => {
 			expect(settled.sole).toBe(true);
 			expect(settled.interactive).toBe(false);
 			expect(settled.outcome).toBe("quiet");
+		});
+	});
+
+	describe("interrupt and transition holds", () => {
+		it("Esc does not drop a queued owned steer: it is parked and re-offered with wakeAfterInterrupt", async () => {
+			const slow = slowTool();
+			const { mock, session: s } = makeSession({ tools: [slow.tool] });
+			mock.push(toolCall("slow"));
+			const run = s.prompt("go");
+			await slow.started;
+			const handle = s.deliverExternalMessage(card("steer-me"), { mode: "steer", wakeAfterInterrupt: true });
+			await setImmediate();
+			expect(handle.state()).toBe("queued");
+			// Interactive Esc: clear the queues for the interrupt, then abort the run.
+			s.clearQueue({ forInterrupt: true });
+			expect(handle.state()).toBe("queued");
+			expect(s.listExternalDeliveries().map(entry => entry.deliveryId)).toEqual([handle.id]);
+			mock.push({ content: ["acted on the steer"] });
+			const aborting = s.abort({ reason: USER_INTERRUPT_LABEL });
+			slow.release();
+			await aborting;
+			await run.catch(() => {});
+			const accepted = await handle.accepted;
+			expect(accepted.mode).toBe("steer");
+			expect(accepted.mechanism).not.toBe("aside");
+			const settled = await handle.settled;
+			expect(settled.included).toBe(true);
+			expect(userTexts(mock, mock.calls.length - 1)).toContain("steer-me");
+		});
+
+		it("holds owned records at the stop boundary while a session transition is open instead of spinning", async () => {
+			const modelRegistry = new ModelRegistry(authStorage);
+			const hookReached = Promise.withResolvers<void>();
+			const releaseHook = Promise.withResolvers<void>();
+			const sessionManager = SessionManager.inMemory(tempDir.path());
+			const runtime = new ExtensionRuntime();
+			const extension = await loadExtensionFromFactory(
+				pi => {
+					pi.on("session_before_switch", async () => {
+						hookReached.resolve();
+						await releaseHook.promise;
+					});
+				},
+				tempDir.path(),
+				new EventBus(),
+				runtime,
+				"held-new-session-hook",
+			);
+			const extensionRunner = new ExtensionRunner(
+				[extension],
+				runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const slow = slowTool();
+			const { mock, session: s } = makeSession({ tools: [slow.tool], sessionManager, extensionRunner });
+			// A delivery-owned run whose wake calls a slow tool, so it is busy when the transition opens.
+			mock.push(toolCall("slow"));
+			mock.push(EMPTY_STOP);
+			const first = s.deliverExternalMessage(card("first"), { mode: "aside" });
+			await first.accepted;
+			await slow.started;
+			const second = s.deliverExternalMessage(card("second"), { mode: "aside" });
+			const switching = s.newSession();
+			await hookReached.promise;
+			expect(s.isSessionTransitioning).toBe(true);
+			// Reach the stop boundary with the transition still open.
+			slow.release();
+			await first.settled;
+			// Without the hold this spins defer → requeue → drain at the boundary; the
+			// deferral counter would climb while the hook is pending.
+			const deferrals = (second as unknown as { deferrals?: number }).deferrals;
+			for (let i = 0; i < 25; i++) await setImmediate();
+			expect(second.state()).toBe("queued");
+			expect(mock.calls).toHaveLength(2);
+			expect((second as unknown as { deferrals?: number }).deferrals).toBe(deferrals);
+			releaseHook.resolve();
+			await switching;
+			const discarded = await second.discarded;
+			expect(discarded.reason).toBe("new-session");
+		});
+
+		it("does not wake into an admitted-but-not-started submission; the record folds into that turn", async () => {
+			// The real window: a prompt admitted while a manual /compact is in flight
+			// waits on compaction cleanup before its busy check. A delivery that
+			// woke here would race that prompt into AgentBusyError.
+			const modelRegistry = new ModelRegistry(authStorage);
+			const compactStarted = Promise.withResolvers<void>();
+			const compactGate = Promise.withResolvers<void>();
+			const sessionManager = SessionManager.inMemory(tempDir.path());
+			const runtime = new ExtensionRuntime();
+			const extension = await loadExtensionFromFactory(
+				pi => {
+					pi.on("session_before_compact", async event => {
+						compactStarted.resolve();
+						await compactGate.promise;
+						return {
+							compaction: {
+								summary: "compacted",
+								shortSummary: undefined,
+								firstKeptEntryId: event.preparation.firstKeptEntryId,
+								tokensBefore: event.preparation.tokensBefore,
+								details: {},
+							},
+						};
+					});
+				},
+				tempDir.path(),
+				new EventBus(),
+				runtime,
+				"parked-compaction",
+			);
+			const extensionRunner = new ExtensionRunner(
+				[extension],
+				runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const { mock, session: s } = makeSession({ sessionManager, extensionRunner, compaction: true });
+			mock.push({ content: ["seed"] });
+			await s.prompt("seed turn");
+			expect(mock.calls).toHaveLength(1);
+
+			const compaction = s.compact();
+			await compactStarted.promise;
+			const operatorTurn = s.prompt("operator turn");
+			await setImmediate();
+			expect(s.hasAdmittedSubmission).toBe(true);
+			expect(s.isStreaming).toBe(false);
+
+			mock.push({ content: ["turn two"] });
+			const handle = s.deliverExternalMessage(card("folded"), { mode: "aside" });
+			for (let i = 0; i < 5; i++) await setImmediate();
+			expect(handle.state()).toBe("queued");
+			expect(mock.calls).toHaveLength(1);
+
+			compactGate.resolve();
+			await compaction;
+			// Neither input is lost or starved: the operator prompt dispatches
+			// (no AgentBusyError from a racing delivery wake) and the record reaches
+			// a provider request, either folded into that turn or right after it.
+			await expect(operatorTurn).resolves.toBe(true);
+			mock.push({ content: ["turn three"] });
+			await handle.accepted;
+			const settled = await handle.settled;
+			expect(settled.included).toBe(true);
+			await s.waitForIdle();
+			const texts = mock.calls.slice(1).flatMap((_, index) => userTexts(mock, index + 1));
+			expect(texts).toContain("operator turn");
+			expect(texts).toContain("folded");
 		});
 	});
 
