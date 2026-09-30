@@ -1031,14 +1031,12 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		// Extension-initiated session changes get the same goal quiesce/reattach as the commands below.
 		wrapSessionChange: async <T extends { cancelled: boolean }>(change: () => Promise<T>): Promise<T> => {
 			await goalController.beginSessionChange();
-			let result: T | undefined;
 			try {
-				result = await change();
+				return await change();
 			} finally {
-				await goalController.endSessionChange(result?.cancelled ?? true);
-				if (result && !result.cancelled) void settleWatcher.check();
+				// Reattaches only if the session actually changed, then re-checks settlement.
+				await goalController.endSessionChange();
 			}
-			return result;
 		},
 		reportSendError: (action, err) => {
 			output(error(undefined, action, err.message));
@@ -1288,7 +1286,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				try {
 					result = await handleRpcSessionChange(session, command, subagentRegistry);
 				} finally {
-					await goalController.endSessionChange(result?.data.cancelled ?? true);
+					await goalController.endSessionChange();
 				}
 				if (!result.data.cancelled) {
 					promptResults.abortOpen();
@@ -1305,7 +1303,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				try {
 					result = await openRpcSession(session, command.sessionDir, subagentRegistry);
 				} finally {
-					await goalController.endSessionChange(result?.cancelled ?? true);
+					await goalController.endSessionChange();
 				}
 				if (!result.cancelled) {
 					promptResults.abortOpen();

@@ -210,6 +210,21 @@ describe("RPC goal command", () => {
 		expect((await rpc.goal("create", { objective: "second session goal" })).goal?.status).toBe("active");
 	}, 30_000);
 
+	test("an extension command that starts a new session leaves the goal behind; navigation within the session keeps it", async () => {
+		const rpc = await start({ continuation: false });
+		await rpc.goal("create", { objective: "survives in-session navigation" });
+
+		await rpc.promptAndWait("/goaltest-navigate-here");
+		const kept = await rpc.getState();
+		expect(kept.goal?.goal).toMatchObject({ objective: "survives in-session navigation", status: "active" });
+		expect(kept.dumpTools?.map(tool => tool.name)).toContain("goal");
+
+		await rpc.promptAndWait("/goaltest-new-session");
+		const fresh = await rpc.getState();
+		expect(fresh.goal).toBeNull();
+		expect(fresh.dumpTools?.map(tool => tool.name)).not.toContain("goal");
+	}, 30_000);
+
 	test("prompt_result reports the session unsettled when a goal continuation follows the prompt", async () => {
 		const rpc = await start({ continuation: true, script: "idle" });
 		const firstSettle = Promise.withResolvers<void>();
@@ -252,6 +267,7 @@ describe("RpcGoalController continuation gate", () => {
 		idle.resolve();
 		const session = {
 			settings: Settings.isolated({ "goal.continuationModes": ["rpc"] }),
+			sessionId: "s1",
 			isDisposed: false,
 			isSessionTransitioning: false,
 			isStreaming: false,
@@ -360,24 +376,32 @@ describe("RpcGoalController continuation gate", () => {
 		expect(controller.continuationPending).toBe(false);
 	});
 
-	test("a session change voids a waiting continuation; a cancelled change resumes it", async () => {
+	test("a change that stays in the same session holds, then resumes the goal without settling in between", async () => {
 		const admitted: string[] = [];
-		const { controller, hold, release } = fakeSession(async customType => {
+		const { controller, hold, release, dropped } = fakeSession(async customType => {
 			admitted.push(customType);
 			return true;
 		});
 
 		hold();
 		controller.observe(agentEnd);
-		expect(controller.continuationPending).toBe(true);
 		await controller.beginSessionChange();
-		expect(controller.continuationPending).toBe(false);
+		// The change may be cancelled and the goal resumed: still reported as pending.
+		expect(controller.continuationPending).toBe(true);
 		release();
 		await nextMacrotask();
+		// A run that yields during the change (for example while a before-switch hook waits) is held too.
+		controller.observe(agentEnd);
+		await nextMacrotask();
 		expect(admitted).toEqual([]);
+		const droppedDuringChange = dropped();
 
-		await controller.endSessionChange(true);
+		// Same session afterwards (cancelled, or navigation within it): the goal resumes exactly once.
+		await controller.endSessionChange();
 		await nextMacrotask();
 		expect(admitted).toEqual(["goal-continuation"]);
+		expect(controller.continuationPending).toBe(false);
+		// Settlement is re-checked only once the change has ended.
+		expect(dropped()).toBeGreaterThan(droppedDuringChange);
 	});
 });

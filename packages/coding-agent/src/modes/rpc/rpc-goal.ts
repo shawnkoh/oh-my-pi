@@ -50,6 +50,7 @@ export type RpcGoalSession = Pick<
 	| "isSessionTransitioning"
 	| "hasAdmittedSubmission"
 	| "queuedMessageCount"
+	| "sessionId"
 >;
 
 export class RpcGoalController {
@@ -67,6 +68,12 @@ export class RpcGoalController {
 	#continuationGeneration = 0;
 	/** Tool-set restoration triggered by session events; commands and reads wait for it. */
 	#exitTask: Promise<void> = Promise.resolve();
+	/** Session changes in progress; goal turns and exits wait for them to end. */
+	#sessionChanges = 0;
+	/** Session id when the outermost in-progress change began. */
+	#sessionBeforeChange: string | undefined;
+	/** A goal completed during a session change; its exit runs once the change ends. */
+	#completionDuringChange = false;
 	readonly #onContinuationDropped: (() => void) | undefined;
 
 	/**
@@ -83,7 +90,8 @@ export class RpcGoalController {
 	 * quiescence checks must treat the session as busy during this window.
 	 */
 	get continuationPending(): boolean {
-		return this.#continuationScheduled;
+		// A change in progress may resume the goal when it is cancelled: never settled meanwhile.
+		return this.#continuationScheduled || this.#sessionChanges > 0;
 	}
 
 	/**
@@ -109,26 +117,45 @@ export class RpcGoalController {
 	}
 
 	/**
-	 * Call before any session change (RPC command or extension action). Waits for a
-	 * pending goal exit so it cannot land in the next session, and voids a waiting
-	 * continuation so it cannot be admitted mid-transition.
+	 * Call before any session change or tree navigation (RPC command or extension
+	 * action). Waits for a pending goal exit so it cannot land in the next session,
+	 * voids a waiting continuation, and holds new goal turns until
+	 * {@link endSessionChange}.
 	 */
 	async beginSessionChange(): Promise<void> {
+		if (this.#sessionChanges++ === 0) this.#sessionBeforeChange = this.#session.sessionId;
 		this.#continuationScheduled = false;
 		this.#continuationGeneration++;
 		await this.#exitTask;
 	}
 
 	/**
-	 * Call after the change settles. A completed change adopts the target session's
-	 * goal; a cancelled one stays in the current session, so continuation resumes.
+	 * Call after the change resolves, is cancelled, or throws. Only a change that
+	 * actually switched the session adopts the target session's goal. A cancelled
+	 * or no-op change (same session, for example tree navigation or reopening the
+	 * open session) leaves the running goal untouched and resumes continuation.
+	 * Never throws; settlement is re-checked afterwards.
 	 */
-	async endSessionChange(cancelled: boolean): Promise<void> {
-		if (cancelled) {
-			this.#scheduleContinuation();
-			return;
+	async endSessionChange(): Promise<void> {
+		if (--this.#sessionChanges > 0) return;
+		const switched = this.#session.sessionId !== this.#sessionBeforeChange;
+		this.#sessionBeforeChange = undefined;
+		const completed = this.#completionDuringChange;
+		this.#completionDuringChange = false;
+		try {
+			if (switched) {
+				// A goal completed in the previous session is journaled there; the target's own state wins.
+				await this.reconcile();
+			} else if (completed) {
+				this.#queueExit(() => this.#completeExit());
+				await this.#exitTask;
+			} else {
+				this.#scheduleContinuation();
+			}
+		} catch (error) {
+			reportControllerError(error);
 		}
-		await this.reconcile();
+		this.#onContinuationDropped?.();
 	}
 
 	#queueExit(exit: () => Promise<void>): void {
@@ -299,6 +326,10 @@ export class RpcGoalController {
 			this.#previousContinuationActivity = activity;
 		}
 		if (this.#session.getGoalModeState()?.mode === "exiting") {
+			if (this.#sessionChanges > 0) {
+				this.#completionDuringChange = true;
+				return;
+			}
 			this.#queueExit(() => this.#completeExit());
 			return;
 		}
@@ -329,7 +360,7 @@ export class RpcGoalController {
 	 * an abort, disposal, pause, plan mode, or another turn starting meanwhile drops it.
 	 */
 	#scheduleContinuation(): void {
-		if (this.#continuationScheduled || !this.#continuationWanted()) return;
+		if (this.#sessionChanges > 0 || this.#continuationScheduled || !this.#continuationWanted()) return;
 		this.#continuationScheduled = true;
 		const generation = this.#continuationGeneration;
 		void (async () => {

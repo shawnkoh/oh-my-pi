@@ -40,6 +40,24 @@ const { session } = await createAgentSession({
 	slashCommands: [],
 	enableMCP: false,
 	enableLsp: false,
+	// Extension commands that change the session (/goaltest-new-session) or navigate within it (/goaltest-navigate-here).
+	extensions: [
+		pi => {
+			pi.registerCommand("goaltest-new-session", {
+				description: "start a new session from an extension",
+				handler: async (_args, ctx) => {
+					await ctx.newSession();
+				},
+			});
+			pi.registerCommand("goaltest-navigate-here", {
+				description: "navigate to the current leaf (no session change)",
+				handler: async (_args, ctx) => {
+					const leaf = ctx.sessionManager.getLeafId();
+					if (leaf) await ctx.navigateTree(leaf);
+				},
+			});
+		},
+	],
 });
 // GOAL_RPC_SCRIPT="slow": the first turn stalls long enough for the host to abort it.
 const turns: MockResponse[] =
