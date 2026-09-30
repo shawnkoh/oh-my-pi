@@ -286,26 +286,66 @@ export function assertAttestationWritable(file: string): void {
 export function writeTerminalAttestationSync(file: string, attestation: TerminalAttestation): void {
 	const dir = path.dirname(file);
 	fs.mkdirSync(dir, { recursive: true });
-	const temp = `${file}.${process.pid}.tmp`;
-	const fd = fs.openSync(temp, "w", 0o600);
+	const temp = attestationTempPath(file, process.pid);
 	try {
-		fs.writeSync(fd, `${JSON.stringify(attestation, null, 2)}\n`);
-		fs.fsyncSync(fd);
-	} finally {
-		fs.closeSync(fd);
+		const fd = fs.openSync(temp, "w", 0o600);
+		try {
+			fs.writeSync(fd, `${JSON.stringify(attestation, null, 2)}\n`);
+			fs.fsyncSync(fd);
+		} finally {
+			fs.closeSync(fd);
+		}
+		fs.renameSync(temp, file);
+	} catch (error) {
+		// An unpublished attestation must not be left where it could be mistaken for one.
+		fs.rmSync(temp, { force: true });
+		throw error;
 	}
-	fs.renameSync(temp, file);
 	fsyncDirectory(dir);
+}
+
+function attestationTempPath(file: string, pid: number): string {
+	return `${file}.${pid}.tmp`;
+}
+
+/** Remove temp attestations whose writer is gone (a crash between write and publish). */
+function sweepAttestationTempFiles(file: string): void {
+	const dir = path.dirname(file);
+	const prefix = `${path.basename(file)}.`;
+	let names: string[];
+	try {
+		names = fs.readdirSync(dir);
+	} catch {
+		return;
+	}
+	for (const name of names) {
+		const match = name.startsWith(prefix) ? /^(\d+)\.tmp$/.exec(name.slice(prefix.length)) : null;
+		if (!match) continue;
+		const pid = Number(match[1]);
+		if (pid === process.pid || isProcessRunning(pid)) continue;
+		fs.rmSync(path.join(dir, name), { force: true });
+	}
+}
+
+function isProcessRunning(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
 }
 
 /**
  * Retire a terminal attestation left by an earlier invocation of this session: rename it to
  * `<base>.terminal.<pid>-<startId>.json` (its writer's identity) and fsync the directory, so
- * `<base>.terminal.json` only ever describes the latest invocation's exit. Returns the
- * retired path, or `null` when there was nothing to retire.
+ * `<base>.terminal.json` only ever describes the latest invocation's exit. Unpublished temp
+ * attestations of writers that are gone are removed. Returns the retired path, or `null`
+ * when there was nothing to retire.
  */
 export function retireTerminalAttestationSync(sessionFile: string): string | null {
 	const file = terminalAttestationPath(sessionFile);
+	sweepAttestationTempFiles(file);
 	let writer = "unknown";
 	try {
 		const previous = JSON.parse(fs.readFileSync(file, "utf8")) as Partial<TerminalAttestation>;

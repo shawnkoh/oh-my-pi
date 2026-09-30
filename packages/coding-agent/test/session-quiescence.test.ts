@@ -367,6 +367,56 @@ describe("AgentSession quiesce-and-exit", () => {
 		// The transcript is final and no input is taken; a retry learns the same outcome.
 		expect(s.isAdmissionClosed()).toBe(true);
 		expect(s.quiesceForExit(request(s))).toBe(result);
+		// The unpublished attestation is not left behind where it could be mistaken for one.
+		const dir = path.dirname(target);
+		expect(fs.readdirSync(dir).filter(name => name.startsWith(`${path.basename(target)}.`))).toEqual([]);
+	});
+
+	it("keeps the transcript final on exit_unattested even when finalizing it failed", async () => {
+		const s = createSession();
+		await s.prompt("materialize the transcript");
+		vi.spyOn(s.sessionManager, "finalizeForExit").mockImplementation(() => {
+			throw new Error("flush failed");
+		});
+		const file = s.sessionFile!;
+		expect(s.quiesceForExit(request(s))).toMatchObject({ status: "exit_unattested" });
+		const size = fs.statSync(file).size;
+		s.sessionManager.appendCustomEntry("late", { after: "exit" });
+		s.sessionManager.flushSync();
+		expect(fs.statSync(file).size).toBe(size);
+	});
+
+	it("removes a crashed writer's unpublished attestation when the session is opened again", async () => {
+		const s = createSession();
+		await s.prompt("materialize the transcript");
+		const file = s.sessionFile!;
+		const stale = `${terminalAttestationPath(file)}.${0x7ffffff7}.tmp`;
+		fs.writeFileSync(stale, "{}");
+		await s.dispose();
+		session = undefined;
+		AsyncJobManager.resetForTests();
+		createSession({
+			sessionManager: await SessionManager.open(file, path.join(tempDir.path(), "sessions")),
+			modelRegistry: new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml")),
+		});
+		expect(fs.existsSync(stale)).toBe(false);
+	});
+
+	it("refuses while a session switch is still being set up", async () => {
+		const entered = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		const s = await createSessionWithExtension(pi => {
+			pi.on("session_before_switch", async () => {
+				entered.resolve();
+				await gate.promise;
+			});
+		});
+		const switching = s.newSession();
+		await entered.promise;
+		const result = s.quiesceForExit(request(s));
+		expect(result).toMatchObject({ status: "refused", reason: "work_active" });
+		gate.resolve();
+		await switching;
 	});
 
 	it("starts no scheduled continuation after a pass", async () => {

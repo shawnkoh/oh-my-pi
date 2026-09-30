@@ -427,6 +427,7 @@ import {
 	type QuiesceRefusalReason,
 	type QuiesceRequest,
 	type QuiesceResult,
+	QUIESCE_EXIT_DEADLINE_MS,
 	quiesceEndsProcess,
 	quiesceExitCode,
 	retireTerminalAttestationSync,
@@ -2086,9 +2087,15 @@ export class AgentSession implements SettingsScope {
 		);
 		this.#cancelExitRecorder = postmortem.register(`agent-session:${this.sessionManager.getSessionId()}`, reason => {
 			this.#recordSessionExit(reason);
-			// Without a host teardown nothing else makes the transcript final: seal it now and
-			// add its digest, so the hang-up attestation matches the file after exit.
-			if (HANGUP_REASONS.has(reason)) this.#sealHangupTranscript();
+			if (!HANGUP_REASONS.has(reason)) return;
+			// A host with its own signal teardown (interactive, ACP) disposes the session, which
+			// seals the transcript after `session_shutdown` handlers wrote to it and completes the
+			// hang-up attestation. Decide once every cleanup callback of this pass has started
+			// (their synchronous parts run first), so a host registered before this session is
+			// seen too. Only with no host teardown (RPC) is the transcript sealed here.
+			return Promise.resolve().then(() => {
+				if (!this.#isDisposed && !this.#disposeCall) this.#sealHangupTranscript();
+			});
 		});
 		this.#cancelFatalRecoveryHint = postmortem.registerFatalRecoveryHint(() => {
 			const sessionId = this.sessionManager.getSessionId();
@@ -2983,7 +2990,9 @@ export class AgentSession implements SettingsScope {
 			this.#inFlightEventHandlers.size +
 			this.#pendingMessageEndPersistence.size +
 			this.#advisors.pendingWork() +
-			(this.#cacheWarmer?.refreshing ? 1 : 0);
+			(this.#cacheWarmer?.refreshing ? 1 : 0) +
+			// A new/switched/forked/branched session is being set up; its transcript is not final.
+			(this.#sessionTransitionDepth > 0 ? 1 : 0);
 		counts.goalContinuationScheduled = this.#goalContinuationReservations;
 		for (const source of this.#workSources) counts[source.kind] += Math.max(0, source.count());
 		return counts;
@@ -3139,9 +3148,11 @@ export class AgentSession implements SettingsScope {
 				this.#admissionClosedBy = undefined;
 				return refuse("attestation_unavailable", counts);
 			}
-			// The exit record is written and the transcript is final: the session cannot take
-			// more input, so it must not stay up with admission closed. The host exits; with no
-			// terminal attestation, consumers take the registry path.
+			// The exit record is written: the session cannot take more input, so it must not stay
+			// up with admission closed. Make sure nothing appends after this point even when
+			// finalizing itself failed, then the host exits; with no terminal attestation,
+			// consumers take the registry path.
+			this.sessionManager.seal();
 			return {
 				status: "exit_unattested",
 				operationId,
@@ -8287,7 +8298,12 @@ export class AgentSession implements SettingsScope {
 			quiesceAndExit: request => {
 				const result = this.quiesceForExit(request);
 				if (quiesceEndsProcess(result)) {
-					void this.dispose().finally(() => process.exit(quiesceExitCode(result)));
+					const code = quiesceExitCode(result);
+					const deadline = setTimeout(() => postmortem.exitProcess(code), QUIESCE_EXIT_DEADLINE_MS);
+					void this.dispose().finally(() => {
+						clearTimeout(deadline);
+						process.exit(code);
+					});
 				}
 				return result;
 			},
