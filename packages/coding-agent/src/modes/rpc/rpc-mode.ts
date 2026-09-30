@@ -818,8 +818,13 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	const extensionUserMessageTracker = new RpcExtensionUserMessageTracker();
 	// A continuation abandoned while waiting leaves nothing to end the activity stretch: re-check settlement.
 	const goalController = new RpcGoalController(session, () => void settleWatcher.check());
-	// A scheduled goal continuation will start a turn: every settle report treats it as busy.
-	const goalTurnScheduled = () => goalController.continuationPending;
+	// A scheduled or held goal turn will start a turn: every settle report treats it as busy,
+	// and any report of "not settled" for that reason is later closed by `session_settled`.
+	const goalTurnScheduled = () => {
+		const pending = goalController.continuationPending;
+		if (pending) settleWatcher.markActive();
+		return pending;
+	};
 	const promptResults = new RpcPromptResults(session, output, goalTurnScheduled);
 	const sessionEvents = new RpcSessionEventForwarder(output);
 	const settleWatcher = new RpcSessionSettleWatcher(session, output, goalTurnScheduled);

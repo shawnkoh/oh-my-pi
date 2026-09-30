@@ -5,6 +5,11 @@ import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
 import { RpcGoalController, type RpcGoalSession } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-goal";
+import {
+	isRpcSessionSettled,
+	RpcSessionSettleWatcher,
+	type RpcSettleSession,
+} from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-session-settle";
 import type { RpcSessionState } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { GoalModeState } from "@oh-my-pi/pi-coding-agent/goals/state";
@@ -286,6 +291,8 @@ describe("RpcGoalController continuation gate", () => {
 			isStreaming: false,
 			hasAdmittedSubmission: false,
 			queuedMessageCount: 0,
+			hasPendingAsyncWork: () => false,
+			settleAsyncWork: async () => {},
 			getPlanModeState: () => undefined,
 			getGoalModeState: () => goalState,
 			setGoalModeState: (state: GoalModeState | undefined) => {
@@ -465,8 +472,9 @@ describe("RpcGoalController continuation gate", () => {
 		const current = session.getGoalModeState();
 		session.setGoalModeState(current && { ...current, enabled: false, mode: "exiting", reason: "completed" });
 		controller.observe(agentEnd);
-		await controller.settled();
+		// The switch commits before any queued exit work could run.
 		transcript.id = "t2";
+		await controller.settled();
 		await controller.endSessionChange();
 		expect(journal).toEqual(["t1:mode:none", "t1:goal-completed"]);
 	});
@@ -495,5 +503,33 @@ describe("RpcGoalController continuation gate", () => {
 		await controller.endSessionChange();
 		await nextMacrotask();
 		expect(admitted).toEqual(["goal-continuation"]);
+	});
+
+	test("a pending goal turn reported during a change is always closed by session_settled", async () => {
+		const frames: string[] = [];
+		const { session, controller, transcript } = fakeSession(async () => true);
+		session.setGoalModeState(undefined);
+		// Same wiring as rpc-mode: the probe marks the watcher active whenever it reports pending.
+		const ref: { watcher?: RpcSessionSettleWatcher } = {};
+		const probe = () => {
+			const pending = controller.continuationPending;
+			if (pending) ref.watcher?.markActive();
+			return pending;
+		};
+		const watcher = new RpcSessionSettleWatcher(
+			session as unknown as ConstructorParameters<typeof RpcSessionSettleWatcher>[0],
+			frame => frames.push(frame.type),
+			probe,
+		);
+		ref.watcher = watcher;
+		await controller.beginSessionChange();
+		await controller.handle({ op: "create", objective: "held during the change" });
+		expect(isRpcSessionSettled(session as unknown as RpcSettleSession, probe)).toBe(false);
+		// The change switches away, so the held turn is abandoned and nothing will run.
+		transcript.id = "t2";
+		await controller.endSessionChange();
+		await watcher.check();
+		expect(isRpcSessionSettled(session as unknown as RpcSettleSession, probe)).toBe(true);
+		expect(frames).toEqual(["session_settled"]);
 	});
 });

@@ -70,6 +70,14 @@ export class RpcSessionSettleWatcher {
 	}
 
 	/**
+	 * Record activity that no `agent_start` announces (for example a reported pending
+	 * goal turn), so the stretch it opens still ends with `session_settled`.
+	 */
+	markActive(): void {
+		this.#active = true;
+	}
+
+	/**
 	 * Settle the current stretch of activity if the session is quiet, waiting out
 	 * background work that will wake it. A live run is left alone: its own
 	 * terminal `agent_end` triggers the next check.
