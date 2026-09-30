@@ -132,7 +132,7 @@ import type { EvalPreludeDefinition } from "../eval/preludes";
 import type { PythonResult } from "../eval/py/executor";
 import { formatEvalStateContext } from "../eval/state";
 import { WorkPoolRegistry } from "../task/workpool";
-import type { BashPtyOptions, BashResult } from "../exec/bash-executor";
+import { type BashPtyOptions, type BashResult, retainedShellWorkCount } from "../exec/bash-executor";
 import type { TtsrManager } from "../export/ttsr";
 import type { LoadedCustomCommand } from "../extensibility/custom-commands";
 import type { CustomTool } from "../extensibility/custom-tools/types";
@@ -416,7 +416,24 @@ import { ToolChoiceQueue } from "./tool-choice-queue";
 import { planTurnPersistence, sameMessageContent, sessionMessagePersistenceKey } from "./turn-persistence";
 import { TurnRecovery, type TurnRecoveryHost } from "./turn-recovery";
 import { YieldQueue } from "./yield-queue";
-import { OwnedJobRegistry } from "./owned-job-registry";
+import { currentInvocation, OwnedJobRegistry } from "./owned-job-registry";
+import {
+	type AdmissionCloser,
+	AdmissionClosedError,
+	emptyWorkCounts,
+	hasOutstandingWork,
+	type QuiesceRequest,
+	type QuiesceResult,
+	type SessionIdentity,
+	type SessionWorkSource,
+	TERMINAL_ATTESTATION_VERSION,
+	type TerminalAttestation,
+	terminalAttestationPath,
+	WORK_ATTESTATION_VERSION,
+	type WorkAttestation,
+	type WorkCounts,
+	writeTerminalAttestationSync,
+} from "./quiescence";
 
 export * from "./agent-session-events";
 export * from "./agent-session-types";
@@ -667,6 +684,18 @@ export function powerAssertionOptions(mode: "off" | "idle" | "display" | "system
 		user: mode === "system",
 	};
 }
+
+/** Session events that mark new work starting; each advances {@link AgentSession.activityEpoch}. */
+const ACTIVITY_EVENT_TYPES: ReadonlySet<AgentSessionEvent["type"]> = new Set([
+	"agent_start",
+	"turn_start",
+	"tool_execution_start",
+	"auto_compaction_start",
+	"auto_retry_start",
+]);
+
+/** Signals that end the process from outside; teardown on these records a hang-up attestation first. */
+const HANGUP_REASONS: ReadonlySet<postmortem.Reason> = new Set([postmortem.Reason.SIGHUP, postmortem.Reason.SIGTERM]);
 
 export class AgentSession implements SettingsScope {
 	readonly agent: Agent;
@@ -959,6 +988,17 @@ export class AgentSession implements SettingsScope {
 	 *  incremented, so `isStreaming` alone cannot tell a host that a submission is admitted. */
 	#admittedSubmissionCount = 0;
 	#admittedSubmissionsSettled: PromiseWithResolvers<void> | undefined;
+	/** Set while input admission is closed. A refused quiesce reopens it before returning; a passed
+	 *  quiesce or a hang-up keeps it closed until the process exits. */
+	#admissionClosedBy: AdmissionCloser | undefined;
+	/** Monotonic activity counter; see {@link activityEpoch}. */
+	#activityEpoch = 0;
+	/** steer()/followUp()/queued sendUserMessage() calls still preprocessing before they reach a queue. */
+	#queuedInputsInFlight = 0;
+	readonly #workSources = new Set<SessionWorkSource>();
+	/** Highest quiesce attempt answered per operation id. */
+	readonly #answeredQuiesceAttempts = new Map<string, number>();
+	#terminalAttestation: TerminalAttestation | undefined;
 	/** Owned-job registry this session created (root sessions that own the async job manager). */
 	#ownedJobRegistry: OwnedJobRegistry | undefined;
 	#unobserveAsyncJobs: (() => void) | undefined;
@@ -1057,6 +1097,7 @@ export class AgentSession implements SettingsScope {
 
 	#beginInFlight(): void {
 		this.#promptInFlightCount++;
+		this.#activityEpoch++;
 		if (this.#promptInFlightCount === 1) {
 			this.#acquirePowerAssertion();
 		}
@@ -2005,6 +2046,9 @@ export class AgentSession implements SettingsScope {
 			},
 		});
 		this.#cancelExitRecorder = postmortem.register(`agent-session:${this.sessionManager.getSessionId()}`, reason => {
+			// Hosts whose own teardown runs first route the reason through beginDispose(); this
+			// covers hosts with no signal teardown of their own (RPC mode).
+			if (HANGUP_REASONS.has(reason)) this.captureHangup(reason);
 			this.#recordSessionExit(reason);
 		});
 		this.#cancelFatalRecoveryHint = postmortem.registerFatalRecoveryHint(() => {
@@ -2710,7 +2754,8 @@ export class AgentSession implements SettingsScope {
 		return this.#admittedSubmissionsSettled.promise;
 	}
 
-	async #admitSubmission<T>(work: () => Promise<T>): Promise<T> {
+	async #admitSubmission<T>(input: string, work: () => Promise<T>): Promise<T> {
+		this.#admitInput(input);
 		this.#admittedSubmissionCount++;
 		try {
 			return await work();
@@ -2723,15 +2768,278 @@ export class AgentSession implements SettingsScope {
 		}
 	}
 
+	/**
+	 * Admit a queued input (steer/follow-up) and count it until it reaches a queue or bails.
+	 * Returns `work()`'s own promise so callers observe the same settle timing as before.
+	 */
+	#admitQueuedInput<T>(input: string, work: () => Promise<T>): Promise<T> {
+		const refused = this.#refuseInput(input);
+		if (refused) return refused;
+		this.#queuedInputsInFlight++;
+		const pending = work();
+		const settle = (): void => {
+			this.#queuedInputsInFlight--;
+		};
+		void pending.then(settle, settle);
+		return pending;
+	}
+
+	/**
+	 * Admission gate for promise-returning entry points that must keep their existing settle
+	 * timing: a rejected promise while admission is closed, otherwise `undefined` (admitted).
+	 */
+	#refuseInput(input: string): Promise<never> | undefined {
+		if (this.#admissionClosedBy) return Promise.reject(new AdmissionClosedError(input, this.#admissionClosedBy));
+		this.#activityEpoch++;
+		return undefined;
+	}
+
+	// =========================================================================
+	// Quiescence: input admission, work counts, attestations
+	// =========================================================================
+
+	/** True while input admission is closed for exit (see {@link quiesceForExit}, {@link captureHangup}). */
+	isAdmissionClosed(): boolean {
+		return this.#admissionClosedBy !== undefined;
+	}
+
+	/**
+	 * Throw {@link AdmissionClosedError} while input admission is closed. Every path that hands
+	 * new input or work to this session calls this synchronously, before its first await.
+	 * Transports that hold input outside the session (external deliveries, host queues) must
+	 * call it before handing a record over, and report the rejection to the sender.
+	 */
+	assertAdmissionOpen(input: string): void {
+		if (this.#admissionClosedBy) throw new AdmissionClosedError(input, this.#admissionClosedBy);
+	}
+
+	#admitInput(input: string): void {
+		this.assertAdmissionOpen(input);
+		this.#activityEpoch++;
+	}
+
+	/**
+	 * Monotonic activity counter. It increases whenever input is admitted, a turn or tool
+	 * starts, a background job, shell run, owned process or subagent is registered, compaction
+	 * or a handoff starts, or a host reports activity through {@link noteActivity}. An
+	 * unchanged epoch between two observations means no new work began in between.
+	 */
+	get activityEpoch(): number {
+		return this.#activityEpoch;
+	}
+
+	/** Report host-owned activity (e.g. a scheduled goal continuation) that invalidates earlier attestations. */
+	noteActivity(): void {
+		this.#activityEpoch++;
+	}
+
+	/**
+	 * Register work the session cannot observe itself (host input queues, host timers, external
+	 * delivery records). `count()` must be synchronous. Returns an unregister function.
+	 */
+	registerWorkSource(source: SessionWorkSource): () => void {
+		this.#workSources.add(source);
+		return () => {
+			this.#workSources.delete(source);
+		};
+	}
+
 	/** Owned-job registry for this process: the one this session created, else the root session's. */
 	get ownedJobRegistry(): OwnedJobRegistry | undefined {
 		return this.#ownedJobRegistry ?? OwnedJobRegistry.instance();
+	}
+
+	/** The terminal attestation written by a passed quiesce or a hang-up capture, if any. */
+	get terminalAttestation(): TerminalAttestation | undefined {
+		return this.#terminalAttestation;
+	}
+
+	/** Synchronously count all outstanding work. Never awaits; safe to call with admission closed. */
+	getWorkCounts(): WorkCounts {
+		const counts = emptyWorkCounts();
+		counts.streaming = this.isStreaming || this.isBashRunning || this.isEvalRunning ? 1 : 0;
+		counts.queuedInput =
+			this.agent.peekSteeringQueue().length +
+			this.agent.peekFollowUpQueue().length +
+			this.#pendingNextTurnMessages.length +
+			this.#irc.pendingCount() +
+			this.yieldQueue.size() +
+			this.#admittedSubmissionCount +
+			this.#queuedInputsInFlight;
+		const manager = this.#asyncJobManager;
+		if (manager) {
+			// The session that owns the process-wide manager answers for every owner's jobs.
+			const filter = this.#ownedAsyncJobManager || !this.#agentId ? undefined : { ownerId: this.#agentId };
+			for (const job of manager.getRunningJobs(filter)) {
+				if (job.type === "task") counts.subagents++;
+				else counts.asyncJobs++;
+			}
+			const delivery = manager.getDeliveryState(filter);
+			counts.queuedInput += delivery.queued + (delivery.delivering ? 1 : 0);
+		}
+		counts.retainedJobs = retainedShellWorkCount();
+		counts.detachedJobs = this.ownedJobRegistry?.liveProcessCount() ?? 0;
+		counts.compacting = this.isCompacting ? 1 : 0;
+		counts.handoff = this.isGeneratingHandoff ? 1 : 0;
+		counts.scheduledTurns =
+			this.#postPromptTasks.size + (this.#activeAgentContinue ? 1 : 0) + (this.isRetrying ? 1 : 0);
+		for (const source of this.#workSources) counts[source.kind] += Math.max(0, source.count());
+		return counts;
+	}
+
+	/** Read-only snapshot of outstanding work, echoing the caller's operation id and nonce. */
+	attest(operationId: string, nonce: string): WorkAttestation {
+		const registry = this.ownedJobRegistry;
+		registry?.ensureHeader();
+		const epoch = this.#activityEpoch;
+		return {
+			version: WORK_ATTESTATION_VERSION,
+			operationId,
+			nonce,
+			epoch,
+			session: this.#sessionIdentity(),
+			invocation: currentInvocation(),
+			counts: this.getWorkCounts(),
+			admission: this.#admissionClosedBy ? "closed" : "open",
+			registry: {
+				path: registry?.path ?? null,
+				complete: registry !== undefined && registry.complete && registry.path !== null,
+			},
+			observedAt: new Date().toISOString(),
+		};
+	}
+
+	/**
+	 * Decide, synchronously and without awaiting, whether this session may exit now.
+	 *
+	 * Closes every input-admission path first, then requires: no outstanding work, the
+	 * caller's epoch still current, and the deadline not reached. On success it durably writes
+	 * the terminal attestation next to the session file and leaves admission closed; the host
+	 * must then exit. On refusal it reopens admission exactly as before and changes nothing
+	 * else — no work is cancelled. Each `(operationId, attempt)` is answered once; a repeated
+	 * or older attempt is refused without being evaluated.
+	 */
+	quiesceForExit(request: QuiesceRequest): QuiesceResult {
+		const { operationId, attempt } = request;
+		const refuse = (reason: Extract<QuiesceResult, { status: "refused" }>["reason"], counts = this.getWorkCounts()) =>
+			({
+				status: "refused",
+				operationId,
+				attempt,
+				reason,
+				snapshot: { epoch: this.#activityEpoch, counts, observedAt: new Date().toISOString() },
+			}) satisfies QuiesceResult;
+		if (
+			typeof operationId !== "string" ||
+			operationId.length === 0 ||
+			!Number.isSafeInteger(attempt) ||
+			attempt < 0 ||
+			!Number.isSafeInteger(request.epoch) ||
+			!Number.isFinite(request.deadline)
+		) {
+			return refuse("invalid_request");
+		}
+		const answered = this.#answeredQuiesceAttempts.get(operationId);
+		if (answered !== undefined && attempt <= answered) {
+			return refuse(attempt === answered ? "duplicate_attempt" : "stale_attempt");
+		}
+		this.#answeredQuiesceAttempts.set(operationId, attempt);
+		if (this.#admissionClosedBy || this.#isDisposed) return refuse("admission_closed");
+
+		// Close admission before looking at anything. Nothing below awaits, so no input can
+		// interleave; a refusal reopens before returning.
+		this.#admissionClosedBy = "quiesce";
+		const epoch = this.#activityEpoch;
+		const counts = this.getWorkCounts();
+		const sessionFile = this.sessionManager.getSessionFile();
+		let reason: Extract<QuiesceResult, { status: "refused" }>["reason"] | undefined;
+		if (Date.now() >= request.deadline) reason = "deadline_expired";
+		else if (epoch !== request.epoch) reason = "epoch_mismatch";
+		else if (hasOutstandingWork(counts)) reason = "work_active";
+		else if (!sessionFile) reason = "attestation_unavailable";
+		if (reason || !sessionFile) {
+			this.#admissionClosedBy = undefined;
+			return refuse(reason ?? "attestation_unavailable", counts);
+		}
+
+		const registry = this.ownedJobRegistry;
+		registry?.ensureHeader();
+		const attestation: TerminalAttestation = {
+			version: TERMINAL_ATTESTATION_VERSION,
+			kind: "quiesce",
+			operationId,
+			attempt,
+			session: this.#sessionIdentity(),
+			invocation: currentInvocation(),
+			epoch,
+			counts,
+			interrupted: false,
+			registryComplete: registry !== undefined && registry.complete && registry.path !== null,
+			registryPath: registry?.path ?? null,
+			writtenAt: new Date().toISOString(),
+		};
+		const file = terminalAttestationPath(sessionFile);
+		try {
+			writeTerminalAttestationSync(file, attestation);
+		} catch (error) {
+			logger.warn("Failed to write terminal attestation", { file, error: String(error) });
+			this.#admissionClosedBy = undefined;
+			return refuse("attestation_unavailable", counts);
+		}
+		this.#terminalAttestation = attestation;
+		return { status: "quiesced", operationId, attempt, attestation, path: file };
+	}
+
+	/**
+	 * Hang-up capture: close admission and record the work that was outstanding *before* any
+	 * teardown clears queues, aborts the turn or cancels jobs. Writes a `hangup` terminal
+	 * attestation with `interrupted: true` when anything was outstanding. Idempotent; a no-op
+	 * after a passed quiesce (its attestation already describes this exit) or once disposal began.
+	 */
+	captureHangup(signal: string): TerminalAttestation | undefined {
+		if (this.#terminalAttestation) return this.#terminalAttestation;
+		if (this.#isDisposed) return undefined;
+		this.#admissionClosedBy = "hangup";
+		const counts = this.getWorkCounts();
+		const registry = this.ownedJobRegistry;
+		registry?.ensureHeader();
+		const attestation: TerminalAttestation = {
+			version: TERMINAL_ATTESTATION_VERSION,
+			kind: "hangup",
+			session: this.#sessionIdentity(),
+			invocation: currentInvocation(),
+			epoch: this.#activityEpoch,
+			counts,
+			interrupted: hasOutstandingWork(counts),
+			registryComplete: registry !== undefined && registry.complete && registry.path !== null,
+			registryPath: registry?.path ?? null,
+			signal,
+			writtenAt: new Date().toISOString(),
+		};
+		this.#terminalAttestation = attestation;
+		const sessionFile = this.sessionManager.getSessionFile();
+		if (sessionFile) {
+			const file = terminalAttestationPath(sessionFile);
+			try {
+				writeTerminalAttestationSync(file, attestation);
+			} catch (error) {
+				logger.warn("Failed to write hang-up attestation", { file, error: String(error) });
+			}
+		}
+		return attestation;
+	}
+
+	#sessionIdentity(): SessionIdentity {
+		return { id: this.sessionManager.getSessionId(), file: this.sessionManager.getSessionFile() ?? null };
 	}
 
 	#initOwnedJobRegistry(manager: AsyncJobManager): void {
 		const registry = new OwnedJobRegistry({
 			getSessionFile: () => this.sessionManager.getSessionFile(),
 			getSessionId: () => this.sessionManager.getSessionId(),
+			onRegister: () => {
+				this.#activityEpoch++;
+			},
 		});
 		this.#ownedJobRegistry = registry;
 		OwnedJobRegistry.setInstance(registry);
@@ -2884,6 +3192,7 @@ export class AgentSession implements SettingsScope {
 
 	/** Emit an event to all listeners */
 	#emit(event: AgentSessionEvent): void {
+		if (ACTIVITY_EVENT_TYPES.has(event.type)) this.#activityEpoch++;
 		// Copy array before iteration to avoid mutation during iteration.
 		const listeners = [...this.#eventListeners];
 		for (const l of listeners) {
@@ -5206,8 +5515,13 @@ export class AgentSession implements SettingsScope {
 	 * Wrappers that await other teardown before delegating to `dispose()` MUST
 	 * call this before their first await — otherwise work started in that async
 	 * gap slips past the disposal guards.
+	 *
+	 * `reason` is the postmortem reason when a signal triggered the teardown. A
+	 * hang-up (SIGHUP/SIGTERM) first runs {@link captureHangup}, so the recorded
+	 * work counts predate every queue clear, abort and cancellation below.
 	 */
-	beginDispose(): void {
+	beginDispose(reason?: postmortem.Reason): void {
+		if (reason && HANGUP_REASONS.has(reason)) this.captureHangup(reason);
 		this.#isDisposed = true;
 		for (const dispose of this.#disposers.splice(0)) dispose();
 		this.#modelDiscoveryAbortController.abort();
@@ -5374,7 +5688,7 @@ export class AgentSession implements SettingsScope {
 	}
 
 	async #doDispose(options: AgentSessionDisposeOptions = {}): Promise<void> {
-		this.beginDispose();
+		this.beginDispose(options.reason);
 		// Stop cache warming before the drain windows below: an armed tick firing
 		// mid-dispose would issue a paid warm request and persist usage into the
 		// closing session writer.
@@ -6194,6 +6508,8 @@ export class AgentSession implements SettingsScope {
 
 	/** Compact the active session history. */
 	compact(customInstructions?: string, options?: CompactOptions): Promise<CompactionResult> {
+		const refused = this.#refuseInput("compact");
+		if (refused) return refused;
 		return this.#maintenance.compact(customInstructions, options);
 	}
 
@@ -6898,7 +7214,7 @@ export class AgentSession implements SettingsScope {
 	 * {@link PromptDroppedError} instead.
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<boolean> {
-		return this.#admitSubmission(() => this.#prompt(text, options));
+		return this.#admitSubmission("prompt", () => this.#prompt(text, options));
 	}
 
 	async #prompt(text: string, options?: PromptOptions): Promise<boolean> {
@@ -7147,7 +7463,7 @@ export class AgentSession implements SettingsScope {
 			queueOnly?: boolean;
 		},
 	): Promise<boolean> {
-		return this.#admitSubmission(() => this.#promptCustomMessage(message, options));
+		return this.#admitSubmission("prompt", () => this.#promptCustomMessage(message, options));
 	}
 
 	async #promptCustomMessage<T = unknown>(
@@ -7803,7 +8119,11 @@ export class AgentSession implements SettingsScope {
 	/**
 	 * Queue a steering message to interrupt the agent mid-run.
 	 */
-	async steer(text: string, images?: ImageContent[], options?: SteerOptions): Promise<void> {
+	steer(text: string, images?: ImageContent[], options?: SteerOptions): Promise<void> {
+		return this.#admitQueuedInput("steer", () => this.#steer(text, images, options));
+	}
+
+	async #steer(text: string, images?: ImageContent[], options?: SteerOptions): Promise<void> {
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
@@ -7826,7 +8146,11 @@ export class AgentSession implements SettingsScope {
 	 * uses this to land its execution directive behind a queued user turn without
 	 * flipping advisor auto-resume.
 	 */
-	async followUp(text: string, images?: ImageContent[], options?: FollowUpOptions): Promise<void> {
+	followUp(text: string, images?: ImageContent[], options?: FollowUpOptions): Promise<void> {
+		return this.#admitQueuedInput("follow-up", () => this.#followUp(text, images, options));
+	}
+
+	async #followUp(text: string, images?: ImageContent[], options?: FollowUpOptions): Promise<void> {
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
@@ -8067,11 +8391,15 @@ export class AgentSession implements SettingsScope {
 	}
 
 	queueDeferredMessage(message: CustomMessage): void {
+		this.#admitInput("deferred message");
 		this.#queueHiddenNextTurnMessage(message, true);
 	}
 
 	queueLaunchCompletion(notification: DaemonCompletionNotification): Promise<void> {
 		if (this.#isDisposed) return Promise.reject(new Error("Session disposed before launch completion delivery"));
+		// Rejecting leaves the completion pending with the broker instead of losing it.
+		const refused = this.#refuseInput("launch completion");
+		if (refused) return refused;
 		const delivered = this.yieldQueue.enqueueWithReceipt<LaunchCompletionEntry>(
 			LAUNCH_COMPLETION_MESSAGE_TYPE,
 			notification,
@@ -8288,7 +8616,7 @@ export class AgentSession implements SettingsScope {
 			acceptTerminalEmptyStop?: boolean;
 		},
 	): Promise<boolean> {
-		return this.#admitSubmission(() => this.#sendCustomMessage(message, options));
+		return this.#admitSubmission("custom message", () => this.#sendCustomMessage(message, options));
 	}
 
 	async #sendCustomMessage<T = unknown>(
@@ -8473,7 +8801,11 @@ export class AgentSession implements SettingsScope {
 	 * Explicit `deliverAs` queues without starting a turn in either state; `aside` at
 	 * an idle session instead starts a turn, since there is no live run to inject into.
 	 */
-	async sendUserMessage(
+	sendUserMessage(content: string | (TextContent | ImageContent)[], options?: SendUserMessageOptions): Promise<void> {
+		return this.#admitQueuedInput("user message", () => this.#sendUserMessage(content, options));
+	}
+
+	async #sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
 		options?: SendUserMessageOptions,
 	): Promise<void> {
@@ -9664,6 +9996,8 @@ export class AgentSession implements SettingsScope {
 	 * @returns The handoff document text, or undefined if cancelled/failed
 	 */
 	handoff(customInstructions?: string, options?: SessionHandoffOptions): Promise<HandoffResult | undefined> {
+		const refused = this.#refuseInput("handoff");
+		if (refused) return refused;
 		return this.#maintenance.handoff(customInstructions, options);
 	}
 
@@ -10124,6 +10458,8 @@ export class AgentSession implements SettingsScope {
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean; useUserShell?: boolean; pty?: BashPtyOptions },
 	): Promise<BashResult> {
+		const refused = this.#refuseInput("bash");
+		if (refused) return refused;
 		return this.#bash.executeBash(command, onChunk, options);
 	}
 
@@ -10163,6 +10499,8 @@ export class AgentSession implements SettingsScope {
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean },
 	): Promise<PythonResult> {
+		const refused = this.#refuseInput("python");
+		if (refused) return refused;
 		// Kernel code can start processes the owned-job registry never sees.
 		this.ownedJobRegistry?.markIncomplete("eval code can start untracked processes");
 		return this.#eval.executePython(code, onChunk, options);
@@ -10218,6 +10556,8 @@ export class AgentSession implements SettingsScope {
 
 	/** Delivers an IRC message into this recipient session. */
 	deliverIrcMessage(msg: IrcMessage): Promise<"injected" | "woken"> {
+		// A rejected hand-off is buffered in the recipient's inbox by the bus, not lost.
+		this.#admitInput("irc message");
 		return this.#irc.deliver(msg);
 	}
 

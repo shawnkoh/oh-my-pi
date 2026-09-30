@@ -102,6 +102,13 @@ export class YieldQueue {
 		return false;
 	}
 
+	/** Number of queued entries across every kind. */
+	size(): number {
+		let total = 0;
+		for (const entries of this.#entries.values()) total += entries.length;
+		return total;
+	}
+
 	/** Arrange an idle flush for entries queued near the end of a streaming run. */
 	requestIdleFlush(): void {
 		for (const [kind, dispatcher] of this.#dispatchers) {

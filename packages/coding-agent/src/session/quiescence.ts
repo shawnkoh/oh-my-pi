@@ -1,0 +1,220 @@
+/**
+ * Input admission, work attestation and terminal attestation for an
+ * {@link AgentSession}.
+ *
+ * A supervisor that wants to stop an agent without interrupting work needs a
+ * decision that cannot race new input: the session closes every admission
+ * path, counts all outstanding work, and either records a durable terminal
+ * attestation (then the host exits) or reopens admission unchanged. Every
+ * step of that decision is synchronous, so no input can interleave with it.
+ */
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { fsyncDirectory, type InvocationIdentity, stripJsonl } from "./owned-job-registry";
+
+/** Capability: `attest` + `quiesce_and_exit` with a terminal attestation file. */
+export const QUIESCE_EXIT_CAPABILITY = "quiesce-exit/1";
+/** Capability: durable owned-job registry next to the session file. */
+export const OWNED_JOBS_CAPABILITY = "owned-jobs/1";
+/** Capabilities advertised by hosts that wire quiesce-and-exit (RPC `get_state`, extension `ctx.capabilities`). */
+export const SESSION_CAPABILITIES: readonly string[] = Object.freeze([QUIESCE_EXIT_CAPABILITY, OWNED_JOBS_CAPABILITY]);
+
+export const TERMINAL_ATTESTATION_VERSION = 1;
+export const WORK_ATTESTATION_VERSION = 1;
+
+/** Why admission is closed. Admission closes only on the way out of the process. */
+export type AdmissionCloser = "quiesce" | "hangup";
+
+/** Thrown by every input-admission path while the session is closing for exit. */
+export class AdmissionClosedError extends Error {
+	readonly code = "admission_closed";
+	constructor(
+		readonly input: string,
+		readonly closedBy: AdmissionCloser,
+	) {
+		super(`Session is exiting (${closedBy}); ${input} was not accepted`);
+		this.name = "AdmissionClosedError";
+	}
+}
+
+/**
+ * Outstanding work, counted synchronously. Every field is a count; flags are
+ * 0 or 1. Any non-zero field means the session is not quiescent.
+ */
+export interface WorkCounts {
+	/** 1 while a turn is streaming or a prompt is in flight. */
+	streaming: number;
+	/** Input accepted but not yet consumed: steering/follow-up/next-turn queues, IRC records,
+	 *  queued async results and launch completions, admitted submissions still preprocessing,
+	 *  and host-registered sources (e.g. RPC commands read but not yet dispatched). */
+	queuedInput: number;
+	/** Running or queued background jobs other than subagents (async bash, eval, …). */
+	asyncJobs: number;
+	/** Running or queued subagent (task) jobs. */
+	subagents: number;
+	/** Shells kept alive because background jobs they started are still running. */
+	retainedJobs: number;
+	/** Registered owned processes (background/detached/service) still alive. */
+	detachedJobs: number;
+	/** 1 while compaction runs. */
+	compacting: number;
+	/** 1 while a handoff is being generated. */
+	handoff: number;
+	/** 1 while a goal continuation turn is scheduled. */
+	goalContinuationScheduled: number;
+	/** Continuations the session scheduled for itself (retries, compaction continuation, reminders). */
+	scheduledTurns: number;
+}
+
+export const WORK_COUNT_KEYS = [
+	"streaming",
+	"queuedInput",
+	"asyncJobs",
+	"subagents",
+	"retainedJobs",
+	"detachedJobs",
+	"compacting",
+	"handoff",
+	"goalContinuationScheduled",
+	"scheduledTurns",
+] as const satisfies readonly (keyof WorkCounts)[];
+
+export type WorkCountKind = keyof WorkCounts;
+
+/** Host-provided work that the session cannot see itself (see {@link AgentSession.registerWorkSource}). */
+export interface SessionWorkSource {
+	kind: WorkCountKind;
+	/** Synchronous count; must never await. */
+	count(): number;
+}
+
+export function emptyWorkCounts(): WorkCounts {
+	return {
+		streaming: 0,
+		queuedInput: 0,
+		asyncJobs: 0,
+		subagents: 0,
+		retainedJobs: 0,
+		detachedJobs: 0,
+		compacting: 0,
+		handoff: 0,
+		goalContinuationScheduled: 0,
+		scheduledTurns: 0,
+	};
+}
+
+export function hasOutstandingWork(counts: WorkCounts): boolean {
+	return WORK_COUNT_KEYS.some(key => counts[key] > 0);
+}
+
+export interface SessionIdentity {
+	id: string;
+	/** Session JSONL path, or `null` for a non-persistent session. */
+	file: string | null;
+}
+
+export interface OwnedJobRegistryState {
+	/** Registry JSONL path, or `null` when the session has no registry. */
+	path: string | null;
+	/** False when some owned process may be missing from the registry. */
+	complete: boolean;
+}
+
+/** Read-only snapshot answering an `attest` request. */
+export interface WorkAttestation {
+	version: typeof WORK_ATTESTATION_VERSION;
+	operationId: string;
+	nonce: string;
+	/** Monotonic activity epoch; changes whenever work starts or input is admitted. */
+	epoch: number;
+	session: SessionIdentity;
+	invocation: InvocationIdentity;
+	counts: WorkCounts;
+	admission: "open" | "closed";
+	registry: OwnedJobRegistryState;
+	/** ISO-8601 timestamp. */
+	observedAt: string;
+}
+
+export interface QuiesceRequest {
+	operationId: string;
+	/** Non-negative integer; each new attempt for an operation must use a higher number. */
+	attempt: number;
+	/** The epoch from the attestation the caller based its decision on. */
+	epoch: number;
+	/** Absolute deadline, Unix epoch milliseconds. The attempt never executes at or after it. */
+	deadline: number;
+}
+
+export type QuiesceRefusalReason =
+	| "invalid_request"
+	| "duplicate_attempt"
+	| "stale_attempt"
+	| "admission_closed"
+	| "deadline_expired"
+	| "epoch_mismatch"
+	| "work_active"
+	| "attestation_unavailable";
+
+export interface TerminalAttestation {
+	version: typeof TERMINAL_ATTESTATION_VERSION;
+	kind: "quiesce" | "hangup";
+	operationId?: string;
+	attempt?: number;
+	session: SessionIdentity;
+	invocation: InvocationIdentity;
+	epoch: number;
+	/** Counts captured with admission closed, before any teardown. */
+	counts: WorkCounts;
+	/** True when any work was outstanding at capture (always false for `quiesce`). */
+	interrupted: boolean;
+	registryComplete: boolean;
+	registryPath: string | null;
+	/** Signal that triggered a `hangup` capture. */
+	signal?: string;
+	/** ISO-8601 timestamp. */
+	writtenAt: string;
+}
+
+export type QuiesceResult =
+	| {
+			status: "quiesced";
+			operationId: string;
+			attempt: number;
+			attestation: TerminalAttestation;
+			/** Where the attestation was written. */
+			path: string;
+	  }
+	| {
+			status: "refused";
+			operationId: string;
+			attempt: number;
+			reason: QuiesceRefusalReason;
+			/** Work observed while deciding (admission was closed at that instant). */
+			snapshot: { epoch: number; counts: WorkCounts; observedAt: string };
+	  };
+
+/** `<session file without .jsonl>.terminal.json` */
+export function terminalAttestationPath(sessionFile: string): string {
+	return `${stripJsonl(sessionFile)}.terminal.json`;
+}
+
+/**
+ * Durably publish `attestation` at `file`: write a sibling temp file, fsync it,
+ * rename over the target, then fsync the directory. Synchronous on purpose —
+ * the quiesce decision must complete before the event loop can admit input.
+ */
+export function writeTerminalAttestationSync(file: string, attestation: TerminalAttestation): void {
+	const dir = path.dirname(file);
+	fs.mkdirSync(dir, { recursive: true });
+	const temp = `${file}.${process.pid}.tmp`;
+	const fd = fs.openSync(temp, "w", 0o600);
+	try {
+		fs.writeSync(fd, `${JSON.stringify(attestation, null, 2)}\n`);
+		fs.fsyncSync(fd);
+	} finally {
+		fs.closeSync(fd);
+	}
+	fs.renameSync(temp, file);
+	fsyncDirectory(dir);
+}
