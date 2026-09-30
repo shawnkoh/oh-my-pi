@@ -4296,6 +4296,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 							});
 							pendingExtensionMessages.push(sendPromise);
 						},
+						deliverMessage: (record, options) => session.deliverExternalMessage(record, options),
 						appendEntry: (customType, data) => {
 							session.sessionManager.appendCustomEntry(customType, data);
 						},
