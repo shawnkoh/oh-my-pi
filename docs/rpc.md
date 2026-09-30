@@ -813,6 +813,21 @@ Use `--mode rpc --no-ui` for a host without a tool UI surface; use `--mode rpc-u
     description, emits a positionally aligned
     `optionDetails: Array<{ description?: string }>` array. Hosts that do not
     render descriptions can continue using `options` alone.
+  - A tool-approval `select` (`options: ["Approve", "Deny"]`) also carries
+    `approval: { toolCallId, toolName, arguments, reason? }` (capability
+    `tool-approval-binding/1`): the native call id and the arguments the
+    approval policy evaluated. Those are the tool's arguments, except for
+    provider computer-use calls, where they are the provider's `{ actions }`.
+    Eval prelude approvals carry the same binding with the enclosing eval
+    call's `toolCallId`, so several approvals can share one id; `(toolCallId,
+    toolName)` identifies the decision. Hosts should bind their answer to that
+    call, not to the title. An interrupt sends `cancel` for the pending dialog.
+    An answer that arrives after the call was aborted never runs it.
+  - Under protocol v1, a frame over 1 MiB is shrunk: long strings end in
+    `…[N chars elided for RPC frame]`, so large `arguments` are not exact.
+    Hosts that need exact arguments for review should negotiate protocol v2.
+    Otherwise, treat a binding that contains an elision marker as not
+    reviewable.
 - `notify`, `setStatus`, `setWidget`, `setTitle`, `set_editor_text`
 - `open_url` (emitted by RPC login flows)
 
