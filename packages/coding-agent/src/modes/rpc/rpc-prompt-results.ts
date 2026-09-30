@@ -12,19 +12,39 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { stripRawHttpRequestDiagnostics } from "@oh-my-pi/pi-ai/utils/http-inspector";
-import type { AgentSessionEvent } from "../../session/agent-session";
+import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
 import { isRpcSessionSettled, type RpcScheduledTurnProbe, type RpcSettleSession } from "./rpc-session-settle";
 import type { RpcPromptError, RpcPromptResultFrame, RpcPromptStatus } from "./rpc-types";
 
 /** A prompt accepted by RPC mode whose `prompt_result` is still owed; see {@link RpcPromptResults.begin}. */
 export interface RpcPromptTicket {
 	readonly id: string | undefined;
+	/** Exact user text of a literal prompt, used to find its persisted message; undefined when parsing may rewrite it. */
+	readonly text?: string;
 }
 
 interface RunOutcome {
 	status: RpcPromptStatus;
 	error?: RpcPromptError;
+	/** Engine-local ordinal of the run whose yield answered the prompt; shared by prompts answered together. */
+	run?: number;
+	/** This prompt's entries in that run, resolved at the yield; present whenever `run` is. */
+	attribution?: Attribution;
 }
+
+/** A prompt's own persisted user entry and the assistant entries that answered it. */
+interface Attribution {
+	prompt?: string;
+	reply: string[];
+}
+
+/** Message entries a run persisted on the branch, from its first `agent_start` to its yield. */
+type RunSegment = ReadonlyArray<{ id: string; role: string; text?: string }>;
+
+/** Session surface the reporter reads: settle state plus the persisted branch. */
+export type RpcPromptResultSession = RpcSettleSession & {
+	readonly sessionManager: Pick<AgentSession["sessionManager"], "getLeafId" | "getBranch" | "getSessionId">;
+};
 
 interface OpenPrompt {
 	/** `agent_start` count at acceptance; a later start begins a run this prompt may own. */
@@ -51,17 +71,21 @@ interface OpenPrompt {
  */
 export class RpcPromptResults {
 	#agentStarts = 0;
+	/** Runs counted from the first `agent_start` after a yield; retries and continuations stay in the same run. */
+	#runs = 0;
+	#betweenRuns = true;
+	#runStart: { leaf: string | null; sessionId: string } | undefined;
 	#open = new Map<RpcPromptTicket, OpenPrompt>();
-	readonly #session: RpcSettleSession;
+	readonly #session: RpcPromptResultSession;
 	readonly #output: (frame: RpcPromptResultFrame) => void;
 	readonly #scheduledTurn: RpcScheduledTurnProbe | undefined;
 
 	/**
-	 * @param session read for queue state and, at report time, the `sessionSettled` predicate.
+	 * @param session read for queue state, persisted entry ids and, at report time, the `sessionSettled` predicate.
 	 * @param scheduledTurn reports a host-scheduled turn not yet admitted (not settled).
 	 */
 	constructor(
-		session: RpcSettleSession,
+		session: RpcPromptResultSession,
 		output: (frame: RpcPromptResultFrame) => void,
 		scheduledTurn?: RpcScheduledTurnProbe,
 	) {
@@ -71,8 +95,8 @@ export class RpcPromptResults {
 	}
 
 	/** Open a ticket before the prompt starts any work. Close it with exactly one report or {@link discard}. */
-	begin(id: string | undefined): RpcPromptTicket {
-		const ticket: RpcPromptTicket = { id };
+	begin(id: string | undefined, literalText?: string): RpcPromptTicket {
+		const ticket: RpcPromptTicket = literalText === undefined ? { id } : { id, text: literalText };
 		this.#open.set(ticket, { startsAtBegin: this.#agentStarts, waiting: false });
 		return ticket;
 	}
@@ -116,6 +140,9 @@ export class RpcPromptResults {
 	 * publishes a terminal `agent_end` for them.
 	 */
 	abortOpen(): void {
+		// The detached run never yields; the next start begins a new run in the new session.
+		this.#betweenRuns = true;
+		this.#runStart = undefined;
 		for (const [ticket, open] of this.#open) {
 			if (open.waiting) this.#report(ticket, true, { status: "aborted" });
 			else open.ownOutcome ??= { status: "aborted" };
@@ -126,21 +153,67 @@ export class RpcPromptResults {
 	observe(event: AgentSessionEvent): void {
 		if (event.type === "agent_start") {
 			this.#agentStarts++;
+			if (this.#betweenRuns) {
+				this.#betweenRuns = false;
+				this.#runs++;
+				const manager = this.#session.sessionManager;
+				this.#runStart = { leaf: manager.getLeafId(), sessionId: manager.getSessionId() };
+			}
 			return;
 		}
-		if (event.type !== "agent_end" || this.#open.size === 0) return;
+		if (event.type !== "agent_end") return;
 		// Older sessions omit `yielded`; only their terminal ends were yields.
 		if (!(event.yielded ?? event.isTerminal !== false)) return;
+		// An end with no start since the last yield belongs to no run this engine counted.
+		const inRun = !this.#betweenRuns;
+		this.#betweenRuns = true;
+		if (this.#open.size === 0) return;
 		const outcome = runOutcome(event.messages);
 		// A still-queued steer/follow-up has not been read by the agent yet.
 		const queueDrained = this.#session.queuedMessageCount === 0;
+		// Every prompt this yield answers, in acceptance order: those waiting on it
+		// report now, a prompt whose own run this was reports when it settles.
+		const answered: Array<[RpcPromptTicket, OpenPrompt]> = [];
 		for (const [ticket, open] of this.#open) {
-			if (open.waiting) {
-				if (queueDrained) this.#report(ticket, true, outcome);
-			} else if (!open.ownOutcome && this.#agentStarts > open.startsAtBegin) {
-				open.ownOutcome = outcome;
+			if (open.waiting ? queueDrained : !open.ownOutcome && this.#agentStarts > open.startsAtBegin) {
+				answered.push([ticket, open]);
 			}
 		}
+		// Attribution is resolved once for all of them, before any report.
+		const attributions = inRun
+			? attribute(
+					answered.map(([ticket]) => ticket),
+					this.#segment(),
+				)
+			: undefined;
+		for (const [index, [ticket, open]] of answered.entries()) {
+			const own: RunOutcome = attributions
+				? { ...outcome, run: this.#runs, attribution: attributions[index] }
+				: outcome;
+			if (open.waiting) this.#report(ticket, true, own);
+			else open.ownOutcome = own;
+		}
+	}
+
+	/**
+	 * Snapshot, at the yield, of the message entries the run persisted: those
+	 * after its start leaf on the current branch of the same session. A session
+	 * switch or a branch that no longer holds the start leaf yields nothing.
+	 */
+	#segment(): RunSegment | undefined {
+		const start = this.#runStart;
+		const manager = this.#session.sessionManager;
+		if (!start || manager.getSessionId() !== start.sessionId) return undefined;
+		const branch = manager.getBranch();
+		const from = start.leaf === null ? 0 : branch.findIndex(entry => entry.id === start.leaf) + 1;
+		if (from === 0 && start.leaf !== null) return undefined;
+		const entries = branch.slice(from).flatMap(entry => {
+			if (entry.type !== "message") return [];
+			const message = entry.message;
+			if (message.role === "user") return [{ id: entry.id, role: "user", text: userText(message.content) }];
+			return message.role === "assistant" ? [{ id: entry.id, role: "assistant" }] : [];
+		});
+		return entries;
 	}
 
 	#report(ticket: RpcPromptTicket, agentInvoked: boolean, outcome: RunOutcome): void {
@@ -158,9 +231,52 @@ export class RpcPromptResults {
 				sessionSettled: isRpcSessionSettled(this.#session, this.#scheduledTurn),
 			};
 			if (outcome.error) frame.error = outcome.error;
+			if (outcome.run !== undefined) {
+				frame.run = outcome.run;
+				if (outcome.attribution?.prompt) frame.promptEntryId = outcome.attribution.prompt;
+				frame.replyEntryIds = outcome.attribution?.reply ?? [];
+			}
 			this.#output(frame);
 		});
 	}
+}
+
+/**
+ * Each answered prompt's own user entry and the assistant entries after it up
+ * to the next user entry. A literal prompt is identified by its exact text
+ * only when no other prompt answered by this yield has the same text and one
+ * user entry carries it: a steer can overtake an earlier follow-up, so
+ * acceptance order is not delivery order. A parsed prompt is identified only
+ * when it is the sole prompt answered and the run delivered one user message.
+ * Anything else is claimed as nothing, never guessed.
+ */
+function attribute(tickets: readonly RpcPromptTicket[], segment: RunSegment | undefined): Attribution[] {
+	if (!segment) return tickets.map(() => ({ reply: [] }));
+	const users = segment.filter(entry => entry.role === "user");
+	const count = <T>(values: T[], value: T) => values.filter(candidate => candidate === value).length;
+	const texts = tickets.map(ticket => ticket.text);
+	return tickets.map(ticket => {
+		let own: (typeof segment)[number] | undefined;
+		if (ticket.text !== undefined) {
+			const matches = users.filter(entry => entry.text === ticket.text);
+			if (count(texts, ticket.text) === 1 && matches.length === 1) own = matches[0];
+		} else if (tickets.length === 1 && users.length === 1) {
+			own = users[0];
+		}
+		if (!own) return { reply: [] };
+		const reply: string[] = [];
+		for (const entry of segment.slice(segment.indexOf(own) + 1)) {
+			if (entry.role === "user") break;
+			reply.push(entry.id);
+		}
+		return { prompt: own.id, reply };
+	});
+}
+
+function userText(content: string | ReadonlyArray<{ type: string; text?: string }>): string {
+	return typeof content === "string"
+		? content
+		: content.map(part => (part.type === "text" ? (part.text ?? "") : "")).join("");
 }
 
 /** Outcome of a run, read from its final assistant message. */

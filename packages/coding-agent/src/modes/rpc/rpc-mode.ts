@@ -14,7 +14,13 @@
 import * as path from "node:path";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
+import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
+import type {
+	ExtensionAskDialogQuestion,
+	ExtensionAskDialogResult,
+	ExtensionAskDialogResultItem,
+} from "@oh-my-pi/pi-tui/overlays/ask-dialog";
 import { $env, isRecord, logger, Snowflake } from "@oh-my-pi/pi-utils";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
@@ -61,6 +67,7 @@ import {
 import { RpcSessionEventForwarder } from "./rpc-session-events";
 import { isRpcSessionSettled, RpcSessionSettleWatcher, watchedScheduledTurnProbe } from "./rpc-session-settle";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
+import { RICH_ASK_CAPABILITY, RPC_ENGINE_CAPABILITIES } from "./rpc-types";
 import type {
 	RpcCommand,
 	RpcDeliveryEventFrame,
@@ -596,10 +603,156 @@ export function requestRpcSelect(
 			title,
 			options: labels,
 			...(optionDetails ? { optionDetails } : {}),
+			...(dialogOptions?.approval ? { approval: dialogOptions.approval } : {}),
 			timeout: dialogOptions?.timeout,
 		},
 		response => parseValueDialogResponse(response, dialogOptions),
 	);
+}
+
+/**
+ * Sends the complete rich ask (`method: "ask"`, capability `rich-ask/1`) and
+ * resolves the host's answers. Question text, option labels and `multi` come
+ * from the engine, never from the reply; a malformed reply resolves as
+ * cancellation rather than a partially trusted answer.
+ */
+export function requestRpcAskDialog(
+	pendingRequests: Map<string, PendingExtensionRequest>,
+	output: RpcOutput,
+	questions: ExtensionAskDialogQuestion[],
+	dialogOptions?: ExtensionUIDialogOptions,
+): Promise<ExtensionAskDialogResult | undefined> {
+	// The engine owns the timeout: like the terminal dialog, it auto-selects each
+	// question's recommended (or first) option instead of cancelling the turn.
+	let timedOut = false;
+	const options: ExtensionUIDialogOptions | undefined =
+		dialogOptions?.timeout === undefined
+			? dialogOptions
+			: {
+					...dialogOptions,
+					onTimeout: () => {
+						timedOut = true;
+						dialogOptions.onTimeout?.();
+					},
+				};
+	return requestRpcDialog<ExtensionAskDialogResult | undefined>(
+		pendingRequests,
+		output,
+		options,
+		undefined,
+		{
+			method: "ask",
+			questions: questions.map(question => ({
+				id: question.id,
+				question: question.question,
+				...(question.header ? { header: question.header } : {}),
+				options: question.options.map(option => ({
+					label: option.label,
+					...(option.description ? { description: option.description } : {}),
+					...(option.preview ? { preview: option.preview } : {}),
+				})),
+				multi: question.multi === true,
+				...(question.recommended !== undefined ? { recommended: question.recommended } : {}),
+			})),
+			acceptImages: dialogOptions?.acceptImages === true,
+			timeout: dialogOptions?.timeout,
+		},
+		response => {
+			const result = parseRpcAskResponse(response, questions, dialogOptions);
+			if (result === undefined && !("cancelled" in response && response.cancelled))
+				logger.warn("RPC ask reply did not match the asked questions; treated as cancellation", {
+					id: response.id,
+				});
+			return result;
+		},
+	).then(result => (timedOut ? timedOutAskResult(questions) : result));
+}
+
+function timedOutAskResult(questions: readonly ExtensionAskDialogQuestion[]): ExtensionAskDialogResult {
+	return {
+		kind: "submit",
+		results: questions.map(question => {
+			const labels = question.options.map(option => option.label);
+			const fallback = labels[Math.min(Math.max(question.recommended ?? 0, 0), Math.max(labels.length - 1, 0))];
+			return {
+				id: question.id,
+				question: question.question,
+				options: labels,
+				multi: question.multi === true,
+				selectedOptions: fallback === undefined ? [] : [fallback],
+				timedOut: true,
+			};
+		}),
+	};
+}
+
+const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
+
+function rpcAskImages(value: unknown): ImageContent[] | undefined | false {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value)) return false;
+	for (const image of value) {
+		if (
+			!isRecord(image) ||
+			image.type !== "image" ||
+			typeof image.data !== "string" ||
+			typeof image.mimeType !== "string" ||
+			!image.mimeType.startsWith("image/") ||
+			image.mimeType.startsWith("image/svg") ||
+			image.data.length % 4 !== 0 ||
+			!BASE64.test(image.data)
+		)
+			return false;
+	}
+	return value as ImageContent[];
+}
+
+/** Validates a host's `ask` reply against the questions the engine asked. */
+export function parseRpcAskResponse(
+	response: RpcExtensionUIResponse,
+	questions: readonly ExtensionAskDialogQuestion[],
+	dialogOptions?: ExtensionUIDialogOptions,
+): ExtensionAskDialogResult | undefined {
+	if ("cancelled" in response && response.cancelled) {
+		if (response.timedOut) dialogOptions?.onTimeout?.();
+		return undefined;
+	}
+	if (!("ask" in response) || !isRecord(response.ask)) return undefined;
+	const answer = response.ask;
+	if (answer.kind === "chat") return { kind: "chat" };
+	if (answer.kind !== "submit" || !Array.isArray(answer.results) || answer.results.length !== questions.length)
+		return undefined;
+	const results: ExtensionAskDialogResultItem[] = [];
+	for (const [index, question] of questions.entries()) {
+		const item: unknown = answer.results[index];
+		if (!isRecord(item) || item.id !== question.id || !Array.isArray(item.selectedOptions)) return undefined;
+		const labels = question.options.map(option => option.label);
+		const selected = item.selectedOptions;
+		if (!selected.every(label => typeof label === "string" && labels.includes(label))) return undefined;
+		if (question.multi !== true && selected.length > 1) return undefined;
+		if (new Set(selected).size !== selected.length) return undefined;
+		for (const field of ["customInput", "note"] as const) {
+			if (item[field] !== undefined && typeof item[field] !== "string") return undefined;
+		}
+		// A single choice is either an offered option or custom text, never both.
+		if (question.multi !== true && selected.length > 0 && item.customInput !== undefined) return undefined;
+		const customInputImages = rpcAskImages(item.customInputImages);
+		const noteImages = rpcAskImages(item.noteImages);
+		if (customInputImages === false || noteImages === false) return undefined;
+		if (dialogOptions?.acceptImages !== true && (customInputImages || noteImages)) return undefined;
+		results.push({
+			id: question.id,
+			question: question.question,
+			options: labels,
+			multi: question.multi === true,
+			selectedOptions: selected as string[],
+			...(typeof item.customInput === "string" ? { customInput: item.customInput } : {}),
+			...(customInputImages ? { customInputImages } : {}),
+			...(typeof item.note === "string" ? { note: item.note } : {}),
+			...(noteImages ? { noteImages } : {}),
+		});
+	}
+	return { kind: "submit", results };
 }
 
 export function requestRpcEditor(
@@ -700,6 +853,13 @@ export function requestRpcDialog<T>(
 
 	if (opts?.timeout !== undefined) {
 		timeoutId = setTimeout(() => {
+			// The engine decided; close the host's presentation so it cannot answer a settled dialog.
+			output({
+				type: "extension_ui_request",
+				id: Snowflake.next() as string,
+				method: "cancel",
+				targetId: id,
+			} as RpcExtensionUIRequest);
 			opts.onTimeout?.();
 			cleanup();
 			resolve(defaultValue);
@@ -774,6 +934,13 @@ export interface RpcModeOptions {
  */
 export async function runRpcMode(session: AgentSession, options: RpcModeOptions = {}): Promise<never> {
 	const { setToolUIContext, headless = false, subagentEventBus, input = claimRpcInput() } = options;
+	// One list for the ready frame and get_state: RPC protocol features, the engine's
+	// external delivery, and rich ask, which reaches a host only through the tool UI context.
+	const engineCapabilities: readonly string[] = [
+		...RPC_ENGINE_CAPABILITIES,
+		EXTERNAL_DELIVERY_CAPABILITY,
+		...(setToolUIContext ? [RICH_ASK_CAPABILITY] : []),
+	];
 	// Signal to RPC clients that the server is ready to accept commands
 	// Suppress terminal notifications: they write \x07 (BEL) or OSC sequences directly to
 	// process.stdout with no newline, which the reader merges with the next JSON line and
@@ -793,7 +960,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			supportedProtocolVersions: [1, 2],
 			maxFrameBytes: MAX_RPC_FRAME_BYTES,
 			maxReassembledFrameBytes: MAX_RPC_REASSEMBLED_BYTES,
-			capabilities: [EXTERNAL_DELIVERY_CAPABILITY],
+			capabilities: [...engineCapabilities],
 		}),
 	);
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
@@ -854,6 +1021,22 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			dialogOptions?: ExtensionUIDialogOptions,
 		): Promise<string | undefined> {
 			return requestRpcSelect(this.pendingRequests, this.output, title, options, dialogOptions);
+		}
+
+		/** Set by `set_ui_capabilities`; hosts that have not opted in keep the select/editor fallback. */
+		richAsk = false;
+
+		// A getter returning a bound function: the ask tool reads `askDialog` at call
+		// time and invokes it detached from the context.
+		get askDialog():
+			| ((
+					questions: ExtensionAskDialogQuestion[],
+					dialogOptions?: ExtensionUIDialogOptions,
+			  ) => Promise<ExtensionAskDialogResult | undefined>)
+			| undefined {
+			if (!this.richAsk) return undefined;
+			return (questions, dialogOptions) =>
+				requestRpcAskDialog(this.pendingRequests, this.output, questions, dialogOptions);
 		}
 
 		confirm(title: string, message: string, dialogOptions?: ExtensionUIDialogOptions): Promise<boolean> {
@@ -1145,6 +1328,9 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
 		const id = command.id;
+		// A malformed security flag fails closed instead of falling back to parsing.
+		if ("literal" in command && command.literal !== undefined && typeof command.literal !== "boolean")
+			return error(id, command.type, "literal must be a boolean");
 
 		switch (command.type) {
 			case "negotiate_protocol": {
@@ -1160,8 +1346,26 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			case "prompt": {
 				// Taken before any dispatch so a builtin that schedules a turn (e.g. `/retry`)
 				// cannot start its run ahead of the prompt's event-stream position.
-				const ticket = promptResults.begin(id);
+				// Literal text is the persisted user message verbatim, so it identifies the reply.
+				const ticket = promptResults.begin(id, command.literal === true ? command.message : undefined);
 				try {
+					if (command.literal === true) {
+						// Literal input never reaches skill, builtin, extension, custom or
+						// template dispatch: the exact text is the user's message.
+						watchAndReportPromptResult({
+							ticket,
+							startPrompt: () =>
+								session.prompt(command.message, {
+									images: command.images,
+									streamingBehavior: command.streamingBehavior,
+									literal: true,
+								}),
+							results: promptResults,
+							onError: onPromptError(id, "prompt"),
+							extensionUserMessageTracker,
+						});
+						return success(id, "prompt");
+					}
 					const skillResult = await dispatchRpcSkillPrompt({
 						ticket,
 						session,
@@ -1245,12 +1449,12 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			}
 
 			case "steer": {
-				await session.steer(command.message, command.images);
+				await session.steer(command.message, command.images, { literal: command.literal === true });
 				return success(id, "steer");
 			}
 
 			case "follow_up": {
-				await session.followUp(command.message, command.images);
+				await session.followUp(command.message, command.images, { literal: command.literal === true });
 				return success(id, "follow_up");
 			}
 
@@ -1277,8 +1481,9 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				await session.abort({ reason: USER_INTERRUPT_LABEL });
 				// After the abort so the aborted run's terminal agent_end cannot settle this prompt.
 				watchAndReportPromptResult({
-					ticket: promptResults.begin(id),
-					startPrompt: () => session.prompt(command.message, { images: command.images }),
+					ticket: promptResults.begin(id, command.literal === true ? command.message : undefined),
+					startPrompt: () =>
+						session.prompt(command.message, { images: command.images, literal: command.literal === true }),
 					results: promptResults,
 					onError: onPromptError(id, "abort_and_prompt"),
 					extensionUserMessageTracker,
@@ -1407,7 +1612,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					isSettled: isRpcSessionSettled(session, goalTurnScheduled),
 					queuedMessages: { steering: [...queuedMessages.steering], followUp: [...queuedMessages.followUp] },
 					todoPhases: session.getTodoPhases(),
-					capabilities: [EXTERNAL_DELIVERY_CAPABILITY],
+					capabilities: [...engineCapabilities],
 					externalDeliveries: session.listExternalDeliveries(),
 					fastModeEnabled: session.isFastModeEnabled(),
 					tokensPerSecond: calculateTokensPerSecond(session.messages, session.isStreaming),
@@ -1443,6 +1648,16 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				} catch (goalError) {
 					return error(id, "goal", goalError instanceof Error ? goalError.message : String(goalError));
 				}
+			}
+
+			case "set_ui_capabilities": {
+				if (!Array.isArray(command.capabilities) || !command.capabilities.every(entry => typeof entry === "string"))
+					return error(id, "set_ui_capabilities", "capabilities must be an array of strings");
+				// Opt-in: an older host that only answers select/editor is never sent `ask`.
+				rpcUiContext.richAsk = setToolUIContext !== undefined && command.capabilities.includes(RICH_ASK_CAPABILITY);
+				return success(id, "set_ui_capabilities", {
+					capabilities: rpcUiContext.richAsk ? [RICH_ASK_CAPABILITY] : [],
+				});
 			}
 
 			case "get_available_commands": {
