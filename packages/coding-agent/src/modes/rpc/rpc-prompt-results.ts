@@ -92,6 +92,24 @@ export class RpcPromptResults {
 		return ticket;
 	}
 
+	/**
+	 * The prompt's command scheduled agent work (for example an extension
+	 * command's `sendUserMessage`). When nothing is streaming, that work starts
+	 * a fresh run, and the prompt owns that run, not an earlier one (such as a
+	 * delivery wake while the command's handler ran). Work queued into a live
+	 * run leaves ownership unchanged. When a command schedules work from idle
+	 * more than once, the run started by the last such work is reported.
+	 * Known limit: a send that lands while a wake run is unwinding (still
+	 * streaming, past its last queue poll) is queued, so that wake still
+	 * answers the prompt.
+	 */
+	rebase(ticket: RpcPromptTicket): void {
+		const open = this.#open.get(ticket);
+		if (!open || open.waiting || this.#session.isStreaming) return;
+		open.ownOutcome = undefined;
+		open.startsAtBegin = this.#agentStarts;
+	}
+
 	/** Drop a ticket whose command was rejected before it was accepted (no `prompt_result` is owed). */
 	discard(ticket: RpcPromptTicket): void {
 		this.#open.delete(ticket);
@@ -198,7 +216,8 @@ export class RpcPromptResults {
 		const branch = manager.getBranch();
 		const from = start.leaf === null ? 0 : branch.findIndex(entry => entry.id === start.leaf) + 1;
 		if (from === 0 && start.leaf !== null) return undefined;
-		const entries = branch.slice(from).flatMap(entry => {
+		const entries = branch.slice(from).flatMap((entry): RunSegment[number][] => {
+			if (entry.type === "custom_message") return isReplyBoundary(entry) ? [{ id: entry.id, role: "boundary" }] : [];
 			if (entry.type !== "message") return [];
 			const message = entry.message;
 			if (message.role === "user") return [{ id: entry.id, role: "user", text: userText(message.content) }];
@@ -257,11 +276,26 @@ function attribute(tickets: readonly RpcPromptTicket[], segment: RunSegment | un
 		if (!own) return { reply: [] };
 		const reply: string[] = [];
 		for (const entry of segment.slice(segment.indexOf(own) + 1)) {
-			if (entry.role === "user") break;
+			if (entry.role === "user" || entry.role === "boundary") break;
 			reply.push(entry.id);
 		}
 		return { prompt: own.id, reply };
 	});
+}
+
+/** Custom entries the model reads as a new input it answers, not as context for the prompt. */
+const REPLY_BOUNDARY_CUSTOM_TYPES: ReadonlySet<string> = new Set(["goal-mode-context", "irc:incoming"]);
+
+/**
+ * A persisted custom entry that ends the preceding reply: an owner-projected
+ * external input (a delivery, carrying `details["omp.llm"]`), goal-mode
+ * context steered into a live run, or an incoming subagent message. Such entries are never a prompt's own
+ * message, so they are not counted when identifying prompts.
+ */
+function isReplyBoundary(entry: { customType: string; details?: unknown }): boolean {
+	if (REPLY_BOUNDARY_CUSTOM_TYPES.has(entry.customType)) return true;
+	const details = entry.details;
+	return typeof details === "object" && details !== null && "omp.llm" in details;
 }
 
 function userText(content: string | ReadonlyArray<{ type: string; text?: string }>): string {
@@ -305,6 +339,8 @@ function promptError(message: AssistantMessage): RpcPromptError {
 type RpcExtensionUserMessageScope = {
 	hasAgentMessageTask: boolean;
 	pendingAgentMessageTasks: Set<Promise<void>>;
+	/** Called as each agent-message task is scheduled, before it can start a run. */
+	onAgentMessageTask?: () => void;
 };
 
 /**
@@ -318,12 +354,14 @@ export class RpcExtensionUserMessageTracker {
 
 	markAgentMessageTask(): void {
 		for (const scope of this.#activePromptScopes) {
+			scope.onAgentMessageTask?.();
 			scope.hasAgentMessageTask = true;
 		}
 	}
 
 	trackAgentMessageTask(task: Promise<unknown>): void {
 		for (const scope of this.#activePromptScopes) {
+			scope.onAgentMessageTask?.();
 			this.#trackAgentMessageTaskForScope(scope, task);
 		}
 	}
@@ -347,7 +385,10 @@ export class RpcExtensionUserMessageTracker {
 		}
 	}
 
-	watchPrompt<T>(startPrompt: () => Promise<T>): {
+	watchPrompt<T>(
+		startPrompt: () => Promise<T>,
+		onAgentMessageTask?: () => void,
+	): {
 		prompt: Promise<T>;
 		hasAgentMessageTask: () => boolean;
 		waitForAgentMessageTasks: () => Promise<void>;
@@ -355,6 +396,7 @@ export class RpcExtensionUserMessageTracker {
 		const scope: RpcExtensionUserMessageScope = {
 			hasAgentMessageTask: false,
 			pendingAgentMessageTasks: new Set(),
+			onAgentMessageTask,
 		};
 		this.#activePromptScopes.add(scope);
 		let prompt: Promise<T>;
@@ -417,7 +459,10 @@ export function watchAndReportPromptResult(input: {
 	extensionUserMessageTracker: RpcExtensionUserMessageTracker;
 }): Promise<void> {
 	const admitted = Promise.withResolvers<void>();
-	const trackedPrompt = input.extensionUserMessageTracker.watchPrompt(() => input.startPrompt(admitted.resolve));
+	const trackedPrompt = input.extensionUserMessageTracker.watchPrompt(
+		() => input.startPrompt(admitted.resolve),
+		() => input.results.rebase(input.ticket),
+	);
 	reportPromptResult({
 		ticket: input.ticket,
 		prompt: trackedPrompt.prompt,
