@@ -51,6 +51,7 @@ export type RpcCommand =
 	// State
 	| { id?: string; type: "get_state" }
 	| { id?: string; type: "set_fast_mode"; enabled: boolean }
+	| { id?: string; type: "set_ui_capabilities"; capabilities: string[] }
 	| { id?: string; type: "get_available_commands" }
 	| { id?: string; type: "get_entries"; since?: string }
 	| { id?: string; type: "get_tree" }
@@ -223,18 +224,27 @@ export interface RpcReadyFrame {
 	supportedProtocolVersions: [1, 2];
 	maxFrameBytes: number;
 	maxReassembledFrameBytes: number;
-	/** Engine features a host may rely on without probing (see {@link RPC_ENGINE_CAPABILITIES}). Absent on older engines. */
+	/** Engine features a host may rely on (see {@link RPC_ENGINE_CAPABILITIES}). Absent on older engines. */
 	capabilities?: string[];
 }
 
-/**
- * Capabilities advertised on the ready frame, one versioned name per feature
- * (`name/major`). Features that change behavior for a host also require the
- * host to opt in; the entry here only says the engine supports them.
- */
 /** Ready-frame capability: tool-approval selects carry an `approval` binding and interrupts cancel them. */
 export const TOOL_APPROVAL_BINDING_CAPABILITY = "tool-approval-binding/1";
 
+/**
+ * Ready-frame capability, advertised only when the engine has a tool UI context
+ * and enabled per host with `set_ui_capabilities`: every `ui.askDialog` caller
+ * (the ask tool, extensions, preludes) then sends one `method: "ask"` request
+ * with every question (multi-select, previews, recommended option) and accepts
+ * submit (with optional custom text, notes and pasted images) or chat replies.
+ */
+export const RICH_ASK_CAPABILITY = "rich-ask/1";
+
+/**
+ * Capabilities the engine always supports, one versioned name per feature
+ * (`name/major`). Features that change what a host receives also require the
+ * host to opt in; the entry only says the engine supports them.
+ */
 export const RPC_ENGINE_CAPABILITIES: readonly string[] = [LITERAL_INPUT_CAPABILITY, TOOL_APPROVAL_BINDING_CAPABILITY];
 
 export interface RpcChunkFrame {
@@ -552,6 +562,21 @@ export type RpcExtensionUIRequest =
 			prefill?: string;
 			promptStyle?: boolean;
 	  }
+	| {
+			type: "extension_ui_request";
+			id: string;
+			method: "ask";
+			questions: Array<{
+				id: string;
+				question: string;
+				header?: string;
+				options: Array<{ label: string; description?: string; preview?: string }>;
+				multi: boolean;
+				recommended?: number;
+			}>;
+			acceptImages: boolean;
+			timeout?: number;
+	  }
 	| { type: "extension_ui_request"; id: string; method: "cancel"; targetId: string }
 	| {
 			type: "extension_ui_request";
@@ -701,7 +726,23 @@ export interface RpcHostUriResult {
 export type RpcExtensionUIResponse =
 	| { type: "extension_ui_response"; id: string; value: string }
 	| { type: "extension_ui_response"; id: string; confirmed: boolean }
-	| { type: "extension_ui_response"; id: string; cancelled: true; timedOut?: boolean };
+	| { type: "extension_ui_response"; id: string; cancelled: true; timedOut?: boolean }
+	| { type: "extension_ui_response"; id: string; ask: RpcAskReply };
+
+/** Reply to a `method: "ask"` request, in question order. */
+export type RpcAskReply =
+	| { kind: "chat" }
+	| {
+			kind: "submit";
+			results: Array<{
+				id: string;
+				selectedOptions: string[];
+				customInput?: string;
+				customInputImages?: ImageContent[];
+				note?: string;
+				noteImages?: ImageContent[];
+			}>;
+	  };
 
 // ============================================================================
 // Helper type for extracting command types
