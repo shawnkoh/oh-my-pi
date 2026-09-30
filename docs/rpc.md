@@ -45,9 +45,17 @@ The initial ready frame uses protocol v1 and advertises the opt-in lossless tran
   "protocolVersion": 1,
   "supportedProtocolVersions": [1, 2],
   "maxFrameBytes": 1048576,
-  "maxReassembledFrameBytes": 67108864
+  "maxReassembledFrameBytes": 67108864,
+  "capabilities": ["external-delivery/1"]
 }
 ```
+
+`capabilities` lists engine capabilities a host may negotiate on before issuing
+an effectful command (currently `external-delivery/1`, see
+[External delivery](#external-delivery)). Older engines omit the field; treat a
+missing entry as the capability being absent. The same list is returned by
+`get_state.capabilities`, so a host attached after startup can negotiate
+without a destructive command.
 
 Clients that support protocol v2 SHOULD immediately send:
 
@@ -235,6 +243,15 @@ correlate it via `id`. Ordering across concurrent commands is not guaranteed
 
 The bundled TypeScript `RpcClient.getMessages()` and Python `RpcClient.get_messages()` drain this paged endpoint automatically after negotiating v2. They retain the legacy monolithic command when connected to a v1 server, and on either `session_busy` or `stale_cursor` they discard partial pages and fall back to the legacy best-effort snapshot. Direct `getMessagesPage()` and `get_messages_page()` calls remain strict so incremental hosts never mix snapshots silently.
 
+### External delivery commands
+
+- `{ id?, type: "deliver", record: CustomMessagePayload, options: { mode: "aside" | "steer", quiet?: true, wakeAfterInterrupt?: true, wakeInPlanMode?: true } }`
+- `{ id?, type: "cancel_delivery", deliveryId: string }`
+
+Both require `external-delivery/1` in `ready.capabilities`. See
+[External delivery](#external-delivery) for the record shape, receipts and
+events.
+
 ### Login
 
 - `{ id?, type: "get_login_providers" }`
@@ -393,6 +410,11 @@ is re-armed.
 Fields whose values are `undefined` are omitted from JSON, including an unset
 model/thinking level, session name/file, or unavailable `contextUsage`.
 `dumpTools` may also include each tool's `examples` alongside its schema.
+
+`capabilities` repeats the ready frame's capability list. `externalDeliveries`
+lists every delivery record the session still holds as
+`{ deliveryId, state: "queued" | "accepted", mode }`; settled, cancelled and
+discarded records drop out of the list once their receipt event is emitted.
 
 `queuedMessages` holds the same displayable queue-chip text as the `queue_update`
 event below. Use this text with `remove_queued_message`, subject to its pending-queue
@@ -648,6 +670,7 @@ Common event types:
 - `todo_reminder`, `todo_auto_clear`
 - `irc_message`, `notice`, `goal_updated`
 - `queue_update`
+- `delivery_accepted`, `delivery_settled`, `delivery_discarded`, `delivery_cancelled`
 
 ### `queue_update` event
 
@@ -758,6 +781,78 @@ refresh, for example `"refresh missed the cache"`, `"refresh failed"`,
 `"cache warming disabled"`, or `"conversation context changed"`. It is absent
 when warming continues: the refresh rescheduled, or a new request replaced the
 run.
+
+## External delivery
+
+`external-delivery/1` lets a host hand the session a record authored by
+another actor (a peer agent, an operator on another device, a mailbox) without
+it going through prompt or slash-command parsing, and get a receipt that says
+exactly whether and how the model saw it. Extensions get the same surface as
+`ExtensionAPI.deliverMessage(record, options)` with `ExtensionAPI.capabilities`
+(a `ReadonlySet<string>`) for negotiation; `deliverMessage` throws when the
+capability is absent.
+
+The record is a custom message payload (`customType`, `content`, `display`,
+`details`, optional `attribution`). `content` is the display form and never
+reaches a provider. The provider view MUST be declared in `details`:
+
+```json
+{
+  "customType": "peer-mail",
+  "content": "[mail from T-42]",
+  "display": true,
+  "details": {
+    "omp.llm": { "role": "user", "content": [{ "type": "text", "text": "..." }] },
+    "omp.llm.source": "mail:01ABC"
+  }
+}
+```
+
+`omp.llm.content` is a string or an array of `text`/`image` parts. A record
+without a valid projection (wrong role, unknown part type, missing string
+`omp.llm.source`) is rejected by `deliver` with an error response; it is never
+sent as a fallback developer message.
+
+`options.mode`:
+
+- `aside` never interrupts. Idle: it wakes a turn. Busy: it joins the running
+  evaluation at the next poll. At a stop boundary it only joins a run the
+  deliveries themselves own; otherwise it waits for its own wake once the run
+  settles.
+- `steer` forces the next turn boundary and is never accepted as an aside.
+
+For `aside` only: idle in plan mode holds the record unless `wakeInPlanMode`
+is set; idle after an operator interrupt holds it unless `wakeAfterInterrupt`
+is set (the interrupt latch is not cleared). A `steer` always wakes. A record
+delivered while a prompt is waiting on manual-compaction cleanup or setting up
+its turn, or while a session transition is open, is held and folds into or
+follows that turn rather than racing it; a prompt that only runs an extension
+command does not hold it. Pressing Esc in the interactive UI parks a queued
+`steer` instead of dropping it; it wakes as soon as the abort settles.
+
+Receipts, one event each, all carrying `deliveryId`:
+
+- `delivery_accepted` `{ at, mode, mechanism: "wake" | "aside" | "steer-boundary" }` when the
+  loop commits the record into context (never when merely queued).
+- `delivery_settled` `{ outcome: "quiet" | "text" | "refused" | "error" | "aborted", included, requests, sole, interactive }`
+  when the owning evaluation ends. `included` is true only when exactly one
+  stamped projection reached a main request that completed without error or
+  abort. `sole` means no other queue-delivered input (prompt, steer, follow-up,
+  another record, a hidden or synthetic prompt, a goal continuation, an
+  extension message, hook output) joined the evaluation; records the engine
+  injects on its own (soft-requirement reminders, execution additional
+  context, todo/context nudges, plan/goal context frames) do not count.
+  `interactive`
+  means an operator-authored input joined. A delivery-owned evaluation may end
+  quietly (thinking only, no visible text or tool call) and reports `quiet`
+  without the usual empty-response retry.
+- `delivery_discarded` `{ reason }` when the session lets go of a queued
+  record without admitting it: `new-session`, `session-switched`, `disposed`.
+- `delivery_cancelled` when `cancel_delivery` succeeded (only while `queued`).
+
+`delivery_settled` is emitted after the run's `agent_end`. A wake whose only
+inputs were cancelled or vetoed still yields an `agent_start` + `agent_end`
+pair with no provider request.
 
 ### Available commands
 

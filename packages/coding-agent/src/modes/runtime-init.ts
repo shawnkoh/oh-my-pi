@@ -111,6 +111,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 					reportSendError("extension_send_user", e instanceof Error ? e : new Error(String(e)));
 				});
 			},
+			deliverMessage: (record, deliveryOptions) => session.deliverExternalMessage(record, deliveryOptions),
 			appendEntry: (customType, data) => {
 				session.sessionManager.appendCustomEntry(customType, data);
 			},
