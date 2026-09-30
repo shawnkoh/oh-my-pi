@@ -2134,7 +2134,7 @@ export class AgentSession implements SettingsScope {
 				}
 			},
 			sendHiddenMessage: async message => {
-				await this.sendCustomMessage(
+				await this.#sendEngineMessage(
 					{
 						customType: message.customType,
 						content: message.content,
@@ -6720,7 +6720,7 @@ export class AgentSession implements SettingsScope {
 	async sendPlanModeContext(options?: { deliverAs?: "steer" | "followUp" | "nextTurn" | "aside" }): Promise<void> {
 		const message = await this.#buildPlanModeMessage();
 		if (!message) return;
-		await this.sendCustomMessage(
+		await this.#sendEngineMessage(
 			{
 				customType: message.customType,
 				content: message.content,
@@ -6734,7 +6734,7 @@ export class AgentSession implements SettingsScope {
 	async sendGoalModeContext(options?: { deliverAs?: "steer" | "followUp" | "nextTurn" | "aside" }): Promise<void> {
 		const message = this.#buildGoalModeMessage();
 		if (!message) return;
-		await this.sendCustomMessage(
+		await this.#sendEngineMessage(
 			{
 				customType: message.customType,
 				content: message.content,
@@ -6749,7 +6749,7 @@ export class AgentSession implements SettingsScope {
 	async sendVibeModeContext(options?: { deliverAs?: "steer" | "followUp" | "nextTurn" | "aside" }): Promise<void> {
 		const message = this.#buildVibeModeMessage();
 		if (!message) return;
-		await this.sendCustomMessage(
+		await this.#sendEngineMessage(
 			{
 				customType: message.customType,
 				content: message.content,
