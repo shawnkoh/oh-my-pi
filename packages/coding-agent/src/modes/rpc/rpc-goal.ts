@@ -50,7 +50,6 @@ export type RpcGoalSession = Pick<
 	| "isSessionTransitioning"
 	| "hasAdmittedSubmission"
 	| "queuedMessageCount"
-	| "sessionId"
 >;
 
 export class RpcGoalController {
@@ -70,10 +69,10 @@ export class RpcGoalController {
 	#exitTask: Promise<void> = Promise.resolve();
 	/** Session changes in progress; goal turns and exits wait for them to end. */
 	#sessionChanges = 0;
-	/** Session id when the outermost in-progress change began. */
+	/** Transcript (session manager) id when the outermost in-progress change began. */
 	#sessionBeforeChange: string | undefined;
-	/** A goal completed during a session change; its exit runs once the change ends. */
-	#completionDuringChange = false;
+	/** A goal turn was waiting or became due during the change; report busy until it ends. */
+	#heldDuringChange = false;
 	readonly #onContinuationDropped: (() => void) | undefined;
 
 	/**
@@ -90,8 +89,8 @@ export class RpcGoalController {
 	 * quiescence checks must treat the session as busy during this window.
 	 */
 	get continuationPending(): boolean {
-		// A change in progress may resume the goal when it is cancelled: never settled meanwhile.
-		return this.#continuationScheduled || this.#sessionChanges > 0;
+		// A change that is holding a goal turn may resume it when cancelled: not settled meanwhile.
+		return this.#continuationScheduled || (this.#sessionChanges > 0 && this.#heldDuringChange);
 	}
 
 	/**
@@ -123,7 +122,12 @@ export class RpcGoalController {
 	 * {@link endSessionChange}.
 	 */
 	async beginSessionChange(): Promise<void> {
-		if (this.#sessionChanges++ === 0) this.#sessionBeforeChange = this.#session.sessionId;
+		if (this.#sessionChanges++ === 0) {
+			// The transcript id, not `session.sessionId`: a host-pinned provider session id
+			// (`--provider-session-id`) does not change when the transcript does.
+			this.#sessionBeforeChange = this.#session.sessionManager.getSessionId();
+			this.#heldDuringChange = this.#continuationScheduled || this.#continuationWanted();
+		}
 		this.#continuationScheduled = false;
 		this.#continuationGeneration++;
 		await this.#exitTask;
@@ -131,27 +135,19 @@ export class RpcGoalController {
 
 	/**
 	 * Call after the change resolves, is cancelled, or throws. Only a change that
-	 * actually switched the session adopts the target session's goal. A cancelled
+	 * actually switched the transcript adopts the target session's goal. A cancelled
 	 * or no-op change (same session, for example tree navigation or reopening the
 	 * open session) leaves the running goal untouched and resumes continuation.
 	 * Never throws; settlement is re-checked afterwards.
 	 */
 	async endSessionChange(): Promise<void> {
 		if (--this.#sessionChanges > 0) return;
-		const switched = this.#session.sessionId !== this.#sessionBeforeChange;
+		const switched = this.#session.sessionManager.getSessionId() !== this.#sessionBeforeChange;
 		this.#sessionBeforeChange = undefined;
-		const completed = this.#completionDuringChange;
-		this.#completionDuringChange = false;
+		this.#heldDuringChange = false;
 		try {
-			if (switched) {
-				// A goal completed in the previous session is journaled there; the target's own state wins.
-				await this.reconcile();
-			} else if (completed) {
-				this.#queueExit(() => this.#completeExit());
-				await this.#exitTask;
-			} else {
-				this.#scheduleContinuation();
-			}
+			if (switched) await this.reconcile();
+			else this.#scheduleContinuation();
 		} catch (error) {
 			reportControllerError(error);
 		}
@@ -247,9 +243,16 @@ export class RpcGoalController {
 		if (previousTools) await this.#session.setActiveToolsByName(previousTools);
 	}
 
-	async #completeExit(): Promise<void> {
+	/**
+	 * @param transcriptId the transcript the goal completed in. If a session change
+	 *   switched away before this ran, its journal records are not written into the
+	 *   new session, and the new session's goal state is left for reconcile.
+	 */
+	async #completeExit(transcriptId: string): Promise<void> {
+		if (this.#session.sessionManager.getSessionId() !== transcriptId) return;
 		const state = this.#session.getGoalModeState();
-		await this.#exit();
+		// Journal and clear first, synchronously, so the records land in the session
+		// that completed the goal even if a session change follows; then restore tools.
 		this.#session.setGoalModeState(undefined);
 		this.#session.sessionManager.appendModeChange("none");
 		this.#session.sessionManager.appendCustomEntry("goal-completed", {
@@ -258,6 +261,7 @@ export class RpcGoalController {
 			tokenBudget: state?.goal.tokenBudget,
 			timeUsedSeconds: state?.goal.timeUsedSeconds,
 		});
+		await this.#exit();
 	}
 
 	#resetContinuation(): void {
@@ -326,11 +330,13 @@ export class RpcGoalController {
 			this.#previousContinuationActivity = activity;
 		}
 		if (this.#session.getGoalModeState()?.mode === "exiting") {
-			if (this.#sessionChanges > 0) {
-				this.#completionDuringChange = true;
-				return;
-			}
-			this.#queueExit(() => this.#completeExit());
+			const transcriptId = this.#session.sessionManager.getSessionId();
+			this.#queueExit(() => this.#completeExit(transcriptId));
+			return;
+		}
+		if (this.#sessionChanges > 0) {
+			// Held until the change ends; a same-session change resumes it.
+			if (this.#continuationWanted()) this.#heldDuringChange = true;
 			return;
 		}
 		this.#scheduleContinuation();

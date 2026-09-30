@@ -7,7 +7,7 @@ import { RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
 import { RpcGoalController, type RpcGoalSession } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-goal";
 import type { RpcSessionState } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import type { Goal } from "@oh-my-pi/pi-tui/tools/goal";
+import type { GoalModeState } from "@oh-my-pi/pi-coding-agent/goals/state";
 import { removeWithRetries, withTimeout } from "@oh-my-pi/pi-utils";
 
 function nextMacrotask(): Promise<void> {
@@ -254,29 +254,47 @@ describe("RpcGoalController continuation gate", () => {
 	const hostInput = { type: "message_start", message: { role: "user", content: [] } } as unknown as AgentSessionEvent;
 
 	function fakeSession(admit: (customType: string) => Promise<boolean>) {
-		const goal: Goal = {
-			id: "g1",
-			objective: "o",
-			status: "active",
-			tokensUsed: 0,
-			timeUsedSeconds: 0,
-			createdAt: 0,
-			updatedAt: 0,
+		let goalState: GoalModeState | undefined = {
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "g1",
+				objective: "o",
+				status: "active",
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				createdAt: 0,
+				updatedAt: 0,
+			},
 		};
 		let idle = Promise.withResolvers<void>();
 		idle.resolve();
+		const journal: string[] = [];
+		const transcript = { id: "t1" };
 		const session = {
 			settings: Settings.isolated({ "goal.continuationModes": ["rpc"] }),
-			sessionId: "s1",
+			// Provider-facing id pinned by the host: must not be used to detect a session change.
+			sessionId: "pinned-provider-id",
+			sessionManager: {
+				getSessionId: () => transcript.id,
+				buildSessionContext: () => ({ mode: "none" }),
+				appendModeChange: (mode: string) => journal.push(`${transcript.id}:mode:${mode}`),
+				appendCustomEntry: (type: string) => journal.push(`${transcript.id}:${type}`),
+			},
 			isDisposed: false,
 			isSessionTransitioning: false,
 			isStreaming: false,
 			hasAdmittedSubmission: false,
 			queuedMessageCount: 0,
 			getPlanModeState: () => undefined,
-			getGoalModeState: () => ({ enabled: true, mode: "active" as const, goal }),
+			getGoalModeState: () => goalState,
+			setGoalModeState: (state: GoalModeState | undefined) => {
+				goalState = state;
+			},
+			getEnabledToolNames: () => ["read"],
+			setActiveToolsByName: async () => {},
 			getTodoPhases: () => [],
-			goalRuntime: { buildContinuationPrompt: () => "continue" },
+			goalRuntime: { buildContinuationPrompt: () => "continue", clearAccounting: () => {} },
 			promptCustomMessage: (message: { customType: string }) => admit(message.customType),
 			waitForIdle: () => idle.promise,
 		};
@@ -285,6 +303,9 @@ describe("RpcGoalController continuation gate", () => {
 		return {
 			session,
 			controller,
+			journal,
+			transcript,
+			goalState: () => goalState,
 			dropped: () => dropped,
 			/** Hold waitForIdle until {@link release}. */
 			hold: () => {
@@ -403,5 +424,41 @@ describe("RpcGoalController continuation gate", () => {
 		expect(controller.continuationPending).toBe(false);
 		// Settlement is re-checked only once the change has ended.
 		expect(dropped()).toBeGreaterThan(droppedDuringChange);
+	});
+
+	test("a transcript switch is detected even when the host pins the provider session id", async () => {
+		const admitted: string[] = [];
+		const { controller, transcript, goalState } = fakeSession(async customType => {
+			admitted.push(customType);
+			return true;
+		});
+		await controller.beginSessionChange();
+		transcript.id = "t2";
+		await controller.endSessionChange();
+		await nextMacrotask();
+		// The old goal is left behind, and nothing continues it in the new transcript.
+		expect(goalState()).toBeUndefined();
+		expect(admitted).toEqual([]);
+	});
+
+	test("a goal completed while a switch is pending is journaled in its own session", async () => {
+		const { session, controller, transcript, journal } = fakeSession(async () => true);
+		await controller.beginSessionChange();
+		// The goal tool completes the goal while a before-switch hook is still pending.
+		const current = session.getGoalModeState();
+		session.setGoalModeState(current && { ...current, enabled: false, mode: "exiting", reason: "completed" });
+		controller.observe(agentEnd);
+		await controller.settled();
+		transcript.id = "t2";
+		await controller.endSessionChange();
+		expect(journal).toEqual(["t1:mode:none", "t1:goal-completed"]);
+	});
+
+	test("a session change with no goal turn to hold does not withhold settlement", async () => {
+		const { session, controller } = fakeSession(async () => true);
+		session.setGoalModeState(undefined);
+		await controller.beginSessionChange();
+		expect(controller.continuationPending).toBe(false);
+		await controller.endSessionChange();
 	});
 });

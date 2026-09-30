@@ -412,9 +412,12 @@ turn, sent as a hidden `goal-continuation` message.
   Either way, the next host prompt, steer or follow-up (or `goal resume`) re-arms it.
 - A session change leaves the previous goal and its tool behind and restores a goal
   journaled in the target session. This covers `new_session`, `switch_session`,
-  `branch` and `open_session`, and the same changes made by extension commands.
-  A goal turn waiting to start is dropped when the change begins. If the change is
-  cancelled, continuation resumes in the current session.
+  `branch` and `open_session`, and the same changes made by extension commands. A
+  change is detected by the transcript id, so a host-pinned `--provider-session-id`
+  does not hide it. A goal turn that is waiting or becomes due while a change is in
+  progress is held. If the change is cancelled, or leaves the session unchanged
+  (tree navigation, reopening the open session), the goal continues. While such a
+  turn is held, the session is not reported as settled.
 
 When the agent completes the goal, the goal tool is removed again and
 `get_state.goal` becomes `null`.
