@@ -21,6 +21,7 @@ import {
 	ASIDE_MESSAGE_COMMIT,
 	ASIDE_MESSAGE_DEFER,
 	ASIDE_MESSAGE_DISCARD,
+	isEngineInjected,
 	isOwnedAsideMessage,
 	LLM_MESSAGE_SOURCE,
 	type OwnedAsideAdmission,
@@ -178,25 +179,21 @@ function hasDeliverableOutput(message: AssistantMessage): boolean {
 	return message.content.some(block => !isSilentBlock(block));
 }
 
-/** Inputs admitted to an evaluation through a queue: prompts, steering, asides,
- *  follow-ups, continuations and owned records. Engine-authored context the
- *  loop injects on its own (reminders, execution context, nudges) is not an
- *  input: it never makes a delivery "shared" and never revokes quiet privilege. */
+/** Inputs admitted to an evaluation: everything that entered through
+ *  `agent.prompt()` or a queue poll — operator prompts (including hidden and
+ *  synthetic ones), goal continuations, extension messages, hook output,
+ *  owned records. Records the engine injects on its own (soft-requirement
+ *  reminders, execution additional context, nudges, context frames) are
+ *  marked by origin ({@link isEngineInjected}) and never count: they cannot
+ *  make a delivery shared or revoke quiet privilege. */
 function isEvaluationInput(message: AgentMessage): boolean {
-	if (isOwnedAsideMessage(message) || isUserAuthoredQueuedMessage(message)) return true;
-	if (message.role === "user") return true;
-	if (message.role !== "custom" && message.role !== "hookMessage") return false;
-	return !isEngineAuthoredContext(message);
-}
-
-/** Engine-injected context (reminders, execution/goal/plan context, nudges,
- *  hook output) is hidden (`display:false`) or a hook message; queue-delivered
- *  peer input is a displayed record. This structural rule needs no type list. */
-function isEngineAuthoredContext(message: AgentMessage): boolean {
-	if (message.role === "hookMessage") return true;
-	if (message.role !== "custom") return false;
-	if (message.attribution === "user") return false;
-	return message.display !== true;
+	if (isEngineInjected(message)) return false;
+	return (
+		message.role === "user" ||
+		message.role === "custom" ||
+		message.role === "hookMessage" ||
+		message.role === "developer"
+	);
 }
 
 /** One in-flight prompt cycle as seen by the owners admitted into it. */
@@ -204,6 +201,8 @@ class DeliveryEvaluation {
 	readonly owners: ExternalDeliveryOwner[] = [];
 	/** Inputs admitted so far (owned records included). */
 	inputs = 0;
+	/** `agent_start` seen: the run this evaluation belongs to exists. */
+	started = false;
 	interactive = false;
 	aborted = false;
 	/** True while the initial prompt set is still being observed (before the first assistant message). */
@@ -446,6 +445,9 @@ export class ExternalDeliveries {
 
 	/** Discards every unaccepted owner (committed transition or disposal). Rollback never calls this. */
 	retireAll(reason: string): void {
+		// The context these owners were queued against is gone: inputs folded into
+		// it while idle no longer wait for a run.
+		if (this.#evaluation && !this.#evaluation.started) this.#evaluation = undefined;
 		// Snapshot: #retire deletes from #owners while we iterate.
 		// oxlint-disable-next-line unicorn/no-useless-spread
 		for (const owner of [...this.#owners.values()]) {
@@ -492,16 +494,23 @@ export class ExternalDeliveries {
 	/** Synchronous bookkeeping at the top of the session's agent event handler. */
 	onAgentEvent(event: AgentEvent): void {
 		if (event.type === "agent_start") {
-			this.#ensureEvaluation();
+			this.#ensureEvaluation().started = true;
+			return;
+		}
+		if (event.type === "message_end" && event.message.role !== "assistant") {
+			// An input folded into context between runs (a stranded extension aside
+			// after an interrupt, a plan-mode fold) is answered by the next run: it
+			// opens the evaluation that run adopts, so that run is neither sole nor
+			// delivery-owned.
+			if (isEvaluationInput(event.message)) this.#ensureEvaluation().noteInput(event.message);
 			return;
 		}
 		const evaluation = this.#evaluation;
 		if (!evaluation) return;
 		if (event.type === "message_start" && event.message.role === "assistant") {
 			evaluation.noteAssistantStart();
-		} else if (event.type === "message_end") {
-			if (event.message.role === "assistant") evaluation.noteAssistantEnd(event.message);
-			else if (isEvaluationInput(event.message)) evaluation.noteInput(event.message);
+		} else if (event.type === "message_end" && event.message.role === "assistant") {
+			evaluation.noteAssistantEnd(event.message);
 		}
 	}
 
@@ -518,7 +527,8 @@ export class ExternalDeliveries {
 	/** Settles every owner admitted into the evaluation that just settled. */
 	settleEvaluation(options?: { aborted?: boolean }): void {
 		const evaluation = this.#evaluation;
-		if (!evaluation) return;
+		// A pending evaluation (inputs folded while idle, no run yet) waits for its run.
+		if (!evaluation?.started) return;
 		this.#evaluation = undefined;
 		const aborted = options?.aborted === true || evaluation.aborted;
 		for (const owner of evaluation.owners) {

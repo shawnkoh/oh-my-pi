@@ -38,6 +38,7 @@ import {
 	type BeforeToolCallResult,
 	EventLoopKeepalive,
 	isOwnedAsideMessage,
+	markEngineInjected,
 	type QueuedMessagePreparation,
 	resolveTelemetry,
 	type StreamFn,
@@ -1940,18 +1941,23 @@ export class AgentSession implements SettingsScope {
 			thunks.push(...this.yieldQueue.drainLazy());
 			// Mid-run todo reconciliation — evaluated at injection time so a turn
 			// that flips a todo just before this poll suppresses the nudge.
-			thunks.push(() => this.#todo.takeMidRunNudge());
+			thunks.push(() => {
+				const nudge = this.#todo.takeMidRunNudge();
+				return nudge ? markEngineInjected(nudge) : nudge;
+			});
 			const contextNotesReminder = this.#experimentalContextNotesReminder;
 			if (contextNotesReminder) {
 				this.#experimentalContextNotesReminder = undefined;
 				if (contextNotesReminder.generation === this.#promptGeneration) {
-					thunks.push(() => ({
-						role: "custom",
-						customType: "experimental-context-notes-reminder",
-						content: contextNotesReminder.prompt,
-						display: false,
-						timestamp: Date.now(),
-					}));
+					thunks.push(() =>
+						markEngineInjected({
+							role: "custom",
+							customType: "experimental-context-notes-reminder",
+							content: contextNotesReminder.prompt,
+							display: false,
+							timestamp: Date.now(),
+						}),
+					);
 				}
 			}
 			return thunks;
@@ -2928,7 +2934,7 @@ export class AgentSession implements SettingsScope {
 	 */
 	async #deliverRuleWarning(content: string, ruleNames: string[]): Promise<void> {
 		if (this.#isDisposed) return;
-		await this.sendCustomMessage(
+		await this.#sendEngineMessage(
 			{ customType: "ttsr-injection", content, display: false, details: { rules: ruleNames }, attribution: "agent" },
 			{ deliverAs: "aside" },
 		);
@@ -3668,7 +3674,7 @@ export class AgentSession implements SettingsScope {
 			};
 			this.#pendingRewindReport = undefined;
 			this.#lastCompletedRewind = undefined;
-			this.agent.steer(checkpointReminder);
+			this.agent.steer(markEngineInjected(checkpointReminder));
 		}
 
 		// Local completion time for prompt→yield timing: stamped here, not by the
@@ -3881,7 +3887,7 @@ export class AgentSession implements SettingsScope {
 						"Fix the todo payload and call todo again before continuing.",
 						"</system-reminder>",
 					].join("\n");
-					await this.sendCustomMessage(
+					await this.#sendEngineMessage(
 						{
 							customType: "todo-error-reminder",
 							content: reminderText,
@@ -4841,14 +4847,14 @@ export class AgentSession implements SettingsScope {
 		if (result?.decision !== "block") this.#sessionStopContinuationCount++;
 		this.#sessionStopHookActive = true;
 		this.#queueHiddenNextTurnMessage(
-			{
+			markEngineInjected({
 				role: "custom",
 				customType: "session-stop-continuation",
 				content: additionalContext,
 				display: false,
 				attribution: "agent",
 				timestamp: Date.now(),
-			},
+			}),
 			true,
 		);
 		return true;
@@ -6399,14 +6405,14 @@ export class AgentSession implements SettingsScope {
 		});
 		const content = formatEvalStateContext(session, { historyHasEval });
 		if (!content) return undefined;
-		return {
+		return markEngineInjected({
 			role: "custom",
 			customType: "eval-state-context",
 			content,
 			display: false,
 			attribution: "agent",
 			timestamp: Date.now(),
-		};
+		});
 	}
 
 	/**
@@ -6792,14 +6798,14 @@ export class AgentSession implements SettingsScope {
 			planContent: plan.content,
 		});
 
-		return {
+		return markEngineInjected({
 			role: "custom",
 			customType: "plan-mode-reference",
 			content,
 			display: false,
 			attribution: "agent",
 			timestamp: Date.now(),
-		};
+		});
 	}
 
 	#isScoutAvailable(): boolean {
@@ -6836,28 +6842,28 @@ export class AgentSession implements SettingsScope {
 			scoutAvailable: this.#isScoutAvailable(),
 		});
 
-		return {
+		return markEngineInjected({
 			role: "custom",
 			customType: "plan-mode-context",
 			content,
 			display: false,
 			attribution: "agent",
 			timestamp: Date.now(),
-		};
+		});
 	}
 
 	#buildGoalModeMessage(): CustomMessage | null {
 		const content = this.#goalRuntime.buildActivePrompt();
 		if (!content) return null;
 		const todoContext = this.#buildGoalTodoContext();
-		return {
+		return markEngineInjected({
 			role: "custom",
 			customType: "goal-mode-context",
 			content: prompt.render(goalModeContextPrompt, { goalContext: content, todoContext }),
 			display: false,
 			attribution: "agent",
 			timestamp: Date.now(),
-		};
+		});
 	}
 
 	#buildVibeModeMessage(): CustomMessage | null {
@@ -8487,6 +8493,21 @@ export class AgentSession implements SettingsScope {
 		return this.#admitSubmission(() => this.#sendCustomMessage(message, options));
 	}
 
+	/** A custom message the engine itself authors (reminders, notices, rule
+	 *  warnings): same delivery paths as {@link sendCustomMessage}, but the record
+	 *  is marked engine-injected so receipts classify it by origin, not as input. */
+	#sendEngineMessage<T = unknown>(
+		message: CustomMessagePayload<T>,
+		options?: {
+			triggerTurn?: boolean;
+			deliverAs?: "steer" | "followUp" | "nextTurn" | "aside";
+			queueChipText?: string;
+			acceptTerminalEmptyStop?: boolean;
+		},
+	): Promise<boolean> {
+		return this.#admitSubmission(() => this.#sendCustomMessage(message, { ...options, engineInjected: true }));
+	}
+
 	async #sendCustomMessage<T = unknown>(
 		message: CustomMessagePayload<T>,
 		options?: {
@@ -8494,6 +8515,8 @@ export class AgentSession implements SettingsScope {
 			deliverAs?: "steer" | "followUp" | "nextTurn" | "aside";
 			queueChipText?: string;
 			acceptTerminalEmptyStop?: boolean;
+			/** Internal: the engine authored this record (see {@link markEngineInjected}). */
+			engineInjected?: true;
 		},
 	): Promise<boolean> {
 		// An extension command parked on a manual compaction may fire this
@@ -8517,6 +8540,7 @@ export class AgentSession implements SettingsScope {
 		options:
 			| {
 					triggerTurn?: boolean;
+					engineInjected?: true;
 					deliverAs?: "steer" | "followUp" | "nextTurn" | "aside";
 					queueChipText?: string;
 					acceptTerminalEmptyStop?: boolean;
@@ -8547,6 +8571,7 @@ export class AgentSession implements SettingsScope {
 			timestamp: Date.now(),
 		};
 		const normalizedAppMessage = await this.#normalizeAgentMessageImages(appMessage);
+		if (options?.engineInjected) markEngineInjected(normalizedAppMessage);
 		if (this.isStreaming) {
 			// Queued into a turn the agent owns: that turn holds the session. Busy only
 			// from another prompt's setup claims nothing (that prompt decides).
@@ -9659,14 +9684,16 @@ export class AgentSession implements SettingsScope {
 		const key = `${lane}#${window}`;
 		if (this.#anthropicWrapUpHinted === key) return;
 		this.#anthropicWrapUpHinted = key;
-		this.agent.steer({
-			role: "custom",
-			customType: "anthropic-usage-wrap-up",
-			content: anthropicUsageWrapUpPrompt,
-			attribution: "agent",
-			display: false,
-			timestamp: Date.now(),
-		});
+		this.agent.steer(
+			markEngineInjected({
+				role: "custom",
+				customType: "anthropic-usage-wrap-up",
+				content: anthropicUsageWrapUpPrompt,
+				attribution: "agent",
+				display: false,
+				timestamp: Date.now(),
+			}),
+		);
 	}
 
 	/** Sets or clears one model family's live service tier. */
@@ -9784,7 +9811,7 @@ export class AgentSession implements SettingsScope {
 				message => message.role === "custom" && message.customType === "skillful-notice",
 			);
 			if (hasReadableSkills && !alreadyAnnounced) {
-				await this.sendCustomMessage(
+				await this.#sendEngineMessage(
 					{
 						customType: "skillful-notice",
 						content: prompt.render(skillfulNoticePrompt, { skills: renderedSkills }),

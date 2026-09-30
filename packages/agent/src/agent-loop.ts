@@ -100,6 +100,7 @@ import {
 	ASIDE_MESSAGE_DISCARD,
 	isOwnedAsideMessage,
 	isSoftToolRequirement,
+	markEngineInjected,
 	SPECULATIVE_STREAM_SESSION,
 } from "./types";
 import { yieldIfDue } from "./utils/yield";
@@ -1132,7 +1133,7 @@ function injectExecutionAdditionalContext(
 	additionalContext: string | undefined,
 ): AgentMessage | undefined {
 	if (additionalContext === undefined) return undefined;
-	const contextMessage = createAdditionalContextMessage(additionalContext);
+	const contextMessage = markEngineInjected(createAdditionalContextMessage(additionalContext));
 	currentContext.messages.push(contextMessage);
 	newMessages.push(contextMessage);
 	emitInputMessages(stream, [contextMessage]);
@@ -1382,6 +1383,7 @@ async function runLoopBody(
 								softRequirementState.forcedToolChoice = undefined;
 								softRequirementState.escalations = 0;
 								for (const reminder of softReq.reminder) {
+									markEngineInjected(reminder);
 									currentContext.messages.push(reminder);
 									newMessages.push(reminder);
 									turnMessages.push(reminder);
