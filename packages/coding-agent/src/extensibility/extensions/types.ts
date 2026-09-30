@@ -204,6 +204,22 @@ export interface ExtensionUIDialogOptions {
 	markableCount?: number;
 	/** Allow image pastes in rich ask-dialog custom-answer and note prompts. */
 	acceptImages?: boolean;
+	/** Present for a tool-approval select: the exact call the answer approves. */
+	approval?: ToolApprovalBinding;
+}
+
+/**
+ * The tool call a tool-approval dialog decides. `arguments` are what the
+ * approval policy evaluated: the call's parameters after any preflight
+ * revision, or a provider computer-use call's `{ actions }`. An eval prelude
+ * approval carries the enclosing eval call's `toolCallId`, so one call can ask
+ * several times: `(toolCallId, toolName)` identifies the decision.
+ */
+export interface ToolApprovalBinding {
+	toolCallId: string;
+	toolName: string;
+	arguments: unknown;
+	reason?: string;
 }
 
 /** Raw terminal input listener for extensions. */

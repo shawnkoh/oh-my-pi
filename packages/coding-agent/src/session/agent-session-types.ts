@@ -384,6 +384,13 @@ export interface PromptOptions {
 	skipCompactionCheck?: boolean;
 	/** Delegator's open-endedness description (task tool `solutionSpace`); replaces the prompt as `auto` thinking classification input. */
 	solutionSpace?: string;
+	/**
+	 * Deliver the text exactly as the user's message: no slash, skill, builtin,
+	 * extension or custom command dispatch, no prompt-template expansion and no
+	 * model-mention rewriting. For remote hosts whose users may send conversation
+	 * but must not reach administrative commands through message text.
+	 */
+	literal?: boolean;
 }
 
 /** Payload for {@link AgentSession.setPromptDropped}: a user prompt cancelled
@@ -404,12 +411,16 @@ export interface FollowUpOptions {
 	expandPromptTemplates?: boolean;
 	/** Explicit billing/initiator attribution. */
 	attribution?: MessageAttribution;
+	/** Queue the text verbatim; see {@link PromptOptions.literal}. */
+	literal?: boolean;
 }
 
 /** Options for AgentSession.steer(). */
 export interface SteerOptions {
 	/** Explicit billing/initiator attribution. */
 	attribution?: MessageAttribution;
+	/** Queue the text verbatim; see {@link PromptOptions.literal}. */
+	literal?: boolean;
 }
 
 /** Options for AgentSession.sendUserMessage(). */
