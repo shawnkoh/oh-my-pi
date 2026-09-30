@@ -97,6 +97,17 @@ export interface RpcClientOptions {
 	customTools?: RpcClientCustomTool[];
 }
 
+/** Per-message options for prompt/steer/follow-up/abort-and-prompt. */
+export interface RpcTextInputOptions {
+	/** Deliver the text verbatim (engine capability `literal-input/1`). */
+	literal?: boolean;
+}
+
+// Omit the field unless requested so older engines receive unchanged commands.
+function literalField(options: RpcTextInputOptions | undefined): { literal?: true } {
+	return options?.literal === true ? { literal: true } : {};
+}
+
 export type ModelInfo = Pick<Model, "provider" | "id" | "contextWindow" | "reasoning" | "thinking">;
 
 export type RpcEventListener = (event: AgentEvent) => void;
@@ -290,6 +301,12 @@ function isPageFallbackError(error: unknown): boolean {
 
 export class RpcClient {
 	#process: RpcAgentProcess | null = null;
+	#capabilities: readonly string[] = [];
+
+	/** Engine capabilities advertised on the ready frame; empty before start or on older engines. */
+	get capabilities(): readonly string[] {
+		return this.#capabilities;
+	}
 	#reaping: Promise<void> | null = null;
 	#eventListeners: RpcEventListener[] = [];
 	#sessionEventListeners: RpcSessionEventListener[] = [];
@@ -394,6 +411,9 @@ export class RpcClient {
 			for await (const line of lines) {
 				if (!readySettled && isRecord(line) && line.type === "ready") {
 					protocolV2Supported = supportsRpcProtocolV2(line);
+					this.#capabilities = Array.isArray(line.capabilities)
+						? line.capabilities.filter((entry): entry is string => typeof entry === "string")
+						: [];
 					readySettled = true;
 					readyResolve();
 					continue;
@@ -633,8 +653,8 @@ export class RpcClient {
 	 * Returns the request id once accepted; use onEvent() to receive streaming events
 	 * and onPromptResult() to observe its completion under that id.
 	 */
-	async prompt(message: string, images?: ImageContent[]): Promise<string> {
-		const response = await this.#send({ type: "prompt", message, images });
+	async prompt(message: string, images?: ImageContent[], options?: RpcTextInputOptions): Promise<string> {
+		const response = await this.#send({ type: "prompt", message, images, ...literalField(options) });
 		this.#getData(response);
 		return response.id ?? "";
 	}
@@ -642,15 +662,15 @@ export class RpcClient {
 	/**
 	 * Queue a steering message to interrupt the agent mid-run.
 	 */
-	async steer(message: string, images?: ImageContent[]): Promise<void> {
-		await this.#send({ type: "steer", message, images });
+	async steer(message: string, images?: ImageContent[], options?: RpcTextInputOptions): Promise<void> {
+		await this.#send({ type: "steer", message, images, ...literalField(options) });
 	}
 
 	/**
 	 * Queue a follow-up message to be processed after the agent finishes.
 	 */
-	async followUp(message: string, images?: ImageContent[]): Promise<void> {
-		await this.#send({ type: "follow_up", message, images });
+	async followUp(message: string, images?: ImageContent[], options?: RpcTextInputOptions): Promise<void> {
+		await this.#send({ type: "follow_up", message, images, ...literalField(options) });
 	}
 
 	/**
@@ -671,8 +691,8 @@ export class RpcClient {
 	/**
 	 * Abort current operation and immediately start a new turn with the given message.
 	 */
-	async abortAndPrompt(message: string, images?: ImageContent[]): Promise<void> {
-		await this.#send({ type: "abort_and_prompt", message, images });
+	async abortAndPrompt(message: string, images?: ImageContent[], options?: RpcTextInputOptions): Promise<void> {
+		await this.#send({ type: "abort_and_prompt", message, images, ...literalField(options) });
 	}
 
 	/**
