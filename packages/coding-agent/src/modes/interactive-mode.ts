@@ -6244,6 +6244,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	/** Enter through the same goal activation path as `/goal set`, then start its first turn. */
 	async startGoalAtStartup(objective: string): Promise<void> {
 		await this.#enterGoalMode({ objective, silent: true });
+		if (!this.goalModeEnabled) return;
 		this.#resetGoalContinuationSuppression();
 		using _keepalive = new EventLoopKeepalive();
 		await this.session.prompt(objective, { streamingBehavior: "steer" });
