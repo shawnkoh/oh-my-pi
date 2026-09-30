@@ -736,7 +736,12 @@ describe.skipIf(process.platform === "win32")("owned-job registry", () => {
 
 	it("never reads a header as complete unless `complete` is exactly true with no reasons", () => {
 		const pid = 0x7ffffff4;
-		for (const override of [{ complete: false, incompleteReasons: [] }, { complete: "false" }, { complete: 1 }]) {
+		for (const override of [
+			{ complete: false, incompleteReasons: [] },
+			{ complete: true, incompleteReasons: ["x"] },
+			{ complete: "false" },
+			{ complete: 1 },
+		]) {
 			const file = path.join(tempDir.path(), "crafted.jobs.jsonl");
 			fs.writeFileSync(file, `${JSON.stringify({ ...header(pid, "5"), ...override })}\n`);
 			expect(verifyOwnedJobRegistry(file).status).toBe("unknown");
@@ -963,4 +968,85 @@ describe.skipIf(process.platform === "win32")("owned-job registry", () => {
 			expect(registry.liveProcessCount()).toBe(1);
 		},
 	);
+
+	it("keeps two session objects in one process on the same file apart", () => {
+		registry.ensureHeader();
+		const second = new OwnedJobRegistry({
+			getSessionFile: () => sessionFile,
+			getSessionId: () => "session",
+			pollIntervalMs: 0,
+		});
+		try {
+			// The second object headers the file after the first: both headers name this pid.
+			second.ensureHeader();
+			const child = Bun.spawn(["/bin/sleep", uniqueSleep()], { stdout: "ignore", stderr: "ignore" });
+			spawned.push(child.pid);
+			registry.registerProcess({ kind: "process", pid: child.pid, command: "sleep" });
+			registry.registerInProcessJob({ jobId: "shell-run:1", kind: "shell-run", command: "first run" });
+			// Same job id, different job: ending it must not end the first object's run.
+			second.registerInProcessJob({ jobId: "shell-run:1", kind: "shell-run", command: "second run" });
+			second.end("shell-run:1", "settled");
+			const parsed = parseOwnedJobRegistry(fs.readFileSync(ownedJobRegistryPath(sessionFile), "utf8"));
+			expect(parsed.problems).toEqual([]);
+			expect(parsed.segments.map(segment => [...segment.open.keys()])).toEqual([
+				[`process:${child.pid}:${processIdentity(child.pid).startId}`, "shell-run:1"],
+				[],
+			]);
+			// The second object sees the first's work instead of mistaking it for its own.
+			second.scanOwnedProcesses();
+			expect(second.liveProcessCount()).toBe(1);
+			expect(second.complete).toBe(false);
+		} finally {
+			second.close();
+		}
+	});
+
+	it("takes over what another invocation left in a file this registry switched away from", async () => {
+		registry.ensureHeader();
+		const { recordedPid } = await startConcurrentInvocation(false);
+		sessionFile = path.join(tempDir.path(), "2026-01-04_switched.jsonl");
+		registry.ensureHeader();
+		registry.scanOwnedProcesses();
+		expect(registry.openJobs()).toContainEqual(expect.objectContaining({ pid: recordedPid }));
+		expect(registry.liveProcessCount()).toBe(1);
+		expect(registry.complete).toBe(false);
+	});
+
+	it("reads a replaced registry file again from the start", () => {
+		registry.ensureHeader();
+		// This registry has read the whole file.
+		registry.scanOwnedProcesses();
+		const file = ownedJobRegistryPath(sessionFile);
+		const size = fs.statSync(file).size;
+		// A running "invocation" in a same-size replacement: the old read offset would skip it.
+		const child = Bun.spawn(["/bin/sleep", uniqueSleep()], { stdout: "ignore", stderr: "ignore" });
+		spawned.push(child.pid);
+		const foreign = JSON.stringify(header(child.pid, processIdentity(child.pid).startId!));
+		const line = `${foreign.padEnd(size - 1)}\n`;
+		expect(Buffer.byteLength(line)).toBe(size);
+		fs.writeFileSync(`${file}.new`, line);
+		fs.renameSync(`${file}.new`, file);
+		registry.scanOwnedProcesses();
+		expect(registry.liveProcessCount()).toBe(1);
+		expect(registry.complete).toBe(false);
+	});
+
+	it("stops vouching once a record nobody is left to finish is torn at the end of the file", () => {
+		registry.ensureHeader();
+		expect(registry.complete).toBe(true);
+		fs.appendFileSync(ownedJobRegistryPath(sessionFile), '{"type":"start","jobId":"half');
+		registry.scanOwnedProcesses();
+		registry.scanOwnedProcesses();
+		expect(registry.complete).toBe(false);
+		expect(registry.incompleteReasons).toContain("a registry file ends in a torn record");
+	});
+
+	it("takes over the reasons of every header one writer wrote", () => {
+		const pid = 0x7ffffffa;
+		const first = { ...header(pid, "5"), writer: "w" };
+		const again = { ...header(pid, "5"), writer: "w", complete: false, incompleteReasons: ["x"] };
+		fs.writeFileSync(ownedJobRegistryPath(sessionFile), `${JSON.stringify(first)}\n${JSON.stringify(again)}\n`);
+		registry.ensureHeader();
+		expect(registry.incompleteReasons).toContain("inherited: x");
+	});
 });

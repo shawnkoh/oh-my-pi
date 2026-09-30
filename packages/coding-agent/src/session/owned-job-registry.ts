@@ -4,16 +4,19 @@
  *
  * File: `<session file without .jsonl>.jobs.jsonl`, append-only JSONL. Every
  * record is written with a synchronous append + fsync before the registering
- * call returns. Each process invocation that writes to a file first appends an
- * `invocation` record; `start` and `end` records carry the invocation pid.
+ * call returns. Each registry object that writes to a file first appends an
+ * `invocation` header (with its random `writer` id); its `start`, `end` and
+ * `incomplete` records carry the invocation pid and the same `writer`.
  *
- * Consumers decide per invocation:
- * - any `incomplete` record, or an `invocation` record with `complete: false`,
- *   means some owned process may be missing: answer `unknown`;
+ * Consumers decide per header segment ({@link verifyOwnedJobRegistry} is the rule):
+ * - a header that is not exactly `complete: true` with no `incompleteReasons`, a
+ *   header or start record of the wrong shape, or any `incomplete` record means some
+ *   owned process may be missing: answer `unknown`;
  * - a `start` with `inProcess: true` and no `end` after its invocation ended
  *   means the job's descendants were never enumerated: answer `unknown`;
- * - a `start` with `inProcess: false` and no `end` is alive iff a process with
- *   that `pid` exists whose OS start time equals `startTime`.
+ * - a `start` with `inProcess: false` and no `end` is alive iff a live, non-zombie
+ *   process with that `pid` has that `startId`;
+ * - a scan for every owner token any header names finds processes nobody reported.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -96,6 +99,8 @@ export interface OwnedJobStartRecord {
 	 */
 	adoptedFrom?: InvocationIdentity;
 	invocationPid: number;
+	/** The `writer` of the header this record belongs to (see {@link RegistryReader}). */
+	writer?: string;
 	/** ISO-8601 timestamp. */
 	registeredAt: string;
 }
@@ -106,6 +111,8 @@ export interface OwnedJobEndRecord {
 	/** `exited`: the OS process was observed gone. `settled`: an in-process job finished. */
 	how: "exited" | "settled";
 	invocationPid: number;
+	/** The `writer` of the header this record belongs to. */
+	writer?: string;
 	endedAt: string;
 }
 
@@ -120,8 +127,9 @@ export interface OwnedJobInvocationRecord {
 	/** Environment marker inherited by processes this invocation spawns (see {@link OWNER_MARKER_ENV}). */
 	ownerMarker?: { env: string; token: string };
 	/**
-	 * Random id of the registry object that wrote this header, so a registry reading the file
-	 * back tells its own records from another writer's in the same process.
+	 * Random id of the registry object that wrote this header. Its `start`, `end` and
+	 * `incomplete` records carry the same `writer`, so records of two session objects in one
+	 * process are told apart (and a registry reading the file back skips its own).
 	 */
 	writer?: string;
 	/**
@@ -143,6 +151,8 @@ export interface OwnedJobIncompleteRecord {
 	type: "incomplete";
 	reason: string;
 	invocationPid: number;
+	/** The `writer` of the header this record belongs to. */
+	writer?: string;
 	at: string;
 }
 
@@ -151,6 +161,17 @@ export type OwnedJobRecord =
 	| OwnedJobStartRecord
 	| OwnedJobEndRecord
 	| OwnedJobIncompleteRecord;
+
+interface RegistryFileRead {
+	reader: RegistryReader;
+	/** Bytes consumed: every whole line before this offset has been fed to `reader`. */
+	offset: number;
+	problemsSeen: number;
+	/** `dev:ino` of the file when last read; a change means it was replaced. */
+	identity?: string;
+	/** File size at the previous read when it ended in an unterminated line. */
+	tornAtSize?: number;
+}
 
 export interface OwnedProcessInput {
 	kind: "process" | "service" | "internal";
@@ -379,16 +400,20 @@ export function headerIncompleteReasons(header: OwnedJobInvocationRecord): strin
 
 /**
  * Incremental registry parser. A record belongs to the latest preceding header whose
- * invocation has its `invocationPid`, so a pid reused by a later invocation never ends or
- * reopens an earlier invocation's jobs. Malformed lines, unknown record types, headers of the
- * wrong shape and records with no owning header are reported as problems rather than guessed
- * at. {@link feed} keeps a trailing partial line until more text (or {@link finish}) arrives,
- * so a file can be read while another process appends to it.
+ * invocation has its `invocationPid` and, when the record carries `writer`, whose `writer`
+ * is the same: a pid reused by a later invocation never ends or reopens an earlier
+ * invocation's jobs, and two session objects in one process never end or hide each other's.
+ * Malformed lines, unknown record types, headers or start records of the wrong shape and
+ * records with no owning header are reported as problems rather than guessed at. {@link feed}
+ * keeps a trailing partial line until more text (or {@link finish}) arrives, so a file can be
+ * read while another process appends to it.
  */
 export class RegistryReader {
 	readonly segments: RegistrySegment[] = [];
 	readonly problems: string[] = [];
 	readonly #latestByPid = new Map<number, RegistrySegment>();
+	/** Keyed by `<pid>:<writer>`. */
+	readonly #latestByWriter = new Map<string, RegistrySegment>();
 	#pending = "";
 
 	/** Parse every complete line of `text` (appended to what was fed before). */
@@ -426,13 +451,24 @@ export class RegistryReader {
 			const segment: RegistrySegment = { header: value, open: new Map(), incomplete: [] };
 			this.segments.push(segment);
 			this.#latestByPid.set(value.invocation.pid, segment);
+			if (value.writer !== undefined) this.#latestByWriter.set(`${value.invocation.pid}:${value.writer}`, segment);
 			return;
 		}
 		if (value.type !== "start" && value.type !== "end" && value.type !== "incomplete") {
 			this.problems.push(`registry has a record of unknown type ${JSON.stringify(value.type)}`);
 			return;
 		}
-		const segment = typeof value.invocationPid === "number" ? this.#latestByPid.get(value.invocationPid) : undefined;
+		if (value.writer !== undefined && typeof value.writer !== "string") {
+			this.problems.push(`registry has a ${value.type} record with a malformed writer`);
+			return;
+		}
+		const pid = value.invocationPid;
+		const segment =
+			typeof pid !== "number"
+				? undefined
+				: value.writer === undefined
+					? this.#latestByPid.get(pid)
+					: this.#latestByWriter.get(`${pid}:${value.writer}`);
 		if (!segment) {
 			this.problems.push(`registry has a ${value.type} record with no invocation header`);
 			return;
@@ -508,13 +544,13 @@ export class OwnedJobRegistry {
 	readonly #persistedReasons = new Map<string, Set<string>>();
 	/** Owner tokens of other invocations taken over from bound files, by token. */
 	readonly #inheritedMarkers = new Map<string, InheritedOwnerMarker>();
-	/** Per bound file: the incremental reader and how many bytes of the file it has read. */
-	readonly #readers = new Map<string, { reader: RegistryReader; offset: number; problemsSeen: number }>();
+	/** Per bound file: its incremental reader and read position. */
+	readonly #readers = new Map<string, RegistryFileRead>();
 	/** Foreign headers, reasons and records already acted on (adopted or flagged). */
 	readonly #handledForeign = new Set<string>();
 	/** Other invocations that wrote a bound file and are still running (or cannot be examined). */
 	readonly #foreignInvocations = new Map<string, InvocationIdentity>();
-	/** Identifies this registry's own headers in a file it reads back. */
+	/** Identifies this registry's header and records in a file it reads back. */
 	readonly #writerId = crypto.randomUUID();
 	/** Taken-over tokens the previous owner scan found prunable; pruned if the next agrees. */
 	#prunable = new Set<string>();
@@ -715,17 +751,17 @@ export class OwnedJobRegistry {
 	}
 
 	/**
-	 * Read what other invocations appended to the current registry file since the last read
-	 * and take it over (see {@link #takeOver}). Another process can have the same session
-	 * open at the same time; this is how its work becomes visible here. Runs before every
-	 * owner scan (so on every `attest`, quiesce and hang-up capture).
+	 * Read what other invocations appended to every registry file this registry bound since
+	 * the last read and take it over (see {@link #takeOver}) into the current file. Another
+	 * process can have a session open at the same time, including one this registry switched
+	 * away from; this is how its work becomes visible here. Runs before every owner scan (so on
+	 * every `attest`, quiesce and hang-up capture).
 	 */
 	refresh(): void {
-		const file = this.path;
-		if (!file || !this.#readers.has(file)) return;
-		const adopted = this.#readTail(file);
-		this.#adopt(file, adopted);
-		if (this.#headered.has(file)) this.#prepare(file);
+		const current = this.path;
+		const target = current && this.#readers.has(current) ? current : undefined;
+		for (const file of this.#readers.keys()) this.#adopt(target ?? file, this.#readTail(file));
+		if (target && this.#headered.has(target)) this.#prepare(target);
 	}
 
 	/**
@@ -905,7 +941,8 @@ export class OwnedJobRegistry {
 	/**
 	 * Parse what `file` gained since the last read (everything on the first read) and take
 	 * over what other writers put there. Only whole lines are consumed; a line another process
-	 * is still appending is read next time. Returns the records to adopt.
+	 * is still appending is read next time. A file replaced by another one is read again from
+	 * the start. Returns the records to adopt.
 	 */
 	#readTail(file: string): OwnedJobStartRecord[] {
 		let state = this.#readers.get(file);
@@ -921,7 +958,9 @@ export class OwnedJobRegistry {
 			return [];
 		}
 		try {
-			const size = fs.fstatSync(fd).size;
+			const stat = fs.fstatSync(fd);
+			state = this.#checkFileIdentity(file, state, stat);
+			const size = stat.size;
 			if (size < state.offset) {
 				this.#noteIncomplete("the registry file shrank while this invocation had it open");
 				state.offset = size;
@@ -934,6 +973,13 @@ export class OwnedJobRegistry {
 					state.offset += complete;
 				}
 			}
+			const torn = size > state.offset;
+			// An unterminated last line that did not grow since the previous read, with no other
+			// invocation of the file running to finish it, is a record its writer died writing.
+			if (torn && state.tornAtSize === size && !this.#foreignInvocationRunning()) {
+				this.#noteIncomplete("a registry file ends in a torn record");
+			}
+			state.tornAtSize = torn ? size : undefined;
 		} catch (error) {
 			this.#noteIncomplete("a registry file could not be read");
 			logger.warn("Owned job registry read failed", { file, error: String(error) });
@@ -945,11 +991,33 @@ export class OwnedJobRegistry {
 		for (const problem of reader.problems.slice(state.problemsSeen)) this.#noteIncomplete(inheritedReason(problem));
 		state.problemsSeen = reader.problems.length;
 		const adopted: OwnedJobStartRecord[] = [];
-		for (const segment of reader.segments) {
-			if (segment.header.writer === this.#writerId) continue;
-			adopted.push(...this.#takeOver(segment));
-		}
+		reader.segments.forEach((segment, index) => {
+			if (segment.header.writer !== this.#writerId) adopted.push(...this.#takeOver(segment, index));
+		});
 		return adopted;
+	}
+
+	/**
+	 * Note the identity of `file` as just opened. Another file put in its place may lack
+	 * records `state` already consumed, this invocation's own included: the registry stops
+	 * vouching and the file is read again from the start. Returns the state to use.
+	 */
+	#checkFileIdentity(file: string, state: RegistryFileRead, stat: fs.Stats): RegistryFileRead {
+		const identity = `${stat.dev}:${stat.ino}`;
+		if (state.identity !== undefined && state.identity !== identity) {
+			this.#noteIncomplete("the registry file was replaced while this invocation had it open");
+			state = { reader: new RegistryReader(), offset: 0, problemsSeen: 0 };
+			this.#readers.set(file, state);
+		}
+		state.identity = identity;
+		return state;
+	}
+
+	#foreignInvocationRunning(): boolean {
+		for (const invocation of this.#foreignInvocations.values()) {
+			if (ownedProcessState(invocation.pid, invocation.startId) !== "gone") return true;
+		}
+		return false;
 	}
 
 	/**
@@ -957,27 +1025,30 @@ export class OwnedJobRegistry {
 	 * another session object in this process — left, so this registry never reads clearer
 	 * than the file:
 	 * - its incomplete state (header not exactly `complete: true`, `incomplete` records)
-	 *   becomes this registry's, as does an in-process job it never ended once it is gone;
+	 *   becomes this registry's, as does an in-process job it never ended once it is gone (at
+	 *   once for another session object in this process, which is not watched);
 	 * - its owner tokens are scanned from now on;
 	 * - while it is still running (or cannot be examined) it counts as live work;
 	 * - every open OS-process record that is not provably gone is returned for adoption
 	 *   (re-appended under this invocation with `adoptedFrom`).
-	 * Idempotent per record: re-reading a segment acts only on what is new.
+	 * Idempotent per segment (`index` in file order) and record: re-reading acts only on what
+	 * is new.
 	 */
-	#takeOver(segment: RegistrySegment): OwnedJobStartRecord[] {
+	#takeOver(segment: RegistrySegment, index: number): OwnedJobStartRecord[] {
 		const me = currentInvocation();
 		const writer = segment.header.invocation;
 		const key = `${writer.pid}:${writer.startId ?? "unknown"}:${segment.header.writer ?? ""}`;
-		if (!this.#handledForeign.has(key)) {
-			this.#handledForeign.add(key);
+		const segmentKey = `${key}:${index}`;
+		if (!this.#handledForeign.has(segmentKey)) {
+			this.#handledForeign.add(segmentKey);
 			const ownToken = ownerToken();
 			for (const marker of headerMarkers(segment.header)) {
 				if (marker.token !== ownToken) this.#inheritedMarkers.set(marker.token, marker);
 			}
 			for (const reason of headerIncompleteReasons(segment.header)) this.#noteIncomplete(inheritedReason(reason));
 		}
-		segment.incomplete.forEach((reason, index) => {
-			const reasonKey = `${key}:incomplete:${index}`;
+		segment.incomplete.forEach((reason, reasonIndex) => {
+			const reasonKey = `${segmentKey}:incomplete:${reasonIndex}`;
 			if (this.#handledForeign.has(reasonKey)) return;
 			this.#handledForeign.add(reasonKey);
 			this.#noteIncomplete(inheritedReason(reason));
@@ -989,21 +1060,21 @@ export class OwnedJobRegistry {
 		else this.#foreignInvocations.set(key, writer);
 		const adopted: OwnedJobStartRecord[] = [];
 		for (const record of segment.open.values()) {
-			// A record this registry holds open is its own (attributed here when another writer in
-			// this process headered the file later).
-			if (record.kind === "internal" || this.#open.has(record.jobId)) continue;
-			const recordKey = `${key}:${record.jobId}`;
+			if (record.kind === "internal") continue;
+			const recordKey = `${segmentKey}:${record.jobId}`;
 			if (this.#handledForeign.has(recordKey)) continue;
 			if (record.inProcess) {
 				// Unfinished only once its writer is gone; while it runs it is counted as live.
+				// Job ids are per writer: one equal to an id of this registry is a different job.
 				if (!writerGone) continue;
 				this.#handledForeign.add(recordKey);
 				this.#noteIncomplete(inheritedReason(`invocation ${writer.pid} left ${record.kind} work unfinished`));
 				continue;
 			}
 			this.#handledForeign.add(recordKey);
-			if (ownedProcessState(record.pid, record.startId) === "gone") continue;
-			const { carriedFrom: _carried, ...rest } = record;
+			// The same process (process job ids name pid and start identity) is already tracked.
+			if (this.#open.has(record.jobId) || ownedProcessState(record.pid, record.startId) === "gone") continue;
+			const { carriedFrom: _carried, writer: _writer, ...rest } = record;
 			adopted.push({
 				...rest,
 				adoptedFrom: record.adoptedFrom ?? writer,
@@ -1032,15 +1103,19 @@ export class OwnedJobRegistry {
 			if (created) fs.mkdirSync(dir, { recursive: true });
 			const fd = fs.openSync(file, "a+", 0o600);
 			try {
+				const stat = fs.fstatSync(fd);
+				const read = this.#readers.get(file);
+				if (read) this.#checkFileIdentity(file, read, stat);
 				// A torn last line (a writer that died mid-record) must not swallow this record.
-				const size = fs.fstatSync(fd).size;
+				const size = stat.size;
 				let separator = "";
 				if (size > 0) {
 					const last = Buffer.alloc(1);
 					fs.readSync(fd, last, 0, 1, size - 1);
 					if (last[0] !== 0x0a) separator = "\n";
 				}
-				fs.writeSync(fd, `${separator}${JSON.stringify(record)}\n`);
+				const stamped = record.type === "invocation" ? record : { ...record, writer: this.#writerId };
+				fs.writeSync(fd, `${separator}${JSON.stringify(stamped)}\n`);
 				fs.fsyncSync(fd);
 			} finally {
 				fs.closeSync(fd);
@@ -1103,8 +1178,11 @@ export interface VerifyOwnedJobRegistryOptions {
  * helpers never block. Consumers in other languages reimplement exactly this rule:
  *
  * 1. A record belongs to the latest preceding header whose invocation has its
- *    `invocationPid`; job ids restart in every invocation. A malformed line, a record of
- *    unknown type, or one with no owning header makes the answer at best `unknown`.
+ *    `invocationPid` and, when the record has a `writer`, the same `writer`; job ids restart
+ *    per header. A malformed line, a record of unknown type, a start record without a string
+ *    `jobId` and `kind`, an integer `pid`, a boolean `inProcess` and a decimal-string or null
+ *    `startId`, a non-string `writer`, or a record with no owning header makes the answer at
+ *    best `unknown`.
  * 2. A header counts as complete only when `complete` is exactly `true` and it lists no
  *    `incompleteReasons`; headers whose fields have the wrong type are malformed (rule 1).
  *    Incomplete headers and `incomplete` records make the answer at best `unknown`. With

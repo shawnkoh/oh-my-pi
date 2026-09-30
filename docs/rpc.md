@@ -489,8 +489,12 @@ false` when some process may be untracked; `writer`, a random id of the registry
 (`jobId`, `kind`, `pid`, `pgid`, `startId`, `startTime` in Unix seconds for display,
 `command` (at most 4096 characters), `cwd`, `sleepable`, `inProcess`, `reparented?`,
 `groupMember?`, `discovered?`, `carriedFrom?`, `adoptedFrom?`), `end` records, and
-`incomplete` records. A record belongs to the latest preceding header whose invocation
-has its `invocationPid`; job ids restart in every invocation. `startId` is an opaque,
+`incomplete` records; `start`, `end` and `incomplete` records carry `invocationPid` and
+the `writer` of their header (records written before `writer` existed have none). A
+record belongs to the latest preceding header whose invocation has its `invocationPid`
+and, when the record has a `writer`, the same `writer` — so two session objects in one
+process writing the same file never end or hide each other's jobs; job ids restart per
+header. `startId` is an opaque,
 clock-independent start identity (Linux: start ticks since boot; macOS: start time in
 microseconds; Windows: creation `FILETIME`) compared for equality only. An open record
 with `inProcess: false` is alive iff a live, non-zombie process with that `pid` has that
@@ -504,9 +508,14 @@ the first file; the end record then goes to every file holding the start.
 
 **Other invocations of the same session file.** OMP does not lock a session file: a
 resume can bind a file earlier invocations wrote, and a second OMP can have it open at
-the same time. The agent reads what other writers append — on first binding the file and
+the same time. The agent reads what other writers append — on first binding a file and
 again, incrementally, before every owner scan (so on every `attest`, `quiesce_and_exit`
-and hang-up capture) — and takes it over:
+and hang-up capture), for every file it has bound, not only the current one — and takes
+it over into the current file. It reads only whole lines: an unterminated last line that
+stays the same across two reads while no other invocation of the file is running is a
+record its writer died writing, and makes this invocation incomplete. A registry file
+replaced by another file (a different inode) also makes it incomplete, and is read again
+from the start. What it takes over:
 - every open process record that is not provably gone is re-appended under this
   invocation with `adoptedFrom` and counted in `detachedJobs`;
 - another invocation still running (or one whose identity cannot be read) counts as one
@@ -517,9 +526,12 @@ and hang-up capture) — and takes it over:
   record was adopted from that invocation, and two consecutive scans that could examine
   every candidate process — tracked or not — found none carrying it (the header that
   issued it still names it);
-- their incomplete state — a header that is not exactly `complete: true` with no reasons,
-  an `incomplete` record, an in-process job still open once its invocation is gone, an
-  unparseable line — makes this invocation incomplete too (`inherited: <reason>`).
+- their incomplete state — a header that is not exactly `complete: true` with no reasons
+  (every header, including a writer's repeated one), an `incomplete` record, an
+  in-process job still open once its invocation is gone, an unparseable line — makes
+  this invocation incomplete too (`inherited: <reason>`). Another session object in the
+  same process is not watched for liveness: its open in-process jobs make this one
+  incomplete at once, and it never counts as live work.
 Incompleteness therefore sticks to a session file: once an invocation could not vouch
 for everything it started, no later invocation of that file claims `complete`.
 
@@ -576,12 +588,16 @@ and consumers get `unknown` rather than a false clear. Windows has no scan.
 **Consumer rule after the agent exited** (`verifyOwnedJobRegistry(path, {
 expectedInvocation })` in `@oh-my-pi/pi-coding-agent/session/owned-job-registry`
 implements it):
-1. Attribute each record to the latest preceding header with its `invocationPid`. A
-   malformed line, an unknown record type, a header whose fields do not have the types
-   above (`complete` a boolean, `incompleteReasons` strings, `ownerMarker` and every
-   `inheritedOwnerMarkers` entry with string `token`/`env` and a decimal-string or null
-   `startId`), or a record with no such header → at best `unknown`. With
-   `expectedInvocation`, no header for it → at best `unknown`.
+1. Attribute each record to the latest preceding header with its `invocationPid` and,
+   when the record has a `writer`, the same `writer`. At best `unknown` for: a malformed
+   line; an unknown record type; a header whose fields do not have the types above
+   (`invocation.pid` an integer, `invocation.startId` a decimal string or null,
+   `sessionId` a string, `complete` a boolean, `incompleteReasons` strings, `writer` a
+   string, `ownerMarker` and every `inheritedOwnerMarkers` entry with string
+   `token`/`env` and a decimal-string or null `startId`); a start record without a string
+   `jobId` and `kind`, an integer `pid`, a boolean `inProcess` and a decimal-string or
+   null `startId`; a record with a non-string `writer`; a record with no such header.
+   With `expectedInvocation`, no header for it → at best `unknown`.
 2. Any invocation still alive (pid + `startId`) → `live`: use `attest` instead; one
    whose identity cannot be read → at best `unknown`.
 3. A header counts as complete only when `complete` is exactly `true` and it lists no
