@@ -74,6 +74,15 @@ describe("external delivery over RPC", () => {
 		return { command, until, received, receive };
 	}
 
+	test("the ready frame advertises the capability before any command", async () => {
+		const rpc = start();
+		const ready = await rpc.receive();
+		expect(ready.type).toBe("ready");
+		expect(ready.capabilities).toEqual(["external-delivery/1"]);
+		// Advertised before negotiation: a v1-only host can read it from the first frame.
+		expect(rpc.received.length).toBe(1);
+	});
+
 	test("deliver never parses commands, and receipts correlate by the engine-minted delivery id", async () => {
 		const rpc = start();
 		await rpc.until(frame => frame.type === "ready");

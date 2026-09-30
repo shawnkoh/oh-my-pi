@@ -224,6 +224,8 @@ export interface RpcReadyFrame {
 	supportedProtocolVersions: [1, 2];
 	maxFrameBytes: number;
 	maxReassembledFrameBytes: number;
+	/** Optional engine capabilities a host may rely on (for example `external-delivery/1`). Absent on older engines. */
+	capabilities: string[];
 }
 
 export interface RpcChunkFrame {
