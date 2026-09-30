@@ -46,7 +46,7 @@ The initial ready frame uses protocol v1 and advertises the opt-in lossless tran
   "supportedProtocolVersions": [1, 2],
   "maxFrameBytes": 1048576,
   "maxReassembledFrameBytes": 67108864,
-  "capabilities": []
+  "capabilities": ["literal-input/1", "tool-approval-binding/1", "reply-attribution/1", "rich-ask/1"]
 }
 ```
 
@@ -286,6 +286,7 @@ Data payloads are command-specific and defined in `rpc-types.ts`.
 - `agentInvoked: true`: the prompt was dispatched or queued for agent work; normal completion reports when the agent **yielded** — see [Yield vs settled](#yield-vs-settled). An abort that wins before dispatch can still report `true` with `status: "aborted"`. A prompt dispatched as a fresh turn reports the first run that started after it was accepted, so a late `agent_end` from an earlier run never completes it. A prompt queued into a live run (`streamingBehavior`) reports at the first yield after its message left the queue. An `agent_end` with `yielded: false` (the agent is retrying, compacting, or answering a stop-time reminder) never completes a prompt.
 - `status`: `"completed"`, `"aborted"` (interrupted by `abort`, `abort_and_prompt`, or a session transition, or dropped by an abort before dispatch), or `"error"`.
 - `error` (only with `status: "error"`): `{ message, provider?, model?, httpStatus?, retryable }`. `message` is the provider's error text with OMP-local diagnostics (such as saved request-dump paths) removed. `retryable` marks a transient failure; OMP's own automatic retries have already been exhausted. A prompt that fails before reaching the agent also gets the legacy error response with the same `id` before its `prompt_result`.
+- `run`, `promptEntryId` and `replyEntryIds` (capability `reply-attribution/1`). `run` is the engine-local ordinal of the run whose yield answered the prompt. A run spans retries and continuations up to that yield, and prompts reported with the same `run` were answered together, such as a follow-up folded into a live turn. `promptEntryId` is the session entry of the prompt's own user message. `replyEntryIds` are the assistant entries that followed it, up to the next user message; the last is the reply. A `literal` prompt is found by its exact text, unless another prompt answered by the same yield has the same text. Any other prompt is attributed only when it is the sole prompt answered and its run delivered a single user message. Every persisted user message counts: a host `steer`, an extension `sendUserMessage` or a subagent steer ends the preceding reply early and makes parsed prompts unattributable; skill prompts are never attributed. Entries are read at the yield. `replyEntryIds` is empty, and `promptEntryId` absent, rather than guessed when the prompt cannot be identified or the session or branch changed during the run. All three are absent for local-only commands.
 - `sessionSettled`: whether the session is already done when the result is written — see [Yield vs settled](#yield-vs-settled). `false` means background work can still wake the agent; a `session_settled` frame follows once it has.
 
 A failed provider turn is not a failed command: the prompt response is still `success: true`, and the turn ends with a normal terminal `agent_end` whose last assistant message has `stopReason: "error"`. Use `prompt_result.status` rather than parsing that message.
