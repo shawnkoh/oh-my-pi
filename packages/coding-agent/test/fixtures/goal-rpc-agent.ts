@@ -40,14 +40,17 @@ const { session } = await createAgentSession({
 	enableMCP: false,
 	enableLsp: false,
 });
+// GOAL_RPC_SCRIPT="slow": the first turn stalls long enough for the host to abort it.
 const turns: MockResponse[] =
 	Bun.env.GOAL_RPC_SCRIPT === "idle"
 		? []
-		: [
-				{ content: [{ type: "toolCall", id: "t1", name: "goal", arguments: { op: "get" } }] },
-				{ content: [{ type: "toolCall", id: "t2", name: "goal", arguments: { op: "complete" } }] },
-				{ content: ["Goal complete."] },
-			];
+		: Bun.env.GOAL_RPC_SCRIPT === "slow"
+			? [{ content: [{ type: "toolCall", id: "s1", name: "goal", arguments: { op: "get" } }], delayMs: 10_000 }]
+			: [
+					{ content: [{ type: "toolCall", id: "t1", name: "goal", arguments: { op: "get" } }] },
+					{ content: [{ type: "toolCall", id: "t2", name: "goal", arguments: { op: "complete" } }] },
+					{ content: ["Goal complete."] },
+				];
 const mock = createMockModel({ handler: () => turns.shift() ?? { content: ["Nothing left to do."] } });
 session.agent.streamFn = mock.stream;
 if (Bun.env.GOAL_RPC_PLAN === "1") {

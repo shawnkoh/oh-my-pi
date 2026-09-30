@@ -45,6 +45,7 @@ export type RpcGoalSession = Pick<
 	| "getTodoPhases"
 	| "promptCustomMessage"
 	| "isStreaming"
+	| "isDisposed"
 	| "hasAdmittedSubmission"
 	| "queuedMessageCount"
 >;
@@ -58,11 +59,32 @@ export class RpcGoalController {
 	#previousContinuationActivity: string | undefined;
 	/** A continuation turn made no new progress; wait for the host before continuing. */
 	#suppressContinuation = false;
+	/** A continuation is scheduled for the next macrotask and not yet admitted. */
+	#continuationScheduled = false;
 	/** Tool-set restoration triggered by session events; commands and reads wait for it. */
 	#exitTask: Promise<void> = Promise.resolve();
 
 	constructor(session: RpcGoalSession) {
 		this.#session = session;
+	}
+
+	/**
+	 * True while a goal continuation has been decided but not yet admitted. Hosts and
+	 * quiescence checks must treat the session as busy during this window.
+	 */
+	get continuationPending(): boolean {
+		return this.#continuationScheduled;
+	}
+
+	/**
+	 * The host interrupted the session (`abort`). Stop automatic continuation until
+	 * the host acts again (a prompt, steer, follow-up, or `goal resume`/`create`).
+	 * Called before the abort starts, so the aborted run's own `agent_end` cannot
+	 * schedule another goal turn. The runtime separately pauses the interrupted goal.
+	 */
+	stopForHostAbort(): void {
+		this.#suppressContinuation = true;
+		this.#continuationScheduled = false;
 	}
 
 	get #state(): RpcGoalResult {
@@ -242,10 +264,15 @@ export class RpcGoalController {
 		this.#scheduleContinuation();
 	}
 
+	/**
+	 * The continuation turn to start now, or undefined when any gate is closed.
+	 * Every gate is read from the live session at submission time; there is no
+	 * cached "idle" inference. A disposed session never admits a continuation.
+	 */
 	#continuationPrompt(): string | undefined {
 		const session = this.#session;
 		if (!cfgGoalContinuationModes.get(session.settings).includes(RPC_GOAL_CONTINUATION_MODE)) return undefined;
-		if (this.#suppressContinuation) return undefined;
+		if (this.#suppressContinuation || session.isDisposed) return undefined;
 		if (session.getPlanModeState()?.enabled) return undefined;
 		const state = session.getGoalModeState();
 		if (!state?.enabled || state.goal.status !== "active") return undefined;
@@ -263,11 +290,17 @@ export class RpcGoalController {
 	 * never reports settled while a continuation is about to be admitted.
 	 */
 	#scheduleContinuation(): void {
-		if (!this.#continuationPrompt()) return;
+		if (this.#continuationScheduled || !this.#continuationPrompt()) return;
+		this.#continuationScheduled = true;
 		setImmediate(() => {
+			if (!this.#continuationScheduled) return;
+			this.#continuationScheduled = false;
+			// Re-check every gate: an abort, disposal, pause or host input may have landed meanwhile.
 			const prompt = this.#continuationPrompt();
 			if (!prompt) return;
 			this.#pendingContinuationTurns++;
+			// Admission is synchronous inside promptCustomMessage, so the gate check and
+			// the admitted submission cannot be separated by another event.
 			this.#session
 				.promptCustomMessage({ customType: "goal-continuation", content: prompt, display: false })
 				.then(dispatched => {

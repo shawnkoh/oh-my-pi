@@ -2,8 +2,19 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
+import { RpcGoalController, type RpcGoalSession } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-goal";
+import type { RpcSessionState } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
+import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { Goal } from "@oh-my-pi/pi-tui/tools/goal";
 import { removeWithRetries, withTimeout } from "@oh-my-pi/pi-utils";
+
+function nextMacrotask(): Promise<void> {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	setImmediate(resolve);
+	return promise;
+}
 
 describe("RPC goal command", () => {
 	let client: RpcClient | undefined;
@@ -18,7 +29,7 @@ describe("RPC goal command", () => {
 
 	async function start(options: {
 		continuation: boolean;
-		script?: "complete" | "idle";
+		script?: "complete" | "idle" | "slow";
 		plan?: boolean;
 	}): Promise<RpcClient> {
 		directory = await fs.mkdtemp(path.join(os.tmpdir(), "omp-rpc-goal-"));
@@ -144,4 +155,91 @@ describe("RPC goal command", () => {
 			),
 		).toBe(true);
 	}, 30_000);
+
+	test("host abort of a continuation turn pauses the goal and starts no further goal turn", async () => {
+		const rpc = await start({ continuation: true, script: "slow" });
+		let agentStarts = 0;
+		const started = Promise.withResolvers<void>();
+		const unsubscribe = rpc.onSessionEvent(event => {
+			if (event.type === "agent_start") {
+				agentStarts++;
+				started.resolve();
+			}
+		});
+		let state: RpcSessionState;
+		try {
+			await rpc.goal("create", { objective: "long task" });
+			await withTimeout(started.promise, 10_000, "Continuation turn never started");
+			await rpc.abort();
+			// A continuation escaping the abort is admitted synchronously one macrotask after
+			// the aborted run's agent_end; this later round-trip would observe it as busy.
+			state = await rpc.getState();
+		} finally {
+			unsubscribe();
+		}
+		expect(agentStarts).toBe(1);
+		expect(state.goal?.goal.status).toBe("paused");
+		expect(state.isStreaming).toBe(false);
+		expect(state.isSettled).toBe(true);
+	}, 30_000);
+});
+
+describe("RpcGoalController continuation gate", () => {
+	test("a continuation decided before the session closes is never admitted after it", async () => {
+		const settings = Settings.isolated({ "goal.continuationModes": ["rpc"] });
+		const goal: Goal = {
+			id: "g1",
+			objective: "o",
+			status: "active",
+			tokensUsed: 0,
+			timeUsedSeconds: 0,
+			createdAt: 0,
+			updatedAt: 0,
+		};
+		let disposed = false;
+		const admitted: string[] = [];
+		const session = {
+			settings,
+			get isDisposed() {
+				return disposed;
+			},
+			isStreaming: false,
+			hasAdmittedSubmission: false,
+			queuedMessageCount: 0,
+			getPlanModeState: () => undefined,
+			getGoalModeState: () => ({ enabled: true, mode: "active" as const, goal }),
+			getTodoPhases: () => [],
+			goalRuntime: { buildContinuationPrompt: () => "continue" },
+			promptCustomMessage: async (message: { customType: string }) => {
+				admitted.push(message.customType);
+				return true;
+			},
+		};
+		const controller = new RpcGoalController(session as unknown as RpcGoalSession);
+		const agentEnd = { type: "agent_end", messages: [], isTerminal: true } as unknown as AgentSessionEvent;
+
+		controller.observe(agentEnd);
+		expect(controller.continuationPending).toBe(true);
+		disposed = true;
+		await nextMacrotask();
+		expect(admitted).toEqual([]);
+		expect(controller.continuationPending).toBe(false);
+
+		// A host abort closes the gate before the aborted run's agent_end arrives.
+		disposed = false;
+		controller.stopForHostAbort();
+		controller.observe(agentEnd);
+		await nextMacrotask();
+		expect(admitted).toEqual([]);
+
+		// Host input re-arms it; the next yield continues exactly once.
+		controller.observe({
+			type: "message_start",
+			message: { role: "user", content: [] },
+		} as unknown as AgentSessionEvent);
+		controller.observe(agentEnd);
+		controller.observe(agentEnd);
+		await nextMacrotask();
+		expect(admitted).toEqual(["goal-continuation"]);
+	});
 });
