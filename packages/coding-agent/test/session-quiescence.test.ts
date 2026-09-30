@@ -8,6 +8,9 @@ import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import * as bashExecutor from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
+import type { ExtensionFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { type OwnedJobRecord, ownedJobRegistryPath } from "@oh-my-pi/pi-coding-agent/session/owned-job-registry";
@@ -19,6 +22,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/quiescence";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { postmortem, TempDir } from "@oh-my-pi/pi-utils";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import type { DaemonCompletionNotification } from "@oh-my-pi/pi-coding-agent/launch/protocol";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
@@ -52,7 +56,20 @@ describe("AgentSession quiesce-and-exit", () => {
 		tempDir.removeSync();
 	});
 
-	function createSession(): AgentSession {
+	interface SessionParts {
+		sessionManager: SessionManager;
+		modelRegistry: ModelRegistry;
+		extensionRunner?: ExtensionRunner;
+	}
+
+	function sessionParts(): SessionParts {
+		return {
+			sessionManager: SessionManager.create(tempDir.path(), path.join(tempDir.path(), "sessions")),
+			modelRegistry: new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml")),
+		};
+	}
+
+	function createSession(parts: SessionParts = sessionParts()): AgentSession {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("expected bundled model");
 		mock = createMockModel({
@@ -69,17 +86,41 @@ describe("AgentSession quiesce-and-exit", () => {
 		manager = new AsyncJobManager({ maxRunningJobs: 4 });
 		session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.create(tempDir.path(), path.join(tempDir.path(), "sessions")),
+			sessionManager: parts.sessionManager,
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml")),
+			modelRegistry: parts.modelRegistry,
 			ownedAsyncJobManager: manager,
 			agentId: "Main",
+			...(parts.extensionRunner ? { extensionRunner: parts.extensionRunner } : {}),
 		});
 		return session;
 	}
 
+	async function createSessionWithExtension(factory: ExtensionFactory): Promise<AgentSession> {
+		const parts = sessionParts();
+		const runtime = new ExtensionRuntime();
+		const extension = await loadExtensionFromFactory(factory, tempDir.path(), new EventBus(), runtime, "quiesce");
+		parts.extensionRunner = new ExtensionRunner(
+			[extension],
+			runtime,
+			tempDir.path(),
+			parts.sessionManager,
+			parts.modelRegistry,
+		);
+		return createSession(parts);
+	}
+
+	/** A quiesce request built from a fresh attestation (its epoch and instance id). */
 	function request(s: AgentSession, overrides: Partial<QuiesceRequest> = {}): QuiesceRequest {
-		return { operationId: "op-1", attempt: 1, epoch: s.activityEpoch, deadline: Date.now() + 60_000, ...overrides };
+		const attested = s.attest("op-1", "nonce");
+		return {
+			operationId: "op-1",
+			attempt: 1,
+			epoch: attested.epoch,
+			instanceId: attested.instanceId,
+			deadline: Date.now() + 60_000,
+			...overrides,
+		};
 	}
 
 	function readAttestation(s: AgentSession): TerminalAttestation {
@@ -145,7 +186,7 @@ describe("AgentSession quiesce-and-exit", () => {
 		expect(mock.calls.length).toBe(0);
 	});
 
-	it("refuses when input was admitted in the same tick, reopens, and runs that input", async () => {
+	it("refuses with work_active when input admitted before the attestation is still outstanding", async () => {
 		for (const admit of [
 			(s: AgentSession) => s.prompt("racing prompt"),
 			(s: AgentSession) => s.steer("racing steer"),
@@ -153,13 +194,10 @@ describe("AgentSession quiesce-and-exit", () => {
 			(s: AgentSession) => s.sendUserMessage("racing user message"),
 		]) {
 			const s = createSession();
-			const epoch = s.activityEpoch;
 			const pending = admit(s);
-			const result = s.quiesceForExit(request(s, { epoch }));
-			expect(result).toMatchObject({ status: "refused" });
-			if (result.status !== "refused") throw new Error("unreachable");
-			// Either the input counts as outstanding or it already moved the epoch.
-			expect(["work_active", "epoch_mismatch"]).toContain(result.reason);
+			// Attest after the admission: the epoch is current, so only counting can refuse.
+			const result = s.quiesceForExit(request(s));
+			expect(result).toMatchObject({ status: "refused", reason: "work_active" });
 			expect(s.isAdmissionClosed()).toBe(false);
 			expect(fs.existsSync(terminalAttestationPath(s.sessionFile!))).toBe(false);
 			await pending;
@@ -170,6 +208,50 @@ describe("AgentSession quiesce-and-exit", () => {
 			session = undefined;
 			AsyncJobManager.resetForTests();
 		}
+	});
+
+	it("refuses while an extension handler is still running after the turn went idle", async () => {
+		const entered = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		const s = await createSessionWithExtension(pi => {
+			pi.on("turn_end", async () => {
+				entered.resolve();
+				await gate.promise;
+			});
+		});
+		const turn = s.prompt("hello");
+		await entered.promise;
+		await turn;
+		expect(s.isStreaming).toBe(false);
+		const result = s.quiesceForExit(request(s));
+		expect(result).toMatchObject({ status: "refused", reason: "work_active" });
+		if (result.status !== "refused") throw new Error("unreachable");
+		expect(result.snapshot.counts.scheduledTurns).toBeGreaterThan(0);
+		gate.resolve();
+		await s.waitForIdle();
+		expect(s.quiesceForExit(request(s, { attempt: 2 }))).toMatchObject({ status: "quiesced" });
+	});
+
+	it("starts no provider turn from an internal producer after a pass", async () => {
+		const s = createSession();
+		s.yieldQueue.register<string>("test-notice", {
+			build: notes => ({
+				role: "custom",
+				customType: "test-notice",
+				content: notes.join("\n"),
+				display: false,
+				timestamp: 0,
+			}),
+		});
+		expect(s.quiesceForExit(request(s))).toMatchObject({ status: "quiesced" });
+		s.yieldQueue.enqueue("test-notice", "late notice");
+		await expect(s.yieldQueue.enqueueWithReceipt("test-notice", "late receipt")).rejects.toBeInstanceOf(
+			AdmissionClosedError,
+		);
+		await expect(s.runEphemeralTurn({ promptText: "side question" })).rejects.toBeInstanceOf(AdmissionClosedError);
+		await s.waitForIdle();
+		expect(s.yieldQueue.size()).toBe(0);
+		expect(mock.calls.length).toBe(0);
 	});
 
 	it("refuses while a background job runs and never cancels it", async () => {
@@ -221,14 +303,14 @@ describe("AgentSession quiesce-and-exit", () => {
 		expect(readRecords().some(record => record.type === "end" && record.jobId === start.jobId)).toBe(true);
 	});
 
-	it("answers each attempt once and never executes an expired or stale attempt", () => {
+	it("evaluates each attempt once: a repeat replays its answer, an older one never executes", () => {
 		const s = createSession();
 		const expired = s.quiesceForExit(request(s, { attempt: 1, deadline: Date.now() - 1 }));
 		expect(expired).toMatchObject({ status: "refused", reason: "deadline_expired" });
 		expect(s.isAdmissionClosed()).toBe(false);
 
-		// Same attempt again: refused without evaluation, even though it would now pass.
-		expect(s.quiesceForExit(request(s, { attempt: 1 }))).toMatchObject({ reason: "duplicate_attempt" });
+		// Same attempt again: the original answer, not a fresh evaluation that would now pass.
+		expect(s.quiesceForExit(request(s, { attempt: 1 }))).toEqual(expired);
 		expect(s.quiesceForExit(request(s, { attempt: 0 }))).toMatchObject({ reason: "stale_attempt" });
 		expect(fs.existsSync(terminalAttestationPath(s.sessionFile!))).toBe(false);
 
@@ -236,7 +318,53 @@ describe("AgentSession quiesce-and-exit", () => {
 			reason: "epoch_mismatch",
 		});
 		expect(s.isAdmissionClosed()).toBe(false);
-		expect(s.quiesceForExit(request(s, { attempt: 3 }))).toMatchObject({ status: "quiesced" });
+		const passed = s.quiesceForExit(request(s, { attempt: 3 }));
+		expect(passed).toMatchObject({ status: "quiesced" });
+		// A retry after a lost response learns the attempt passed.
+		expect(s.quiesceForExit(request(s, { attempt: 3 }))).toBe(passed);
+	});
+
+	it("refuses a request built from another session object's attestation, even with a matching epoch", async () => {
+		const other = createSession();
+		const foreign = other.attest("op-1", "nonce");
+		await other.dispose();
+		AsyncJobManager.resetForTests();
+		const s = createSession();
+		const result = s.quiesceForExit(request(s, { instanceId: foreign.instanceId }));
+		expect(result).toMatchObject({ status: "refused", reason: "invocation_mismatch" });
+		expect(s.isAdmissionClosed()).toBe(false);
+		expect(fs.existsSync(terminalAttestationPath(s.sessionFile!))).toBe(false);
+	});
+
+	it("retires a previous invocation's terminal attestation when the session is opened again", async () => {
+		const first = createSession();
+		await first.prompt("materialize the transcript");
+		expect(first.quiesceForExit(request(first))).toMatchObject({ status: "quiesced" });
+		const sessionFile = first.sessionFile!;
+		await first.dispose();
+		session = undefined;
+		AsyncJobManager.resetForTests();
+
+		const reopened = createSession({
+			sessionManager: await SessionManager.open(sessionFile, path.join(tempDir.path(), "sessions")),
+			modelRegistry: new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml")),
+		});
+		// The stale attestation no longer sits where a consumer looks for this exit.
+		expect(fs.existsSync(terminalAttestationPath(sessionFile))).toBe(false);
+		const dir = path.dirname(sessionFile);
+		const base = path.basename(sessionFile, ".jsonl");
+		expect(
+			fs.readdirSync(dir).some(name => name.startsWith(`${base}.terminal.`) && name !== `${base}.terminal.json`),
+		).toBe(true);
+		// The latest registry header is this invocation's, written at bind.
+		const headers = fs
+			.readFileSync(ownedJobRegistryPath(sessionFile), "utf8")
+			.trim()
+			.split("\n")
+			.map(line => JSON.parse(line) as OwnedJobRecord)
+			.filter(record => record.type === "invocation");
+		expect(headers.length).toBe(2);
+		expect(reopened.isAdmissionClosed()).toBe(false);
 	});
 
 	it("reopens admission after a refusal so later input runs normally", async () => {

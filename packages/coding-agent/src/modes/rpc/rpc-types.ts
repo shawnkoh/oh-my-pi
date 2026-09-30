@@ -104,7 +104,15 @@ export type RpcCommand =
 
 	// Quiescence (dispatched on receipt, ahead of queued commands)
 	| { id?: string; type: "attest"; operationId: string; nonce: string }
-	| { id?: string; type: "quiesce_and_exit"; operationId: string; attempt: number; epoch: number; deadline: number };
+	| {
+			id?: string;
+			type: "quiesce_and_exit";
+			operationId: string;
+			attempt: number;
+			epoch: number;
+			instanceId: string;
+			deadline: number;
+	  };
 
 // ============================================================================
 // RPC State

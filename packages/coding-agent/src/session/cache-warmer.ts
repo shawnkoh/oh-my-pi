@@ -277,6 +277,11 @@ export class CacheWarmer {
 		this.#inactive = { state: "inactive", reason: "waiting for first request" };
 	}
 
+	/** True while a warm request is being decided or is in flight (it may still persist usage). */
+	get refreshing(): boolean {
+		return this.#run !== undefined && this.#run.timer === undefined;
+	}
+
 	get status(): CacheWarmingStatus {
 		if (this.#deps.getMode() === "off") return { state: "inactive", reason: "cache warming disabled" };
 		const run = this.#run;

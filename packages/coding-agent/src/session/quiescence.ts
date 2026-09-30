@@ -10,6 +10,7 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { isEnoent } from "@oh-my-pi/pi-utils";
 import { fsyncDirectory, type InvocationIdentity, type OwnerScanSummary, stripJsonl } from "./owned-job-registry";
 
 /** Capability: `attest` + `quiesce_and_exit` with a terminal attestation file. */
@@ -146,6 +147,12 @@ export interface WorkAttestation {
 	nonce: string;
 	/** Monotonic activity epoch; changes whenever work starts or input is admitted. */
 	epoch: number;
+	/**
+	 * Random id of this session object in this process. A quiesce request must echo it, so a
+	 * request built from one invocation's attestation can never pass in another (epochs
+	 * restart in every process).
+	 */
+	instanceId: string;
 	session: SessionIdentity;
 	invocation: InvocationIdentity;
 	counts: WorkCounts;
@@ -161,13 +168,20 @@ export interface QuiesceRequest {
 	attempt: number;
 	/** The epoch from the attestation the caller based its decision on. */
 	epoch: number;
-	/** Absolute deadline, Unix epoch milliseconds. The attempt never executes at or after it. */
+	/** The `instanceId` from that attestation. */
+	instanceId: string;
+	/**
+	 * Absolute deadline, Unix epoch milliseconds, compared against the agent host's clock
+	 * (`Date.now()` in the agent process). The attempt never executes at or after it. A
+	 * supervisor on another host should derive it from the attestation's `observedAt` plus a
+	 * relative budget so clock offset between hosts cannot extend it.
+	 */
 	deadline: number;
 }
 
 export type QuiesceRefusalReason =
 	| "invalid_request"
-	| "duplicate_attempt"
+	| "invocation_mismatch"
 	| "stale_attempt"
 	| "admission_closed"
 	| "deadline_expired"
@@ -182,6 +196,8 @@ export interface TerminalAttestation {
 	attempt?: number;
 	session: SessionIdentity;
 	invocation: InvocationIdentity;
+	/** The session object's `instanceId` (see {@link WorkAttestation.instanceId}). */
+	instanceId: string;
 	epoch: number;
 	/** Counts captured with admission closed, before any teardown. */
 	counts: WorkCounts;
@@ -245,4 +261,25 @@ export function writeTerminalAttestationSync(file: string, attestation: Terminal
 	}
 	fs.renameSync(temp, file);
 	fsyncDirectory(dir);
+}
+
+/**
+ * Retire a terminal attestation left by an earlier invocation of this session: rename it to
+ * `<base>.terminal.<pid>-<startId>.json` (its writer's identity) and fsync the directory, so
+ * `<base>.terminal.json` only ever describes the latest invocation's exit. Returns the
+ * retired path, or `null` when there was nothing to retire.
+ */
+export function retireTerminalAttestationSync(sessionFile: string): string | null {
+	const file = terminalAttestationPath(sessionFile);
+	let writer = "unknown";
+	try {
+		const previous = JSON.parse(fs.readFileSync(file, "utf8")) as Partial<TerminalAttestation>;
+		if (previous.invocation) writer = `${previous.invocation.pid}-${previous.invocation.startId ?? "unknown"}`;
+	} catch (error) {
+		if (isEnoent(error)) return null;
+	}
+	const retired = `${stripJsonl(sessionFile)}.terminal.${writer}.json`;
+	fs.renameSync(file, retired);
+	fsyncDirectory(path.dirname(file));
+	return retired;
 }

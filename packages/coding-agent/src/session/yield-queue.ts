@@ -15,6 +15,13 @@ export interface YieldQueueOptions {
 	injectStreaming?(msg: AgentMessage): void;
 	injectIdle(messages: AgentMessage[]): Promise<void>;
 	scheduleIdleFlush(run: () => Promise<void>): void;
+	/**
+	 * Admission gate: an entry is refused (and its receipt rejected with the returned error)
+	 * when this returns an error, so nothing is queued after the session closed for exit.
+	 */
+	refuseEntry?(kind: string): Error | undefined;
+	/** Called after an entry is queued (the session advances its activity epoch). */
+	onEnqueued?(): void;
 }
 
 type YieldFlushMode = "streaming" | "idle";
@@ -66,10 +73,17 @@ export class YieldQueue {
 	}
 
 	enqueue<P>(kind: string, entry: P): void {
+		const refused = this.#options.refuseEntry?.(kind);
+		if (refused) {
+			logger.debug("Yield queue entry refused", { kind, reason: refused.message });
+			return;
+		}
 		this.#enqueue(kind, { value: entry });
 	}
 
 	enqueueWithReceipt<P>(kind: string, entry: P): Promise<void> {
+		const refused = this.#options.refuseEntry?.(kind);
+		if (refused) return Promise.reject(refused);
 		const { promise, resolve, reject } = Promise.withResolvers<void>();
 		if (!this.#enqueue(kind, { value: entry, resolve, reject })) {
 			reject(new Error(`Yield queue entry ignored for unregistered kind: ${kind}`));
@@ -88,6 +102,7 @@ export class YieldQueue {
 			this.#entries.set(kind, entries);
 		}
 		entries.push(entry);
+		this.#options.onEnqueued?.();
 		if (!this.#options.isStreaming() && !this.#dispatchers.get(kind)!.skipIdleFlush) {
 			this.#scheduleIdleFlush();
 		}

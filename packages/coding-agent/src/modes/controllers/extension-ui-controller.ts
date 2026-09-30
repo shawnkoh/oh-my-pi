@@ -1267,10 +1267,10 @@ export class ExtensionUiController {
 		await this.ctx.executeCompaction(instructionsOrOptions, false);
 	}
 
-	/** A passed quiesce leaves admission closed; exit through the normal shutdown after returning. */
+	/** A passed quiesce leaves admission closed; the process exits after returning, whatever teardown does. */
 	#quiesceAndExit(request: QuiesceRequest): QuiesceResult {
 		const result = this.ctx.session.quiesceForExit(request);
-		if (result.status === "quiesced") queueMicrotask(() => void this.ctx.shutdown());
+		if (result.status === "quiesced") queueMicrotask(() => void this.ctx.exitAfterQuiesce());
 		return result;
 	}
 

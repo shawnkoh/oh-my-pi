@@ -1451,6 +1451,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * escape hatch: exit without writing the session log.
 	 */
 	#teardownFailed = false;
+	/** A passed quiesce requested exit: the process must end even if teardown fails. */
+	#exitAfterQuiesce = false;
 	/** True once a graceful `shutdown()` teardown failed at the memoized
 	 *  dispose stage. Surfaced to the input controller so the next single
 	 *  Ctrl+C skips the double-tap gate and runs `shutdown()` — which
@@ -6768,7 +6770,38 @@ export class InteractiveMode implements InteractiveModeContext {
 		await postmortem.quit(0);
 	}
 
+	/** See {@link InteractiveModeContext.exitAfterQuiesce}. */
+	async exitAfterQuiesce(): Promise<void> {
+		this.#exitAfterQuiesce = true;
+		// A shutdown already in flight exits on success; on failure #handleTeardownError
+		// sees the flag and exits instead of leaving the process up.
+		if (this.#isShuttingDown) return;
+		this.#isShuttingDown = true;
+		let code = 0;
+		try {
+			await this.#teardown();
+		} catch (error) {
+			logger.error("Teardown after a passed quiesce failed; exiting anyway", { error: String(error) });
+			code = 1;
+		}
+		await this.#forceQuit(code);
+	}
+
+	async #forceQuit(code: number): Promise<void> {
+		try {
+			await postmortem.quit(code);
+		} catch {
+			// Extension/hook loading temporarily guards process.exit; bypass it for this host exit.
+			postmortem.exitProcess(code);
+		}
+	}
+
 	#handleTeardownError(action: "close" | "restart", error: unknown): void {
+		if (this.#exitAfterQuiesce) {
+			logger.error("Teardown after a passed quiesce failed; exiting anyway", { action, error: String(error) });
+			void this.#forceQuit(1);
+			return;
+		}
 		this.#isShuttingDown = false;
 		const detail = error instanceof Error ? error.message : String(error);
 		// Arm the escape hatch only once dispose() has begun: its promise is

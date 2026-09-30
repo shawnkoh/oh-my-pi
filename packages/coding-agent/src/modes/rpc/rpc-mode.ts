@@ -256,25 +256,37 @@ export interface RpcInputFrameDeps {
 const IMMEDIATE_RPC_COMMANDS: ReadonlySet<string> = new Set(["attest", "quiesce_and_exit"]);
 
 /**
- * Commands that hand the session new input or work; refused once admission is closed for exit.
- * `goal` is gated only for ops that can start a continuation turn; `deliver` is the external
- * delivery command (when present).
+ * Commands still answered normally once admission is closed for exit (a passed quiesce or a
+ * hang-up): they read state or change only this connection's view, never the session or its
+ * transcript. Every other command is refused with `admission_closed`, so nothing mutates the
+ * session after its terminal attestation. `goal` is allowed only for its read op.
  */
-const ADMISSION_GATED_RPC_COMMANDS: ReadonlySet<string> = new Set([
-	"prompt",
-	"steer",
-	"follow_up",
-	"abort_and_prompt",
-	"bash",
-	"compact",
-	"handoff",
-	"deliver",
+const RPC_COMMANDS_ALLOWED_WHILE_EXITING: ReadonlySet<string> = new Set([
+	"attest",
+	"quiesce_and_exit",
+	"negotiate_protocol",
+	"set_event_filter",
+	"set_subagent_subscription",
+	"get_available_commands",
+	"get_available_models",
+	"get_available_thinking_levels",
+	"get_branch_messages",
+	"get_entries",
+	"get_last_assistant_text",
+	"get_login_providers",
+	"get_messages",
+	"get_messages_page",
+	"get_session_stats",
+	"get_state",
+	"get_subagent_messages",
+	"get_subagents",
+	"get_tree",
 ]);
-const ADMISSION_GATED_GOAL_OPS: ReadonlySet<string> = new Set(["create", "resume"]);
+const RPC_GOAL_OPS_ALLOWED_WHILE_EXITING: ReadonlySet<string> = new Set(["get"]);
 
-export function isAdmissionGatedRpcCommand(command: { type: string; op?: unknown }): boolean {
-	if (command.type === "goal") return ADMISSION_GATED_GOAL_OPS.has(String(command.op));
-	return ADMISSION_GATED_RPC_COMMANDS.has(command.type);
+export function isRpcCommandAllowedWhileExiting(command: { type: string; op?: unknown }): boolean {
+	if (command.type === "goal") return RPC_GOAL_OPS_ALLOWED_WHILE_EXITING.has(String(command.op));
+	return RPC_COMMANDS_ALLOWED_WHILE_EXITING.has(command.type);
 }
 
 /**
@@ -1165,9 +1177,10 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
 		const id = command.id;
-		// Admission closes only on the way out (passed quiesce or hang-up); answer with a
-		// machine-readable code rather than letting the session reject deep in dispatch.
-		if (session.isAdmissionClosed() && isAdmissionGatedRpcCommand(command)) {
+		// Admission closes only on the way out (passed quiesce or hang-up). From then on only
+		// read-only commands run; the rest get a machine-readable refusal, so no command can
+		// mutate the session (or append to the attested transcript) after the decision.
+		if (session.isAdmissionClosed() && !isRpcCommandAllowedWhileExiting(command)) {
 			return error(id, command.type, "Session is exiting; input is no longer admitted", "admission_closed");
 		}
 
@@ -1806,6 +1819,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			operationId: command.operationId,
 			attempt: command.attempt,
 			epoch: command.epoch,
+			instanceId: command.instanceId,
 			deadline: command.deadline,
 		});
 		if (result.status === "quiesced") exitAfterQuiesce();

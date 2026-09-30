@@ -7,10 +7,10 @@ import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as bashExecutor from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
-import { isAdmissionGatedRpcCommand } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
+import { isRpcCommandAllowedWhileExiting } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import { type AgentSession, AgentSession as Session } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import type { QuiesceResult } from "@oh-my-pi/pi-coding-agent/session/quiescence";
+import type { QuiesceRequest, QuiesceResult } from "@oh-my-pi/pi-coding-agent/session/quiescence";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
@@ -91,6 +91,11 @@ describe("goal continuation reservation seam", () => {
 		return session;
 	}
 
+	function request(s: AgentSession, attempt: number): QuiesceRequest {
+		const { epoch, instanceId } = s.attest("op", "nonce");
+		return { operationId: "op", attempt, epoch, instanceId, deadline: Date.now() + 60_000 };
+	}
+
 	it("never lets a quiesce pass between the terminal agent_end and the continuation submission", async () => {
 		const s = createSession();
 		const controller = new StubGoalController(s, 1);
@@ -104,12 +109,7 @@ describe("goal continuation reservation seam", () => {
 			if (terminalEnds === 1) {
 				inWindow = {
 					scheduled: s.getWorkCounts().goalContinuationScheduled,
-					quiesce: s.quiesceForExit({
-						operationId: "op",
-						attempt: 1,
-						epoch: s.activityEpoch,
-						deadline: Date.now() + 60_000,
-					}),
+					quiesce: s.quiesceForExit(request(s, 1)),
 				};
 			} else {
 				continuationEnded.resolve();
@@ -133,26 +133,23 @@ describe("goal continuation reservation seam", () => {
 		const epoch = s.activityEpoch;
 		const reservation = s.reserveGoalContinuation();
 		expect(s.activityEpoch).toBeGreaterThan(epoch);
-		expect(
-			s.quiesceForExit({ operationId: "op", attempt: 1, epoch: s.activityEpoch, deadline: Date.now() + 60_000 }),
-		).toMatchObject({ status: "refused", reason: "work_active" });
+		expect(s.quiesceForExit(request(s, 1))).toMatchObject({ status: "refused", reason: "work_active" });
 
 		// A dropped continuation releases its reservation; releasing twice changes nothing.
 		reservation?.release();
 		reservation?.release();
 		expect(s.getWorkCounts().goalContinuationScheduled).toBe(0);
-		expect(
-			s.quiesceForExit({ operationId: "op", attempt: 2, epoch: s.activityEpoch, deadline: Date.now() + 60_000 }),
-		).toMatchObject({ status: "quiesced" });
+		expect(s.quiesceForExit(request(s, 2))).toMatchObject({ status: "quiesced" });
 		expect(s.reserveGoalContinuation()).toBeUndefined();
 	});
 
-	it("gates RPC goal ops that can start a continuation turn, but not reads", () => {
-		expect(isAdmissionGatedRpcCommand({ type: "goal", op: "create" })).toBe(true);
-		expect(isAdmissionGatedRpcCommand({ type: "goal", op: "resume" })).toBe(true);
-		expect(isAdmissionGatedRpcCommand({ type: "goal", op: "get" })).toBe(false);
-		expect(isAdmissionGatedRpcCommand({ type: "goal", op: "pause" })).toBe(false);
-		expect(isAdmissionGatedRpcCommand({ type: "deliver" })).toBe(true);
-		expect(isAdmissionGatedRpcCommand({ type: "get_state" })).toBe(false);
+	it("lets only goal reads through RPC once the session is exiting", () => {
+		expect(isRpcCommandAllowedWhileExiting({ type: "goal", op: "get" })).toBe(true);
+		for (const op of ["create", "resume", "pause"]) {
+			expect(isRpcCommandAllowedWhileExiting({ type: "goal", op })).toBe(false);
+		}
+		expect(isRpcCommandAllowedWhileExiting({ type: "deliver" })).toBe(false);
+		expect(isRpcCommandAllowedWhileExiting({ type: "set_session_name" })).toBe(false);
+		expect(isRpcCommandAllowedWhileExiting({ type: "get_state" })).toBe(true);
 	});
 });

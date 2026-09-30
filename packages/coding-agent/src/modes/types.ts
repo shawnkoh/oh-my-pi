@@ -271,6 +271,12 @@ export interface InteractiveModeContext {
 	init(options?: InteractiveModeInitOptions): Promise<void>;
 	playWelcomeIntro(): void;
 	shutdown(): Promise<void>;
+	/**
+	 * Exit after a passed quiesce. Unlike {@link shutdown} it always ends the process: a
+	 * teardown failure (or a shutdown already in flight that fails) is logged and the process
+	 * exits anyway, because the session's terminal attestation is already written.
+	 */
+	exitAfterQuiesce(): Promise<void>;
 	/** Tear down like {@link shutdown}, then relaunch the CLI with the original launch flags, resuming this session. */
 	restart(): Promise<void>;
 	/** Request graceful shutdown at the next fully settled boundary, including background turns. */

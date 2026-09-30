@@ -403,12 +403,7 @@ import {
 	SessionMaintenance,
 	type SessionMaintenanceHost,
 } from "./session-maintenance";
-import {
-	cleanupEmptyMoveSession,
-	copySessionArtifacts,
-	type SessionManager,
-	type TranscriptDigest,
-} from "./session-manager";
+import { cleanupEmptyMoveSession, copySessionArtifacts, type SessionManager } from "./session-manager";
 import { SessionMemory, type SessionMemoryHost } from "./session-memory";
 import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
@@ -429,8 +424,10 @@ import {
 	emptyWorkCounts,
 	type GoalContinuationReservation,
 	hasOutstandingWork,
+	type QuiesceRefusalReason,
 	type QuiesceRequest,
 	type QuiesceResult,
+	retireTerminalAttestationSync,
 	SESSION_CAPABILITIES,
 	type SessionIdentity,
 	type SessionWorkSource,
@@ -700,6 +697,7 @@ const ACTIVITY_EVENT_TYPES: ReadonlySet<AgentSessionEvent["type"]> = new Set([
 	"tool_execution_start",
 	"auto_compaction_start",
 	"auto_retry_start",
+	"cache_warming_start",
 ]);
 
 /** Signals that end the process from outside; teardown on these records a hang-up attestation first. */
@@ -1008,8 +1006,12 @@ export class AgentSession implements SettingsScope {
 	#goalContinuationReservations = 0;
 	/** The owner-marker scan taken by the latest {@link getWorkCounts}. */
 	#lastOwnerScan: OwnerScanSummary | null = null;
-	/** Highest quiesce attempt answered per operation id. */
-	readonly #answeredQuiesceAttempts = new Map<string, number>();
+	/** The answer given to the highest quiesce attempt per operation id (replayed for duplicates). */
+	readonly #answeredQuiesceAttempts = new Map<string, { attempt: number; result: QuiesceResult }>();
+	/** Side-channel provider turns (`runEphemeralTurn`) currently streaming. */
+	#activeEphemeralTurns = 0;
+	/** Random per-object id binding quiesce requests to the attestation they were built from. */
+	readonly #instanceId = crypto.randomUUID();
 	#terminalAttestation: TerminalAttestation | undefined;
 	/** Owned-job registry this session created (root sessions that own the async job manager). */
 	#ownedJobRegistry: OwnedJobRegistry | undefined;
@@ -1263,6 +1265,11 @@ export class AgentSession implements SettingsScope {
 	 *  because #canAutoContinueForFollowUp suppresses follow-up auto-resume while a user interrupt is
 	 *  in effect, even though the wake left a provider-valid tail. */
 	#wakeForIrc(records: AgentMessage[]): void {
+		if (this.#turnStartBlocked("irc wake")) {
+			// Kept with the bridge: disposal persists undelivered records.
+			this.#irc.queueAside(records);
+			return;
+		}
 		if (this.#modeExitDrainSuppressionDepth > 0) {
 			this.#irc.queueAside(records);
 			return;
@@ -1806,9 +1813,15 @@ export class AgentSession implements SettingsScope {
 		});
 		this.yieldQueue = new YieldQueue({
 			isStreaming: () => this.isStreaming,
+			refuseEntry: kind =>
+				this.#admissionClosedBy ? new AdmissionClosedError(`${kind} delivery`, this.#admissionClosedBy) : undefined,
+			onEnqueued: () => {
+				this.#activityEpoch++;
+			},
 			injectIdle: async messages => {
 				const first = messages[0];
 				if (!first) return;
+				if (this.#turnStartBlocked("idle injection")) return;
 				this.#beginInFlight();
 				try {
 					await this.agent.prompt(messages.length === 1 ? first : messages);
@@ -2831,6 +2844,18 @@ export class AgentSession implements SettingsScope {
 	}
 
 	/**
+	 * Chokepoint for every internal path that starts a provider turn (post-prompt tasks, idle
+	 * injection, agent continues, IRC wakes, prompt dispatch). True while admission is closed:
+	 * the caller must not start the turn. Public entry points refuse earlier with an
+	 * {@link AdmissionClosedError} so senders learn why; this catches producers that bypass them.
+	 */
+	#turnStartBlocked(source: string): boolean {
+		if (!this.#admissionClosedBy) return false;
+		logger.debug("Turn start refused: session is exiting", { source, closedBy: this.#admissionClosedBy });
+		return true;
+	}
+
+	/**
 	 * Monotonic activity counter. It increases whenever input is admitted, a turn or tool
 	 * starts, a background job, shell run, owned process or subagent is registered, compaction
 	 * or a handoff starts, or a host reports activity through {@link noteActivity}. An
@@ -2859,7 +2884,7 @@ export class AgentSession implements SettingsScope {
 	 * `release()` is idempotent.
 	 */
 	reserveGoalContinuation(): GoalContinuationReservation | undefined {
-		if (this.#admissionClosedBy) return undefined;
+		if (this.#turnStartBlocked("goal continuation")) return undefined;
 		this.#activityEpoch++;
 		this.#goalContinuationReservations++;
 		let released = false;
@@ -2923,8 +2948,19 @@ export class AgentSession implements SettingsScope {
 		counts.detachedJobs = registry?.liveProcessCount() ?? 0;
 		counts.compacting = this.isCompacting ? 1 : 0;
 		counts.handoff = this.isGeneratingHandoff ? 1 : 0;
+		// Everything waitForIdle() waits on is outstanding work too: persistence and extension
+		// handlers still running after the agent went idle, retry/TTSR resumes, advisor reviews
+		// (which can steer a new turn), side-channel ephemeral turns and in-flight cache warms.
+		counts.streaming += this.#activeEphemeralTurns;
 		counts.scheduledTurns =
-			this.#postPromptTasks.size + (this.#activeAgentContinue ? 1 : 0) + (this.isRetrying ? 1 : 0);
+			Math.max(this.#postPromptTasks.size, this.#postPromptTasksPromise ? 1 : 0) +
+			(this.#activeAgentContinue ? 1 : 0) +
+			(this.isRetrying || this.#recovery.retryPromise ? 1 : 0) +
+			(this.#ttsr.resumeGate ? 1 : 0) +
+			this.#inFlightEventHandlers.size +
+			this.#pendingMessageEndPersistence.size +
+			this.#advisors.pendingWork() +
+			(this.#cacheWarmer?.refreshing ? 1 : 0);
 		counts.goalContinuationScheduled = this.#goalContinuationReservations;
 		for (const source of this.#workSources) counts[source.kind] += Math.max(0, source.count());
 		return counts;
@@ -2934,15 +2970,19 @@ export class AgentSession implements SettingsScope {
 	attest(operationId: string, nonce: string): WorkAttestation {
 		const registry = this.ownedJobRegistry;
 		registry?.ensureHeader();
+		// Count first: the owner-marker scan inside may record (and so move the epoch past) a
+		// process nobody tracked yet. The attested epoch must include that registration.
+		const counts = this.getWorkCounts();
 		const epoch = this.#activityEpoch;
 		return {
 			version: WORK_ATTESTATION_VERSION,
 			operationId,
 			nonce,
 			epoch,
+			instanceId: this.#instanceId,
 			session: this.#sessionIdentity(),
 			invocation: currentInvocation(),
-			counts: this.getWorkCounts(),
+			counts,
 			admission: this.#admissionClosedBy ? "closed" : "open",
 			registry: {
 				path: registry?.path ?? null,
@@ -2956,99 +2996,117 @@ export class AgentSession implements SettingsScope {
 	/**
 	 * Decide, synchronously and without awaiting, whether this session may exit now.
 	 *
-	 * Closes every input-admission path first, then requires: no outstanding work, the
-	 * caller's epoch still current, and the deadline not reached. On success it durably writes
-	 * the terminal attestation next to the session file and leaves admission closed; the host
+	 * Closes every input-admission path first, then requires: the request bound to this
+	 * session object (`instanceId`), no outstanding work, the caller's epoch still current,
+	 * and the deadline (agent host clock) not reached. On success it durably writes the
+	 * terminal attestation next to the session file and leaves admission closed; the host
 	 * must then exit. On refusal it reopens admission exactly as before and changes nothing
-	 * else — no work is cancelled. Each `(operationId, attempt)` is answered once; a repeated
-	 * or older attempt is refused without being evaluated.
+	 * else — no work is cancelled. Each `(operationId, attempt)` is evaluated once: repeating
+	 * it returns the original answer unchanged, and an older attempt is refused.
 	 */
 	quiesceForExit(request: QuiesceRequest): QuiesceResult {
 		const { operationId, attempt } = request;
-		const refuse = (reason: Extract<QuiesceResult, { status: "refused" }>["reason"], counts = this.getWorkCounts()) =>
-			({
+		const refuse = (reason: QuiesceRefusalReason, counts?: WorkCounts): QuiesceResult => {
+			let snapshotCounts = counts;
+			if (!snapshotCounts) {
+				try {
+					snapshotCounts = this.getWorkCounts();
+				} catch {
+					snapshotCounts = emptyWorkCounts();
+				}
+			}
+			return {
 				status: "refused",
 				operationId,
 				attempt,
 				reason,
-				snapshot: { epoch: this.#activityEpoch, counts, observedAt: new Date().toISOString() },
-			}) satisfies QuiesceResult;
+				snapshot: { epoch: this.#activityEpoch, counts: snapshotCounts, observedAt: new Date().toISOString() },
+			};
+		};
 		if (
 			typeof operationId !== "string" ||
 			operationId.length === 0 ||
 			!Number.isSafeInteger(attempt) ||
 			attempt < 0 ||
 			!Number.isSafeInteger(request.epoch) ||
-			!Number.isFinite(request.deadline)
+			!Number.isFinite(request.deadline) ||
+			typeof request.instanceId !== "string"
 		) {
 			return refuse("invalid_request");
 		}
 		const answered = this.#answeredQuiesceAttempts.get(operationId);
-		if (answered !== undefined && attempt <= answered) {
-			return refuse(attempt === answered ? "duplicate_attempt" : "stale_attempt");
+		if (answered !== undefined && attempt <= answered.attempt) {
+			return attempt === answered.attempt ? answered.result : refuse("stale_attempt");
 		}
-		this.#answeredQuiesceAttempts.set(operationId, attempt);
+		const result = this.#evaluateQuiesce(request, refuse);
+		this.#answeredQuiesceAttempts.set(operationId, { attempt, result });
+		return result;
+	}
+
+	#evaluateQuiesce(
+		request: QuiesceRequest,
+		refuse: (reason: QuiesceRefusalReason, counts?: WorkCounts) => QuiesceResult,
+	): QuiesceResult {
+		const { operationId, attempt } = request;
+		if (request.instanceId !== this.#instanceId) return refuse("invocation_mismatch");
 		if (this.#admissionClosedBy || this.#isDisposed) return refuse("admission_closed");
 
 		// Close admission before looking at anything. Nothing below awaits, so no input can
-		// interleave; a refusal reopens before returning.
+		// interleave; a refusal — including one caused by a throw — reopens before returning.
 		this.#admissionClosedBy = "quiesce";
-		const epoch = this.#activityEpoch;
-		const counts = this.getWorkCounts();
-		const sessionFile = this.sessionManager.getSessionFile();
-		let reason: Extract<QuiesceResult, { status: "refused" }>["reason"] | undefined;
-		if (Date.now() >= request.deadline) reason = "deadline_expired";
-		else if (epoch !== request.epoch) reason = "epoch_mismatch";
-		else if (hasOutstandingWork(counts)) reason = "work_active";
-		else if (!sessionFile) reason = "attestation_unavailable";
-		if (reason || !sessionFile) {
-			this.#admissionClosedBy = undefined;
-			return refuse(reason ?? "attestation_unavailable", counts);
-		}
-
-		// Make the transcript final before attesting it: record the exit, flush, seal. Nothing
-		// appends to the session file after this point, so the attested digest stays valid.
-		const file = terminalAttestationPath(sessionFile);
-		let transcript: TranscriptDigest | null;
+		let sealed = false;
+		let counts: WorkCounts | undefined;
 		try {
+			const epoch = this.#activityEpoch;
+			counts = this.getWorkCounts();
+			const sessionFile = this.sessionManager.getSessionFile();
+			let reason: QuiesceRefusalReason | undefined;
+			if (Date.now() >= request.deadline) reason = "deadline_expired";
+			else if (epoch !== request.epoch) reason = "epoch_mismatch";
+			else if (hasOutstandingWork(counts)) reason = "work_active";
+			else if (!sessionFile) reason = "attestation_unavailable";
+			if (reason || !sessionFile) {
+				this.#admissionClosedBy = undefined;
+				return refuse(reason ?? "attestation_unavailable", counts);
+			}
+
+			// Make the transcript final before attesting it: record the exit, flush, seal.
+			// Nothing appends to the session file after this point, so the attested digest
+			// stays valid.
+			const file = terminalAttestationPath(sessionFile);
 			assertAttestationWritable(file);
 			this.#recordSessionExit("quiesce");
-			transcript = this.sessionManager.finalizeForExit();
-		} catch (error) {
-			logger.warn("Failed to finalize the transcript for a quiesce attestation", { error: String(error) });
-			this.#admissionClosedBy = undefined;
-			return refuse("attestation_unavailable", counts);
-		}
-		const registry = this.ownedJobRegistry;
-		registry?.ensureHeader();
-		const attestation: TerminalAttestation = {
-			version: TERMINAL_ATTESTATION_VERSION,
-			kind: "quiesce",
-			operationId,
-			attempt,
-			session: { ...this.#sessionIdentity(), size: transcript?.size ?? null, sha256: transcript?.sha256 ?? null },
-			invocation: currentInvocation(),
-			epoch,
-			counts,
-			interrupted: false,
-			registryComplete: this.#registryComplete(registry),
-			registryPath: registry?.path ?? null,
-			ownerScan: this.#lastOwnerScan,
-			writtenAt: new Date().toISOString(),
-		};
-		try {
+			sealed = true;
+			const transcript = this.sessionManager.finalizeForExit();
+			const registry = this.ownedJobRegistry;
+			registry?.ensureHeader();
+			const attestation: TerminalAttestation = {
+				version: TERMINAL_ATTESTATION_VERSION,
+				kind: "quiesce",
+				operationId,
+				attempt,
+				session: { ...this.#sessionIdentity(), size: transcript?.size ?? null, sha256: transcript?.sha256 ?? null },
+				invocation: currentInvocation(),
+				instanceId: this.#instanceId,
+				epoch,
+				counts,
+				interrupted: false,
+				registryComplete: this.#registryComplete(registry),
+				registryPath: registry?.path ?? null,
+				ownerScan: this.#lastOwnerScan,
+				writtenAt: new Date().toISOString(),
+			};
 			writeTerminalAttestationSync(file, attestation);
+			this.#terminalAttestation = attestation;
+			return { status: "quiesced", operationId, attempt, attestation, path: file };
 		} catch (error) {
-			// The transcript is already sealed, so the session cannot safely take more input:
-			// admission stays closed and no attestation exists (consumers answer `unknown`).
-			logger.error("Failed to write terminal attestation after sealing the transcript", {
-				file,
-				error: String(error),
-			});
+			// Once the exit record is written the transcript is final, so the session cannot
+			// safely take more input: admission stays closed and no attestation exists
+			// (consumers answer `unknown`). Before that, the refusal reopens admission.
+			logger.error("Quiesce could not produce a terminal attestation", { sealed, error: String(error) });
+			if (!sealed) this.#admissionClosedBy = undefined;
 			return refuse("attestation_unavailable", counts);
 		}
-		this.#terminalAttestation = attestation;
-		return { status: "quiesced", operationId, attempt, attestation, path: file };
 	}
 
 	/**
@@ -3069,6 +3127,7 @@ export class AgentSession implements SettingsScope {
 			kind: "hangup",
 			session: this.#sessionIdentity(),
 			invocation: currentInvocation(),
+			instanceId: this.#instanceId,
 			epoch: this.#activityEpoch,
 			counts,
 			interrupted: hasOutstandingWork(counts),
@@ -3134,6 +3193,7 @@ export class AgentSession implements SettingsScope {
 		});
 		this.#ownedJobRegistry = registry;
 		OwnedJobRegistry.setInstance(registry);
+		this.#bindSessionForExit();
 		const registryIds = new WeakMap<AsyncJob, string>();
 		let sequence = 0;
 		this.#unobserveAsyncJobs = manager.observe({
@@ -3152,6 +3212,26 @@ export class AgentSession implements SettingsScope {
 				if (jobId) registry.end(jobId, "settled");
 			},
 		});
+	}
+
+	/**
+	 * Session bind (open, resume, every switch): retire a terminal attestation an earlier
+	 * invocation left for this session file, then write this invocation's registry header,
+	 * so `.terminal.json` only ever describes the invocation named by the last header.
+	 */
+	#bindSessionForExit(): void {
+		const registry = this.#ownedJobRegistry;
+		if (!registry || this.#terminalAttestation) return;
+		const sessionFile = this.sessionManager.getSessionFile();
+		if (sessionFile) {
+			try {
+				retireTerminalAttestationSync(sessionFile);
+			} catch (error) {
+				registry.markIncomplete("a stale terminal attestation could not be retired");
+				logger.warn("Failed to retire a stale terminal attestation", { sessionFile, error: String(error) });
+			}
+		}
+		registry.ensureHeader();
 	}
 
 	#closeOwnedJobRegistry(): void {
@@ -4676,6 +4756,11 @@ export class AgentSession implements SettingsScope {
 				options.onSkip?.("stale-generation");
 				return;
 			}
+			// Nothing scheduled earlier may start once the session is closing for exit.
+			if (this.#turnStartBlocked("post-prompt task")) {
+				options?.onSkip?.("aborted");
+				return;
+			}
 			await task(signal);
 		})();
 		this.#trackPostPromptTask(scheduled);
@@ -4740,7 +4825,13 @@ export class AgentSession implements SettingsScope {
 					});
 					await this.agent.waitForIdle();
 					await this.#drainInFlightEventHandlers();
-					if (signal.aborted || this.#isDisposed || this.isCompacting || this.isGeneratingHandoff) {
+					if (
+						signal.aborted ||
+						this.#isDisposed ||
+						this.isCompacting ||
+						this.isGeneratingHandoff ||
+						this.#turnStartBlocked("agent continue")
+					) {
 						return { status: "skipped", reason: "session-unavailable" };
 					}
 					if (request.options.generation !== undefined && this.#promptGeneration !== request.options.generation) {
@@ -4779,7 +4870,13 @@ export class AgentSession implements SettingsScope {
 				// streaming turn — agent.continue() here would race the handoff's session
 				// reset. The first-class fix is in #checkCompaction/the agent_end handler,
 				// but this guard catches anything that bypasses that path.
-				if (signal.aborted || this.#isDisposed || this.isCompacting || this.isGeneratingHandoff) {
+				if (
+					signal.aborted ||
+					this.#isDisposed ||
+					this.isCompacting ||
+					this.isGeneratingHandoff ||
+					this.#turnStartBlocked("agent continue")
+				) {
 					this.#skipAgentContinue("session-unavailable", request);
 					return;
 				}
@@ -5515,6 +5612,7 @@ export class AgentSession implements SettingsScope {
 			this.#observedSessionId = currentSessionId;
 		} else if (this.#observedSessionId !== currentSessionId) {
 			this.#observedSessionId = currentSessionId;
+			this.#bindSessionForExit();
 			if (notifyChange) this.#notifySessionChangeCallbacks();
 		}
 		const sid = this.#activeProviderSessionId(sessionId);
@@ -7830,6 +7928,7 @@ export class AgentSession implements SettingsScope {
 		// every pre-dispatch bail (generation bump from abort, disposal, usage
 		// preflight denial) exits silently, and prompt() uses the outcome to hand
 		// the typed text back to the host instead of losing it.
+		if (this.#turnStartBlocked("prompt")) return false;
 		this.#beginInFlight();
 		const generation = this.#promptGeneration;
 		this.#promptSequence++;
@@ -8603,6 +8702,7 @@ export class AgentSession implements SettingsScope {
 		message: CustomMessage,
 		options?: { acceptTerminalEmptyStop?: boolean },
 	): Promise<boolean> {
+		if (this.#turnStartBlocked("agent-initiated message")) return false;
 		this.#beginInFlight();
 		try {
 			if (!(await this.#runUsageAwarePreflightForNextModelCall())) return false;
@@ -10698,7 +10798,19 @@ export class AgentSession implements SettingsScope {
 	 * streaming assistant text so the model sees the half-finished response
 	 * rather than missing context.
 	 */
-	async runEphemeralTurn(args: EphemeralTurnOptions): Promise<EphemeralTurnResult> {
+	runEphemeralTurn(args: EphemeralTurnOptions): Promise<EphemeralTurnResult> {
+		const refused = this.#refuseInput("ephemeral turn");
+		if (refused) return refused;
+		this.#activeEphemeralTurns++;
+		const pending = this.#runEphemeralTurn(args);
+		const settle = (): void => {
+			this.#activeEphemeralTurns--;
+		};
+		void pending.then(settle, settle);
+		return pending;
+	}
+
+	async #runEphemeralTurn(args: EphemeralTurnOptions): Promise<EphemeralTurnResult> {
 		const model = this.model;
 		if (!model) {
 			throw new Error("No active model on session");

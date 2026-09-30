@@ -4,8 +4,8 @@
 
 ### Added
 
-- Sessions keep a durable owned-job registry next to the session file (`<session>.jobs.jsonl`) recording every background job, subagent, shell run, surviving or `nohup`'d process (with pid, process group and OS start time) and named service, so a supervisor can tell after the agent exits whether anything it started is still running; named services accept `sleepable: true`
-- Supervisors can stop an agent only when it is provably idle: RPC `attest` and `quiesce_and_exit` (also `ctx.attest()` / `ctx.quiesceAndExit()` for extensions) close every input path, check that no turn, queued input, job, subagent, shell, compaction or scheduled continuation remains, write a terminal attestation next to the session file and exit — or refuse and change nothing; `get_state` advertises `capabilities: ["quiesce-exit/1", "owned-jobs/1"]`
+- Sessions keep a durable owned-job registry next to the session file (`<session>.jobs.jsonl`) recording every background job, subagent, shell run, retained background shell, surviving or `nohup`'d process (with pid, process group and a clock-independent start identity) and named service, so a supervisor can tell after the agent exits whether anything it started is still running; the registry follows session switches and marks itself incomplete whenever a process may have escaped it; named services accept `sleepable: true`
+- Supervisors can stop an agent only when it is provably idle: RPC `attest` and `quiesce_and_exit` (also `ctx.attest()` / `ctx.quiesceAndExit()` for extensions) close every input path, check that no turn, queued input, job, subagent, shell, compaction, running handler, advisor review, side turn or scheduled continuation remains, write a terminal attestation next to the session file and exit — or refuse and change nothing; requests are bound to the attesting session (`instanceId`), a repeated attempt replays its answer, only read-only RPC commands run after a pass, and reopening a session retires the previous invocation's attestation; `get_state` advertises `capabilities: ["quiesce-exit/1", "owned-jobs/1"]`
 - SIGHUP/SIGTERM now record which work was still outstanding before teardown in `<session>.terminal.json` (`kind: "hangup"`, `interrupted: true` when anything was running or queued)
 - Processes the agent starts for work inherit an `OMP_OWNER` owner marker, so `attest`, `quiesce_and_exit` and hang-up capture also find and record descendants that double-forked or called `setsid` away from the shell; attestations report the scan (`ownerScan`), and `verifyOwnedJobRegistry()` applies the post-exit consumer rule
 - A passed `quiesce_and_exit` now makes the session transcript final before attesting it and records its `session.size` and `session.sha256`, so the file hashes the same after exit; hang-up attestations gain the same digest once teardown finishes
@@ -21,6 +21,7 @@
 
 - `omp auth-gateway serve` now attributes peers to the socket address by default; deployments behind a trusted reverse proxy can restore forwarded peer headers with `--trust-proxy-headers` ([#13827](https://github.com/can1357/oh-my-pi/pull/13827) by [@shawnkoh](https://github.com/shawnkoh))
 - `--no-ui` now also works with `--mode rpc-ui`: extensions run headless while tool UI such as the `ask` tool still reaches the host ([#13718](https://github.com/can1357/oh-my-pi/pull/13718) by [@alphastorm](https://github.com/alphastorm))
+- A shell `&` job that is still running when its command returns, including an in-process one such as `{ sleep 1; cmd; } &`, now keeps its shell alive until it finishes instead of being cut off when an `async` job's shell is released
 
 ### Fixed
 

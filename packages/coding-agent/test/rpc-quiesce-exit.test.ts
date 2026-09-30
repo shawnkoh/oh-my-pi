@@ -109,6 +109,7 @@ describe.skipIf(process.platform === "win32").each(MODES)("RPC quiesce_and_exit 
 			operationId: "op-1",
 			attempt: 1,
 			epoch,
+			instanceId: attest.data?.instanceId,
 			deadline: Date.now() + 30_000,
 		});
 		expect(quiesce).toMatchObject({
@@ -121,7 +122,7 @@ describe.skipIf(process.platform === "win32").each(MODES)("RPC quiesce_and_exit 
 		expect(onDisk).toMatchObject({ kind: "quiesce", operationId: "op-1", attempt: 1, epoch, interrupted: false });
 	}, 30_000);
 
-	it("refuses input that arrives after a passed quiesce and exits with the transcript as attested", async () => {
+	it("refuses every mutating command after a passed quiesce and exits with the transcript as attested", async () => {
 		const file = await sessionFile();
 		await rpc.request({ id: "p0", type: "prompt", message: "materialize the transcript" });
 		await rpc.waitFor(frame => frame.type === "agent_end", "agent_end");
@@ -133,18 +134,26 @@ describe.skipIf(process.platform === "win32").each(MODES)("RPC quiesce_and_exit 
 				operationId: "op-3",
 				attempt: 1,
 				epoch: attest.data?.epoch,
+				instanceId: attest.data?.instanceId,
 				deadline: Date.now() + 30_000,
 			},
 			{ id: "p1", type: "prompt", message: "too late" },
 			{ id: "s1", type: "steer", message: "too late" },
 			{ id: "f1", type: "follow_up", message: "too late" },
+			{ id: "n1", type: "set_session_name", name: "renamed after exit" },
+			{ id: "n2", type: "new_session" },
+			{ id: "g1", type: "get_state" },
 		);
 		const quiesce = await rpc.waitFor(frame => frame.type === "response" && frame.id === "q1", "q1");
 		expect(quiesce.data).toMatchObject({ status: "quiesced", operationId: "op-3", attempt: 1 });
-		for (const id of ["p1", "s1", "f1"]) {
+		for (const id of ["p1", "s1", "f1", "n1", "n2"]) {
 			const refused = await rpc.waitFor(frame => frame.type === "response" && frame.id === id, id);
 			expect(refused).toMatchObject({ success: false, code: "admission_closed" });
 		}
+		// Reads still answer while the process exits.
+		expect(await rpc.waitFor(frame => frame.type === "response" && frame.id === "g1", "g1")).toMatchObject({
+			success: true,
+		});
 		expect(await withTimeout(rpc.child.exited, 15_000, "RPC process did not exit")).toBe(0);
 		// The response frame is wire JSON: its shape is the TerminalAttestation contract.
 		const result: QuiesceResult = quiesce.data as unknown as QuiesceResult;
@@ -164,6 +173,7 @@ describe.skipIf(process.platform === "win32").each(MODES)("RPC quiesce_and_exit 
 				operationId: "op-2",
 				attempt: 1,
 				epoch: attest.data?.epoch,
+				instanceId: attest.data?.instanceId,
 				deadline: Date.now() + 30_000,
 			},
 		);
@@ -179,6 +189,7 @@ describe.skipIf(process.platform === "win32").each(MODES)("RPC quiesce_and_exit 
 			operationId: "op-2",
 			attempt: 2,
 			epoch: reattest.data?.epoch,
+			instanceId: reattest.data?.instanceId,
 			deadline: Date.now() + 30_000,
 		});
 		expect(quiesce.data).toMatchObject({ status: "quiesced", attempt: 2 });
@@ -253,6 +264,7 @@ describe.skipIf(process.platform === "win32").each(MODES)("CLI --mode %s quiesce
 				operationId: "cli",
 				attempt: 1,
 				epoch: attest.data?.epoch,
+				instanceId: attest.data?.instanceId,
 				deadline: Date.now() + 30_000,
 			},
 			{ id: "p1", type: "prompt", message: "too late" },
