@@ -146,6 +146,7 @@ With `literal: true` (capability `literal-input/1`) the message is the user's te
 
 - `{ id?, type: "get_state" }`
 - `{ id?, type: "set_fast_mode", enabled: boolean }`
+- `{ id?, type: "set_ui_capabilities", capabilities: string[] }` — opt in to UI extensions the host can answer (currently `rich-ask/1`); the response lists those enabled
 - `{ id?, type: "get_available_commands" }`
 - `{ id?, type: "get_entries", since?: string }`
 - `{ id?, type: "get_tree" }`
@@ -883,7 +884,24 @@ Use `--mode rpc --no-ui` for a host without a tool UI surface; use `--mode rpc-u
 
 `RpcExtensionUIRequest` (`type: "extension_ui_request"`) methods:
 
-- `select`, `confirm`, `input`, `editor`, `cancel`
+- `select`, `confirm`, `input`, `editor`, `cancel`, `ask`
+  - `ask` (capability `rich-ask/1`, advertised only by `--mode rpc-ui`; opt-in:
+    sent only after the host sends `{ type: "set_ui_capabilities", capabilities:
+    ["rich-ask/1"] }`, otherwise askers keep their `select`/`editor` fallback)
+    carries every question of one ask dialog, from the ask tool, an extension's
+    `ui.askDialog`, or a prelude: `questions: [{ id, question, header?, options: [{ label,
+    description?, preview? }], multi, recommended? }]`, plus `acceptImages` and
+    `timeout`. Reply with `{ type: "extension_ui_response", id, ask: { kind:
+    "submit", results: [{ id, selectedOptions, customInput?, customInputImages?,
+    note?, noteImages? }] } }` in question order, `ask: { kind: "chat"
+    }` to discuss instead, or `cancelled: true`. Selected labels must be offered
+    options (at most one unless `multi`), and images are accepted only when
+    `acceptImages` is true. A single-choice answer has either one selected
+    option or `customInput`, not both. Images must be base64 raster images (no
+    SVG). Any other reply is logged and treated as cancellation. The engine
+    owns `timeout`: when it expires, each question gets its recommended (or
+    first) option, marked timed out, as in the terminal dialog. As with any
+    dialog that has a `timeout`, the engine then sends `cancel` for the request.
   - `select` keeps labels in `options: string[]` and, when any option has a
     description, emits a positionally aligned
     `optionDetails: Array<{ description?: string }>` array. Hosts that do not
@@ -933,6 +951,7 @@ Example:
 - `{ type: "extension_ui_response", id: string, value: string }`
 - `{ type: "extension_ui_response", id: string, confirmed: boolean }`
 - `{ type: "extension_ui_response", id: string, cancelled: true, timedOut?: boolean }`
+- `{ type: "extension_ui_response", id: string, ask: RpcAskReply }` (reply to `ask`)
 
 `select` and `input` resolve to `undefined`, and `confirm` to `false`, on
 cancellation, timeout, or signal abort. Signal abort emits a `cancel` request
