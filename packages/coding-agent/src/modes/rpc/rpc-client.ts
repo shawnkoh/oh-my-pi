@@ -14,6 +14,7 @@ import type { BashResult } from "../../exec/bash-executor";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
 import type { CacheWarmingMode } from "../../session/cache-warmer";
 import type { SessionEntry, SessionTreeNode } from "../../session/session-entries";
+import type { QuiesceRequest, QuiesceResult, WorkAttestation } from "../../session/quiescence";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameDecoder, type RpcProtocolVersion } from "./rpc-frame";
 import type { RpcGoalResult } from "./rpc-goal";
 import {
@@ -678,6 +679,23 @@ export class RpcClient {
 	 */
 	async removeQueuedMessage(message: string, queue: "steering" | "followUp"): Promise<{ removed: boolean }> {
 		const response = await this.#send({ type: "remove_queued_message", message, queue });
+		return this.#getData(response);
+	}
+
+	/**
+	 * Read-only snapshot of outstanding work. Requires the `quiesce-exit/1` capability.
+	 */
+	async attest(operationId: string, nonce: string): Promise<WorkAttestation> {
+		const response = await this.#send({ type: "attest", operationId, nonce });
+		return this.#getData(response);
+	}
+
+	/**
+	 * Exit the agent if nothing is outstanding and `request.epoch` is still current. On
+	 * `status: "quiesced"` the process exits after answering; a refusal changes nothing.
+	 */
+	async quiesceAndExit(request: QuiesceRequest): Promise<QuiesceResult> {
+		const response = await this.#send({ type: "quiesce_and_exit", ...request });
 		return this.#getData(response);
 	}
 

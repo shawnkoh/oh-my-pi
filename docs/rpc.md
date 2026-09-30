@@ -158,6 +158,13 @@ With `literal: true` (capability `literal-input/1`) the message is the user's te
 - `{ id?, type: "get_subagents" }`
 - `{ id?, type: "get_subagent_messages", subagentId?: string, sessionFile?: string, fromByte?: number }`
 
+### Quiescence
+
+- `{ id?, type: "attest", operationId: string, nonce: string }`
+- `{ id?, type: "quiesce_and_exit", operationId: string, attempt: number, epoch: number, instanceId: string, sessionId: string, deadline: number }`
+
+Both run on receipt, ahead of any queued command; see [Quiesce and exit](#quiesce-and-exit).
+
 ### Model
 
 - `{ id?, type: "set_model", provider: string, modelId: string }`
@@ -402,7 +409,8 @@ is re-armed.
     "tokens": 1100,
     "contextWindow": 200000,
     "percent": 0.55
-  }
+  },
+  "capabilities": ["quiesce-exit/1", "owned-jobs/1"]
 }
 ```
 
@@ -463,6 +471,253 @@ turn, sent as a hidden `goal-continuation` message.
 
 When the agent completes the goal, the goal tool is removed again and
 `get_state.goal` becomes `null`.
+
+`capabilities` lists protocol features this process implements. A client must
+check for `quiesce-exit/1` before sending `attest` or `quiesce_and_exit`, and for
+`owned-jobs/1` before relying on the owned-job registry file.
+
+### Quiesce and exit
+
+A supervisor that wants the agent to exit without interrupting work first takes a
+read-only snapshot, then asks the process to exit only if nothing changed:
+
+1. `attest` → `data`: `{ version: 1, operationId, nonce, epoch, instanceId,
+   session: { id, file }, invocation: { pid, startId, startTime }, counts,
+   admission: "open" | "closed", registry: { path, complete, ownerScan }, observedAt }`.
+   `counts` has `streaming`, `queuedInput`, `asyncJobs`, `subagents`, `retainedJobs`,
+   `detachedJobs`, `compacting`, `handoff`, `goalContinuationScheduled`,
+   `scheduledTurns`; any non-zero value means work is outstanding. `queuedInput`
+   includes commands this process has read but not yet answered and notifications
+   received but not yet queued (MCP resource changes inside their debounce window).
+   `scheduledTurns` includes turns scheduled to start, retry and TTSR resumes, event
+   and extension handlers still running after the agent went idle, message
+   persistence in flight, advisor reviews, and an in-flight cache-warming request;
+   `streaming` includes side-channel (ephemeral) turns. `epoch` increases whenever
+   input is admitted or work starts. `instanceId` is random per session object and
+   process. `detachedJobs` counts live owned processes, including ones found by the
+   owner-marker scan below; `registry.complete` is false unless that scan was `sound`
+   and the session is persisted.
+2. `quiesce_and_exit` `{ operationId, attempt, epoch, instanceId, sessionId, deadline }`,
+   with `epoch`, `instanceId` and `sessionId` (`session.id`) copied from the attestation
+   the decision is based on. `deadline` is Unix epoch milliseconds compared against the
+   agent host's clock (`Date.now()` in the agent process); a supervisor on another host
+   should derive it from the attestation's `observedAt` plus a relative budget. The
+   process closes every input path, then requires the `instanceId` and `sessionId` to
+   match, all counts zero, `epoch` unchanged and the deadline not reached — all without
+   yielding, so no input can interleave. A session switch (`new_session`,
+   `switch_session`, `open_session`, `branch` to another session) also advances `epoch`.
+   - Pass → `data: { status: "quiesced", operationId, attempt, attestation, path }`.
+     Before the attestation is written the transcript is made final (the exit record
+     is appended, flushed and the file sealed), and `attestation.session` carries its
+     `size` and `sha256`; nothing is appended to the session file afterwards.
+     `attestation` (`kind: "quiesce"`, with `invocation` and `instanceId`) was already
+     fsync'd to `path` (`<session file without .jsonl>.terminal.json`) before the
+     response is written; the process then disposes the session and exits with code
+     0. From the pass on, only read-only commands run (`attest`, `get_*`,
+     `negotiate_protocol`, `set_event_filter`, `set_subagent_subscription`, `goal`
+     `get`); every other command — input and state-changing commands alike — fails
+     with `code: "admission_closed"`, and no internal producer (queued notifications,
+     scheduled continuations, IRC wakes, cache warming) starts a provider call.
+   - Exit without attestation → `data: { status: "exit_unattested", operationId,
+     attempt, reason: "attestation_unavailable", error, snapshot }`. The session was
+     idle and its transcript was made final, but the attestation could not be written.
+     The process exits anyway, with code 1; there is no terminal attestation for this
+     exit, so the consumer decides from the registry (`verifyOwnedJobRegistry`).
+   - Refusal → `data: { status: "refused", operationId, attempt, reason, snapshot:
+     { epoch, counts, observedAt } }`. Admission is reopened and nothing is cancelled.
+     `reason` is one of `work_active`, `epoch_mismatch`, `deadline_expired`,
+     `invocation_mismatch` (the `instanceId` belongs to another session object or
+     process), `session_mismatch` (the session was switched since the attestation),
+     `stale_attempt`, `admission_closed`, `invalid_request`, `attestation_unavailable`
+     (no session file, or the attestation directory is not writable).
+
+Each `(operationId, attempt)` is evaluated once: repeating it returns the original
+answer unchanged (so a retry after a lost response learns whether it passed), and a
+lower attempt is refused with `stale_attempt` without evaluation; an expired deadline
+never executes. Malformed requests and requests refused with `invocation_mismatch` or
+`session_mismatch` do not use up the attempt number. Once a result ends the process,
+teardown gets at most 30 seconds before the process is ended regardless.
+
+Extensions (`ctx.quiesceAndExit`) cannot quiesce from inside their own command or event
+handler: the running handler is outstanding work, so the answer is `work_active`.
+Call it from outside any handler (for example from a timer or an external trigger).
+
+On SIGHUP or SIGTERM the process writes the same file with `kind: "hangup"`,
+`signal`, and `interrupted: true` when any count was non-zero, capturing the counts
+before any other exit cleanup clears queues, timers or jobs. It then makes the
+transcript final and adds its `size` and `sha256`, as a passed quiesce does; afterwards
+the same read-only allowlist applies. In interactive and ACP hosts the digest is added
+after the host's own teardown (so `session_shutdown` handlers' writes are covered);
+exit cleanup gets at most 10 seconds, and a teardown that outlives it ends with the
+process killed before the digest is added: `session.size` and `session.sha256` are then
+absent, and the attestation binds no transcript content.
+
+**Which attestation describes an exit.** When a session is opened, resumed or
+switched to, the agent renames any `<base>.terminal.json` an earlier invocation left to
+`<base>.terminal.<pid>-<startId>.json` (its writer's identity, directory fsync'd),
+removes unpublished `<base>.terminal.json.<pid>.tmp` files whose writer is gone, and
+writes its own registry header. A terminal attestation is valid for a request only if
+its `operationId`/`attempt` match the request and its `invocation` equals the invocation
+the consumer last observed through `attest` (or `get_state`).
+
+**Decide from both.** A clean terminal attestation is necessary, not sufficient: after
+observing that the process exited, a consumer must also run
+`verifyOwnedJobRegistry(path, { expectedInvocation })` with that invocation and treat
+the session as clear only if the attestation is clean **and** the verdict is `clear`.
+The attestation describes what this invocation could see when it decided; the registry
+check also covers what happened afterwards or elsewhere (another invocation writing the
+same session file, a process that outlived the exit). A registry with no header for the
+expected invocation may be missing that invocation's records, and answers `unknown`.
+
+The owned-job registry (`<session file without .jsonl>.jobs.jsonl`, append-only,
+fsync'd per record; a writer that finds a torn last line starts a new line first) lists
+processes and in-process jobs the agent started: `invocation` headers (`complete:
+false` when some process may be untracked; `writer`, a random id of the registry object;
+`inheritedOwnerMarkers` when it took over other invocations, below), `start` records
+(`jobId`, `kind`, `pid`, `pgid`, `startId`, `startTime` in Unix seconds for display,
+`command` (at most 4096 characters), `cwd`, `sleepable`, `inProcess`, `reparented?`,
+`groupMember?`, `discovered?`, `carriedFrom?`, `adoptedFrom?`), `end` records, and
+`incomplete` records; `start`, `end` and `incomplete` records carry `invocationPid` and
+the `writer` of their header (records written before `writer` existed have none). A
+record belongs to the latest preceding header whose invocation has its `invocationPid`
+and, when the record has a `writer`, the same `writer` — so two session objects in one
+process writing the same file never end or hide each other's jobs; job ids restart per
+header. `startId` is an opaque,
+clock-independent start identity (Linux: start ticks since boot; macOS: start time in
+microseconds; Windows: creation `FILETIME`) compared for equality only. An open record
+with `inProcess: false` is alive iff a live, non-zombie process with that `pid` has that
+`startId`; a process whose identity cannot be read counts as possibly alive. An open
+`inProcess` record after its invocation ended, or any incomplete marker, means the
+registry cannot vouch for every process. `kind: "retained-shell"` stays open while a
+shell is kept alive for a running background job, which can start processes nobody
+reports. Every time the agent binds a session file (a switch, including a switch back)
+it re-appends every open start record not yet in that file with `carriedFrom` naming
+the first file; the end record then goes to every file holding the start.
+
+**Other invocations of the same session file.** OMP does not lock a session file: a
+resume can bind a file earlier invocations wrote, and a second OMP can have it open at
+the same time. The agent reads what other writers append — on first binding a file and
+again, incrementally, before every owner scan (so on every `attest`, `quiesce_and_exit`
+and hang-up capture), for every file it has bound, not only the current one — and takes
+it over into the current file. It reads only whole lines: an unterminated last line that
+stays the same across two reads while no other invocation of the file is running is a
+record its writer died writing, and makes this invocation incomplete. A registry file
+replaced by another file (a different inode), or truncated or rewritten in place (the
+last 512 bytes it consumed are no longer where it read them), also makes it incomplete
+and is read again from the start; a registry file it read that has since been removed
+makes it incomplete. What it takes over, separately for every file it reads and every
+read of a file from its start:
+- every open process record that is not provably gone is re-appended under this
+  invocation with `adoptedFrom` and counted in `detachedJobs`;
+- another invocation still running (or one whose identity cannot be read) counts as one
+  live process in `detachedJobs`, so no quiesce passes while it can still start work;
+- their owner tokens go into `inheritedOwnerMarkers` and are scanned from then on,
+  counting unexaminable processes started since the earliest of those invocations; a
+  token stops being copied into new headers only when its invocation is gone, no open
+  record was adopted from that invocation, and two consecutive scans that could examine
+  every candidate process — tracked or not — found none carrying it, with no counted
+  process exiting between those scans and their counts (the header that issued it still
+  names it, so consumers keep scanning it). Two scans that each miss a carrier that
+  forks and exits during its own scan could still drop a token whose child lives; only
+  this invocation's later headers and attestations lose it;
+- their incomplete state — a header that is not exactly `complete: true` with no reasons
+  (every header, including a writer's repeated one), an `incomplete` record, an
+  in-process job still open once its invocation is gone, an unparseable line — makes
+  this invocation incomplete too (`inherited: <reason>`). Another session object in the
+  same process is not watched for liveness: its open in-process jobs make this one
+  incomplete at once, and it never counts as live work.
+Incompleteness therefore sticks to a session file: once an invocation could not vouch
+for everything it started, no later invocation of that file claims `complete`.
+
+`kind: "internal"` records are engine helper daemons this invocation started (the
+daemon broker `__omp_worker_daemon_broker`, text prediction
+`__omp_worker_text_predict`). They are shared by every agent process in their scope,
+run no Thread work, and exit on their own idle timer (broker: a few seconds after the
+last agent process in its scope disconnects, stopping non-persistent children such as
+text prediction) — so they never count as outstanding work, alive or not. Services a
+broker hosts, including persistent or detached ones that outlive it, have their own
+`service` records; a mode change that restarts a service records the new process with
+the `sleepable` value given at start. A helper started by a different agent process
+has no record here; consumers identify it by that worker selector in its argv.
+
+**Owner marker.** Every process the agent starts for work — embedded shell runs,
+PTY shells, named services, apps the browser tool launches (`app.path`, also recorded as
+`process`), and commands run by extensions (`pi.exec`), hooks and custom tools — inherits
+`OMP_OWNER`, a comma-separated list of owner tokens `omp1:<pid>:<startId>` (an agent
+started from another agent's shell appends its token to the inherited list; the shared
+daemon broker gets none). Each `invocation` header records `ownerMarker: { env:
+"OMP_OWNER", token }`. A process that double-forks, calls `setsid` or otherwise escapes
+the shell keeps its environment, so `attest`, `quiesce_and_exit` and a hang-up capture
+scan processes that run as (or were started by) this user — real, effective or saved uid
+— for the token, record every live marked process the registry did not track as a
+`start` record with `discovered: true`, and count it in `detachedJobs`. A counted
+process (or another invocation) that exits between the scan and the count may have
+handed the marker to a child the scan did not see, so the scan and count are repeated
+while that happens; after 3 rounds that never settle, `sound` is false. `ownerScan` is
+`{ supported, sound, scanned, discovered, opaque }` (`discovered` summed over the
+rounds): `opaque` lists candidate processes started since the invocation began whose
+environment could not be examined (including setuid descendants), which could hide the
+marker; `sound` is false if any exist, if the OS hides processes from the scan (Linux
+`/proc` mounted with `hidepid`), or if the rounds never settled.
+
+Limits — the classes that can read as clear on Linux, where the scan is otherwise sound,
+so a consumer must keep its own host process census as a required cross-check:
+- a process that clears or replaces its environment (`env -i`, `sudo` with `env_reset`,
+  some daemonizers) carries no marker, so the scan cannot find it — whether it escapes
+  while a shell run is still in flight (`sh -c 'setsid env -i cmd &'` leaves all counts
+  zero) or later; embedded shell runs report only the processes they themselves spawned
+  and were still alive when the run ended;
+- processes started through the extension `user_bash` hook (the extension runs them
+  itself) or on an ACP client terminal (they run in the client) are not registered;
+- engine infrastructure is neither marked nor registered: MCP stdio servers, language
+  servers (including the shared LSP mux daemon), the IDA worker, the tiny-model title
+  worker, the blob broker, the shared headless Chromium and the browser relay daemon
+  (both started through the daemon broker with no marker) and the Chromium the browser
+  tool launches in-process through puppeteer in SDK and `bun` hosts (detached). They run
+  no Thread work; the LSP mux, blob broker, title worker and broker-hosted browsers are
+  shared helpers that can outlive one agent process;
+- a writer in another pid namespace that shares the session directory (a sibling
+  container, `unshare -p`) has pids that mean nothing here: its invocation and processes
+  read as gone, so the registry and the verifier assume every writer of a session file
+  runs in the consumer's pid namespace;
+- a marked process no earlier scan found, which the scan lists but which forks a marked
+  child and exits before its environment is read, is dropped by that scan without a
+  trace: nothing counted vanished, so the answer settles while the child runs. The
+  window is one environment read; the verifier's later scan finds the child.
+
+Paths that mark the registry incomplete instead: every PTY shell run (on every
+platform), eval runs (their long-lived kernels are not marked), a shell run whose spawn
+report is incomplete (a process that could not be identity-pinned, an unreported
+`nohup … &` reparent, a failed run), a background job still running when its run was
+cancelled, a service start or mode change that ended without reporting its process,
+and any debug (DAP) session. On macOS the kernel withholds the environment of Apple
+platform binaries (`sh`, `zsh`, `sleep`, …), so the scan is almost never `sound` there
+and consumers get `unknown` rather than a false clear. Windows has no scan.
+
+**Consumer rule after the agent exited** (`verifyOwnedJobRegistry(path, {
+expectedInvocation })` in `@oh-my-pi/pi-coding-agent/session/owned-job-registry`
+implements it):
+1. Attribute each record to the latest preceding header with its `invocationPid` and,
+   when the record has a `writer`, the same `writer`. At best `unknown` for: a malformed
+   line; an unknown record type; a header whose fields do not have the types above
+   (`invocation.pid` an integer, `invocation.startId` a decimal string or null,
+   `sessionId` a string, `complete` a boolean, `incompleteReasons` strings, `writer` a
+   string, `ownerMarker` and every `inheritedOwnerMarkers` entry with string
+   `token`/`env` and a decimal-string or null `startId`); a start record without a string
+   `jobId` and `kind`, an integer `pid`, a boolean `inProcess` and a decimal-string or
+   null `startId`; a record with a non-string `writer`; a record with no such header.
+   With `expectedInvocation`, no header for it → at best `unknown`.
+2. Any invocation still alive (pid + `startId`) → `live`: use `attest` instead; one
+   whose identity cannot be read → at best `unknown`.
+3. A header counts as complete only when `complete` is exactly `true` and it lists no
+   `incompleteReasons`; any other header, or any `incomplete` record → at best `unknown`.
+4. Open records, ignoring `internal`: `inProcess` → `unknown`; otherwise alive by pid +
+   `startId` → `blocked`; identity unreadable → at best `unknown`.
+5. One scan for every token in any header's `ownerMarker` and
+   `inheritedOwnerMarkers`: any live match → `blocked`; an unexaminable process started
+   since the earliest of those invocations, a scan that reports hidden processes, or no
+   scan on the platform → at best `unknown`.
+6. Otherwise `clear`.
 
 ### `set_fast_mode` payload
 
@@ -1233,7 +1488,7 @@ Failures are `success: false` with string `error`.
 - Malformed JSONL / parse-loop exceptions emit a `parse` error response and continue reading subsequent lines.
 - Empty `set_session_name` is rejected (`Session name cannot be empty`).
 - Extension UI responses and valid host-tool/host-URI updates/results with unknown `id` are ignored. These side-channel frames do not receive command response frames.
-- Normal termination occurs on stdin close or extension-triggered shutdown. Output/spool failures and unrecovered session-persistence failures are fatal.
+- Normal termination occurs on stdin close, extension-triggered shutdown, or a passed `quiesce_and_exit`. Output/spool failures and unrecovered session-persistence failures are fatal.
 - Session-persistence errors emit an unfiltered `{ type: "notice", level: "error", message, source: "session-persistence" }` frame and a stderr mirror. A recovered failure can still shut down normally; a failure still latched during disposal exits with code `1` after draining stdout.
 
 ## Compact Command Flows
