@@ -681,6 +681,42 @@ describe("external delivery (session)", () => {
 			expect(providerRoles).toContain("developer");
 		});
 
+		it("engine context resent through the session's own senders keeps sole (M2)", async () => {
+			const slow = slowTool();
+			const { mock, session: s } = makeSession({ tools: [slow.tool] });
+			const now = Date.now();
+			s.setGoalModeState({
+				enabled: true,
+				mode: "active",
+				goal: {
+					id: "goal-1",
+					objective: "finish",
+					status: "active",
+					tokensUsed: 0,
+					timeUsedSeconds: 0,
+					createdAt: now,
+					updatedAt: now,
+				},
+			});
+			mock.push(toolCall("slow"));
+			mock.push({ content: ["done"] });
+			const handle = s.deliverExternalMessage(card("only-peer"), { mode: "aside" });
+			await handle.accepted;
+			await slow.started;
+			// The goal frame is rebuilt and resent through sendCustomMessage-style
+			// plumbing mid-run: a real engine creation site, not a synthetic event.
+			await s.sendGoalModeContext({ deliverAs: "steer" });
+			slow.release();
+			const settled = await handle.settled;
+			expect(settled.outcome).toBe("text");
+			expect(settled.sole).toBe(true);
+			expect(settled.interactive).toBe(false);
+			// The frame did reach the provider (it is context, not an input).
+			const texts = mock.calls.flatMap((_, index) => userTexts(mock, index));
+			expect(mock.calls.length).toBe(2);
+			expect(texts.some(text => text.includes("only-peer"))).toBe(true);
+		});
+
 		it("an engine-injected record before the first assistant message keeps sole and quiet privilege", async () => {
 			const { mock, session: s } = makeSession();
 			mock.push({ content: [{ type: "thinking", thinking: "noted", thinkingSignature: "sig" }] });
