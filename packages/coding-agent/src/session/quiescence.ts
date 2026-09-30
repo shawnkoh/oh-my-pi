@@ -10,7 +10,7 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { isEnoent } from "@oh-my-pi/pi-utils";
+import { isEnoent, logger } from "@oh-my-pi/pi-utils";
 import { fsyncDirectory, type InvocationIdentity, type OwnerScanSummary, stripJsonl } from "./owned-job-registry";
 
 /** Capability: `attest` + `quiesce_and_exit` with a terminal attestation file. */
@@ -308,7 +308,11 @@ function attestationTempPath(file: string, pid: number): string {
 	return `${file}.${pid}.tmp`;
 }
 
-/** Remove temp attestations whose writer is gone (a crash between write and publish). */
+/**
+ * Remove temp attestations whose writer is gone (a crash between write and publish). Best
+ * effort: an entry that cannot be removed (a directory of that name, a permission error) is
+ * left, and never stops the retirement that follows.
+ */
 function sweepAttestationTempFiles(file: string): void {
 	const dir = path.dirname(file);
 	const prefix = `${path.basename(file)}.`;
@@ -323,7 +327,11 @@ function sweepAttestationTempFiles(file: string): void {
 		if (!match) continue;
 		const pid = Number(match[1]);
 		if (pid === process.pid || isProcessRunning(pid)) continue;
-		fs.rmSync(path.join(dir, name), { force: true });
+		try {
+			fs.rmSync(path.join(dir, name), { force: true });
+		} catch (error) {
+			logger.warn("Could not remove a stale terminal attestation temp file", { name, error: String(error) });
+		}
 	}
 }
 

@@ -19,6 +19,7 @@ import {
 	type QuiesceRequest,
 	quiesceEndsProcess,
 	quiesceExitCode,
+	retireTerminalAttestationSync,
 	type TerminalAttestation,
 	terminalAttestationPath,
 } from "@oh-my-pi/pi-coding-agent/session/quiescence";
@@ -402,6 +403,18 @@ describe("AgentSession quiesce-and-exit", () => {
 		expect(fs.existsSync(stale)).toBe(false);
 	});
 
+	it("retires the previous attestation even when a stale temp entry cannot be removed", () => {
+		const sessionFile = path.join(tempDir.path(), "sweep.jsonl");
+		const attestation = terminalAttestationPath(sessionFile);
+		fs.writeFileSync(attestation, JSON.stringify({ invocation: { pid: 0x7ffffff7, startId: "5" } }));
+		// A directory where a dead writer's temp file would be: removing it fails.
+		fs.mkdirSync(`${attestation}.${0x7ffffff7}.tmp`);
+		expect(retireTerminalAttestationSync(sessionFile)).toBe(
+			path.join(tempDir.path(), `sweep.terminal.${0x7ffffff7}-5.json`),
+		);
+		expect(fs.existsSync(attestation)).toBe(false);
+	});
+
 	it("refuses while a session switch is still being set up", async () => {
 		const entered = Promise.withResolvers<void>();
 		const gate = Promise.withResolvers<void>();
@@ -417,6 +430,26 @@ describe("AgentSession quiesce-and-exit", () => {
 		expect(result).toMatchObject({ status: "refused", reason: "work_active" });
 		gate.resolve();
 		await switching;
+	});
+
+	it("refuses while the session is being moved", async () => {
+		const s = createSession();
+		await s.prompt("materialize the transcript");
+		const entered = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		vi.spyOn(s.sessionManager, "moveTo").mockImplementation(async () => {
+			entered.resolve();
+			await gate.promise;
+		});
+		try {
+			const moving = s.moveSession(path.join(tempDir.path(), "elsewhere"));
+			await entered.promise;
+			expect(s.quiesceForExit(request(s))).toMatchObject({ status: "refused", reason: "work_active" });
+			gate.resolve();
+			await moving;
+		} finally {
+			vi.restoreAllMocks();
+		}
 	});
 
 	it("starts no scheduled continuation after a pass", async () => {

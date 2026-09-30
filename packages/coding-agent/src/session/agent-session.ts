@@ -9943,6 +9943,7 @@ export class AgentSession implements SettingsScope {
 
 	/** Move the active session and artifacts after enforcing mode transition invariants. */
 	async moveSession(newCwd: string, targetSessionDir?: string): Promise<void> {
+		using _transition = this.#beginSessionTransition();
 		this.#assertVibeSessionTransitionAllowed("move the session");
 		await this.sessionManager.moveTo(newCwd, targetSessionDir);
 	}
