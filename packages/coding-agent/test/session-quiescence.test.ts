@@ -14,6 +14,7 @@ import type { ExtensionFactory } from "@oh-my-pi/pi-coding-agent/extensibility/e
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import type { DeliveryHandle } from "@oh-my-pi/pi-coding-agent/session/external-delivery";
+import { IrcBridge } from "@oh-my-pi/pi-coding-agent/session/irc-bridge";
 import type { CustomMessagePayload } from "@oh-my-pi/pi-coding-agent/session/messages";
 import {
 	type OwnedJobRecord,
@@ -551,6 +552,16 @@ describe("AgentSession quiesce-and-exit", () => {
 		expect(held.cancel()).toBe(true);
 		expect(s.quiesceForExit(request(s, { attempt: 2 }))).toMatchObject({ status: "quiesced" });
 		expect(mock.calls.length).toBe(1);
+	});
+
+	it("counts a held external delivery even while no host queue lists it", async () => {
+		const s = createSession();
+		await s.prompt("materialize the transcript");
+		holdDelivery(s, "held");
+		// Owners can sit outside every counted queue (handed back, parked, snapshotted by a
+		// transition): the delivery itself is what counts.
+		vi.spyOn(IrcBridge.prototype, "pendingCount").mockReturnValue(0);
+		expect(s.quiesceForExit(request(s))).toMatchObject({ status: "refused", reason: "work_active" });
 	});
 
 	it("never accepts an external delivery after a pass: the handle is already discarded", async () => {
