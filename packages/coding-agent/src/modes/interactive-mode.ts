@@ -2024,7 +2024,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// signal arriving mid-Ctrl+C no-ops instead of racing a second dispose.
 		this.#signalTeardown = createSessionTeardown({
 			getDraftText: () => this.#inputController.getDraftText(),
-			beginDispose: () => this.session.beginDispose(),
+			beginDispose: reason => this.session.beginDispose(reason),
 			saveDraft: text => this.sessionManager.saveDraft(text),
 			disposeSession: async reason => {
 				await this.#btwController.dispose();
@@ -2040,6 +2040,13 @@ export class InteractiveMode implements InteractiveModeContext {
 		// after the AgentSession constructor's `agent-session:<id>` recorder) runs
 		// FIRST and its dispose() would otherwise persist the generic "dispose".
 		this.#cleanupUnsubscribe = postmortem.register("session-teardown", reason => this.#signalTeardown!(reason));
+		// Host-owned pending work the session cannot see: a submitted editor input not yet
+		// dispatched, and a scheduled goal continuation.
+		this.session.registerWorkSource({ kind: "queuedInput", count: () => (this.hasPendingSubmission() ? 1 : 0) });
+		this.session.registerWorkSource({
+			kind: "goalContinuationScheduled",
+			count: () => (this.#goalContinuationTimer ? 1 : 0),
+		});
 
 		// Wire the report_tool_issue consent gate to the Yes/No dialog popup.
 		// The handler is process-global — subagent tools (which can't reach
@@ -2804,6 +2811,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#cancelGoalContinuation();
 		if (this.loopModeEnabled) return;
 		if (!this.onInputCallback) return;
+		if (this.session.isAdmissionClosed()) return;
 		if (!cfgGoalContinuationModes.get(this.session.settings).includes("interactive")) return;
 		if (this.planModeEnabled || this.planModePaused) return;
 		if (!this.goalModeEnabled || this.goalModePaused) return;
@@ -2843,6 +2851,8 @@ export class InteractiveMode implements InteractiveModeContext {
 				}),
 			);
 		}, 800);
+		// A scheduled continuation is pending work: invalidate earlier attestations.
+		this.session.noteActivity();
 	}
 
 	/** A blocked-only todo list has no work the agent can advance without another turn. */

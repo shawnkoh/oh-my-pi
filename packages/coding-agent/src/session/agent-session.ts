@@ -424,6 +424,7 @@ import {
 	hasOutstandingWork,
 	type QuiesceRequest,
 	type QuiesceResult,
+	SESSION_CAPABILITIES,
 	type SessionIdentity,
 	type SessionWorkSource,
 	TERMINAL_ATTESTATION_VERSION,
@@ -8018,6 +8019,13 @@ export class AgentSession implements SettingsScope {
 				// `void this.dispose()` raced process.exit() and could leave an
 				// OMP-owned Chromium alive (#5643).
 				void this.dispose().finally(() => process.exit(0));
+			},
+			capabilities: SESSION_CAPABILITIES,
+			attest: (operationId, nonce) => this.attest(operationId, nonce),
+			quiesceAndExit: request => {
+				const result = this.quiesceForExit(request);
+				if (result.status === "quiesced") void this.dispose().finally(() => process.exit(0));
+				return result;
 			},
 			getContextUsage: () => this.getContextUsage(),
 			getAsyncJobSnapshot: () => this.getAsyncJobSnapshot(),

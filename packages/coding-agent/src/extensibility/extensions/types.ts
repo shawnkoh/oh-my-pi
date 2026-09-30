@@ -83,6 +83,7 @@ import type { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import type { NativeToolView } from "@oh-my-pi/pi-tui/tools/renderer";
 import type { AsyncJobSnapshot, SendUserMessageOptions } from "../../session/agent-session";
+import type { QuiesceRequest, QuiesceResult, WorkAttestation } from "../../session/quiescence";
 import type { EphemeralTurnOptions, EphemeralTurnResult } from "../../session/agent-session-types";
 import type { CompactMode } from "../../session/compact-modes";
 import type { CustomMessagePayload } from "../../session/messages";
@@ -488,6 +489,19 @@ export interface ExtensionContext {
 	hasPendingMessages(): boolean;
 	/** Gracefully shutdown and exit. */
 	shutdown(): void;
+	/**
+	 * Protocol capabilities this host implements (`quiesce-exit/1`, `owned-jobs/1`).
+	 * Empty when the host cannot quiesce and exit.
+	 */
+	capabilities: readonly string[];
+	/** Read-only snapshot of outstanding work, echoing `operationId` and `nonce`. */
+	attest(operationId: string, nonce: string): WorkAttestation;
+	/**
+	 * Close input admission and, when nothing is outstanding, the epoch is unchanged and the
+	 * deadline has not passed, write the terminal attestation and exit the process after this
+	 * returns. Otherwise reopen admission and return the refusal; nothing is cancelled.
+	 */
+	quiesceAndExit(request: QuiesceRequest): QuiesceResult;
 	/** Identity of the agent this session runs: the top-level session or a subagent. */
 	agent: ExtensionAgentIdentity;
 	/**
@@ -1867,6 +1881,9 @@ export interface ExtensionContextActions {
 	compact: (instructionsOrOptions?: string | CompactOptions) => Promise<void>;
 	getSystemPrompt: () => string[];
 	runEphemeralTurn?: (options: EphemeralTurnOptions) => Promise<EphemeralTurnResult>;
+	/** Hosts that can exit on a passed quiesce supply both; see {@link ExtensionContext.quiesceAndExit}. */
+	attest?: (operationId: string, nonce: string) => WorkAttestation;
+	quiesceAndExit?: (request: QuiesceRequest) => QuiesceResult;
 }
 
 /** Actions for ExtensionCommandContext (ctx.* in command handlers). */

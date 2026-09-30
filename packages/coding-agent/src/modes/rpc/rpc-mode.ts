@@ -58,6 +58,7 @@ import {
 } from "./rpc-prompt-results";
 import { RpcSessionEventForwarder } from "./rpc-session-events";
 import { isRpcSessionSettled, RpcSessionSettleWatcher } from "./rpc-session-settle";
+import { SESSION_CAPABILITIES } from "../../session/quiescence";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
 import type {
 	RpcCommand,
@@ -244,7 +245,26 @@ export interface RpcInputFrameDeps {
 	onHostToolResult: (frame: RpcHostToolResult) => void;
 	onHostToolUpdate: (frame: RpcHostToolUpdate) => void;
 	onHostUriResult: (frame: RpcHostUriResult) => void;
+	/**
+	 * Handles commands that must run on receipt rather than wait behind queued commands
+	 * (`attest`, `quiesce_and_exit`). Writes its own response frame.
+	 */
+	handleImmediateCommand?: (command: RpcCommand) => void;
 }
+
+/** Commands answered on receipt, ahead of the serialized command queue. */
+const IMMEDIATE_RPC_COMMANDS: ReadonlySet<string> = new Set(["attest", "quiesce_and_exit"]);
+
+/** Commands that hand the session new input or work; refused once admission is closed for exit. */
+const ADMISSION_GATED_RPC_COMMANDS: ReadonlySet<string> = new Set([
+	"prompt",
+	"steer",
+	"follow_up",
+	"abort_and_prompt",
+	"bash",
+	"compact",
+	"handoff",
+]);
 
 /**
  * Structural guard for a well-formed extension UI response frame. Mirrors the
@@ -277,6 +297,11 @@ export function dispatchRpcControlFrame(parsed: unknown, deps: RpcInputFrameDeps
 
 	if (isRpcHostUriResult(parsed)) {
 		deps.onHostUriResult(parsed);
+		return true;
+	}
+
+	if (deps.handleImmediateCommand && isRecord(parsed) && IMMEDIATE_RPC_COMMANDS.has(String(parsed.type))) {
+		deps.handleImmediateCommand(parsed as RpcCommand);
 		return true;
 	}
 
@@ -373,6 +398,11 @@ export class RpcInputDispatcher {
 		}
 	}
 
+	/** Accepted serial commands that have not finished (running or waiting their turn). */
+	get pendingCount(): number {
+		return this.#tasks.size;
+	}
+
 	async #dispatchSerialCommand(command: RpcCommand): Promise<void> {
 		try {
 			const awaited = dispatchRpcInputFrame(command, this.#deps);
@@ -407,6 +437,11 @@ export class RpcShutdownCoordinator {
 	constructor(options: { isShutdownRequested: () => boolean; performShutdown: () => Promise<void> }) {
 		this.#isShutdownRequested = options.isShutdownRequested;
 		this.#performShutdown = options.performShutdown;
+	}
+
+	/** Background-dispatched commands (`bash`) that still owe a response. */
+	get pendingCount(): number {
+		return this.#tasks.size;
 	}
 
 	/**
@@ -1032,6 +1067,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		onShutdown: () => {
 			shutdownState.requested = true;
 		},
+		onQuiesced: () => exitAfterQuiesce(),
 		trackAgentInvokingMessage: task => {
 			extensionUserMessageTracker.trackAgentMessageTask(task);
 		},
@@ -1118,8 +1154,17 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
 		const id = command.id;
+		// Admission closes only on the way out (passed quiesce or hang-up); answer with a
+		// machine-readable code rather than letting the session reject deep in dispatch.
+		if (session.isAdmissionClosed() && ADMISSION_GATED_RPC_COMMANDS.has(command.type)) {
+			return error(id, command.type, "Session is exiting; input is no longer admitted", "admission_closed");
+		}
 
 		switch (command.type) {
+			case "attest":
+			case "quiesce_and_exit":
+				return answerQuiescence(command);
+
 			case "negotiate_protocol": {
 				if (command.protocolVersion !== 2)
 					return error(id, "negotiate_protocol", `Unsupported RPC protocol version: ${command.protocolVersion}`);
@@ -1315,6 +1360,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 						examples: tool.examples,
 					})),
 					contextUsage: session.getContextUsage(),
+					capabilities: [...SESSION_CAPABILITIES],
 				};
 				return success(id, "get_state", state);
 			}
@@ -1733,6 +1779,34 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		}
 	};
 
+	/**
+	 * Answer `attest` / `quiesce_and_exit` synchronously. Both run on receipt (see
+	 * {@link IMMEDIATE_RPC_COMMANDS}); the response carries the command `id` and the
+	 * caller's `operationId` (and `attempt`) so a shared stdout reader can correlate it.
+	 */
+	const answerQuiescence = (command: Extract<RpcCommand, { type: "attest" | "quiesce_and_exit" }>): RpcResponse => {
+		if (command.type === "attest") {
+			if (typeof command.operationId !== "string" || typeof command.nonce !== "string") {
+				return error(command.id, "attest", "attest requires string operationId and nonce", "invalid_request");
+			}
+			return success(command.id, "attest", session.attest(command.operationId, command.nonce));
+		}
+		const result = session.quiesceForExit({
+			operationId: command.operationId,
+			attempt: command.attempt,
+			epoch: command.epoch,
+			deadline: command.deadline,
+		});
+		if (result.status === "quiesced") exitAfterQuiesce();
+		return success(command.id, "quiesce_and_exit", result);
+	};
+
+	/** Exit after a passed quiesce: the response is queued first, and dispose drains the writer. */
+	const exitAfterQuiesce = (): void => {
+		shutdownState.requested = true;
+		queueMicrotask(() => void shutdownCoordinator.checkShutdownRequested());
+	};
+
 	// Deferred shutdown (pi.shutdown() from an extension) must not kill the
 	// process while a background-dispatched bash still owes the client its
 	// response frame. The coordinator drains tracked tasks before exiting and
@@ -1758,11 +1832,19 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		onHostToolResult: frame => hostToolBridge.handleResult(frame),
 		onHostToolUpdate: frame => hostToolBridge.handleUpdate(frame),
 		onHostUriResult: frame => hostUriBridge.handleResult(frame),
+		handleImmediateCommand: command => {
+			if (command.type === "attest" || command.type === "quiesce_and_exit") output(answerQuiescence(command));
+		},
 	};
 
 	const inputDispatcher = new RpcInputDispatcher({
 		deps: dispatchFrameDeps,
 		afterSerialCommand: () => shutdownCoordinator.checkShutdownRequested(),
+	});
+	// Commands read but not yet answered are admitted input the session cannot see.
+	session.registerWorkSource({
+		kind: "queuedInput",
+		count: () => inputDispatcher.pendingCount + shutdownCoordinator.pendingCount,
 	});
 
 	// Keep the stdin reader moving: side-channel frames dispatch immediately,

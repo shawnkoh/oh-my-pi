@@ -17,6 +17,7 @@ import type { AgentProgress } from "@oh-my-pi/pi-tui/tools/task";
 import type { SubagentEventPayload, SubagentLifecyclePayload, SubagentProgressPayload } from "../../task";
 import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 import type { RpcMessagesPage } from "./rpc-messages";
+import type { QuiesceResult, WorkAttestation } from "../../session/quiescence";
 
 // ============================================================================
 // RPC Commands (stdin)
@@ -99,7 +100,11 @@ export type RpcCommand =
 
 	// Login
 	| { id?: string; type: "get_login_providers" }
-	| { id?: string; type: "login"; providerId: string };
+	| { id?: string; type: "login"; providerId: string }
+
+	// Quiescence (dispatched on receipt, ahead of queued commands)
+	| { id?: string; type: "attest"; operationId: string; nonce: string }
+	| { id?: string; type: "quiesce_and_exit"; operationId: string; attempt: number; epoch: number; deadline: number };
 
 // ============================================================================
 // RPC State
@@ -136,6 +141,8 @@ export interface RpcSessionState {
 	dumpTools?: Array<{ name: string; description: string; parameters: unknown; examples?: readonly ToolExample[] }>;
 	/** Current context window usage. */
 	contextUsage?: ContextUsage;
+	/** Protocol capabilities this process implements (e.g. `quiesce-exit/1`, `owned-jobs/1`). */
+	capabilities: string[];
 }
 
 export interface RpcAvailableSlashCommand {
@@ -279,6 +286,8 @@ export type RpcResponse =
 
 	// State
 	| { id?: string; type: "response"; command: "get_state"; success: true; data: RpcSessionState }
+	| { id?: string; type: "response"; command: "attest"; success: true; data: WorkAttestation }
+	| { id?: string; type: "response"; command: "quiesce_and_exit"; success: true; data: QuiesceResult }
 	| {
 			id?: string;
 			type: "response";

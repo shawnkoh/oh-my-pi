@@ -255,6 +255,8 @@ Handlers and tool `execute` receive `ctx` with:
 - `compact(...)`
 - `isIdle()`, `hasPendingMessages()`, `abort()`
 - `shutdown()`
+- `capabilities` — `["quiesce-exit/1", "owned-jobs/1"]` when the host can quiesce and exit (interactive, RPC), else `[]`
+- `attest(operationId, nonce)` / `quiesceAndExit({ operationId, attempt, epoch, deadline })` — the same synchronous contract as the RPC `attest` / `quiesce_and_exit` commands ([RPC: Quiesce and exit](rpc.md#quiesce-and-exit)); on `status: "quiesced"` the host exits after the call returns
 - `getSystemPrompt()`
 - `agent` — the agent this session runs: `{ kind: "main" | "sub", id, name, depth, parentId? }`. Factories are rebound to every subagent session (task tool, eval `agent()`, `/tan` clones), so a handler can check `ctx.agent.kind === "sub"` or the lowercased agent definition `name` (for example `"explore"`) to act only in subagents. Use `kind`, not `depth`: `depth` counts `task` nesting only, so `/tan` clones are subagents at depth 0 and report `name: "sub"`
 - `runEphemeralTurn(...)` (optional; see below)

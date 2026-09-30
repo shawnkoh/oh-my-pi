@@ -37,6 +37,7 @@ import { HookSelectorComponent, type HookSelectorSlider } from "@oh-my-pi/pi-tui
 import { getAvailableThemesWithPaths, getThemeByName, setTheme, type Theme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext, InteractiveSelectorDialogOptions } from "../../modes/types";
 import { normalizeCustomMessagePayload, USER_INTERRUPT_LABEL } from "../../session/messages";
+import type { QuiesceRequest, QuiesceResult } from "../../session/quiescence";
 import { disambiguateDisplayLabels, sanitizeCarriageReturns } from "@oh-my-pi/pi-tui/render/render-utils";
 import { setExtensionTerminalTitle, setSessionTerminalTitle } from "../../utils/title-generator";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
@@ -232,6 +233,8 @@ export class ExtensionUiController {
 			compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),
 			getSystemPrompt: () => this.ctx.session.systemPrompt,
 			runEphemeralTurn: args => this.ctx.session.runEphemeralTurn(args),
+			attest: (operationId, nonce) => this.ctx.session.attest(operationId, nonce),
+			quiesceAndExit: request => this.#quiesceAndExit(request),
 		};
 		const commandActions: ExtensionCommandContextActions = {
 			getContextUsage: () => this.ctx.session.getContextUsage(),
@@ -464,6 +467,8 @@ export class ExtensionUiController {
 			compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),
 			getSystemPrompt: () => this.ctx.session.systemPrompt,
 			runEphemeralTurn: args => this.ctx.session.runEphemeralTurn(args),
+			attest: (operationId, nonce) => this.ctx.session.attest(operationId, nonce),
+			quiesceAndExit: request => this.#quiesceAndExit(request),
 		};
 		const commandActions: ExtensionCommandContextActions = {
 			getContextUsage: () => this.ctx.session.getContextUsage(),
@@ -1260,6 +1265,13 @@ export class ExtensionUiController {
 	}
 	async #handleInteractiveCompact(instructionsOrOptions: string | CompactOptions | undefined): Promise<void> {
 		await this.ctx.executeCompaction(instructionsOrOptions, false);
+	}
+
+	/** A passed quiesce leaves admission closed; exit through the normal shutdown after returning. */
+	#quiesceAndExit(request: QuiesceRequest): QuiesceResult {
+		const result = this.ctx.session.quiesceForExit(request);
+		if (result.status === "quiesced") queueMicrotask(() => void this.ctx.shutdown());
+		return result;
 	}
 
 	async #compactSession(instructionsOrOptions: string | CompactOptions | undefined): Promise<void> {

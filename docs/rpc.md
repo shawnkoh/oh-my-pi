@@ -143,6 +143,13 @@ Important edge behavior from runtime:
 - `{ id?, type: "get_subagents" }`
 - `{ id?, type: "get_subagent_messages", subagentId?: string, sessionFile?: string, fromByte?: number }`
 
+### Quiescence
+
+- `{ id?, type: "attest", operationId: string, nonce: string }`
+- `{ id?, type: "quiesce_and_exit", operationId: string, attempt: number, epoch: number, deadline: number }`
+
+Both run on receipt, ahead of any queued command; see [Quiesce and exit](#quiesce-and-exit).
+
 ### Model
 
 - `{ id?, type: "set_model", provider: string, modelId: string }`
@@ -369,7 +376,8 @@ is re-armed.
     "tokens": 1100,
     "contextWindow": 200000,
     "percent": 0.55
-  }
+  },
+  "capabilities": ["quiesce-exit/1", "owned-jobs/1"]
 }
 ```
 
@@ -379,6 +387,56 @@ will match against that queue. Clients should render the pending-message queue
 from these snapshots instead of tracking chips independently, and treat
 `remove_queued_message` responses as confirmation of the change rather than a
 second source of truth.
+
+`capabilities` lists protocol features this process implements. A client must
+check for `quiesce-exit/1` before sending `attest` or `quiesce_and_exit`, and for
+`owned-jobs/1` before relying on the owned-job registry file.
+
+### Quiesce and exit
+
+A supervisor that wants the agent to exit without interrupting work first takes a
+read-only snapshot, then asks the process to exit only if nothing changed:
+
+1. `attest` → `data`: `{ version: 1, operationId, nonce, epoch, session: { id, file },
+   invocation: { pid, startTime }, counts, admission: "open" | "closed",
+   registry: { path, complete }, observedAt }`. `counts` has `streaming`,
+   `queuedInput`, `asyncJobs`, `subagents`, `retainedJobs`, `detachedJobs`,
+   `compacting`, `handoff`, `goalContinuationScheduled`, `scheduledTurns`; any
+   non-zero value means work is outstanding. `queuedInput` includes commands this
+   process has read but not yet answered. `epoch` increases whenever input is
+   admitted or work starts.
+2. `quiesce_and_exit` (`deadline` is Unix epoch milliseconds). The process closes
+   every input path, then requires all counts zero, `epoch` unchanged and the
+   deadline not reached — all without yielding, so no input can interleave.
+   - Pass → `data: { status: "quiesced", operationId, attempt, attestation, path }`.
+     `attestation` (`kind: "quiesce"`) was already fsync'd to `path`
+     (`<session file without .jsonl>.terminal.json`) before the response is
+     written; the process then disposes the session and exits with code 0. Commands
+     received afterwards fail with `code: "admission_closed"`.
+   - Refusal → `data: { status: "refused", operationId, attempt, reason, snapshot:
+     { epoch, counts, observedAt } }`. Admission is reopened and nothing is cancelled.
+     `reason` is one of `work_active`, `epoch_mismatch`, `deadline_expired`,
+     `duplicate_attempt`, `stale_attempt`, `admission_closed`, `invalid_request`,
+     `attestation_unavailable` (no session file, or the write failed).
+
+Each `(operationId, attempt)` is evaluated once; repeating it or sending a lower
+attempt is refused without evaluation, and an expired deadline never executes. If a
+response is lost, read the terminal attestation file: it exists only for an attempt
+that passed.
+
+On SIGHUP or SIGTERM the process writes the same file with `kind: "hangup"`,
+`signal`, and `interrupted: true` when any count was non-zero, capturing the counts
+before teardown clears queues or cancels jobs.
+
+The owned-job registry (`<session file without .jsonl>.jobs.jsonl`, append-only,
+fsync'd per record) lists processes and in-process jobs the agent started:
+`invocation` headers (`complete: false` when some process may be untracked),
+`start` records (`jobId`, `kind`, `pid`, `pgid`, `startTime` in Unix seconds,
+`command`, `cwd`, `sleepable`, `inProcess`, `reparented?`), `end` records, and
+`incomplete` records. An open record with `inProcess: false` is alive iff a process
+with that `pid` has that OS start time; an open `inProcess` record after its
+invocation ended, or any incomplete marker, means the registry cannot vouch for
+every process.
 
 ### `set_fast_mode` payload
 
@@ -1000,7 +1058,7 @@ Failures are `success: false` with string `error`.
 - Malformed JSONL / parse-loop exceptions emit a `parse` error response and continue reading subsequent lines.
 - Empty `set_session_name` is rejected (`Session name cannot be empty`).
 - Extension UI responses with unknown `id` are ignored.
-- Process termination conditions are stdin close or explicit extension-triggered shutdown after the current command.
+- Process termination conditions are stdin close, explicit extension-triggered shutdown after the current command, or a passed `quiesce_and_exit`.
 
 ## Compact Command Flows
 
