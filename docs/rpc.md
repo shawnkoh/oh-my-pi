@@ -507,8 +507,10 @@ read-only snapshot, then asks the process to exit only if nothing changed:
    `counts` has `streaming`, `queuedInput`, `asyncJobs`, `subagents`, `retainedJobs`,
    `detachedJobs`, `compacting`, `handoff`, `goalContinuationScheduled`,
    `scheduledTurns`; any non-zero value means work is outstanding. `queuedInput`
-   includes commands this process has read but not yet answered and notifications
-   received but not yet queued (MCP resource changes inside their debounce window).
+   includes commands this process has read but not yet answered, notifications
+   received but not yet queued (MCP resource changes inside their debounce window),
+   and every [external delivery](#external-delivery) the session still holds (`queued`,
+   or `accepted` and not yet settled).
    `scheduledTurns` includes turns scheduled to start, retry and TTSR resumes, event
    and extension handlers still running after the agent went idle, message
    persistence in flight, advisor reviews, and an in-flight cache-warming request;
@@ -536,8 +538,12 @@ read-only snapshot, then asks the process to exit only if nothing changed:
      0. From the pass on, only read-only commands run (`attest`, `get_*`,
      `negotiate_protocol`, `set_event_filter`, `set_subagent_subscription`, `goal`
      `get`); every other command — input and state-changing commands alike — fails
-     with `code: "admission_closed"`, and no internal producer (queued notifications,
-     scheduled continuations, IRC wakes, cache warming) starts a provider call.
+     with `code: "admission_closed"`, including `deliver` and `cancel_delivery` (no
+     delivery can be held after a pass, since a held one refuses the quiesce; after a
+     hang-up, held records are discarded with `disposed` during teardown), and no
+     internal producer (queued notifications, scheduled continuations, IRC wakes, cache
+     warming) starts a provider call. An extension's `deliverMessage` after that point
+     is not admitted: it returns a handle already discarded with `admission_closed`.
    - Exit without attestation → `data: { status: "exit_unattested", operationId,
      attempt, reason: "attestation_unavailable", error, snapshot }`. The session was
      idle and its transcript was made final, but the attestation could not be written.
@@ -1122,6 +1128,9 @@ Receipts, one event each, all carrying `deliveryId`:
   without the usual empty-response retry.
 - `delivery_discarded` `{ reason }` when the session lets go of a queued
   record without admitting it: `new-session`, `session-switched`, `disposed`.
+  An extension `deliverMessage` made after the session closed input admission
+  (a passed quiesce or a hang-up) returns a handle already discarded with
+  `admission_closed`; RPC `deliver` then fails with `code: "admission_closed"`.
 - `delivery_cancelled` when `cancel_delivery` succeeded (only while `queued`).
 
 `delivery_settled` is emitted after the run's `agent_end`. A wake whose only
