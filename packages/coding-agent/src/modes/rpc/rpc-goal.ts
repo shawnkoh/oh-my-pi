@@ -73,10 +73,16 @@ export class RpcGoalController {
 	#sessionBeforeChange: string | undefined;
 	/** A goal turn was waiting or became due during the change; report busy until it ends. */
 	#heldDuringChange = false;
-	/** Reconciles in flight; a change that overlaps one must reconcile again when it ends. */
-	#reconciling = 0;
-	/** A reconcile was overlapped or superseded; the next change end reconciles regardless of ids. */
-	#reconcileStale = false;
+	/** Reconciles run one at a time, each against the transcript current when it starts. */
+	#reconcileTask: Promise<void> = Promise.resolve();
+	/** Reconciles queued or running. */
+	#reconcilesPending = 0;
+	/**
+	 * The in-progress change began while a reconcile was queued or running, so that
+	 * reconcile may have read a transcript this change later replaced or rolled back:
+	 * reconcile again (after it) when the change ends, whatever the ids say.
+	 */
+	#changeOverlappedReconcile = false;
 	readonly #onContinuationDropped: (() => void) | undefined;
 
 	/**
@@ -132,7 +138,7 @@ export class RpcGoalController {
 			this.#sessionBeforeChange = this.#session.sessionManager.getSessionId();
 			this.#heldDuringChange = this.#continuationScheduled || this.#continuationWanted();
 		}
-		if (this.#reconciling > 0) this.#reconcileStale = true;
+		if (this.#reconcilesPending > 0) this.#changeOverlappedReconcile = true;
 		this.#continuationScheduled = false;
 		this.#continuationGeneration++;
 		await this.#exitTask;
@@ -148,10 +154,20 @@ export class RpcGoalController {
 	async endSessionChange(): Promise<void> {
 		if (--this.#sessionChanges > 0) return;
 		const switched =
-			this.#reconcileStale || this.#session.sessionManager.getSessionId() !== this.#sessionBeforeChange;
+			this.#changeOverlappedReconcile || this.#session.sessionManager.getSessionId() !== this.#sessionBeforeChange;
+		this.#changeOverlappedReconcile = false;
 		this.#sessionBeforeChange = undefined;
 		this.#heldDuringChange = false;
 		try {
+			if (switched && this.#reconcilesPending > 0) {
+				// A reconcile is running, possibly the one whose extension notification
+				// started this change: queue behind it without waiting, or the two would
+				// wait on each other. Settlement is re-checked once it has run.
+				void this.reconcile()
+					.catch(reportControllerError)
+					.finally(() => this.#onContinuationDropped?.());
+				return;
+			}
 			if (switched) await this.reconcile();
 			else this.#scheduleContinuation();
 		} catch (error) {
@@ -271,15 +287,17 @@ export class RpcGoalController {
 	/**
 	 * Leave the previous session's goal behind and restore a goal journaled in the
 	 * current session (startup, new/switch/branch/open), mirroring the TUI's reattach.
+	 * Queued behind any reconcile already running; resolves when this one has run.
+	 * Never awaited from {@link beginSessionChange}: `onThreadResumed` notifies
+	 * extensions, which may start another change.
 	 */
 	async reconcile(): Promise<void> {
-		this.#reconcileStale = false;
-		this.#reconciling++;
-		try {
-			await this.#reconcileOnce();
-		} finally {
-			this.#reconciling--;
-		}
+		this.#reconcilesPending++;
+		const run = this.#reconcileTask.then(() => this.#reconcileOnce());
+		this.#reconcileTask = run.catch(reportControllerError).finally(() => {
+			this.#reconcilesPending--;
+		});
+		await run;
 	}
 
 	async #reconcileOnce(): Promise<void> {
@@ -287,17 +305,8 @@ export class RpcGoalController {
 		// session itself keeps both across a switch, so clear them here first.
 		this.#continuationScheduled = false;
 		this.#continuationGeneration++;
-		const transcriptId = this.#session.sessionManager.getSessionId();
-		// The transcript moved under this reconcile: stop, and make the change that
-		// moved it (or the next one to end) reconcile against the final transcript.
-		const superseded = () => {
-			if (this.#session.sessionManager.getSessionId() === transcriptId) return false;
-			this.#reconcileStale = true;
-			return true;
-		};
 		await this.#exitTask;
 		await this.#exit();
-		if (superseded()) return;
 		this.#session.setGoalModeState(undefined);
 		const context = this.#session.sessionManager.buildSessionContext();
 		const runtime = this.#session.goalRuntime;
@@ -313,7 +322,7 @@ export class RpcGoalController {
 		}
 		this.#session.setGoalModeState({ enabled: context.mode === "goal", mode: "active", goal });
 		const restored = await runtime.onThreadResumed();
-		if (!restored?.goal || superseded()) return;
+		if (!restored?.goal) return;
 		const previousTools = this.#session.getEnabledToolNames();
 		this.#previousTools = previousTools;
 		await this.#session.setActiveToolsByName([...new Set([...previousTools, "goal"])]);

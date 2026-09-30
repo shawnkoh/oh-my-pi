@@ -9,6 +9,7 @@ import {
 	isRpcSessionSettled,
 	RpcSessionSettleWatcher,
 	type RpcSettleSession,
+	watchedScheduledTurnProbe,
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-session-settle";
 import type { RpcSessionState } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -275,6 +276,11 @@ describe("RpcGoalController continuation gate", () => {
 		let idle = Promise.withResolvers<void>();
 		idle.resolve();
 		const journal: string[] = [];
+		let tools: string[] = ["read"];
+		let journaledGoal = false;
+		let resumed = Promise.withResolvers<void>();
+		resumed.resolve();
+		let threadResumes = 0;
 		const transcript = { id: "t1" };
 		const session = {
 			settings: Settings.isolated({ "goal.continuationModes": ["rpc"] }),
@@ -282,7 +288,23 @@ describe("RpcGoalController continuation gate", () => {
 			sessionId: "pinned-provider-id",
 			sessionManager: {
 				getSessionId: () => transcript.id,
-				buildSessionContext: () => ({ mode: "none" }),
+				buildSessionContext: () =>
+					journaledGoal
+						? {
+								mode: "goal_paused",
+								modeData: {
+									goal: {
+										id: "j1",
+										objective: "journaled",
+										status: "paused",
+										tokensUsed: 0,
+										timeUsedSeconds: 0,
+										createdAt: 0,
+										updatedAt: 0,
+									},
+								},
+							}
+						: { mode: "none" },
 				appendModeChange: (mode: string) => journal.push(`${transcript.id}:mode:${mode}`),
 				appendCustomEntry: (type: string) => journal.push(`${transcript.id}:${type}`),
 			},
@@ -298,12 +320,19 @@ describe("RpcGoalController continuation gate", () => {
 			setGoalModeState: (state: GoalModeState | undefined) => {
 				goalState = state;
 			},
-			getEnabledToolNames: () => ["read"],
-			setActiveToolsByName: async () => {},
+			getEnabledToolNames: () => [...tools],
+			setActiveToolsByName: async (names: string[]) => {
+				tools = [...names];
+			},
 			getTodoPhases: () => [],
 			goalRuntime: {
 				buildContinuationPrompt: () => "continue",
 				clearAccounting: () => {},
+				onThreadResumed: async () => {
+					threadResumes++;
+					await resumed.promise;
+					return goalState;
+				},
 				createGoal: async ({ objective }: { objective: string }): Promise<GoalModeState> => ({
 					enabled: true,
 					mode: "active",
@@ -329,6 +358,15 @@ describe("RpcGoalController continuation gate", () => {
 			journal,
 			transcript,
 			goalState: () => goalState,
+			tools: () => tools,
+			threadResumes: () => threadResumes,
+			journalGoal: () => {
+				journaledGoal = true;
+			},
+			holdResume: () => {
+				resumed = Promise.withResolvers<void>();
+			},
+			releaseResume: () => resumed.resolve(),
 			dropped: () => dropped,
 			/** Hold waitForIdle until {@link release}. */
 			hold: () => {
@@ -510,12 +548,12 @@ describe("RpcGoalController continuation gate", () => {
 		const { session, controller, transcript } = fakeSession(async () => true);
 		session.setGoalModeState(undefined);
 		// Same wiring as rpc-mode: the probe marks the watcher active whenever it reports pending.
+		// The same probe rpc-mode wires: every "pending" answer marks the watcher active.
 		const ref: { watcher?: RpcSessionSettleWatcher } = {};
-		const probe = () => {
-			const pending = controller.continuationPending;
-			if (pending) ref.watcher?.markActive();
-			return pending;
-		};
+		const probe = watchedScheduledTurnProbe(
+			() => controller.continuationPending,
+			() => ref.watcher,
+		);
 		const watcher = new RpcSessionSettleWatcher(
 			session as unknown as ConstructorParameters<typeof RpcSessionSettleWatcher>[0],
 			frame => frames.push(frame.type),
@@ -531,5 +569,38 @@ describe("RpcGoalController continuation gate", () => {
 		await watcher.check();
 		expect(isRpcSessionSettled(session as unknown as RpcSettleSession, probe)).toBe(true);
 		expect(frames).toEqual(["session_settled"]);
+	});
+
+	test("a change that overlaps a running reconcile reconciles after it, never alongside it", async () => {
+		const f = fakeSession(async () => true);
+		f.session.setGoalModeState(undefined);
+		f.journalGoal();
+		// Change A switches t1 -> t2; its reconcile stalls inside onThreadResumed.
+		f.holdResume();
+		await f.controller.beginSessionChange();
+		f.transcript.id = "t2";
+		const endA = f.controller.endSessionChange();
+		await nextMacrotask();
+		expect(f.threadResumes()).toBe(1);
+		// Change B begins and ends in the same transcript while A is still running.
+		await f.controller.beginSessionChange();
+		const endB = f.controller.endSessionChange();
+		await nextMacrotask();
+		// B queued a reconcile behind A instead of running one concurrently.
+		expect(f.threadResumes()).toBe(1);
+		f.releaseResume();
+		await endA;
+		await endB;
+		await f.controller.settled();
+		for (let i = 0; i < 5; i++) await nextMacrotask();
+		expect(f.threadResumes()).toBe(2);
+		// The pre-goal tool set was captured without the goal tool.
+		expect(f.tools()).toEqual(["read", "goal"]);
+		// When the goal later completes, exactly the pre-goal tools come back.
+		const current = f.session.getGoalModeState();
+		f.session.setGoalModeState(current && { ...current, enabled: false, mode: "exiting", reason: "completed" });
+		f.controller.observe(agentEnd);
+		await f.controller.settled();
+		expect(f.tools()).toEqual(["read"]);
 	});
 });

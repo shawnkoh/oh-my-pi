@@ -58,7 +58,7 @@ import {
 	watchAndReportPromptResult,
 } from "./rpc-prompt-results";
 import { RpcSessionEventForwarder } from "./rpc-session-events";
-import { isRpcSessionSettled, RpcSessionSettleWatcher } from "./rpc-session-settle";
+import { isRpcSessionSettled, RpcSessionSettleWatcher, watchedScheduledTurnProbe } from "./rpc-session-settle";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
 import type {
 	RpcCommand,
@@ -820,11 +820,10 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	const goalController = new RpcGoalController(session, () => void settleWatcher.check());
 	// A scheduled or held goal turn will start a turn: every settle report treats it as busy,
 	// and any report of "not settled" for that reason is later closed by `session_settled`.
-	const goalTurnScheduled = () => {
-		const pending = goalController.continuationPending;
-		if (pending) settleWatcher.markActive();
-		return pending;
-	};
+	const goalTurnScheduled = watchedScheduledTurnProbe(
+		() => goalController.continuationPending,
+		() => settleWatcher,
+	);
 	const promptResults = new RpcPromptResults(session, output, goalTurnScheduled);
 	const sessionEvents = new RpcSessionEventForwarder(output);
 	const settleWatcher = new RpcSessionSettleWatcher(session, output, goalTurnScheduled);

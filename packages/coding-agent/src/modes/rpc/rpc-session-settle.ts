@@ -20,6 +20,22 @@ export type RpcSettleSession = Pick<
 export type RpcScheduledTurnProbe = () => boolean;
 
 /**
+ * A scheduled-turn probe whose every "not settled" answer marks `watcher` active,
+ * so a stretch reported busy only because of a pending host-scheduled turn still
+ * ends with `session_settled` even if that turn is later abandoned.
+ */
+export function watchedScheduledTurnProbe(
+	pending: () => boolean,
+	watcher: () => Pick<RpcSessionSettleWatcher, "markActive"> | undefined,
+): RpcScheduledTurnProbe {
+	return () => {
+		const isPending = pending();
+		if (isPending) watcher()?.markActive();
+		return isPending;
+	};
+}
+
+/**
  * True when no run is live, admitted or scheduled, no steer/follow-up is queued,
  * and no background job or delivery can re-wake the session. Backs
  * `session_settled`, `prompt_result.sessionSettled`, and `get_state.isSettled`.
