@@ -18,7 +18,13 @@ function createHarness() {
 		queuedMessageCount: 0,
 		hasPendingAsyncWork: () => false,
 		sessionId: "s1",
-		branch: [] as Array<{ id: string; type: string; message?: { role: string; content?: string } }>,
+		branch: [] as Array<{
+			id: string;
+			type: string;
+			message?: { role: string; content?: string };
+			customType?: string;
+			details?: unknown;
+		}>,
 		sessionManager: {
 			getLeafId: (): string | null => session.branch.at(-1)?.id ?? null,
 			getSessionId: () => session.sessionId,
@@ -227,6 +233,77 @@ describe("RpcPromptResults reply attribution", () => {
 				replyEntryIds: ["a"],
 			},
 		]);
+	});
+
+	test("a delivery or goal context during the run ends the prompt's reply without counting as a prompt", async () => {
+		const { frames, session, results } = createHarness();
+		const custom = (id: string, customType: string, details?: unknown) => ({
+			id,
+			type: "custom_message",
+			customType,
+			details,
+		});
+		const ticket = results.begin("req_p");
+		results.observe(agentStart);
+		session.isStreaming = true;
+		results.settle(ticket);
+		session.branch.push(
+			user("u", "P"),
+			reply("a1"),
+			custom("todo", "todo-reminder"),
+			reply("a2"),
+			custom("d", "external-card", { "omp.llm": { role: "user", content: "D" } }),
+			reply("a3"),
+			custom("g", "goal-mode-context"),
+			reply("a4"),
+		);
+		session.isStreaming = false;
+		results.observe(agentEnd([assistant({ stopReason: "stop" })]));
+		await flushFrames();
+		// A context reminder does not end the reply; a delivery does. The prompt is still the run's only user message.
+		expect(frames).toMatchObject([{ id: "req_p", run: 1, promptEntryId: "u", replyEntryIds: ["a1", "a2"] }]);
+	});
+
+	test("a command's own run replaces a wake that ran while its handler worked", async () => {
+		const { frames, session, results } = createHarness();
+		const command = results.begin("req_cmd");
+		// A delivery wake runs and yields while the command's handler is still working.
+		results.observe(agentStart);
+		session.branch.push(user("w", "wake"), reply("wa"));
+		results.observe(agentEnd([assistant({ stopReason: "error" })]));
+		// The handler now schedules agent work from idle.
+		results.rebase(command);
+		results.observe(agentStart);
+		session.branch.push(user("c", "from-command"), reply("ca"));
+		results.observe(agentEnd([assistant({ stopReason: "stop" })]));
+		results.settle(command);
+		await flushFrames();
+		expect(frames).toEqual([
+			{
+				type: "prompt_result",
+				id: "req_cmd",
+				agentInvoked: true,
+				status: "completed",
+				sessionSettled: true,
+				run: 2,
+				promptEntryId: "c",
+				replyEntryIds: ["ca"],
+			},
+		]);
+	});
+
+	test("work a command queues into a live run leaves ownership unchanged", async () => {
+		const { frames, session, results } = createHarness();
+		const command = results.begin("req_live");
+		results.observe(agentStart);
+		session.isStreaming = true;
+		results.rebase(command);
+		session.branch.push(user("x", "X"), reply("xa"));
+		session.isStreaming = false;
+		results.observe(agentEnd([assistant({ stopReason: "stop" })]));
+		results.settle(command);
+		await flushFrames();
+		expect(frames).toMatchObject([{ id: "req_live", run: 1, status: "completed" }]);
 	});
 
 	test("a local-only command carries no run or reply", async () => {
