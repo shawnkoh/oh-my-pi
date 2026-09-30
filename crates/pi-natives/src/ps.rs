@@ -195,6 +195,16 @@ impl Process {
 	}
 }
 
+/// OS start time of `pid` in Unix epoch seconds (floor), or null when the
+/// process does not exist or cannot be read.
+///
+/// Matches the instant `ps -o lstart` prints for the same process, so a
+/// recorded `(pid, startTime)` pair detects pid reuse.
+#[napi]
+pub fn process_start_time(pid: i32) -> Option<i64> {
+	core_process::process_start_time(pid).and_then(|secs| i64::try_from(secs).ok())
+}
+
 /// Replace the current process image via `execvp(3)`.
 ///
 /// On success this never returns: the kernel tears down every other thread and

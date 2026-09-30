@@ -204,6 +204,33 @@ impl From<CoreMinimizerResult> for MinimizerResult {
 	}
 }
 
+/// A process a shell run launched that was still alive when the run resolved.
+#[napi(object)]
+pub struct SpawnedProcess {
+	/// OS process id.
+	pub pid:        i32,
+	/// Process group id when known (reparented launches: the detached
+	/// session/group id).
+	pub pgid:       Option<i32>,
+	/// OS process start time, Unix epoch SECONDS (floor) — the same instant
+	/// `ps -o lstart` prints. Omitted only if unreadable.
+	pub start_time: Option<i64>,
+	/// True for a reparented launch (e.g. `nohup cmd &`): the real
+	/// double-forked descendant, not the dead intermediate.
+	pub reparented: bool,
+}
+
+impl From<pi_shell::process::SpawnedProcess> for SpawnedProcess {
+	fn from(value: pi_shell::process::SpawnedProcess) -> Self {
+		Self {
+			pid:        value.pid,
+			pgid:       value.pgid,
+			start_time: value.start_time.and_then(|secs| i64::try_from(secs).ok()),
+			reparented: value.reparented,
+		}
+	}
+}
+
 /// Result of running a shell command.
 #[napi(object)]
 pub struct ShellRunResult {
@@ -218,19 +245,30 @@ pub struct ShellRunResult {
 	/// original buffer + telemetry so the session layer can persist it as
 	/// an artifact and splice an `artifact://<id>` reference into the
 	/// minimized text shown to the agent. `None` when nothing was rewritten.
-	pub minimized:   Option<MinimizerResult>,
+	pub minimized:         Option<MinimizerResult>,
 	/// Shell working directory after command completion.
-	pub working_dir: Option<String>,
+	pub working_dir:       Option<String>,
+	/// Processes this run launched that were still alive when it resolved,
+	/// identity-pinned (pid + start time), including the real process of
+	/// reparented launches such as `nohup cmd &`. Set on every result.
+	pub spawned_processes: Option<Vec<SpawnedProcess>>,
 }
 
 impl From<CoreShellRunResult> for ShellRunResult {
 	fn from(value: CoreShellRunResult) -> Self {
 		Self {
-			exit_code:   value.exit_code,
-			cancelled:   value.cancelled,
-			timed_out:   value.timed_out,
-			minimized:   value.minimized.map(Into::into),
-			working_dir: value.working_dir,
+			exit_code:         value.exit_code,
+			cancelled:         value.cancelled,
+			timed_out:         value.timed_out,
+			minimized:         value.minimized.map(Into::into),
+			working_dir:       value.working_dir,
+			spawned_processes: Some(
+				value
+					.spawned_processes
+					.into_iter()
+					.map(Into::into)
+					.collect(),
+			),
 		}
 	}
 }
@@ -582,11 +620,12 @@ mod tests {
 			.expect("pump should be connected");
 		drop(tx);
 		let result = Ok(ShellRunResult {
-			exit_code:   Some(0),
-			cancelled:   false,
-			timed_out:   false,
-			minimized:   None,
-			working_dir: None,
+			exit_code:         Some(0),
+			cancelled:         false,
+			timed_out:         false,
+			minimized:         None,
+			working_dir:       None,
+			spawned_processes: None,
 		});
 
 		time::timeout(
@@ -614,11 +653,12 @@ mod tests {
 			napi::tokio::spawn(pump_chunks(rx, FORWARD_STALL_TIMEOUT, async |_payload: String| true));
 		drop(tx);
 		let result = Ok(ShellRunResult {
-			exit_code:   None,
-			cancelled:   false,
-			timed_out:   true,
-			minimized:   None,
-			working_dir: None,
+			exit_code:         None,
+			cancelled:         false,
+			timed_out:         true,
+			minimized:         None,
+			working_dir:       None,
+			spawned_processes: None,
 		});
 		let started = time::Instant::now();
 		time::timeout(

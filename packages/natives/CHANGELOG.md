@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `spawnedProcesses` to `Shell.run`/`executeShell` results — each process the command launched that is still alive when it resolves, with pid, process group and OS start time, including the real process behind `nohup cmd &` (`reparented: true`) — and `processStartTime(pid)`, so callers can tell later whether that exact process is still running.
+
 ### Fixed
 
 - Fixed `computer.windows()` on macOS marking every window of the frontmost app as focused. One window is marked now: the app's accessibility focused window, or its frontmost window when Accessibility permission is not granted. With the permission, `computer.focusedWindow()` no longer returns a floating panel such as TextEdit's Fonts panel in front of the document ([#13673](https://github.com/can1357/oh-my-pi/pull/13673) by [@will-bogusz](https://github.com/will-bogusz)).

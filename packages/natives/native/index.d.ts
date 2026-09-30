@@ -2482,6 +2482,15 @@ export interface PredictedWord {
   confidence: number
 }
 
+/**
+ * OS start time of `pid` in Unix epoch seconds (floor), or null when the
+ * process does not exist or cannot be read.
+ *
+ * Matches the instant `ps -o lstart` prints for the same process, so a
+ * recorded `(pid, startTime)` pair detects pid reuse.
+ */
+export declare function processStartTime(pid: number): number | null
+
 /** Current state of a process reference. */
 export declare enum ProcessStatus {
   /** The referenced process is still running. */
@@ -3058,6 +3067,12 @@ export interface ShellRunResult {
   minimized?: MinimizerResult
   /** Shell working directory after command completion. */
   workingDir?: string
+  /**
+   * Processes this run launched that were still alive when it resolved,
+   * identity-pinned (pid + start time), including the real process of
+   * reparented launches such as `nohup cmd &`. Set on every result.
+   */
+  spawnedProcesses?: Array<SpawnedProcess>
 }
 
 /**
@@ -3132,6 +3147,27 @@ export interface SnapcompactRenderOptions {
  * considered renderable because they are interpreted outside font lookup.
  */
 export declare function snapcompactSupportedChars(font: string, chars: string): string
+
+/** A process a shell run launched that was still alive when the run resolved. */
+export interface SpawnedProcess {
+  /** OS process id. */
+  pid: number
+  /**
+   * Process group id when known (reparented launches: the detached
+   * session/group id).
+   */
+  pgid?: number
+  /**
+   * OS process start time, Unix epoch SECONDS (floor) — the same instant
+   * `ps -o lstart` prints. Omitted only if unreadable.
+   */
+  startTime?: number
+  /**
+   * True for a reparented launch (e.g. `nohup cmd &`): the real
+   * double-forked descendant, not the dead intermediate.
+   */
+  reparented: boolean
+}
 
 /** A misspelled span measured in JavaScript/UTF-16 code units. */
 export interface SpellingRange {

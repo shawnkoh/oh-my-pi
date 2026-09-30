@@ -241,6 +241,25 @@ mod platform {
 			self.status() == ProcessStatus::Running
 				&& read_start_time(self.pid) == Some(self.start_time)
 		}
+
+		/// Start time pinned at open, in Unix epoch seconds (floor): boot time
+		/// plus the `/proc/<pid>/stat` start tick count, as `ps -o lstart` does.
+		pub fn start_time_unix_secs(&self) -> Option<u64> {
+			// SAFETY: `sysconf` takes a scalar name and touches no caller memory.
+			let ticks_per_sec = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) })
+				.ok()
+				.filter(|ticks| *ticks > 0)?;
+			Some(read_boot_time()? + self.start_time / ticks_per_sec)
+		}
+	}
+
+	/// System boot time in Unix epoch seconds (`btime` in `/proc/stat`).
+	fn read_boot_time() -> Option<u64> {
+		let content = fs::read_to_string("/proc/stat").ok()?;
+		content
+			.lines()
+			.find_map(|line| line.strip_prefix("btime "))
+			.and_then(|btime| btime.trim().parse().ok())
 	}
 
 	fn split_nul_arguments(content: &[u8]) -> Vec<String> {
@@ -371,6 +390,12 @@ mod platform {
 				return None;
 			}
 			Some(Self { pid, start_tvsec: info.pbi_start_tvsec, start_tvusec: info.pbi_start_tvusec })
+		}
+
+		/// Start time pinned at open, in Unix epoch seconds (floor).
+		#[allow(clippy::unnecessary_wraps, reason = "matches the fallible Linux/Windows signature")]
+		pub const fn start_time_unix_secs(&self) -> Option<u64> {
+			Some(self.start_tvsec)
 		}
 
 		pub const fn pid(&self) -> i32 {
@@ -892,6 +917,14 @@ mod platform {
 			Some(Self { pid, handle, creation_time })
 		}
 
+		/// Start time pinned at open, in Unix epoch seconds (floor). The
+		/// creation `FILETIME` counts 100ns intervals since 1601-01-01 UTC.
+		pub const fn start_time_unix_secs(&self) -> Option<u64> {
+			const FILETIME_TICKS_PER_SEC: u64 = 10_000_000;
+			const UNIX_EPOCH_OFFSET_SECS: u64 = 11_644_473_600;
+			(self.creation_time / FILETIME_TICKS_PER_SEC).checked_sub(UNIX_EPOCH_OFFSET_SECS)
+		}
+
 		pub const fn pid(&self) -> i32 {
 			self.pid
 		}
@@ -1300,6 +1333,14 @@ mod platform {
 	}
 }
 
+/// OS start time of `pid` in Unix epoch seconds (floor) — the instant
+/// `ps -o lstart` prints — or `None` when the process does not exist or its
+/// start time cannot be read.
+#[must_use]
+pub fn process_start_time(pid: i32) -> Option<u64> {
+	Process::from_pid(pid)?.start_time_unix_secs()
+}
+
 /// Stable process reference.
 #[derive(Clone)]
 pub struct Process {
@@ -1324,6 +1365,17 @@ impl Process {
 	#[must_use]
 	pub const fn pid(&self) -> i32 {
 		self.inner.pid()
+	}
+
+	/// OS start time of this process in Unix epoch seconds (floor), as pinned
+	/// when the reference was opened — the instant `ps -o lstart` prints.
+	#[must_use]
+	#[allow(
+		clippy::missing_const_for_fn,
+		reason = "const only on macOS; Linux reads /proc and Windows converts FILETIME"
+	)]
+	pub fn start_time_unix_secs(&self) -> Option<u64> {
+		self.inner.start_time_unix_secs()
 	}
 
 	/// Parent process id for this process, when available.
@@ -1740,9 +1792,31 @@ impl TerminationTargets {
 /// that happened to acquire the recycled pid between the child exiting and
 /// the run being cancelled (issue #4605).
 #[derive(Clone)]
-struct SpawnedProcess {
+struct OwnedSpawn {
 	process: Option<Process>,
 	pgid:    Option<i32>,
+}
+
+/// The real process of a reparented launch (`nohup cmd &`), identity-pinned at
+/// report time. Informational only: never part of the teardown set.
+struct ReparentedSpawn {
+	process: Process,
+	pgid:    Option<i32>,
+}
+
+/// A process a shell run launched that was still alive when the run resolved.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SpawnedProcess {
+	/// OS process id.
+	pub pid:        i32,
+	/// Process group id when known; for reparented launches the detached
+	/// session/process-group id.
+	pub pgid:       Option<i32>,
+	/// OS start time in Unix epoch seconds (floor), pinned when the process
+	/// was recorded. `None` only when the platform could not report it.
+	pub start_time: Option<u64>,
+	/// True for the real process of a reparented launch (e.g. `nohup cmd &`).
+	pub reparented: bool,
 }
 
 /// Per-run record of the OS processes a single shell command launched,
@@ -1755,7 +1829,7 @@ struct SpawnedProcess {
 /// explicit — only processes this run actually spawned are ever signalled.
 #[derive(Default)]
 struct RegistryState {
-	spawned:       Vec<SpawnedProcess>,
+	spawned:                  Vec<OwnedSpawn>,
 	/// The next `spawned.len()` at which `record` runs a sweep. Bounds sweep
 	/// frequency when the live set stabilizes above the initial threshold:
 	/// without this watermark, every subsequent `record` would find
@@ -1765,7 +1839,12 @@ struct RegistryState {
 	/// `PRUNE_THRESHOLD` entries since the previous sweep — restoring true
 	/// amortized O(1) per spawn regardless of how many entries survive each
 	/// sweep.
-	next_sweep_at: usize,
+	next_sweep_at:            usize,
+	/// Reparented launches' real processes. Kept apart from `spawned` so they
+	/// never reach [`SpawnRegistry::build_targets`].
+	reparented:               Vec<ReparentedSpawn>,
+	/// Sweep watermark for `reparented`, same scheme as `next_sweep_at`.
+	next_reparented_sweep_at: usize,
 }
 
 #[derive(Default)]
@@ -1810,7 +1889,7 @@ impl SpawnRegistry {
 	/// retaining one owned handle per historical spawn.
 	pub fn record(&self, pgid: Option<i32>, process: Option<Process>) {
 		let mut state = self.state.lock();
-		state.spawned.push(SpawnedProcess { process, pgid });
+		state.spawned.push(OwnedSpawn { process, pgid });
 		if state.spawned.len() >= state.next_sweep_at.max(Self::PRUNE_THRESHOLD) {
 			prune_exited(&mut state.spawned);
 			// Schedule the next sweep `PRUNE_THRESHOLD` further records away.
@@ -1821,6 +1900,53 @@ impl SpawnRegistry {
 			// even if the live set stays large.
 			state.next_sweep_at = state.spawned.len() + Self::PRUNE_THRESHOLD;
 		}
+	}
+
+	/// Record the real process of a reparented launch (`nohup cmd &`). Called
+	/// from the spawn-observer hook right after the launch, so identity is
+	/// pinned before the pid can be recycled; a process that already exited is
+	/// dropped. These entries are reported by [`SpawnRegistry::survivors`] but
+	/// never signalled: reparented launches must outlive the run's teardown.
+	pub fn record_reparented(&self, pgid: Option<i32>, process: Option<Process>) {
+		let Some(process) = process else {
+			return;
+		};
+		let mut state = self.state.lock();
+		state.reparented.push(ReparentedSpawn { process, pgid });
+		if state.reparented.len() >= state.next_reparented_sweep_at.max(Self::PRUNE_THRESHOLD) {
+			state
+				.reparented
+				.retain(|entry| entry.process.status() == ProcessStatus::Running);
+			state.next_reparented_sweep_at = state.reparented.len() + Self::PRUNE_THRESHOLD;
+		}
+	}
+
+	/// Processes recorded so far that are still alive — the identity pinned at
+	/// spawn time still matches, so a recycled pid is never reported. Owned
+	/// children come first in spawn order, then reparented launches.
+	#[must_use]
+	pub fn survivors(&self) -> Vec<SpawnedProcess> {
+		let state = self.state.lock();
+		let owned = state.spawned.iter().filter_map(|entry| {
+			let process = entry.process.as_ref()?;
+			(process.status() == ProcessStatus::Running).then(|| SpawnedProcess {
+				pid:        process.pid(),
+				pgid:       process.group_id().or(entry.pgid),
+				start_time: process.start_time_unix_secs(),
+				reparented: false,
+			})
+		});
+		let reparented = state
+			.reparented
+			.iter()
+			.filter(|entry| entry.process.status() == ProcessStatus::Running)
+			.map(|entry| SpawnedProcess {
+				pid:        entry.process.pid(),
+				pgid:       entry.pgid,
+				start_time: entry.process.start_time_unix_secs(),
+				reparented: true,
+			});
+		owned.chain(reparented).collect()
 	}
 
 	/// Build the kill set from the processes recorded so far. Re-read on every
@@ -1878,7 +2004,7 @@ impl SpawnRegistry {
 /// the still-open pinned handle — dropping that handle would release the pid
 /// slot, letting a recycled pid make future Toolhelp walks unsafe (issue
 /// #4605) and orphaning any leftover child from the next cancellation wave.
-fn prune_exited(spawned: &mut Vec<SpawnedProcess>) {
+fn prune_exited(spawned: &mut Vec<OwnedSpawn>) {
 	spawned.retain(|entry| {
 		if let Some(process) = &entry.process {
 			if process.status() == ProcessStatus::Running {
@@ -1943,6 +2069,40 @@ mod tests {
 		assert_eq!(macos_pid_buffer_size(i32::MAX), None, "byte size must fit the C ABI");
 		assert_eq!(macos_pid_buffer_size(0), None);
 		assert_eq!(macos_pid_buffer_size(-1), None);
+	}
+
+	/// A reparented launch is reported as a survivor but never enters the kill
+	/// set, and drops out of the report once it exits.
+	#[cfg(unix)]
+	#[test]
+	fn reparented_spawns_are_reported_but_never_targeted() {
+		use std::{os::unix::process::CommandExt as _, process::Command};
+
+		let mut child = Command::new("sleep")
+			.arg("30")
+			.process_group(0)
+			.spawn()
+			.expect("spawn sleep");
+		let pid = i32::try_from(child.id()).expect("child pid fits in i32");
+		let registry = SpawnRegistry::new();
+		registry.record_reparented(Some(pid), Process::from_pid(pid));
+
+		let targets_empty = registry.build_targets().is_empty();
+		let survivors = registry.survivors();
+		let fresh_start = process_start_time(pid);
+		let _ = child.kill();
+		let _ = child.wait();
+		let after_exit = registry.survivors();
+
+		assert!(targets_empty, "a reparented launch must never be signalled by teardown");
+		assert!(fresh_start.is_some());
+		assert_eq!(survivors, vec![SpawnedProcess {
+			pid,
+			pgid: Some(pid),
+			start_time: fresh_start,
+			reparented: true,
+		}]);
+		assert!(after_exit.is_empty(), "an exited launch must not be reported: {after_exit:?}");
 	}
 
 	/// The harness pid must be the only protected pid. Including its recorded

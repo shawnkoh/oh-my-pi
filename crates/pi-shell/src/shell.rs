@@ -149,11 +149,16 @@ pub struct MinimizerResult {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ShellRunResult {
-	pub exit_code:   Option<i32>,
-	pub cancelled:   bool,
-	pub timed_out:   bool,
-	pub minimized:   Option<MinimizerResult>,
-	pub working_dir: Option<String>,
+	pub exit_code:         Option<i32>,
+	pub cancelled:         bool,
+	pub timed_out:         bool,
+	pub minimized:         Option<MinimizerResult>,
+	pub working_dir:       Option<String>,
+	/// Processes this run launched that were still alive when it resolved
+	/// (identity-pinned), including the real process of reparented launches
+	/// such as `nohup cmd &`. Present on every result, possibly empty.
+	#[serde(default)]
+	pub spawned_processes: Vec<process::SpawnedProcess>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -405,11 +410,12 @@ async fn run_shell_session(
 			}
 			let _ = process_cancel_bridge.await;
 			return Ok(ShellRunResult {
-				exit_code:   None,
-				cancelled:   matches!(reason, AbortReason::Signal),
-				timed_out:   matches!(reason, AbortReason::Timeout),
-				minimized:   None,
-				working_dir: None,
+				exit_code:         None,
+				cancelled:         matches!(reason, AbortReason::Signal),
+				timed_out:         matches!(reason, AbortReason::Timeout),
+				minimized:         None,
+				working_dir:       None,
+				spawned_processes: spawn_registry.survivors(),
 			});
 		}
 	};
@@ -430,6 +436,7 @@ async fn run_shell_session(
 		timed_out: false,
 		working_dir,
 		minimized,
+		spawned_processes: spawn_registry.survivors(),
 	})
 }
 
@@ -475,11 +482,12 @@ async fn run_shell_oneshot(
 			}
 			let _ = process_cancel_bridge.await;
 			return Ok(ShellExecuteResult {
-				exit_code:   None,
-				cancelled:   matches!(reason, AbortReason::Signal),
-				timed_out:   matches!(reason, AbortReason::Timeout),
-				minimized:   None,
-				working_dir: None,
+				exit_code:         None,
+				cancelled:         matches!(reason, AbortReason::Signal),
+				timed_out:         matches!(reason, AbortReason::Timeout),
+				minimized:         None,
+				working_dir:       None,
+				spawned_processes: spawn_registry.survivors(),
 			});
 		},
 	};
@@ -495,6 +503,7 @@ async fn run_shell_oneshot(
 		timed_out: false,
 		working_dir,
 		minimized,
+		spawned_processes: spawn_registry.survivors(),
 	})
 }
 
@@ -546,6 +555,7 @@ async fn run_shell_oneshot_streams(
 				timed_out: matches!(reason, AbortReason::Timeout),
 				minimized: None,
 				working_dir: None,
+				spawned_processes: spawn_registry.survivors(),
 			});
 		},
 	};
@@ -561,6 +571,7 @@ async fn run_shell_oneshot_streams(
 		timed_out: false,
 		working_dir,
 		minimized: None,
+		spawned_processes: spawn_registry.survivors(),
 	})
 }
 
@@ -1639,6 +1650,13 @@ impl SpawnObserver for process::SpawnRegistry {
 		// to an unrelated process — issue #4605.
 		let process = process::Process::from_pid(pid);
 		self.record(pgid, process);
+	}
+
+	fn on_reparented_spawn(&self, pid: i32, pgid: Option<i32>) {
+		// Pinned immediately for the same pid-reuse reason as `on_spawn`, but
+		// recorded apart from the teardown set: reparented launches survive.
+		let process = process::Process::from_pid(pid);
+		self.record_reparented(pgid, process);
 	}
 }
 
@@ -6534,6 +6552,161 @@ replace = [{ pattern = "^.+$", replacement = "PWD" }]
 			.strip_prefix("pid=")
 			.expect("nohup background PID output should include pid= prefix");
 		assert!(pid.parse::<i32>().is_ok_and(|pid| pid > 0), "invalid PID output: {out:?}");
+	}
+
+	/// Reads streamed output until a full `bang=<pid>` line arrives and returns
+	/// the pid. Background children in these tests redirect away from the pipe,
+	/// but a bounded wait keeps a regression from hanging the suite.
+	#[cfg(unix)]
+	async fn recv_bang_pid(rx: &flume::Receiver<String>) -> i32 {
+		let mut out = String::new();
+		time::timeout(Duration::from_secs(10), async {
+			loop {
+				if let Some(line_end) = out.find('\n') {
+					return out[..line_end]
+						.trim()
+						.strip_prefix("bang=")
+						.and_then(|pid| pid.parse::<i32>().ok())
+						.unwrap_or_else(|| panic!("expected `bang=<pid>`, got {out:?}"));
+				}
+				out.push_str(
+					&rx.recv_async()
+						.await
+						.expect("run ended before printing `$!`"),
+				);
+			}
+		})
+		.await
+		.expect("timed out waiting for `$!`")
+	}
+
+	#[cfg(unix)]
+	fn kill_pid(pid: i32) {
+		if let Some(process) = process::Process::from_pid(pid) {
+			let _ = process.kill_tree(Some(process::KILL_SIGNAL));
+		}
+	}
+
+	/// A plain `cmd &` background child outlives the run, so the run result must
+	/// report it — the same pid as `$!`, alive, with its process group and an
+	/// OS start time that matches a fresh read of that pid.
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn run_reports_surviving_background_child() {
+		let _guard = shell_test_lock().lock().await;
+		let shell = Shell::new(None);
+		let (tx, rx) = flume::unbounded::<String>();
+		let result = shell
+			.run(
+				ShellRunOptions {
+					command: "/bin/sleep 30 >/dev/null 2>&1 & printf 'bang=%s\\n' \"$!\"".into(),
+					..Default::default()
+				},
+				Some(tx),
+				CancelToken::default(),
+			)
+			.await
+			.expect("run background sleep");
+		let bang = recv_bang_pid(&rx).await;
+		let spawned = result.spawned_processes.clone();
+		kill_pid(bang);
+
+		assert_eq!(result.exit_code, Some(0));
+		let [entry] = spawned.as_slice() else {
+			panic!("expected exactly the background child, got {spawned:?}");
+		};
+		assert_eq!(entry.pid, bang, "reported pid must be `$!`");
+		assert!(!entry.reparented);
+		assert!(entry.pgid.is_some_and(|pgid| pgid > 0), "missing pgid: {entry:?}");
+		let start_time = entry.start_time.expect("start time should be readable");
+		assert!(start_time > 0);
+	}
+
+	/// `nohup cmd &` double-forks: `$!` is the intermediate that exits at once,
+	/// and the operand runs in a reparented grandchild. The run must report that
+	/// grandchild — alive, no longer a child of this host, in the detached
+	/// session's group — flagged `reparented`, with a start time that matches.
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn run_reports_real_reparented_nohup_grandchild() {
+		let _guard = shell_test_lock().lock().await;
+		let shell = Shell::new(None);
+		let (tx, rx) = flume::unbounded::<String>();
+		let result = shell
+			.run(
+				ShellRunOptions {
+					command: "nohup /bin/sleep 30 >/dev/null 2>&1 & printf 'bang=%s\\n' \"$!\"".into(),
+					..Default::default()
+				},
+				Some(tx),
+				CancelToken::default(),
+			)
+			.await
+			.expect("run nohup sleep");
+		let bang = recv_bang_pid(&rx).await;
+		let spawned = result.spawned_processes.clone();
+		let grandchild = spawned
+			.iter()
+			.find(|entry| entry.reparented)
+			.map(|entry| entry.pid);
+		let checks = grandchild.map(|pid| {
+			let process = process::Process::from_pid(pid);
+			(
+				process.as_ref().map(process::Process::status),
+				process.as_ref().and_then(process::Process::ppid),
+				process::process_start_time(pid),
+				process.as_ref().map(process::Process::args),
+			)
+		});
+		if let Some(pid) = grandchild {
+			kill_pid(pid);
+		}
+
+		assert_eq!(result.exit_code, Some(0));
+		let [entry] = spawned.as_slice() else {
+			panic!("expected exactly the reparented grandchild, got {spawned:?}");
+		};
+		assert!(entry.reparented, "{entry:?}");
+		assert_ne!(entry.pid, bang, "must report the grandchild, not the intermediate `$!`");
+		let (status, ppid, fresh_start, args) = checks.expect("grandchild pid");
+		assert_eq!(status, Some(process::ProcessStatus::Running), "grandchild must be alive");
+		let host = i32::try_from(std::process::id()).expect("host pid fits in i32");
+		assert_ne!(ppid, Some(host), "grandchild must be reparented away from the host");
+		assert_ne!(ppid, Some(bang), "the intermediate must have exited");
+		assert_eq!(
+			args
+				.as_deref()
+				.and_then(|args| args.last().map(String::as_str)),
+			Some("30"),
+			"grandchild should be the exec'd operand, got {args:?}",
+		);
+		// setsid() in the intermediate made it the session/group leader, so the
+		// grandchild's group is the intermediate's pid.
+		assert_eq!(entry.pgid, Some(bang), "{entry:?}");
+		assert!(entry.start_time.is_some());
+		assert_eq!(entry.start_time, fresh_start, "start time must match a fresh read");
+	}
+
+	/// Short-lived foreground commands leave no survivors, so nothing is
+	/// reported — the list is bounded by what is still alive at run end.
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn run_reports_no_processes_for_exited_foreground_commands() {
+		let _guard = shell_test_lock().lock().await;
+		let shell = Shell::new(None);
+		let result = shell
+			.run(
+				ShellRunOptions {
+					command: "for i in 1 2 3 4 5; do /bin/sh -c true; done; true; sleep 0".into(),
+					..Default::default()
+				},
+				None,
+				CancelToken::default(),
+			)
+			.await
+			.expect("run foreground loop");
+		assert_eq!(result.exit_code, Some(0));
+		assert!(result.spawned_processes.is_empty(), "{:?}", result.spawned_processes);
 	}
 
 	/// `nohup` with no operand mirrors coreutils: a `missing operand` diagnostic
