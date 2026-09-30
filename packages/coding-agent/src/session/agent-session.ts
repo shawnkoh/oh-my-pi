@@ -7108,8 +7108,19 @@ export class AgentSession implements SettingsScope {
 					return false;
 				}
 
-				// Try custom commands (TypeScript slash commands)
-				const customResult = await this.#tryExecuteCustomCommand(text);
+				// Custom TS and MCP-prompt commands produce the prompt text that
+				// becomes this turn (an MCP prompt fetches it over the network), so
+				// their run is part of the turn setup: a delivery arriving meanwhile
+				// must park, or the returning prompt would collide with the wake it
+				// started (AgentBusyError). Extension commands above are not held:
+				// they may deliver and await receipts themselves (N3).
+				const leaveCommand = this.#enterTurnDispatch();
+				let customResult: string | null;
+				try {
+					customResult = await this.#tryExecuteCustomCommand(text);
+				} finally {
+					leaveCommand();
+				}
 				if (customResult !== null) {
 					if (customResult === "") {
 						return false;

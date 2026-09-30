@@ -13,6 +13,7 @@ import type { Message } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockHandler, type MockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { LoadedCustomCommand } from "@oh-my-pi/pi-coding-agent/extensibility/custom-commands/types";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -108,6 +109,7 @@ describe("external delivery (session)", () => {
 		extensionRunner?: ExtensionRunner;
 		compaction?: boolean;
 		autoContinue?: boolean;
+		customCommands?: LoadedCustomCommand[];
 	}): { mock: MockModel; agent: Agent; session: AgentSession } {
 		// Exhaustion falls back to a plain reply: an unscripted call must never
 		// become a provider error whose retry backoff would outlive the test.
@@ -130,6 +132,7 @@ describe("external delivery (session)", () => {
 		session = new AgentSession({
 			agent,
 			sessionManager: options?.sessionManager ?? SessionManager.inMemory(tempDir.path()),
+			customCommands: options?.customCommands,
 			settings,
 			modelRegistry: new ModelRegistry(authStorage),
 			toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
@@ -960,6 +963,47 @@ describe("external delivery (session)", () => {
 			if (!holder.acceptance) throw new Error("handler never delivered");
 			const settled = await holder.acceptance.settled;
 			expect(settled.included).toBe(true);
+		});
+
+		it("a delivery during a custom slash command that produces prompt text does not race that prompt into AgentBusyError (M1)", async () => {
+			const inCommand = Promise.withResolvers<void>();
+			const releaseCommand = Promise.withResolvers<void>();
+			const { mock, session: s } = makeSession({
+				customCommands: [
+					{
+						path: "gitstat.ts",
+						resolvedPath: "/virtual/gitstat.ts",
+						source: "project",
+						command: {
+							name: "gitstat",
+							description: "produces prompt text after an await",
+							execute: async () => {
+								inCommand.resolve();
+								await releaseCommand.promise;
+								return "summarize the repository status";
+							},
+						},
+					},
+				],
+			});
+			mock.push({ content: ["status summarized"] });
+			mock.push({ content: ["delivery handled"] });
+			const operatorTurn = s.prompt("/gitstat");
+			await inCommand.promise;
+			// The command is still producing its text: a delivery must not wake a
+			// run the returning prompt would then collide with.
+			const handle = s.deliverExternalMessage(card("mid-command"), { mode: "aside" });
+			for (let i = 0; i < 5; i++) await setImmediate();
+			expect(s.isStreaming).toBe(false);
+			expect(handle.state()).toBe("queued");
+			releaseCommand.resolve();
+			await expect(operatorTurn).resolves.toBe(true);
+			const settled = await handle.settled;
+			expect(settled.included).toBe(true);
+			await s.waitForIdle();
+			const texts = mock.calls.flatMap((_, index) => userTexts(mock, index));
+			expect(texts).toContain("summarize the repository status");
+			expect(texts).toContain("mid-command");
 		});
 
 		it("a steer delivered in a prompt's dispatch window folds into or follows that turn (no AgentBusyError)", async () => {
