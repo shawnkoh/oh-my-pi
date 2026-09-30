@@ -120,9 +120,17 @@ export class RpcGoalController {
 		return { goal: state?.goal ?? null, state: state ?? null };
 	}
 
-	/** Resolves once event-triggered goal exits (completion, drop) have restored the tool set. */
-	settled(): Promise<void> {
-		return this.#exitTask;
+	/**
+	 * Resolves once queued goal exits and reconciles (including ones queued while
+	 * waiting) have run. Host commands and reads wait for it so they never act on
+	 * the previous transcript's goal. Not for use inside extension notifications.
+	 */
+	async settled(): Promise<void> {
+		for (let tail = this.#reconcileTask; ; tail = this.#reconcileTask) {
+			await this.#exitTask;
+			await tail;
+			if (tail === this.#reconcileTask) return;
+		}
 	}
 
 	/**
@@ -181,7 +189,7 @@ export class RpcGoalController {
 	}
 
 	async handle(command: RpcGoalCommand): Promise<RpcGoalResult> {
-		await this.#exitTask;
+		await this.settled();
 		switch (command.op) {
 			case "get":
 				return this.#state;

@@ -1068,6 +1068,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		settleWatcher.observe(event);
 	});
 	await goalController.reconcile();
+	await goalController.settled();
 
 	// Discriminates a store failure from any other dispose rejection below.
 	let persistenceFailure: Error | undefined;
@@ -1291,6 +1292,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					result = await handleRpcSessionChange(session, command, subagentRegistry);
 				} finally {
 					await goalController.endSessionChange();
+					// Respond only once this change's reattach (and any queued ahead of it) has run.
+					await goalController.settled();
 				}
 				if (!result.data.cancelled) {
 					promptResults.abortOpen();
@@ -1308,6 +1311,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					result = await openRpcSession(session, command.sessionDir, subagentRegistry);
 				} finally {
 					await goalController.endSessionChange();
+					// Respond only once this change's reattach (and any queued ahead of it) has run.
+					await goalController.settled();
 				}
 				if (!result.cancelled) {
 					promptResults.abortOpen();

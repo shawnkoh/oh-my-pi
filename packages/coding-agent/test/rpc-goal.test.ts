@@ -603,4 +603,30 @@ describe("RpcGoalController continuation gate", () => {
 		await f.controller.settled();
 		expect(f.tools()).toEqual(["read"]);
 	});
+
+	test("settled() waits for a reattach queued behind a running one", async () => {
+		const f = fakeSession(async () => true);
+		f.session.setGoalModeState(undefined);
+		f.journalGoal();
+		f.holdResume();
+		// An extension change's reconcile is running (stalled in onThreadResumed).
+		await f.controller.beginSessionChange();
+		f.transcript.id = "t2";
+		const endExtension = f.controller.endSessionChange();
+		await nextMacrotask();
+		// A host command's change ends meanwhile: its reattach is queued, not awaited.
+		await f.controller.beginSessionChange();
+		f.transcript.id = "t3";
+		await f.controller.endSessionChange();
+		let settled = false;
+		const done = f.controller.settled().then(() => {
+			settled = true;
+		});
+		await nextMacrotask();
+		expect(settled).toBe(false);
+		f.releaseResume();
+		await endExtension;
+		await done;
+		expect(f.threadResumes()).toBe(2);
+	});
 });
