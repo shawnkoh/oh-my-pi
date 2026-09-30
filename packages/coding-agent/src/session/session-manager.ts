@@ -609,6 +609,12 @@ class SessionEntryIndex {
 	}
 }
 
+/** Size and SHA-256 of a finalized session file; both `null` when no file exists. */
+export interface TranscriptDigest {
+	size: number | null;
+	sha256: string | null;
+}
+
 export type ReadonlySessionManager = Pick<
 	SessionManager,
 	| "getCwd"
@@ -2426,6 +2432,39 @@ export class SessionManager {
 	}
 
 	/**
+	 * Make the transcript final for an exit attestation: flush every entry synchronously,
+	 * disarm draft-only cleanup (the attested file must not be deleted at close), and
+	 * {@link seal} so no later append lands. Returns the on-disk size and SHA-256 of the
+	 * session file, `{ size: null, sha256: null }` when no file exists (it will not be
+	 * created afterwards), or `null` when the transcript has no local file to hash
+	 * (in-memory or deferred-publish backends). Throws when the synchronous flush fails;
+	 * the session is then left unsealed.
+	 */
+	finalizeForExit(): TranscriptDigest | null {
+		if (this.#persist && this.#sessionFile) this.flushSync();
+		this.#draftOnlySessionCleanupArmed = false;
+		this.seal();
+		return this.transcriptDigest();
+	}
+
+	/**
+	 * Size and SHA-256 of the session file as it is on disk now; `null` when the transcript
+	 * has no local file to hash (in-memory or deferred-publish backends).
+	 */
+	transcriptDigest(): TranscriptDigest | null {
+		const file = this.#sessionFile;
+		if (!this.#persist || !file || this.#storage.defersSyncPublish) return null;
+		let bytes: Buffer;
+		try {
+			bytes = fs.readFileSync(file);
+		} catch (error) {
+			if (isEnoent(error)) return { size: null, sha256: null };
+			throw error;
+		}
+		return { size: bytes.byteLength, sha256: new Bun.CryptoHasher("sha256").update(bytes).digest("hex") };
+	}
+
+	/**
 	 * Terminal release: drop the in-memory transcript and complete the
 	 * {@link seal}. The entry journal and its index mirror the agent's message
 	 * array (tool results, file contents, base64 frame images); on a disposed
@@ -2677,6 +2716,8 @@ export class SessionManager {
 		}
 
 		const sessionFile = this.#sessionFile;
+		// A sealed transcript is final: never materialize a session file for a draft after it.
+		if (this.#released && (!sessionFile || !this.#storage.existsSync(sessionFile))) return;
 		const draftWillMaterializeMetadataOnlyFile =
 			sessionFile !== undefined &&
 			!this.#storage.existsSync(sessionFile) &&

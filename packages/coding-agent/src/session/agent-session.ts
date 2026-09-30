@@ -403,7 +403,12 @@ import {
 	SessionMaintenance,
 	type SessionMaintenanceHost,
 } from "./session-maintenance";
-import { cleanupEmptyMoveSession, copySessionArtifacts, type SessionManager } from "./session-manager";
+import {
+	cleanupEmptyMoveSession,
+	copySessionArtifacts,
+	type SessionManager,
+	type TranscriptDigest,
+} from "./session-manager";
 import { SessionMemory, type SessionMemoryHost } from "./session-memory";
 import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
@@ -420,6 +425,7 @@ import { currentInvocation, OwnedJobRegistry } from "./owned-job-registry";
 import {
 	type AdmissionCloser,
 	AdmissionClosedError,
+	assertAttestationWritable,
 	emptyWorkCounts,
 	hasOutstandingWork,
 	type QuiesceRequest,
@@ -2963,6 +2969,19 @@ export class AgentSession implements SettingsScope {
 			return refuse(reason ?? "attestation_unavailable", counts);
 		}
 
+		// Make the transcript final before attesting it: record the exit, flush, seal. Nothing
+		// appends to the session file after this point, so the attested digest stays valid.
+		const file = terminalAttestationPath(sessionFile);
+		let transcript: TranscriptDigest | null;
+		try {
+			assertAttestationWritable(file);
+			this.#recordSessionExit("quiesce");
+			transcript = this.sessionManager.finalizeForExit();
+		} catch (error) {
+			logger.warn("Failed to finalize the transcript for a quiesce attestation", { error: String(error) });
+			this.#admissionClosedBy = undefined;
+			return refuse("attestation_unavailable", counts);
+		}
 		const registry = this.ownedJobRegistry;
 		registry?.ensureHeader();
 		const attestation: TerminalAttestation = {
@@ -2970,7 +2989,7 @@ export class AgentSession implements SettingsScope {
 			kind: "quiesce",
 			operationId,
 			attempt,
-			session: this.#sessionIdentity(),
+			session: { ...this.#sessionIdentity(), size: transcript?.size ?? null, sha256: transcript?.sha256 ?? null },
 			invocation: currentInvocation(),
 			epoch,
 			counts,
@@ -2979,12 +2998,15 @@ export class AgentSession implements SettingsScope {
 			registryPath: registry?.path ?? null,
 			writtenAt: new Date().toISOString(),
 		};
-		const file = terminalAttestationPath(sessionFile);
 		try {
 			writeTerminalAttestationSync(file, attestation);
 		} catch (error) {
-			logger.warn("Failed to write terminal attestation", { file, error: String(error) });
-			this.#admissionClosedBy = undefined;
+			// The transcript is already sealed, so the session cannot safely take more input:
+			// admission stays closed and no attestation exists (consumers answer `unknown`).
+			logger.error("Failed to write terminal attestation after sealing the transcript", {
+				file,
+				error: String(error),
+			});
 			return refuse("attestation_unavailable", counts);
 		}
 		this.#terminalAttestation = attestation;
@@ -3032,6 +3054,28 @@ export class AgentSession implements SettingsScope {
 
 	#sessionIdentity(): SessionIdentity {
 		return { id: this.sessionManager.getSessionId(), file: this.sessionManager.getSessionFile() ?? null };
+	}
+
+	/**
+	 * After teardown has closed the transcript, add its final size and SHA-256 to a `hangup`
+	 * attestation (the work counts keep their pre-teardown values). Best effort: a process
+	 * killed before this point leaves `size`/`sha256` unset.
+	 */
+	#completeHangupAttestation(): void {
+		const attestation = this.#terminalAttestation;
+		const sessionFile = attestation?.session.file;
+		if (attestation?.kind !== "hangup" || !sessionFile) return;
+		try {
+			const transcript = this.sessionManager.transcriptDigest();
+			const completed: TerminalAttestation = {
+				...attestation,
+				session: { ...attestation.session, size: transcript?.size ?? null, sha256: transcript?.sha256 ?? null },
+			};
+			writeTerminalAttestationSync(terminalAttestationPath(sessionFile), completed);
+			this.#terminalAttestation = completed;
+		} catch (error) {
+			logger.warn("Failed to add the transcript digest to the hang-up attestation", { error: String(error) });
+		}
 	}
 
 	#initOwnedJobRegistry(manager: AsyncJobManager): void {
@@ -3255,7 +3299,7 @@ export class AgentSession implements SettingsScope {
 		this.sessionManager.appendCustomEntry(TOOL_EXECUTION_START_CUSTOM_TYPE, data);
 	}
 
-	#recordSessionExit(reason: postmortem.Reason | "dispose"): void {
+	#recordSessionExit(reason: postmortem.Reason | "dispose" | "quiesce"): void {
 		if (this.#exitRecorded) return;
 		this.#exitRecorded = true;
 		const pendingToolCalls = collectPendingToolCalls(this.sessionManager.getBranch());
@@ -3266,7 +3310,7 @@ export class AgentSession implements SettingsScope {
 			return;
 		}
 		const kind: SessionExitData["kind"] =
-			reason === "dispose" || reason === postmortem.Reason.MANUAL
+			reason === "dispose" || reason === "quiesce" || reason === postmortem.Reason.MANUAL
 				? "normal"
 				: reason === postmortem.Reason.UNCAUGHT_EXCEPTION || reason === postmortem.Reason.UNHANDLED_REJECTION
 					? "fatal"
@@ -5762,7 +5806,10 @@ export class AgentSession implements SettingsScope {
 		this.#closeOwnedJobRegistry();
 
 		this.#releasePowerAssertion();
-		await cleanupEmptyMoveSession(this.sessionManager, this.#movedFromEmptySessionFile);
+		// A quiesce attestation already hashed the final transcript; it must stay as attested.
+		if (this.#terminalAttestation?.kind !== "quiesce") {
+			await cleanupEmptyMoveSession(this.sessionManager, this.#movedFromEmptySessionFile);
+		}
 		this.#movedFromEmptySessionFile = undefined;
 		this.#closeAllProviderSessions("dispose");
 		this.#maintenance.cancelSpeculation();
@@ -5813,6 +5860,7 @@ export class AgentSession implements SettingsScope {
 		// closes the writer.
 		this.sessionManager.seal();
 		await this.sessionManager.close();
+		this.#completeHangupAttestation();
 
 		// Release retained conversation memory. dispose() is terminal, and every
 		// revival path reopens the transcript from disk (AgentLifecycleManager

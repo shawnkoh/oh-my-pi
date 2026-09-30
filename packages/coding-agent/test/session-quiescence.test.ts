@@ -285,4 +285,51 @@ describe("AgentSession quiesce-and-exit", () => {
 		session = undefined;
 		expect(readAttestation(s)).toMatchObject({ kind: "hangup", signal: "sigterm", interrupted: false });
 	});
+
+	function sha256OfFile(file: string): string {
+		return new Bun.CryptoHasher("sha256").update(fs.readFileSync(file)).digest("hex");
+	}
+
+	it("attests the final transcript: the session file after exit matches the attested hash", async () => {
+		const s = createSession();
+		await s.prompt("materialize the transcript");
+		const result = s.quiesceForExit(request(s));
+		if (result.status !== "quiesced") throw new Error(`expected quiesced, got ${JSON.stringify(result)}`);
+		const file = s.sessionFile!;
+		expect(result.attestation.session.sha256).toBe(sha256OfFile(file));
+		// The exit record is part of the attested bytes, not appended afterwards.
+		expect(fs.readFileSync(file, "utf8")).toContain('"customType":"session_exit"');
+
+		// Teardown (extension hooks, exit recorder, draft save, close) must not change the file.
+		await s.sessionManager.saveDraft("draft typed after quiesce");
+		await s.dispose();
+		session = undefined;
+		expect(sha256OfFile(file)).toBe(result.attestation.session.sha256!);
+		expect(fs.statSync(file).size).toBe(result.attestation.session.size!);
+		expect(readAttestation(s).session).toMatchObject({
+			size: result.attestation.session.size,
+			sha256: result.attestation.session.sha256,
+		});
+	});
+
+	it("attests an absent transcript as absent and never creates it afterwards", async () => {
+		const s = createSession();
+		const result = s.quiesceForExit(request(s));
+		if (result.status !== "quiesced") throw new Error("expected quiesced");
+		expect(result.attestation.session).toMatchObject({ size: null, sha256: null });
+		await s.sessionManager.saveDraft("draft typed after quiesce");
+		await s.dispose();
+		session = undefined;
+		expect(fs.existsSync(s.sessionFile!)).toBe(false);
+	});
+
+	it("adds the final transcript digest to a hang-up attestation once teardown closes it", async () => {
+		const s = createSession();
+		await s.prompt("materialize the transcript");
+		await s.dispose({ reason: postmortem.Reason.SIGTERM });
+		session = undefined;
+		const onDisk = readAttestation(s);
+		expect(onDisk.kind).toBe("hangup");
+		expect(onDisk.session.sha256).toBe(sha256OfFile(s.sessionFile!));
+	});
 });

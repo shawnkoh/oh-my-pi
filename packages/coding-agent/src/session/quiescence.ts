@@ -111,6 +111,14 @@ export interface SessionIdentity {
 	id: string;
 	/** Session JSONL path, or `null` for a non-persistent session. */
 	file: string | null;
+	/**
+	 * Terminal attestations only: byte size and SHA-256 of the session file once it is final
+	 * (nothing is appended afterwards). `null` when no file exists or the backend keeps no
+	 * local file; for a `hangup` attestation they are filled in after teardown finishes, and
+	 * stay `null` if the process dies first.
+	 */
+	size?: number | null;
+	sha256?: string | null;
 }
 
 export interface OwnedJobRegistryState {
@@ -197,6 +205,13 @@ export type QuiesceResult =
 /** `<session file without .jsonl>.terminal.json` */
 export function terminalAttestationPath(sessionFile: string): string {
 	return `${stripJsonl(sessionFile)}.terminal.json`;
+}
+
+/** Throw unless the attestation's directory exists (created if needed) and is writable. */
+export function assertAttestationWritable(file: string): void {
+	const dir = path.dirname(file);
+	fs.mkdirSync(dir, { recursive: true });
+	fs.accessSync(dir, fs.constants.W_OK);
 }
 
 /**
