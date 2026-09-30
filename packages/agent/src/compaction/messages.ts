@@ -7,7 +7,7 @@ import type {
 	ToolResultMessage,
 } from "@oh-my-pi/pi-ai";
 import { prompt } from "@oh-my-pi/pi-utils";
-import type { AgentMessage } from "../types";
+import { type AgentMessage, LLM_MESSAGE_SOURCE } from "../types";
 import branchSummaryContextPrompt from "./prompts/branch-summary-context.md" with { type: "text" };
 import compactionSummaryContextPrompt from "./prompts/compaction-summary-context.md" with { type: "text" };
 import handoffSummaryContextPrompt from "./prompts/handoff-summary-context.md" with { type: "text" };
@@ -200,6 +200,49 @@ function isCoreCompactionMessage(message: AgentMessage): message is AgentMessage
 	);
 }
 
+/** Message field name carrying an owner-provided user-role provider projection. */
+const LLM_PROJECTION_KEY = "omp.llm";
+/** Message field name carrying the projection's source id, stamped as {@link LLM_MESSAGE_SOURCE}. */
+const LLM_PROJECTION_SOURCE_KEY = "omp.llm.source";
+
+function isProjectionPart(part: unknown): part is TextContent | ImageContent {
+	if (typeof part !== "object" || part === null || !("type" in part)) return false;
+	if (part.type === "text") return "text" in part && typeof part.text === "string";
+	if (part.type === "image") {
+		return "data" in part && typeof part.data === "string" && "mimeType" in part && typeof part.mimeType === "string";
+	}
+	return false;
+}
+
+/**
+ * Owner-declared provider projection of a custom record: `details["omp.llm"]`
+ * with `role: "user"` and text/image content. Plain JSON data so it survives
+ * session persistence; anything else is rejected so a malformed projection
+ * falls back to the ordinary developer conversion instead of reaching the
+ * provider half-validated.
+ */
+function readLlmProjection(
+	details: unknown,
+): { content: string | (TextContent | ImageContent)[]; source: string | undefined } | undefined {
+	if (typeof details !== "object" || details === null || !(LLM_PROJECTION_KEY in details)) return undefined;
+	const projection = details[LLM_PROJECTION_KEY];
+	if (typeof projection !== "object" || projection === null) return undefined;
+	if (!("role" in projection) || projection.role !== "user" || !("content" in projection)) return undefined;
+	const content: unknown = projection.content;
+	let validated: string | (TextContent | ImageContent)[];
+	if (typeof content === "string") {
+		validated = content;
+	} else if (Array.isArray(content) && content.every(isProjectionPart)) {
+		// The array is handed over as-is so hosts can deep-compare the provider
+		// view against the projection they authored.
+		validated = content;
+	} else {
+		return undefined;
+	}
+	const source = LLM_PROJECTION_SOURCE_KEY in details ? details[LLM_PROJECTION_SOURCE_KEY] : undefined;
+	return { content: validated, source: typeof source === "string" ? source : undefined };
+}
+
 /**
  * Transform a single core-domain agent message to its LLM form; `undefined`
  * drops it from the provider request.
@@ -215,6 +258,19 @@ export function convertMessageToLlm(message: AgentMessage): Message | undefined 
 		switch (message.role) {
 			case "custom":
 			case "hookMessage": {
+				const projection = readLlmProjection(message.details);
+				if (projection) {
+					// The record's own `content` is its display header; only the
+					// owner's projection reaches the provider.
+					const projected: Message & { [LLM_MESSAGE_SOURCE]?: string } = {
+						role: "user",
+						content: projection.content,
+						attribution: message.attribution ?? "agent",
+						timestamp: message.timestamp,
+					};
+					projected[LLM_MESSAGE_SOURCE] = projection.source;
+					return projected;
+				}
 				const content =
 					typeof message.content === "string"
 						? [{ type: "text" as const, text: message.content }]
