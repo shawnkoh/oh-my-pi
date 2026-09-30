@@ -416,6 +416,7 @@ import { ToolChoiceQueue } from "./tool-choice-queue";
 import { planTurnPersistence, sameMessageContent, sessionMessagePersistenceKey } from "./turn-persistence";
 import { TurnRecovery, type TurnRecoveryHost } from "./turn-recovery";
 import { YieldQueue } from "./yield-queue";
+import { OwnedJobRegistry } from "./owned-job-registry";
 
 export * from "./agent-session-events";
 export * from "./agent-session-types";
@@ -958,6 +959,9 @@ export class AgentSession implements SettingsScope {
 	 *  incremented, so `isStreaming` alone cannot tell a host that a submission is admitted. */
 	#admittedSubmissionCount = 0;
 	#admittedSubmissionsSettled: PromiseWithResolvers<void> | undefined;
+	/** Owned-job registry this session created (root sessions that own the async job manager). */
+	#ownedJobRegistry: OwnedJobRegistry | undefined;
+	#unobserveAsyncJobs: (() => void) | undefined;
 	// Wire-level agent_end emission deferred until #promptInFlightCount drops to 0.
 	// Internal extension hooks and post-emit work (auto-retry, auto-compaction, todo
 	// checks in #handleAgentEvent) still fire on the original schedule — only the
@@ -1548,6 +1552,7 @@ export class AgentSession implements SettingsScope {
 		});
 		this.#ownedAsyncJobManager = config.ownedAsyncJobManager;
 		this.#asyncJobManager = config.asyncJobManager ?? config.ownedAsyncJobManager;
+		if (config.ownedAsyncJobManager) this.#initOwnedJobRegistry(config.ownedAsyncJobManager);
 		const modelControlsHost: ModelControlsHost = {
 			agent: this.agent,
 			settings: this.settings,
@@ -2716,6 +2721,47 @@ export class AgentSession implements SettingsScope {
 				settled.resolve();
 			}
 		}
+	}
+
+	/** Owned-job registry for this process: the one this session created, else the root session's. */
+	get ownedJobRegistry(): OwnedJobRegistry | undefined {
+		return this.#ownedJobRegistry ?? OwnedJobRegistry.instance();
+	}
+
+	#initOwnedJobRegistry(manager: AsyncJobManager): void {
+		const registry = new OwnedJobRegistry({
+			getSessionFile: () => this.sessionManager.getSessionFile(),
+			getSessionId: () => this.sessionManager.getSessionId(),
+		});
+		this.#ownedJobRegistry = registry;
+		OwnedJobRegistry.setInstance(registry);
+		const registryIds = new WeakMap<AsyncJob, string>();
+		let sequence = 0;
+		this.#unobserveAsyncJobs = manager.observe({
+			registered: job => {
+				const jobId = `${job.type}:${job.id}:${++sequence}`;
+				registryIds.set(job, jobId);
+				registry.registerInProcessJob({
+					jobId,
+					kind: job.type === "task" ? "subagent" : "async-job",
+					command: job.label,
+					cwd: this.sessionManager.getCwd(),
+				});
+			},
+			settled: job => {
+				const jobId = registryIds.get(job);
+				if (jobId) registry.end(jobId, "settled");
+			},
+		});
+	}
+
+	#closeOwnedJobRegistry(): void {
+		this.#unobserveAsyncJobs?.();
+		this.#unobserveAsyncJobs = undefined;
+		const registry = this.#ownedJobRegistry;
+		if (!registry) return;
+		registry.close();
+		if (OwnedJobRegistry.instance() === registry) OwnedJobRegistry.setInstance(undefined);
 	}
 
 	/**
@@ -5397,6 +5443,8 @@ export class AgentSession implements SettingsScope {
 				});
 			}
 		}
+		// After job disposal, so settled jobs have recorded their end.
+		this.#closeOwnedJobRegistry();
 
 		this.#releasePowerAssertion();
 		await cleanupEmptyMoveSession(this.sessionManager, this.#movedFromEmptySessionFile);
@@ -10115,6 +10163,8 @@ export class AgentSession implements SettingsScope {
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean },
 	): Promise<PythonResult> {
+		// Kernel code can start processes the owned-job registry never sees.
+		this.ownedJobRegistry?.markIncomplete("eval code can start untracked processes");
 		return this.#eval.executePython(code, onChunk, options);
 	}
 

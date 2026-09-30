@@ -11,6 +11,7 @@ import type { DaemonOperation, DaemonRpcResult } from "./protocol";
 import { renderTerminalOutputIsolated } from "./terminal-output-worker-client";
 import type { ToolSession } from "../tools";
 import { resolveToCwd } from "../tools/path-utils";
+import { OwnedJobRegistry } from "../session/owned-job-registry";
 
 import { cfgLaunchEnabled } from "../tools/settings";
 
@@ -26,6 +27,8 @@ export interface ServiceStart {
 	cwd?: string;
 	pty?: boolean;
 	ready?: ServiceReady;
+	/** The service may keep running while the owning session is suspended. Recorded at start; never changed later. */
+	sleepable?: boolean;
 }
 
 const serviceStateKey = Symbol("ownedServices");
@@ -222,11 +225,39 @@ export async function startService(
 		persist: false,
 		detached: false,
 	};
-	const result = await request(
-		session,
-		{ op: "start", spec, owner: serviceOwner(session) ?? undefined, replace: true },
-		signal,
-	);
+	// Until the broker reports the service pid, a crash would leave an unrecorded process.
+	const registry = OwnedJobRegistry.instance();
+	const pendingId = registry?.registerInProcessJob({
+		jobId: `service-start:${params.name}:${Date.now()}`,
+		kind: "service-start",
+		command: params.command,
+		cwd: spec.cwd,
+	});
+	let result: DaemonRpcResult;
+	try {
+		result = await request(
+			session,
+			{ op: "start", spec, owner: serviceOwner(session) ?? undefined, replace: true },
+			signal,
+		);
+		if (result.op === "start" && registry) {
+			const daemon = result.daemon;
+			if (daemon.pid !== undefined) {
+				registry.registerProcess({
+					kind: "service",
+					jobId: `service:${daemon.id}:${daemon.startedAt}`,
+					pid: daemon.pid,
+					command: params.command,
+					cwd: spec.cwd,
+					sleepable: params.sleepable === true,
+				});
+			} else if (!TERMINAL_STATES[daemon.state]) {
+				registry.markIncomplete("service started without a reported pid");
+			}
+		}
+	} finally {
+		if (pendingId) registry?.end(pendingId, "settled");
+	}
 	if (result.op !== "start") throw new Error("Unexpected daemon start response");
 	return {
 		daemon: result.daemon,

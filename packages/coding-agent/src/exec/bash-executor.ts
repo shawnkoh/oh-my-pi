@@ -21,6 +21,7 @@ import { getOrCreateSnapshot } from "../utils/shell-snapshot";
 import { TerminalGraphicsDecoder } from "../utils/terminal-graphics";
 import { loadDirenvEnv } from "./direnv";
 import { buildNonInteractiveEnv } from "./non-interactive-env";
+import { OwnedJobRegistry } from "../session/owned-job-registry";
 
 import {
 	cfgBashDirenv,
@@ -183,6 +184,20 @@ const shellSessionsInUse = new Set<string>();
  */
 const retainedShells = new Set<Shell>();
 const RETAIN_REAP_INTERVAL_MS = 5_000;
+/** Native shell runs that have started but not settled (including cancelled runs still unwinding). */
+let unsettledShellRuns = 0;
+let shellRunSequence = 0;
+/** Longest command text stored in an owned-job registry record. */
+const REGISTRY_COMMAND_MAX_CHARS = 4_096;
+
+/**
+ * Shell work that outlives the tool call that started it: shells retained for
+ * live background jobs plus native runs that have not settled yet. Counted by
+ * session quiescence checks.
+ */
+export function retainedShellWorkCount(): number {
+	return retainedShells.size + unsettledShellRuns;
+}
 // Native cancellation may spend two seconds unwinding the shell before its
 // N-API chunk bridge drains. The JS watchdog must not race that teardown.
 const NATIVE_TIMEOUT_FALLBACK_GRACE_MS = 5_000;
@@ -578,6 +593,8 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 
 	if (usePty && ptyRequest) {
 		const requestedMs = options?.timeout;
+		// A PTY shell's descendants are not reported back, so owned-process coverage is incomplete.
+		OwnedJobRegistry.instance()?.markIncomplete("pty shell runs do not report spawned processes");
 		try {
 			return await executeUserShellPty({
 				shell,
@@ -670,21 +687,49 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	let resetSession = false;
 
 	try {
-		const runPromise = executionShell.run(
-			{
-				command: finalCommand,
-				cwd: commandCwd,
-				env: commandEnv,
-				timeoutMs: nativeTimeoutMs,
-				signal: runAbortController.signal,
-				filesystem: options?.filesystem,
-			},
-			(err, chunk) => {
-				if (!err) {
-					enqueueChunk(chunk);
-				}
-			},
+		// Record the run before it can spawn anything: its external children live
+		// in their own sessions, so a run that never settles (crash) leaves the
+		// registry unable to vouch for them.
+		const registry = OwnedJobRegistry.instance();
+		const registryContext = {
+			command: command.slice(0, REGISTRY_COMMAND_MAX_CHARS),
+			cwd: commandCwd ?? process.cwd(),
+		};
+		const runJobId = registry?.registerInProcessJob({
+			jobId: `shell-run:${++shellRunSequence}`,
+			kind: "shell-run",
+			...registryContext,
+		});
+		const runPromise = Promise.try(() =>
+			executionShell.run(
+				{
+					command: finalCommand,
+					cwd: commandCwd,
+					env: commandEnv,
+					timeoutMs: nativeTimeoutMs,
+					signal: runAbortController.signal,
+					filesystem: options?.filesystem,
+				},
+				(err, chunk) => {
+					if (!err) {
+						enqueueChunk(chunk);
+					}
+				},
+			),
 		);
+		// Register processes the run left alive, then close the run record. This
+		// reaction is attached before the race below, so on normal completion it
+		// runs before executeBash returns; cancelled runs register reparented
+		// survivors once native teardown settles.
+		unsettledShellRuns++;
+		const settleRun = (): void => {
+			if (runJobId) registry?.end(runJobId, "settled");
+			unsettledShellRuns--;
+		};
+		void runPromise.then(result => {
+			registry?.registerShellSurvivors(result.spawnedProcesses, registryContext);
+			settleRun();
+		}, settleRun);
 
 		const ey = new ExponentialYield();
 		const winner = await ey.race<

@@ -344,6 +344,9 @@ const bashSchemaWithAsync = type({
 	"async?": "boolean",
 });
 
+const SLEEPABLE_DESCRIPTION =
+	"only with name: service may keep running while this session is suspended (default false)";
+
 const bashSchemaWithService = type({
 	command: "string",
 	"timeout?": type("number").describe(BASH_TIMEOUT_DESCRIPTION),
@@ -356,6 +359,7 @@ const bashSchemaWithService = type({
 		"host?": "string",
 		"timeout?": "number",
 	}),
+	"sleepable?": type("boolean").describe(SLEEPABLE_DESCRIPTION),
 });
 
 const bashSchemaWithAsyncAndService = type({
@@ -371,6 +375,7 @@ const bashSchemaWithAsyncAndService = type({
 		"host?": "string",
 		"timeout?": "number",
 	}),
+	"sleepable?": type("boolean").describe(SLEEPABLE_DESCRIPTION),
 });
 
 type BashToolSchema =
@@ -387,6 +392,7 @@ export interface BashToolInput {
 	ready?: ServiceReady;
 	async?: boolean;
 	pty?: boolean;
+	sleepable?: boolean;
 }
 
 /**
@@ -935,6 +941,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			ready: rawReady,
 			async: rawAsync,
 			pty,
+			sleepable,
 		}: BashToolInput,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<BashToolDetails>,
@@ -1054,6 +1061,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					cwd: commandCwd,
 					pty: pty ?? true,
 					ready,
+					sleepable: sleepable === true,
 				},
 				signal,
 			);
