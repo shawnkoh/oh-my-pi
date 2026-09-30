@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { processIdentity, processStartTime, scanProcessesByEnv } from "../native/index.js";
+import { processIdentity, scanProcessesByEnv } from "../native/index.js";
 
 function isAlive(pid: number): boolean {
 	try {
@@ -53,7 +53,7 @@ describe.skipIf(process.platform === "win32")("scanProcessesByEnv", () => {
 			const [found] = scan.processes;
 			expect(found.ppid).not.toBe(launcherPid);
 			expect(found.startTime).toBeNumber();
-			expect(processStartTime(pid)).toBe(found.startTime!);
+			expect(processIdentity(pid).startTime).toBe(found.startTime!);
 			expect(found.startId).toBe(processIdentity(pid).startId!);
 			expect(scanProcessesByEnv("OMP_OWNER", `${token}0`).processes).toEqual([]);
 		} finally {

@@ -2189,7 +2189,7 @@ export interface MarkedProcess {
   pgid?: number
   /**
    * OS start time, Unix epoch seconds (floor) — the same value as
-   * `processStartTime(pid)`. Display only.
+   * `processIdentity(pid).startTime`. Display only.
    */
   startTime?: number
   /**
@@ -2559,16 +2559,6 @@ export interface ProcessIdentity {
    */
   startTime?: number
 }
-
-/**
- * OS start time of `pid` in Unix epoch seconds (floor), or null when the
- * process does not exist or cannot be read.
- *
- * Matches the instant `ps -o lstart` prints for the same process. Display
- * helper: identify processes by `processIdentity(pid).startId`, which does
- * not depend on the wall clock.
- */
-export declare function processStartTime(pid: number): number | null
 
 /** Current state of a process reference. */
 export declare enum ProcessStatus {

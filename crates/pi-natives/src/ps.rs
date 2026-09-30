@@ -195,17 +195,6 @@ impl Process {
 	}
 }
 
-/// OS start time of `pid` in Unix epoch seconds (floor), or null when the
-/// process does not exist or cannot be read.
-///
-/// Matches the instant `ps -o lstart` prints for the same process. Display
-/// helper: identify processes by `processIdentity(pid).startId`, which does
-/// not depend on the wall clock.
-#[napi]
-pub fn process_start_time(pid: i32) -> Option<i64> {
-	core_process::process_start_time(pid).and_then(|secs| i64::try_from(secs).ok())
-}
-
 /// Clock-independent identity of a process at a moment.
 #[napi(object)]
 pub struct ProcessIdentity {
@@ -252,7 +241,7 @@ pub struct MarkedProcess {
 	/// Process group id when readable.
 	pub pgid:       Option<i32>,
 	/// OS start time, Unix epoch seconds (floor) — the same value as
-	/// `processStartTime(pid)`. Display only.
+	/// `processIdentity(pid).startTime`. Display only.
 	pub start_time: Option<i64>,
 	/// Opaque start identity — the same value as
 	/// `processIdentity(pid).startId`.

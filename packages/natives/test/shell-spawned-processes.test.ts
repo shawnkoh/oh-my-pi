@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { processIdentity, processStartTime, Shell } from "../native/index.js";
+import { processIdentity, Shell } from "../native/index.js";
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
@@ -56,7 +56,7 @@ describe.skipIf(process.platform === "win32")("Shell spawnedProcesses", () => {
 			expect(isAlive(entry.pid)).toBe(true);
 			expect(entry.pgid).toBe(bang);
 			expect(entry.startTime).toBeNumber();
-			expect(processStartTime(entry.pid)).toBe(entry.startTime!);
+			expect(processIdentity(entry.pid).startTime).toBe(entry.startTime!);
 			expect(psStartTime(entry.pid)).toBe(entry.startTime!);
 			expect(entry.startId).toBeString();
 			expect(processIdentity(entry.pid)).toEqual({
@@ -111,11 +111,6 @@ describe.skipIf(process.platform === "win32")("Shell spawnedProcesses", () => {
 		expect(result.spawnedProcesses).toEqual([]);
 		expect(result.spawnedComplete).toBe(true);
 	});
-
-	it("returns null for a process that does not exist", () => {
-		expect(processStartTime(process.pid)).toBe(psStartTime(process.pid));
-		expect(processStartTime(0x7ffffff0)).toBeNull();
-	});
 });
 
 describe.skipIf(process.platform === "win32")("processIdentity", () => {
@@ -123,7 +118,7 @@ describe.skipIf(process.platform === "win32")("processIdentity", () => {
 		const self = processIdentity(process.pid);
 		expect(self.state).toBe("running");
 		expect(self.startId).toMatch(/^\d+$/);
-		expect(self.startTime).toBe(processStartTime(process.pid)!);
+		expect(self.startTime).toBe(psStartTime(process.pid));
 		expect(processIdentity(process.pid)).toEqual(self);
 
 		const child = Bun.spawn(["/bin/sleep", "7413"], { stdio: ["ignore", "ignore", "ignore"] });
