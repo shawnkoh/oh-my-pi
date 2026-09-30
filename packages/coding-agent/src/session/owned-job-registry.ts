@@ -28,7 +28,7 @@ import { logger } from "@oh-my-pi/pi-utils";
 
 export const OWNED_JOB_REGISTRY_VERSION = 1;
 /** Longest command text stored in a registry record. */
-export const REGISTRY_COMMAND_MAX_CHARS = 4_096;
+const REGISTRY_COMMAND_MAX_CHARS = 4_096;
 /**
  * - `async-job`: an in-process background job (async bash, eval, …).
  * - `subagent`: an in-process subagent run.

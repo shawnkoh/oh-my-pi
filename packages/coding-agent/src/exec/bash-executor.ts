@@ -22,12 +22,7 @@ import { getOrCreateSnapshot } from "../utils/shell-snapshot";
 import { TerminalGraphicsDecoder } from "../utils/terminal-graphics";
 import { loadDirenvEnv } from "./direnv";
 import { buildNonInteractiveEnv } from "./non-interactive-env";
-import {
-	OWNER_SCAN_COVERS_PLATFORM,
-	OwnedJobRegistry,
-	ownerMarkerEnv,
-	REGISTRY_COMMAND_MAX_CHARS,
-} from "../session/owned-job-registry";
+import { OWNER_SCAN_COVERS_PLATFORM, OwnedJobRegistry, ownerMarkerEnv } from "../session/owned-job-registry";
 
 import {
 	cfgBashDirenv,
@@ -738,7 +733,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		// registry unable to vouch for them.
 		const registry = OwnedJobRegistry.instance();
 		const registryContext = {
-			command: command.slice(0, REGISTRY_COMMAND_MAX_CHARS),
+			command,
 			cwd: commandCwd ?? process.cwd(),
 		};
 		const runJobId = registry?.registerInProcessJob({
