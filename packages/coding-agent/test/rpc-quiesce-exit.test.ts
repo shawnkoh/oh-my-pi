@@ -64,7 +64,7 @@ class RpcProcess {
 	}
 }
 
-const MODES = ["rpc", "rpc-ui"] as const;
+const MODES: Array<"rpc" | "rpc-ui"> = ["rpc", "rpc-ui"];
 
 function sha256OfFile(file: string): string {
 	return new Bun.CryptoHasher("sha256").update(fs.readFileSync(file)).digest("hex");
