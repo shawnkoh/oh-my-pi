@@ -221,7 +221,7 @@ function isProjectionPart(part: unknown): part is TextContent | ImageContent {
  * falls back to the ordinary developer conversion instead of reaching the
  * provider half-validated.
  */
-function readLlmProjection(
+export function readLlmProjection(
 	details: unknown,
 ): { content: string | (TextContent | ImageContent)[]; source: string | undefined } | undefined {
 	if (typeof details !== "object" || details === null || !(LLM_PROJECTION_KEY in details)) return undefined;

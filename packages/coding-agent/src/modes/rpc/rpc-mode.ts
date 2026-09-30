@@ -1293,6 +1293,19 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				if (!isRecord(deliveryOptions) || (deliveryOptions.mode !== "aside" && deliveryOptions.mode !== "steer")) {
 					return error(id, "deliver", 'options.mode must be "aside" or "steer"');
 				}
+				const deliveryRecord = command.record;
+				if (
+					!isRecord(deliveryRecord) ||
+					typeof deliveryRecord.customType !== "string" ||
+					!("content" in deliveryRecord) ||
+					!isRecord(deliveryRecord.details)
+				) {
+					return error(
+						id,
+						"deliver",
+						"record must be a custom message payload with customType, content and details",
+					);
+				}
 				const handle = session.deliverExternalMessage(command.record, deliveryOptions);
 				const deliveryId = handle.id;
 				const emit = (frame: RpcDeliveryEventFrame) => output(frame);

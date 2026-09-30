@@ -15,6 +15,7 @@ import {
 	type DeliveryHandle,
 	type DeliveryOptions,
 	EXTERNAL_DELIVERY_CAPABILITY,
+	InvalidDeliveryProjectionError,
 	isQuietAssistantStop,
 } from "@oh-my-pi/pi-coding-agent/session/external-delivery";
 import {
@@ -556,16 +557,71 @@ describe("external delivery (session)", () => {
 			expect(first.settled.included).toBe(false);
 		});
 
-		it("is false for a record without a projection", async () => {
+		it("rejects a record without a valid projection instead of sending its display content", async () => {
 			const { mock, session: s } = makeSession();
-			mock.push({ content: ["ok"] });
-			const { settled } = await deliverAndSettle(
-				s,
+			const malformed: CustomMessagePayload[] = [
 				{ customType: CARD_TYPE, content: "no projection", display: false },
-				{ mode: "aside" },
-			);
+				{
+					customType: CARD_TYPE,
+					content: "wrong role",
+					display: true,
+					details: { "omp.llm": { role: "assistant", content: "x" }, "omp.llm.source": "s" },
+				},
+				{
+					customType: CARD_TYPE,
+					content: "bad part",
+					display: true,
+					details: { "omp.llm": { role: "user", content: [{ type: "audio" }] }, "omp.llm.source": "s" },
+				},
+				{
+					customType: CARD_TYPE,
+					content: "no source",
+					display: true,
+					details: { "omp.llm": { role: "user", content: "x" } },
+				},
+			];
+			for (const payload of malformed) {
+				expect(() => s.deliverExternalMessage(payload, { mode: "aside" })).toThrow(InvalidDeliveryProjectionError);
+			}
+			await setImmediate();
+			expect(s.listExternalDeliveries()).toEqual([]);
+			expect(mock.calls.length).toBe(0);
+		});
+
+		it("is false when the request that carried the record was aborted", async () => {
+			const slow = slowTool();
+			const { mock, session: s } = makeSession({ tools: [slow.tool] });
+			mock.push(toolCall("slow"));
+			const run = s.prompt("go");
+			await slow.started;
+			const handle = s.deliverExternalMessage(card("in-flight"), { mode: "aside" });
+			// The record folds into the next request, which the operator aborts mid-stream.
+			mock.push({ content: ["never finishes"], delay: 1_000 } as MockHandler);
+			slow.release();
+			await handle.accepted;
+			await s.abort({ reason: USER_INTERRUPT_LABEL });
+			await run.catch(() => {});
+			const settled = await handle.settled;
+			expect(settled.outcome).toBe("aborted");
 			expect(settled.included).toBe(false);
-			expect(settled.outcome).toBe("text");
+		});
+	});
+
+	describe("engine-injected context is not an input", () => {
+		it("a hidden engine record before the first assistant message keeps sole and delivery-owned", async () => {
+			const { mock, session: s } = makeSession();
+			mock.push(EMPTY_STOP);
+			// Simulate engine-authored hidden context queued alongside the owned record
+			// (the shape reminders, execution context and nudges take: custom,
+			// agent-attributed, display:false).
+			await s.sendCustomMessage(
+				{ customType: "engine-reminder", content: "remember the rules", display: false },
+				{ deliverAs: "nextTurn" },
+			);
+			const { settled } = await deliverAndSettle(s, card("only-peer"), { mode: "aside" });
+			expect(settled.sole).toBe(true);
+			expect(settled.interactive).toBe(false);
+			expect(settled.outcome).toBe("quiet");
 		});
 	});
 

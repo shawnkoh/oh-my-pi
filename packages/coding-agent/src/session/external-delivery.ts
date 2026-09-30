@@ -26,8 +26,8 @@ import {
 	type OwnedAsideAdmission,
 	type OwnedAsideMessage,
 } from "@oh-my-pi/pi-agent-core";
+import { readLlmProjection } from "@oh-my-pi/pi-agent-core/compaction/messages";
 import type { AssistantMessage, ImageContent, Message, TextContent } from "@oh-my-pi/pi-ai";
-import { isRecord } from "@oh-my-pi/pi-utils";
 import type { CustomMessage, NormalizedCustomMessagePayload } from "./messages";
 import { isUserAuthoredQueuedMessage } from "./queued-messages";
 
@@ -82,7 +82,8 @@ export interface DeliveryHandle {
 /** Externally held record listing (RPC `get_state`). */
 export interface ExternalDeliveryListing {
 	deliveryId: string;
-	state: DeliveryState;
+	/** Only records still held by the session are listed: queued or accepted-but-unsettled. */
+	state: "queued" | "accepted";
 	mode: DeliveryMode;
 }
 
@@ -107,22 +108,27 @@ interface IntendedProjection {
 
 type OwnedRecord = CustomMessage & OwnedAsideMessage;
 
+/** Reads the projection with the same validator the core converter uses, so a
+ *  record accepted here can never fall back to its display content at the provider. */
 function readIntendedProjection(record: CustomMessage): IntendedProjection | undefined {
-	const details = record.details;
-	if (!isRecord(details)) return undefined;
-	const projection = details["omp.llm"];
-	const source = details["omp.llm.source"];
-	if (!isRecord(projection) || projection.role !== "user" || typeof source !== "string") return undefined;
-	const content: unknown = projection.content;
-	if (typeof content !== "string" && !Array.isArray(content)) return undefined;
-	// The core projection validates the parts; the host only needs the shape for deep-equality.
-	const projectedContent = content as IntendedProjection["content"];
+	const projection = readLlmProjection(record.details);
+	if (!projection || projection.source === undefined) return undefined;
 	return {
-		source,
-		content: projectedContent,
+		source: projection.source,
+		content: projection.content,
 		attribution: record.attribution ?? "agent",
 		timestamp: record.timestamp,
 	};
+}
+
+/** Thrown by `deliverExternalMessage`/RPC `deliver` for a record without a valid `omp.llm` projection. */
+export class InvalidDeliveryProjectionError extends Error {
+	constructor() {
+		super(
+			'external delivery record needs details["omp.llm"] = { role: "user", content } and a string details["omp.llm.source"]',
+		);
+		this.name = "InvalidDeliveryProjectionError";
+	}
 }
 
 function deepEqual(left: unknown, right: unknown): boolean {
@@ -172,14 +178,25 @@ function hasDeliverableOutput(message: AssistantMessage): boolean {
 	return message.content.some(block => !isSilentBlock(block));
 }
 
-/** Inputs admitted to an evaluation: prompts, steering, asides, follow-ups, continuations. */
+/** Inputs admitted to an evaluation through a queue: prompts, steering, asides,
+ *  follow-ups, continuations and owned records. Engine-authored context the
+ *  loop injects on its own (reminders, execution context, nudges) is not an
+ *  input: it never makes a delivery "shared" and never revokes quiet privilege. */
 function isEvaluationInput(message: AgentMessage): boolean {
-	return (
-		message.role === "user" ||
-		message.role === "custom" ||
-		message.role === "hookMessage" ||
-		message.role === "developer"
-	);
+	if (isOwnedAsideMessage(message) || isUserAuthoredQueuedMessage(message)) return true;
+	if (message.role === "user") return true;
+	if (message.role !== "custom" && message.role !== "hookMessage") return false;
+	return !isEngineAuthoredContext(message);
+}
+
+/** Engine-injected context (reminders, execution/goal/plan context, nudges,
+ *  hook output) is hidden (`display:false`) or a hook message; queue-delivered
+ *  peer input is a displayed record. This structural rule needs no type list. */
+function isEngineAuthoredContext(message: AgentMessage): boolean {
+	if (message.role === "hookMessage") return true;
+	if (message.role !== "custom") return false;
+	if (message.attribution === "user") return false;
+	return message.display !== true;
 }
 
 /** One in-flight prompt cycle as seen by the owners admitted into it. */
@@ -227,7 +244,8 @@ class DeliveryEvaluation {
 			owner.lastAssistant = message;
 			if (hasDeliverableOutput(message)) owner.producedOutput = true;
 		}
-		if (!pending || message.stopReason === "error") return;
+		// "Completed without error": an aborted request never confirms inclusion either.
+		if (!pending || message.stopReason === "error" || message.stopReason === "aborted") return;
 		for (const [owner, count] of pending) if (count === 1) owner.included = true;
 	}
 
@@ -383,6 +401,7 @@ export class ExternalDeliveries {
 
 	create(payload: NormalizedCustomMessagePayload, options: DeliveryOptions): ExternalDeliveryOwner {
 		const id = `delivery_${++this.#sequence}_${Date.now().toString(36)}`;
+		if (readLlmProjection(payload.details)?.source === undefined) throw new InvalidDeliveryProjectionError();
 		const owner = new ExternalDeliveryOwner(id, payload, options, {
 			admit: target => target.admit(this.#host.isSessionTransitioning()),
 			commit: target => {
@@ -405,7 +424,10 @@ export class ExternalDeliveries {
 	list(): ExternalDeliveryListing[] {
 		const listing: ExternalDeliveryListing[] = [];
 		for (const owner of this.#owners.values()) {
-			listing.push({ deliveryId: owner.id, state: owner.state, mode: owner.mode });
+			const state = owner.state;
+			// #retire removes settled/cancelled/discarded owners; guard anyway so the wire type stays honest.
+			if (state !== "queued" && state !== "accepted") continue;
+			listing.push({ deliveryId: owner.id, state, mode: owner.mode });
 		}
 		return listing;
 	}
