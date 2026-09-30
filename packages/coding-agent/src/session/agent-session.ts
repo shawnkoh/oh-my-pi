@@ -8835,9 +8835,10 @@ export class AgentSession implements SettingsScope {
 			? isAdvisorCard
 			: m => !isUserAuthoredQueuedMessage(m) && !isHiddenUserCompanion(m);
 		// An owned external record is never silently dropped: on an interrupt it
-		// moves to the IRC bridge, where the `wakeAfterInterrupt` gating and the
-		// stranded-aside resume decide when it is re-offered, and its owner keeps
-		// its receipts.
+		// moves to the IRC bridge and its owner keeps its receipts. Only `steer`
+		// records can be queued here, and a steer always wakes (contract), so the
+		// stranded resume starts its turn right after the abort settles —
+		// `wakeAfterInterrupt` is not consulted for it.
 		const parked: AgentMessage[] = [];
 		for (const message of [...steeringAll, ...followUpAll]) {
 			if (keep(message)) continue;
