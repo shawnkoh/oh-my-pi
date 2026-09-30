@@ -85,6 +85,24 @@ export function isOwnedAsideMessage(m: AgentMessage): m is OwnedAsideMessage {
 }
 
 /**
+ * Messages the engine injects into a run on its own — soft-requirement
+ * reminders, execution additional context, host nudges and context frames —
+ * as opposed to input admitted through `prompt()` or a queue poll. Marked by
+ * identity at the creation site so consumers (e.g. delivery receipts) can
+ * classify by origin instead of by display or role.
+ */
+const ENGINE_INJECTED_MESSAGES = new WeakSet<object>();
+
+export function markEngineInjected<T extends AgentMessage>(message: T): T {
+	ENGINE_INJECTED_MESSAGES.add(message);
+	return message;
+}
+
+export function isEngineInjected(message: AgentMessage): boolean {
+	return ENGINE_INJECTED_MESSAGES.has(message);
+}
+
+/**
  * Provider projection stamp: a user-role {@link Message} converted from an
  * app record's `details["omp.llm"]` projection carries the owner's source id
  * (`details["omp.llm.source"]`) under this symbol so hosts can verify what the

@@ -2,7 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
 import { setImmediate } from "node:timers/promises";
 import { type } from "@oh-my-pi/omptype";
-import { Agent, type AgentMessage, type AgentTool, LLM_MESSAGE_SOURCE } from "@oh-my-pi/pi-agent-core";
+import {
+	Agent,
+	type AgentMessage,
+	type AgentTool,
+	LLM_MESSAGE_SOURCE,
+	markEngineInjected,
+} from "@oh-my-pi/pi-agent-core";
 import type { Message } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockHandler, type MockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -612,21 +618,105 @@ describe("external delivery (session)", () => {
 		});
 	});
 
-	describe("engine-injected context is not an input", () => {
-		it("a hidden engine record before the first assistant message keeps sole and delivery-owned", async () => {
-			const { mock, session: s } = makeSession();
-			mock.push(EMPTY_STOP);
-			// Simulate engine-authored hidden context queued alongside the owned record
-			// (the shape reminders, execution context and nudges take: custom,
-			// agent-attributed, display:false).
-			await s.sendCustomMessage(
-				{ customType: "engine-reminder", content: "remember the rules", display: false },
-				{ deliverAs: "nextTurn" },
-			);
-			const { settled } = await deliverAndSettle(s, card("only-peer"), { mode: "aside" });
-			expect(settled.sole).toBe(true);
+	describe("inputs are classified by origin", () => {
+		it("an aside folded into a hidden goal-continuation prompt is not sole", async () => {
+			const slow = slowTool();
+			const { mock, session: s } = makeSession({ tools: [slow.tool] });
+			mock.push(toolCall("slow"));
+			mock.push({ content: ["continued"] });
+			// A goal continuation is a hidden custom prompt: hidden, but still an input.
+			const run = s.promptCustomMessage({
+				customType: "goal-continuation",
+				content: "continue the goal",
+				display: false,
+				attribution: "agent",
+			});
+			await slow.started;
+			const handle = s.deliverExternalMessage(card("mid-goal"), { mode: "aside" });
+			slow.release();
+			await run;
+			const settled = await handle.settled;
+			expect(settled.sole).toBe(false);
 			expect(settled.interactive).toBe(false);
-			expect(settled.outcome).toBe("quiet");
+			expect(settled.outcome).toBe("text");
+		});
+
+		it("a wake batch carrying a hidden extension aside is not delivery-owned: no quiet privilege", async () => {
+			const slow = slowTool();
+			const { mock, session: s } = makeSession({ tools: [slow.tool] });
+			mock.push(toolCall("slow"));
+			const run = s.prompt("go");
+			await slow.started;
+			// Extension input queued mid-run, then stranded in the bridge by the abort
+			// (the interrupt skips the loop's final poll) and held by the latch.
+			await s.sendCustomMessage(
+				{ customType: "ext-hidden", content: "EXT HIDDEN INPUT", display: false },
+				{ deliverAs: "aside" },
+			);
+			const aborting = s.abort({ reason: USER_INTERRUPT_LABEL });
+			slow.release();
+			await aborting;
+			await run.catch(() => {});
+			await s.waitForIdle();
+			// The owned wake takes the held extension aside along; the batch is mixed.
+			mock.push(EMPTY_STOP);
+			mock.push({ content: ["retried"] });
+			const handle = s.deliverExternalMessage(card("peer"), { mode: "aside", wakeAfterInterrupt: true });
+			const accepted = await handle.accepted;
+			expect(accepted.mechanism).toBe("wake");
+			const settled = await handle.settled;
+			expect(settled.sole).toBe(false);
+			// Not delivery-owned, so the empty stop goes through the ordinary retry
+			// instead of being dropped as a quiet completion.
+			expect(settled.outcome).not.toBe("quiet");
+			const wakeCall = mock.calls.findIndex((_, index) => userTexts(mock, index).includes("peer"));
+			expect(wakeCall).toBeGreaterThan(0);
+			const providerRoles = mock.calls[wakeCall]?.context.messages.map(message => message.role) ?? [];
+			expect(providerRoles).toContain("developer");
+		});
+
+		it("an engine-injected record before the first assistant message keeps sole and quiet privilege", async () => {
+			const { mock, session: s } = makeSession();
+			mock.push({ content: [{ type: "thinking", thinking: "noted", thinkingSignature: "sig" }] });
+			// The engine injects its own hidden context into the wake's initial set
+			// (the moment soft-requirement reminders and additional context take).
+			const engineContext = (marked: boolean) => {
+				const message: AgentMessage = {
+					role: "custom",
+					customType: "engine-reminder",
+					content: "engine reminder",
+					display: false,
+					attribution: "agent",
+					timestamp: Date.now(),
+				};
+				return marked ? markEngineInjected(message) : message;
+			};
+			let injected = false;
+			s.subscribe(event => {
+				if (event.type === "agent_start" && !injected) {
+					injected = true;
+					s.agent.emitExternalEvent({ type: "message_end", message: engineContext(true) });
+				}
+			});
+			const { settled } = await deliverAndSettle(s, card("only-peer"), { mode: "aside", quiet: true });
+			expect(injected).toBe(true);
+			expect(settled).toMatchObject({ outcome: "quiet", sole: true, interactive: false, requests: 1 });
+
+			// The same record unmarked is an input: the evaluation is shared and
+			// loses quiet privilege (the empty stop is retried).
+			mock.push({ content: [{ type: "thinking", thinking: "noted", thinkingSignature: "sig" }] });
+			mock.push({ content: ["retried"] });
+			let injectedAgain = false;
+			s.subscribe(event => {
+				if (event.type === "agent_start" && !injectedAgain) {
+					injectedAgain = true;
+					s.agent.emitExternalEvent({ type: "message_end", message: engineContext(false) });
+				}
+			});
+			const second = await deliverAndSettle(s, card("second-peer"), { mode: "aside", quiet: true });
+			expect(injectedAgain).toBe(true);
+			expect(second.settled.sole).toBe(false);
+			expect(second.settled.outcome).not.toBe("quiet");
 		});
 	});
 
@@ -780,6 +870,7 @@ describe("external delivery (session)", () => {
 			expect(texts).toContain("operator turn");
 			expect(texts).toContain("folded");
 		});
+
 	});
 
 	describe("quiet completion", () => {
