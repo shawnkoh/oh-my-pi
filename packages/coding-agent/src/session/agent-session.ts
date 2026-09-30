@@ -6720,21 +6720,21 @@ export class AgentSession implements SettingsScope {
 	async sendPlanModeContext(options?: { deliverAs?: "steer" | "followUp" | "nextTurn" | "aside" }): Promise<void> {
 		const message = await this.#buildPlanModeMessage();
 		if (!message) return;
-		await this.#sendEngineMessage(
+		await this.sendCustomMessage(
 			{
 				customType: message.customType,
 				content: message.content,
 				display: message.display,
 				details: message.details,
 			},
-			options ? { deliverAs: options.deliverAs } : undefined,
+			options ? { deliverAs: options.deliverAs, engineInjected: true } : { engineInjected: true },
 		);
 	}
 
 	async sendGoalModeContext(options?: { deliverAs?: "steer" | "followUp" | "nextTurn" | "aside" }): Promise<void> {
 		const message = this.#buildGoalModeMessage();
 		if (!message) return;
-		await this.#sendEngineMessage(
+		await this.sendCustomMessage(
 			{
 				customType: message.customType,
 				content: message.content,
@@ -6742,14 +6742,14 @@ export class AgentSession implements SettingsScope {
 				details: message.details,
 				attribution: message.attribution,
 			},
-			options ? { deliverAs: options.deliverAs } : undefined,
+			options ? { deliverAs: options.deliverAs, engineInjected: true } : { engineInjected: true },
 		);
 	}
 
 	async sendVibeModeContext(options?: { deliverAs?: "steer" | "followUp" | "nextTurn" | "aside" }): Promise<void> {
 		const message = this.#buildVibeModeMessage();
 		if (!message) return;
-		await this.#sendEngineMessage(
+		await this.sendCustomMessage(
 			{
 				customType: message.customType,
 				content: message.content,
@@ -6757,7 +6757,7 @@ export class AgentSession implements SettingsScope {
 				details: message.details,
 				attribution: message.attribution,
 			},
-			options ? { deliverAs: options.deliverAs } : undefined,
+			options ? { deliverAs: options.deliverAs, engineInjected: true } : { engineInjected: true },
 		);
 	}
 
@@ -8561,6 +8561,10 @@ export class AgentSession implements SettingsScope {
 			deliverAs?: "steer" | "followUp" | "nextTurn" | "aside";
 			queueChipText?: string;
 			acceptTerminalEmptyStop?: boolean;
+			/** The engine authored this record (a context frame the session rebuilds
+			 *  and resends): it is marked engine-injected so delivery receipts never
+			 *  count it as an input. Extension and operator messages leave it unset. */
+			engineInjected?: true;
 		},
 	): Promise<boolean> {
 		return this.#admitSubmission(() => this.#sendCustomMessage(message, options));
@@ -8578,7 +8582,7 @@ export class AgentSession implements SettingsScope {
 			acceptTerminalEmptyStop?: boolean;
 		},
 	): Promise<boolean> {
-		return this.#admitSubmission(() => this.#sendCustomMessage(message, { ...options, engineInjected: true }));
+		return this.sendCustomMessage(message, { ...options, engineInjected: true });
 	}
 
 	async #sendCustomMessage<T = unknown>(
