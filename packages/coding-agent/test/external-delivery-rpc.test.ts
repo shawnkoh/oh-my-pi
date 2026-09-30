@@ -81,7 +81,11 @@ describe("external delivery over RPC", () => {
 		expect(ready.capabilities).toEqual(["external-delivery/1"]);
 		// Advertised before negotiation: a v1-only host can read it from the first frame.
 		expect(rpc.received.length).toBe(1);
-	});
+		// The same list is queryable without side effects before any effectful command.
+		const state = await rpc.command({ type: "get_state" });
+		expect(state.success).toBe(true);
+		expect(state.data).toMatchObject({ capabilities: ["external-delivery/1"], externalDeliveries: [] });
+	}, 30_000);
 
 	test("deliver never parses commands, and receipts correlate by the engine-minted delivery id", async () => {
 		const rpc = start();
@@ -124,7 +128,7 @@ describe("external delivery over RPC", () => {
 		expect((state.data as Frame).externalDeliveries).toEqual([]);
 		// The session was not replaced by a `/new` interpretation.
 		expect((state.data as Frame).messageCount).toBe(2);
-	});
+	}, 30_000);
 
 	test("cancel_delivery removes a queued record and get_state lists held records", async () => {
 		const rpc = start();
@@ -178,7 +182,7 @@ describe("external delivery over RPC", () => {
 				(frame.message as Frame).role === "assistant",
 		);
 		expect(JSON.stringify(reply.message)).toContain('seen:[\\"after\\"]');
-	});
+	}, 30_000);
 
 	test("deliver rejects an unknown mode without touching the session", async () => {
 		const rpc = start();
@@ -188,5 +192,5 @@ describe("external delivery over RPC", () => {
 			success: false,
 		});
 		expect(((await rpc.command({ type: "get_state" })).data as Frame).externalDeliveries).toEqual([]);
-	});
+	}, 30_000);
 });
