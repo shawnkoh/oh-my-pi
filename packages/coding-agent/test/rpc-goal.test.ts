@@ -264,6 +264,36 @@ describe("RPC goal command", () => {
 		expect([...results.values()].filter(status => status !== "aborted")).toEqual(["completed"]);
 	}, 30_000);
 
+	test("an extension navigation during a live run leaves that run's prompt to complete normally", async () => {
+		const rpc = await start({ continuation: false, script: "slow" });
+		const results = new Map<string, string>();
+		const unsubscribe = rpc.onPromptResult(result => {
+			if (result.id) results.set(result.id, result.status);
+		});
+		const started = Promise.withResolvers<void>();
+		const unsubscribeEvents = rpc.onEvent(event => {
+			if (event.type === "agent_start") started.resolve();
+		});
+		try {
+			const first = await rpc.prompt("first, stalls");
+			await withTimeout(started.promise, 10_000, "First run never started");
+			// Navigation does not stop the run, so it must not close the run's prompt.
+			await rpc.promptAndWait("/goaltest-navigate-here");
+			expect(results.has(first)).toBe(false);
+			await withTimeout(
+				(async () => {
+					while (!results.has(first)) await Bun.sleep(50);
+				})(),
+				20_000,
+				"The running prompt was never reported",
+			);
+			expect(results.get(first)).toBe("completed");
+		} finally {
+			unsubscribe();
+			unsubscribeEvents();
+		}
+	}, 40_000);
+
 	test("prompt_result reports the session unsettled when a goal continuation follows the prompt", async () => {
 		const rpc = await start({ continuation: true, script: "idle" });
 		const firstSettle = Promise.withResolvers<void>();

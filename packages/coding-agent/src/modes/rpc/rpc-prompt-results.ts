@@ -118,9 +118,9 @@ export class RpcPromptResults {
 	abortOpen(): void {
 		for (const [ticket, open] of this.#open) {
 			if (open.waiting) this.#report(ticket, true, { status: "aborted" });
-			// Only a prompt whose run already started was detached. A command still
-			// running (for example the extension command that made the change) keeps
-			// its ticket for the run it starts in the new session.
+			// A prompt with no run started since it was accepted was not detached: a
+			// command still running (for example the extension command that made the
+			// change) keeps its ticket for the run it starts in the new session.
 			else if (this.#agentStarts > open.startsAtBegin) open.ownOutcome ??= { status: "aborted" };
 		}
 	}

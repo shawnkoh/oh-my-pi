@@ -38,8 +38,13 @@ export interface InitializeExtensionsOptions {
 	 * Optional wrapper around extension-initiated session changes (new, branch,
 	 * navigate, switch), so the host can quiesce and reattach its own per-session
 	 * state exactly as it does for its own session-change commands.
+	 * `detachesRun` is true for changes that stop the running agent (new, switch);
+	 * branch and navigation leave a live run streaming to its normal end.
 	 */
-	wrapSessionChange?: <T extends { cancelled: boolean }>(change: () => Promise<T>) => Promise<T>;
+	wrapSessionChange?: <T extends { cancelled: boolean }>(
+		change: () => Promise<T>,
+		options: { detachesRun: boolean },
+	) => Promise<T>;
 }
 
 /**
@@ -149,28 +154,40 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			getContextUsage: () => session.getContextUsage(),
 			waitForIdle: () => session.agent.waitForIdle(),
 			newSession: newOptions =>
-				wrapSessionChange(async () => {
-					const success = await session.newSession({ parentSession: newOptions?.parentSession });
-					if (success && newOptions?.setup) {
-						await newOptions.setup(session.sessionManager);
-					}
-					return { cancelled: !success };
-				}),
+				wrapSessionChange(
+					async () => {
+						const success = await session.newSession({ parentSession: newOptions?.parentSession });
+						if (success && newOptions?.setup) {
+							await newOptions.setup(session.sessionManager);
+						}
+						return { cancelled: !success };
+					},
+					{ detachesRun: true },
+				),
 			branch: entryId =>
-				wrapSessionChange(async () => {
-					const result = await session.branch(entryId);
-					return { cancelled: result.cancelled };
-				}),
+				wrapSessionChange(
+					async () => {
+						const result = await session.branch(entryId);
+						return { cancelled: result.cancelled };
+					},
+					{ detachesRun: false },
+				),
 			navigateTree: (targetId, navOptions) =>
-				wrapSessionChange(async () => {
-					const result = await session.navigateTree(targetId, { summarize: navOptions?.summarize });
-					return { cancelled: result.cancelled };
-				}),
+				wrapSessionChange(
+					async () => {
+						const result = await session.navigateTree(targetId, { summarize: navOptions?.summarize });
+						return { cancelled: result.cancelled };
+					},
+					{ detachesRun: false },
+				),
 			switchSession: sessionPath =>
-				wrapSessionChange(async () => {
-					const success = await session.switchSession(sessionPath);
-					return { cancelled: !success };
-				}),
+				wrapSessionChange(
+					async () => {
+						const success = await session.switchSession(sessionPath);
+						return { cancelled: !success };
+					},
+					{ detachesRun: true },
+				),
 			reload: async () => {
 				await session.reload();
 			},

@@ -1033,7 +1033,10 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	await initializeExtensions(session, {
 		mode: "rpc",
 		// Extension-initiated session changes get the same goal quiesce/reattach as the commands below.
-		wrapSessionChange: async <T extends { cancelled: boolean }>(change: () => Promise<T>): Promise<T> => {
+		wrapSessionChange: async <T extends { cancelled: boolean }>(
+			change: () => Promise<T>,
+			{ detachesRun }: { detachesRun: boolean },
+		): Promise<T> => {
 			await goalController.beginSessionChange();
 			let result: T | undefined;
 			try {
@@ -1043,9 +1046,10 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				// Reattaches only if the session actually changed, then re-checks settlement.
 				await goalController.endSessionChange();
 				if (result && !result.cancelled) {
-					// As for the host's own session commands: the detached run never yields,
-					// so close the prompts it was answering and re-check settlement.
-					promptResults.abortOpen();
+					// As for the host's new/switch commands: a detached run never yields, so
+					// close the prompts it was answering. Branch and navigation leave a live
+					// run streaming to its normal yield.
+					if (detachesRun) promptResults.abortOpen();
 					void settleWatcher.check();
 				}
 			}
@@ -1304,7 +1308,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					await goalController.settled();
 				}
 				if (!result.data.cancelled) {
-					promptResults.abortOpen();
+					// `branch` leaves a live run streaming to its normal yield; new/switch detach it.
+					if (command.type !== "branch") promptResults.abortOpen();
 					// The detached run publishes no terminal agent_end to settle on.
 					void settleWatcher.check();
 					await emitAvailableCommandsUpdate();
