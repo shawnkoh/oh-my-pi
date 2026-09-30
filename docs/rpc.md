@@ -462,7 +462,11 @@ On SIGHUP or SIGTERM the process writes the same file with `kind: "hangup"`,
 `signal`, and `interrupted: true` when any count was non-zero, capturing the counts
 before any other exit cleanup clears queues, timers or jobs. It then makes the
 transcript final and adds its `size` and `sha256`, as a passed quiesce does; afterwards
-the same read-only allowlist applies.
+the same read-only allowlist applies. In interactive and ACP hosts the digest is added
+after the host's own teardown (so `session_shutdown` handlers' writes are covered);
+exit cleanup gets at most 10 seconds, and a teardown that outlives it ends with the
+process killed before the digest is added: `session.size` and `session.sha256` are then
+absent, and the attestation binds no transcript content.
 
 **Which attestation describes an exit.** When a session is opened, resumed or
 switched to, the agent renames any `<base>.terminal.json` an earlier invocation left to
@@ -573,8 +577,15 @@ so a consumer must keep its own host process census as a required cross-check:
   itself) or on an ACP client terminal (they run in the client) are not registered;
 - engine infrastructure is neither marked nor registered: MCP stdio servers, language
   servers (including the shared LSP mux daemon), the IDA worker, the tiny-model title
-  worker and the blob broker. They run no Thread work; the LSP mux, blob broker and title
-  worker are shared helpers that can outlive one agent process.
+  worker, the blob broker, the shared headless Chromium and the browser relay daemon
+  (both started through the daemon broker with no marker) and the Chromium the browser
+  tool launches in-process through puppeteer in SDK and `bun` hosts (detached). They run
+  no Thread work; the LSP mux, blob broker, title worker and broker-hosted browsers are
+  shared helpers that can outlive one agent process;
+- a writer in another pid namespace that shares the session directory (a sibling
+  container, `unshare -p`) has pids that mean nothing here: its invocation and processes
+  read as gone, so the registry and the verifier assume every writer of a session file
+  runs in the consumer's pid namespace.
 
 Paths that mark the registry incomplete instead: every PTY shell run (on every
 platform), eval runs (their long-lived kernels are not marked), a shell run whose spawn
