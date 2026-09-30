@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { executeBash } from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
@@ -12,7 +12,10 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/owned-job-registry";
 import { processIdentity } from "@oh-my-pi/pi-natives";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { createDaemonBrokerClient } from "@oh-my-pi/pi-coding-agent/launch/client";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import * as brokerClients from "@oh-my-pi/pi-coding-agent/launch/client";
+import { startService } from "@oh-my-pi/pi-coding-agent/launch/services";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { DAEMON_BROKER_WORKER_ARG } from "@oh-my-pi/pi-coding-agent/launch/protocol";
 
 function readRecords(file: string): OwnedJobRecord[] {
@@ -225,7 +228,7 @@ describe.skipIf(process.platform === "win32")("owned-job registry", () => {
 	it("records a daemon broker it spawns as an internal helper that is never counted as work", async () => {
 		const projectDir = path.join(tempDir.path(), "project");
 		fs.mkdirSync(projectDir);
-		const client = await createDaemonBrokerClient(projectDir, {
+		const client = await brokerClients.createDaemonBrokerClient(projectDir, {
 			runtimeDir: path.join(tempDir.path(), "runtime"),
 			idleGraceMs: 100,
 		});
@@ -240,6 +243,42 @@ describe.skipIf(process.platform === "win32")("owned-job registry", () => {
 			expect(registry.liveProcessCount()).toBe(0);
 		} finally {
 			// With no client left the broker exits on its own idle timer.
+			client.close();
+		}
+	});
+
+	it("marks the registry incomplete when a service start ends without reporting its process", async () => {
+		const projectDir = path.join(tempDir.path(), "project");
+		fs.mkdirSync(projectDir);
+		const client = await brokerClients.createDaemonBrokerClient(projectDir, {
+			runtimeDir: path.join(tempDir.path(), "runtime"),
+			idleGraceMs: 100,
+		});
+		// The broker may have started the service when the request timed out in transit.
+		vi.spyOn(client, "request").mockRejectedValue(new Error("Daemon start request timed out"));
+		vi.spyOn(brokerClients, "daemonClientForProject").mockResolvedValue(client);
+		const session: ToolSession = {
+			cwd: projectDir,
+			hasUI: false,
+			settings: Settings.isolated(),
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			getSessionId: () => "session",
+		};
+		try {
+			await expect(startService(session, { name: "svc", command: "sleep 30" })).rejects.toThrow("timed out");
+			expect(registry.complete).toBe(false);
+			const records = readRecords(ownedJobRegistryPath(sessionFile));
+			expect(records).toContainEqual(
+				expect.objectContaining({
+					type: "incomplete",
+					reason: "a service start ended without reporting its process",
+				}),
+			);
+			// The pending start record is closed; nothing claims the service was recorded.
+			expect(records.some(record => record.type === "start" && record.kind === "service")).toBe(false);
+		} finally {
+			vi.restoreAllMocks();
 			client.close();
 		}
 	});
