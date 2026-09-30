@@ -7074,19 +7074,23 @@ export class AgentSession implements SettingsScope {
 		// abort/preflight race hands the resume back via `release(false)`. A prompt
 		// arriving after the cleanup while an earlier parked prompt is still settling
 		// takes part in the same decision. No-op otherwise.
+		// The turn-dispatch window opens here and is handed to #dispatchPrompt,
+		// which keeps it until the turn is set up (or releases it early for an
+		// extension command, which runs unheld). Dropping it between the wait
+		// and the command lookup would let a delivery parked during the wait
+		// wake a run under a slash-prefixed prompt (AgentBusyError).
 		const leaveWait = this.#enterTurnDispatch();
-		let release: Awaited<ReturnType<SessionMaintenance["waitForManualCompactionCleanup"]>>;
 		try {
-			release = await this.#maintenance.waitForManualCompactionCleanup();
+			const release = await this.#maintenance.waitForManualCompactionCleanup();
+			const outcome: PromptDispatchOutcome = { sessionClaimed: false };
+			if (!release) return await this.#dispatchPrompt(text, options, submittedAt, outcome, leaveWait);
+			try {
+				return await this.#dispatchPrompt(text, options, submittedAt, outcome, leaveWait);
+			} finally {
+				release(outcome.sessionClaimed);
+			}
 		} finally {
 			leaveWait();
-		}
-		const outcome: PromptDispatchOutcome = { sessionClaimed: false };
-		if (!release) return this.#dispatchPrompt(text, options, submittedAt, outcome);
-		try {
-			return await this.#dispatchPrompt(text, options, submittedAt, outcome);
-		} finally {
-			release(outcome.sessionClaimed);
 		}
 	}
 
@@ -7095,6 +7099,7 @@ export class AgentSession implements SettingsScope {
 		options: PromptOptions | undefined,
 		submittedAt: number,
 		outcome: PromptDispatchOutcome,
+		leaveWindow: () => void,
 	): Promise<boolean> {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		// Slash/custom-command handling below rewrites `text`; keep the original
@@ -7103,24 +7108,24 @@ export class AgentSession implements SettingsScope {
 		// Handle extension commands first (execute immediately, even during streaming)
 		if (expandPromptTemplates && text.startsWith("/")) {
 			if (options?.runCommands !== false) {
-				const handled = await this.#tryExecuteExtensionCommand(text);
-				if (handled) {
-					return false;
+				// Extension command handlers run unheld: they may deliver and await
+				// receipts themselves (N3). The lookup is synchronous, so the window
+				// held since the compaction wait is released only once the prompt is
+				// known to be one — never in between (P1).
+				if (this.#extensionCommandFor(text)) {
+					leaveWindow();
+					const handled = await this.#tryExecuteExtensionCommand(text);
+					if (handled) {
+						return false;
+					}
 				}
 
 				// Custom TS and MCP-prompt commands produce the prompt text that
 				// becomes this turn (an MCP prompt fetches it over the network), so
 				// their run is part of the turn setup: a delivery arriving meanwhile
 				// must park, or the returning prompt would collide with the wake it
-				// started (AgentBusyError). Extension commands above are not held:
-				// they may deliver and await receipts themselves (N3).
-				const leaveCommand = this.#enterTurnDispatch();
-				let customResult: string | null;
-				try {
-					customResult = await this.#tryExecuteCustomCommand(text);
-				} finally {
-					leaveCommand();
-				}
+				// started (AgentBusyError). The window is still held here.
+				const customResult = await this.#tryExecuteCustomCommand(text);
 				if (customResult !== null) {
 					if (customResult === "") {
 						return false;
@@ -7135,14 +7140,17 @@ export class AgentSession implements SettingsScope {
 				text = expandSlashCommand(text, this.#slashCommands);
 			}
 		}
-		// Command handlers above may run for a long time (dialogs, deliveries of
-		// their own); only the turn setup below counts as a pending dispatch.
-		const leave = this.#enterTurnDispatch();
-		try {
-			return await this.#dispatchPromptTurn(text, options, submittedAt, outcome, typedText, expandPromptTemplates);
-		} finally {
-			leave();
-		}
+		// The turn setup runs inside the window handed in by #prompt (or, after
+		// an unmatched extension lookup, still inside it); the caller closes it.
+		return await this.#dispatchPromptTurn(text, options, submittedAt, outcome, typedText, expandPromptTemplates);
+	}
+
+	/** Synchronous extension-command lookup for a slash-prefixed prompt. */
+	#extensionCommandFor(text: string): boolean {
+		if (!this.#extensionRunner) return false;
+		const spaceIndex = text.indexOf(" ");
+		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
+		return this.#extensionRunner.getCommand(commandName) !== undefined;
 	}
 
 	async #dispatchPromptTurn(

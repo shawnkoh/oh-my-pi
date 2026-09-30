@@ -1042,6 +1042,92 @@ describe("external delivery (session)", () => {
 			expect(texts).toContain("mid-command");
 		});
 
+		// P1: a slash-prefixed prompt issued during a manual-compaction wait, with a
+		// delivery arriving during that wait, must never be lost to the wake the
+		// parked delivery starts (the window is released only for a matched
+		// extension command).
+		async function slashPromptDuringCompaction(text: string, expectedText: string) {
+			const modelRegistry = new ModelRegistry(authStorage);
+			const compactStarted = Promise.withResolvers<void>();
+			const compactGate = Promise.withResolvers<void>();
+			const sessionManager = SessionManager.inMemory(tempDir.path());
+			const runtime = new ExtensionRuntime();
+			const extension = await loadExtensionFromFactory(
+				pi => {
+					pi.on("session_before_compact", async event => {
+						compactStarted.resolve();
+						await compactGate.promise;
+						return {
+							compaction: {
+								summary: "compacted",
+								shortSummary: undefined,
+								firstKeptEntryId: event.preparation.firstKeptEntryId,
+								tokensBefore: event.preparation.tokensBefore,
+								details: {},
+							},
+						};
+					});
+				},
+				tempDir.path(),
+				new EventBus(),
+				runtime,
+				"parked-compaction-slash",
+			);
+			const extensionRunner = new ExtensionRunner(
+				[extension],
+				runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const { mock, session: s } = makeSession({
+				sessionManager,
+				extensionRunner,
+				compaction: true,
+				customCommands: [
+					{
+						path: "gitstat.ts",
+						resolvedPath: "/virtual/gitstat.ts",
+						source: "project",
+						command: {
+							name: "gitstat",
+							description: "produces prompt text",
+							execute: async () => "summarize the repository status",
+						},
+					},
+				],
+			});
+			mock.push({ content: ["seed"] });
+			await s.prompt("seed turn");
+			const compaction = s.compact();
+			await compactStarted.promise;
+			const operatorTurn = s.prompt(text);
+			await setImmediate();
+			expect(s.hasPendingTurnDispatch).toBe(true);
+			mock.push({ content: ["turn two"] });
+			mock.push({ content: ["turn three"] });
+			const handle = s.deliverExternalMessage(card("during-compaction"), { mode: "aside" });
+			for (let i = 0; i < 5; i++) await setImmediate();
+			expect(handle.state()).toBe("queued");
+			compactGate.resolve();
+			await compaction;
+			await expect(operatorTurn).resolves.toBe(true);
+			const settled = await handle.settled;
+			expect(settled.included).toBe(true);
+			await s.waitForIdle();
+			const texts = mock.calls.slice(1).flatMap((_, index) => userTexts(mock, index + 1));
+			expect(texts).toContain("during-compaction");
+			expect(texts.some(t => t.includes(expectedText))).toBe(true);
+		}
+
+		it("a custom slash command issued during a manual-compaction wait survives a delivery that arrives meanwhile (P1)", async () => {
+			await slashPromptDuringCompaction("/gitstat", "summarize the repository status");
+		});
+
+		it("non-command slash text issued during a manual-compaction wait survives a delivery that arrives meanwhile (P1)", async () => {
+			await slashPromptDuringCompaction("/nosuch operator turn", "/nosuch operator turn");
+		});
+
 		it("a steer delivered in a prompt's dispatch window folds into or follows that turn (no AgentBusyError)", async () => {
 			const modelRegistry = new ModelRegistry(authStorage);
 			const compactStarted = Promise.withResolvers<void>();
