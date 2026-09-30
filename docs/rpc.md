@@ -410,9 +410,11 @@ turn, sent as a hidden `goal-continuation` message.
 - `abort` stops continuation before the abort takes effect; the interrupted goal is
   paused. Continuation also stops after a goal turn with no new tool activity.
   Either way, the next host prompt, steer or follow-up (or `goal resume`) re-arms it.
-- A session change (`new_session`, `switch_session`, `branch`, `open_session`)
-  leaves the previous goal and its tool behind and restores a goal journaled in the
-  target session.
+- A session change leaves the previous goal and its tool behind and restores a goal
+  journaled in the target session. This covers `new_session`, `switch_session`,
+  `branch` and `open_session`, and the same changes made by extension commands.
+  A goal turn waiting to start is dropped when the change begins. If the change is
+  cancelled, continuation resumes in the current session.
 
 When the agent completes the goal, the goal tool is removed again and
 `get_state.goal` becomes `null`.

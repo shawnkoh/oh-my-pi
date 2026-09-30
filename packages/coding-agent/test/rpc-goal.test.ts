@@ -185,14 +185,28 @@ describe("RPC goal command", () => {
 	}, 30_000);
 
 	test("a new session leaves the previous session's goal, goal tool and continuation behind", async () => {
-		const rpc = await start({ continuation: false });
+		const rpc = await start({ continuation: true, script: "idle" });
 		const toolsBefore = (await rpc.getState()).dumpTools?.map(tool => tool.name) ?? [];
-		await rpc.goal("create", { objective: "belongs to the first session" });
+		const firstSettle = Promise.withResolvers<void>();
+		const unsubscribe = rpc.onSessionSettled(() => firstSettle.resolve());
+		try {
+			await rpc.goal("create", { objective: "belongs to the first session" });
+			await withTimeout(firstSettle.promise, 15_000, "First session never settled");
+		} finally {
+			unsubscribe();
+		}
 		expect((await rpc.newSession()).cancelled).toBe(false);
 		const state = await rpc.getState();
 		expect(state.goal).toBeNull();
 		expect(state.dumpTools?.map(tool => tool.name)).toEqual(toolsBefore);
-		expect(await rpc.goal("get")).toEqual({ goal: null, state: null });
+		// A turn in the new session must not pick up the old objective's continuation.
+		await rpc.promptAndWait("hello in the second session");
+		const s2 = await rpc.getState();
+		expect(s2.isSettled).toBe(true);
+		const continuations = (await rpc.getMessages()).filter(
+			message => message.role === "custom" && message.customType === "goal-continuation",
+		);
+		expect(continuations).toEqual([]);
 		expect((await rpc.goal("create", { objective: "second session goal" })).goal?.status).toBe("active");
 	}, 30_000);
 
@@ -234,9 +248,12 @@ describe("RpcGoalController continuation gate", () => {
 			createdAt: 0,
 			updatedAt: 0,
 		};
+		let idle = Promise.withResolvers<void>();
+		idle.resolve();
 		const session = {
 			settings: Settings.isolated({ "goal.continuationModes": ["rpc"] }),
 			isDisposed: false,
+			isSessionTransitioning: false,
 			isStreaming: false,
 			hasAdmittedSubmission: false,
 			queuedMessageCount: 0,
@@ -245,9 +262,20 @@ describe("RpcGoalController continuation gate", () => {
 			getTodoPhases: () => [],
 			goalRuntime: { buildContinuationPrompt: () => "continue" },
 			promptCustomMessage: (message: { customType: string }) => admit(message.customType),
-			waitForIdle: async () => {},
+			waitForIdle: () => idle.promise,
 		};
-		return { session, controller: new RpcGoalController(session as unknown as RpcGoalSession) };
+		let dropped = 0;
+		const controller = new RpcGoalController(session as unknown as RpcGoalSession, () => dropped++);
+		return {
+			session,
+			controller,
+			dropped: () => dropped,
+			/** Hold waitForIdle until {@link release}. */
+			hold: () => {
+				idle = Promise.withResolvers<void>();
+			},
+			release: () => idle.resolve(),
+		};
 	}
 
 	test("a continuation decided before the session closes is never admitted after it", async () => {
@@ -296,5 +324,60 @@ describe("RpcGoalController continuation gate", () => {
 		controller.observe(agentEnd);
 		await nextMacrotask();
 		expect(calls).toBe(2);
+	});
+
+	test("a continuation that finds the session busy or is refused releases settlement", async () => {
+		let result = true;
+		const admitted: string[] = [];
+		const { session, controller, dropped } = fakeSession(async customType => {
+			admitted.push(customType);
+			return result;
+		});
+
+		// Another turn was admitted while the continuation waited: dropped, settle re-checked.
+		session.hasAdmittedSubmission = true;
+		controller.observe(agentEnd);
+		await nextMacrotask();
+		expect(admitted).toEqual([]);
+		expect(dropped()).toBe(1);
+
+		// Mid-transition: dropped the same way.
+		session.hasAdmittedSubmission = false;
+		session.isSessionTransitioning = true;
+		controller.observe(agentEnd);
+		await nextMacrotask();
+		expect(admitted).toEqual([]);
+		expect(dropped()).toBe(2);
+
+		// Admitted but the session refuses to start it: no run follows, so settlement is released.
+		session.isSessionTransitioning = false;
+		result = false;
+		controller.observe(agentEnd);
+		await nextMacrotask();
+		await nextMacrotask();
+		expect(admitted).toEqual(["goal-continuation"]);
+		expect(dropped()).toBe(3);
+		expect(controller.continuationPending).toBe(false);
+	});
+
+	test("a session change voids a waiting continuation; a cancelled change resumes it", async () => {
+		const admitted: string[] = [];
+		const { controller, hold, release } = fakeSession(async customType => {
+			admitted.push(customType);
+			return true;
+		});
+
+		hold();
+		controller.observe(agentEnd);
+		expect(controller.continuationPending).toBe(true);
+		await controller.beginSessionChange();
+		expect(controller.continuationPending).toBe(false);
+		release();
+		await nextMacrotask();
+		expect(admitted).toEqual([]);
+
+		await controller.endSessionChange(true);
+		await nextMacrotask();
+		expect(admitted).toEqual(["goal-continuation"]);
 	});
 });

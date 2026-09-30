@@ -47,6 +47,7 @@ export type RpcGoalSession = Pick<
 	| "waitForIdle"
 	| "isStreaming"
 	| "isDisposed"
+	| "isSessionTransitioning"
 	| "hasAdmittedSubmission"
 	| "queuedMessageCount"
 >;
@@ -105,6 +106,29 @@ export class RpcGoalController {
 	/** Resolves once event-triggered goal exits (completion, drop) have restored the tool set. */
 	settled(): Promise<void> {
 		return this.#exitTask;
+	}
+
+	/**
+	 * Call before any session change (RPC command or extension action). Waits for a
+	 * pending goal exit so it cannot land in the next session, and voids a waiting
+	 * continuation so it cannot be admitted mid-transition.
+	 */
+	async beginSessionChange(): Promise<void> {
+		this.#continuationScheduled = false;
+		this.#continuationGeneration++;
+		await this.#exitTask;
+	}
+
+	/**
+	 * Call after the change settles. A completed change adopts the target session's
+	 * goal; a cancelled one stays in the current session, so continuation resumes.
+	 */
+	async endSessionChange(cancelled: boolean): Promise<void> {
+		if (cancelled) {
+			this.#scheduleContinuation();
+			return;
+		}
+		await this.reconcile();
 	}
 
 	#queueExit(exit: () => Promise<void>): void {
@@ -224,6 +248,7 @@ export class RpcGoalController {
 		// session itself keeps both across a switch, so clear them here first.
 		this.#continuationScheduled = false;
 		this.#continuationGeneration++;
+		await this.#exitTask;
 		await this.#exit();
 		this.#session.setGoalModeState(undefined);
 		const context = this.#session.sessionManager.buildSessionContext();
@@ -318,7 +343,11 @@ export class RpcGoalController {
 			}
 			this.#continuationScheduled = false;
 			const session = this.#session;
-			const idle = !session.isStreaming && !session.hasAdmittedSubmission && session.queuedMessageCount === 0;
+			const idle =
+				!session.isStreaming &&
+				!session.hasAdmittedSubmission &&
+				session.queuedMessageCount === 0 &&
+				!session.isSessionTransitioning;
 			const prompt = idle && this.#continuationWanted() ? session.goalRuntime.buildContinuationPrompt() : undefined;
 			if (!prompt) {
 				this.#onContinuationDropped?.();
@@ -327,10 +356,12 @@ export class RpcGoalController {
 			this.#pendingContinuationTurns++;
 			const unclaim = () => {
 				this.#pendingContinuationTurns = Math.max(0, this.#pendingContinuationTurns - 1);
+				// No run follows, so nothing else will end this activity stretch.
+				this.#onContinuationDropped?.();
 			};
 			// promptCustomMessage counts the submission as admitted synchronously, so every
-			// settle report sees it from here on. A rejection (for example a turn another
-			// source started meanwhile) must not leave the continuation counted.
+			// settle report sees it from here on. A continuation that is refused or bails
+			// before its run starts must neither stay counted nor withhold settlement.
 			session.promptCustomMessage({ customType: "goal-continuation", content: prompt, display: false }).then(
 				dispatched => {
 					if (!dispatched) unclaim();

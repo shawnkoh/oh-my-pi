@@ -1028,6 +1028,18 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	// Set up extensions with RPC-based UI context
 	await initializeExtensions(session, {
 		mode: "rpc",
+		// Extension-initiated session changes get the same goal quiesce/reattach as the commands below.
+		wrapSessionChange: async <T extends { cancelled: boolean }>(change: () => Promise<T>): Promise<T> => {
+			await goalController.beginSessionChange();
+			let result: T | undefined;
+			try {
+				result = await change();
+			} finally {
+				await goalController.endSessionChange(result?.cancelled ?? true);
+				if (result && !result.cancelled) void settleWatcher.check();
+			}
+			return result;
+		},
 		reportSendError: (action, err) => {
 			output(error(undefined, action, err.message));
 		},
@@ -1271,10 +1283,15 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			case "new_session":
 			case "switch_session":
 			case "branch": {
-				const result = await handleRpcSessionChange(session, command, subagentRegistry);
+				await goalController.beginSessionChange();
+				let result: RpcSessionChangeResult | undefined;
+				try {
+					result = await handleRpcSessionChange(session, command, subagentRegistry);
+				} finally {
+					await goalController.endSessionChange(result?.data.cancelled ?? true);
+				}
 				if (!result.data.cancelled) {
 					promptResults.abortOpen();
-					await goalController.reconcile();
 					// The detached run publishes no terminal agent_end to settle on.
 					void settleWatcher.check();
 					await emitAvailableCommandsUpdate();
@@ -1283,10 +1300,15 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			}
 
 			case "open_session": {
-				const result = await openRpcSession(session, command.sessionDir, subagentRegistry);
+				await goalController.beginSessionChange();
+				let result: RpcOpenSessionResult | undefined;
+				try {
+					result = await openRpcSession(session, command.sessionDir, subagentRegistry);
+				} finally {
+					await goalController.endSessionChange(result?.cancelled ?? true);
+				}
 				if (!result.cancelled) {
 					promptResults.abortOpen();
-					await goalController.reconcile();
 					void settleWatcher.check();
 					await emitAvailableCommandsUpdate();
 				}
