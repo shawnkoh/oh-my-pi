@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- External deliveries are inside the quiesce boundary: a held delivery keeps `quiesce_and_exit` refused (`queuedInput`) and marks a hang-up `interrupted`, and `deliverMessage` after a passed quiesce or a hang-up returns a handle already discarded with `admission_closed` instead of one that can never be accepted
+
 ## [18.4.5] - 2026-09-30
 
 ### Added

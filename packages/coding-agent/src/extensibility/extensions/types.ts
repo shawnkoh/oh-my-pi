@@ -1615,6 +1615,8 @@ export interface ExtensionAPI {
 	 * context through the loop's own admission; the returned handle reports
 	 * acceptance (`mode`/`mechanism`), settlement, discard or cancellation.
 	 * Throws when the host lacks the capability — check `capabilities` first.
+	 * After the session closed input admission (a passed quiesce or a hang-up) the
+	 * record is not admitted: the handle is already discarded with `admission_closed`.
 	 */
 	deliverMessage<T = unknown>(record: CustomMessagePayload<T>, options: DeliveryOptions): DeliveryHandle;
 
