@@ -142,6 +142,8 @@ export interface RpcSessionState {
 	 *  (and the `queue_update` event) instead of tracking chips independently. */
 	queuedMessages: { steering: string[]; followUp: string[] };
 	todoPhases: TodoPhase[];
+	/** Engine capabilities a host may negotiate on before issuing an effectful command; same list as the ready frame. */
+	capabilities: string[];
 	/** External records held by the session (`external-delivery/1`), queued or accepted but unsettled. */
 	externalDeliveries: ExternalDeliveryListing[];
 	/** For session dump / export (plain-text parity with /dump). */
