@@ -699,7 +699,11 @@ so a consumer must keep its own host process census as a required cross-check:
 - a writer in another pid namespace that shares the session directory (a sibling
   container, `unshare -p`) has pids that mean nothing here: its invocation and processes
   read as gone, so the registry and the verifier assume every writer of a session file
-  runs in the consumer's pid namespace.
+  runs in the consumer's pid namespace;
+- a marked process no earlier scan found, which the scan lists but which forks a marked
+  child and exits before its environment is read, is dropped by that scan without a
+  trace: nothing counted vanished, so the answer settles while the child runs. The
+  window is one environment read; the verifier's later scan finds the child.
 
 Paths that mark the registry incomplete instead: every PTY shell run (on every
 platform), eval runs (their long-lived kernels are not marked), a shell run whose spawn
