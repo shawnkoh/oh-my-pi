@@ -12,6 +12,7 @@ import {
 	parseOwnedJobRegistry,
 	verifyOwnedJobRegistry,
 } from "@oh-my-pi/pi-coding-agent/session/owned-job-registry";
+import * as natives from "@oh-my-pi/pi-natives";
 import { processIdentity } from "@oh-my-pi/pi-natives";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -787,6 +788,8 @@ describe.skipIf(process.platform === "win32")("owned-job registry", () => {
 				await eventually(() => ownedProcessState(pid, null) === "gone", `pid ${pid} to exit`);
 			}
 			registry.liveProcessCount();
+			// Two consecutive sound scans that find nobody carrying it.
+			expect(registry.scanOwnedProcesses().sound).toBe(true);
 			expect(registry.scanOwnedProcesses().sound).toBe(true);
 			// The next file this invocation binds no longer lists the dead token.
 			sessionFile = path.join(tempDir.path(), "2026-01-03_next.jsonl");
@@ -794,6 +797,170 @@ describe.skipIf(process.platform === "win32")("owned-job registry", () => {
 			const next = readRecords(ownedJobRegistryPath(sessionFile)).find(record => record.type === "invocation");
 			if (next?.type !== "invocation") throw new Error("expected a header");
 			expect(next.inheritedOwnerMarkers).toBeUndefined();
+		},
+	);
+
+	/** Bind a fresh session file and return the taken-over tokens its new header lists. */
+	function tokensOnNextBind(): string[] {
+		sessionFile = path.join(tempDir.path(), `${crypto.randomUUID()}.jsonl`);
+		registry.ensureHeader();
+		const next = readRecords(ownedJobRegistryPath(sessionFile)).find(record => record.type === "invocation");
+		if (next?.type !== "invocation") throw new Error("expected a header");
+		return (next.inheritedOwnerMarkers ?? []).map(marker => marker.token);
+	}
+
+	function cleanScan(opaque: natives.MarkedProcess[] = []): natives.MarkedProcessScan {
+		return { supported: true, hidden: false, processes: [], scanned: 1, unreadable: 0, redacted: 0, opaque };
+	}
+
+	it("keeps a taken-over token while work adopted from its invocation is open, and prunes it only after two clean scans", async () => {
+		const pid = 0x7ffffff8;
+		const token = `omp1:${pid}:5`;
+		const child = Bun.spawn(["/bin/sleep", uniqueSleep()], { stdout: "ignore", stderr: "ignore" });
+		spawned.push(child.pid);
+		const identity = processIdentity(child.pid);
+		const adopted: OwnedJobRecord = {
+			type: "start",
+			jobId: "process:1",
+			kind: "process",
+			pid: child.pid,
+			pgid: null,
+			startTime: identity.startTime ?? null,
+			startId: identity.startId ?? null,
+			command: "sleep",
+			cwd: null,
+			sleepable: false,
+			inProcess: false,
+			invocationPid: pid,
+			registeredAt: "2026-01-01T00:00:00.000Z",
+		};
+		fs.writeFileSync(
+			ownedJobRegistryPath(sessionFile),
+			`${JSON.stringify(header(pid, "5"))}\n${JSON.stringify(adopted)}\n`,
+		);
+		registry.ensureHeader();
+		expect(registry.liveProcessCount()).toBe(1);
+		const scan = vi.spyOn(natives, "scanProcessesByEnv").mockReturnValue(cleanScan());
+		try {
+			// Its issuer is gone and no scan finds the token, but the adopted process could hand
+			// it to a child at any time.
+			registry.scanOwnedProcesses();
+			registry.scanOwnedProcesses();
+			expect(tokensOnNextBind()).toContain(token);
+			child.kill("SIGKILL");
+			await child.exited;
+			expect(registry.liveProcessCount()).toBe(0);
+			registry.scanOwnedProcesses();
+			expect(tokensOnNextBind()).toContain(token);
+			registry.scanOwnedProcesses();
+			expect(tokensOnNextBind()).not.toContain(token);
+			expect(scan).toHaveBeenCalled();
+		} finally {
+			vi.restoreAllMocks();
+		}
+	});
+
+	it("never prunes a taken-over token while a tracked process's environment cannot be read", () => {
+		const pid = 0x7ffffff9;
+		const token = `omp1:${pid}:5`;
+		fs.writeFileSync(ownedJobRegistryPath(sessionFile), `${JSON.stringify(header(pid, "5"))}\n`);
+		registry.ensureHeader();
+		const child = Bun.spawn(["/bin/sleep", uniqueSleep()], { stdout: "ignore", stderr: "ignore" });
+		spawned.push(child.pid);
+		const identity = processIdentity(child.pid);
+		// Found once through a token; this registry now tracks it, but it adopted nothing.
+		registry.registerProcess({ kind: "process", pid: child.pid, command: "sleep", discovered: true });
+		const unreadable: natives.MarkedProcess = {
+			pid: child.pid,
+			ppid: process.pid,
+			startId: identity.startId,
+			command: "sleep",
+		};
+		vi.spyOn(natives, "scanProcessesByEnv").mockReturnValue(cleanScan([unreadable]));
+		try {
+			// Tracked, so counted and not opaque for soundness, but it may carry the token.
+			expect(registry.scanOwnedProcesses().sound).toBe(true);
+			expect(registry.scanOwnedProcesses().sound).toBe(true);
+			expect(tokensOnNextBind()).toContain(token);
+			vi.spyOn(natives, "scanProcessesByEnv").mockReturnValue(cleanScan());
+			registry.scanOwnedProcesses();
+			registry.scanOwnedProcesses();
+			expect(tokensOnNextBind()).not.toContain(token);
+		} finally {
+			vi.restoreAllMocks();
+		}
+	});
+
+	it.skipIf(process.platform !== "linux" || process.getuid?.() === 0)(
+		"finds a child an adopted carrier with an unreadable environment forks after later scans",
+		async () => {
+			const dir = tempDir.path();
+			const ready = path.join(dir, "carrier-ready");
+			const forkNow = path.join(dir, "carrier-fork");
+			const childPidFile = path.join(dir, "carrier-child");
+			const carrier = path.join(dir, "carrier.ts");
+			await Bun.write(
+				carrier,
+				[
+					`import { dlopen, FFIType } from "bun:ffi";`,
+					`import * as fs from "node:fs";`,
+					`const libc = dlopen("libc.so.6", { prctl: { args: [FFIType.i32, FFIType.u64, FFIType.u64, FFIType.u64, FFIType.u64], returns: FFIType.i32 } });`,
+					// PR_SET_DUMPABLE 0: /proc/<pid>/environ is no longer readable by this user.
+					"if (libc.symbols.prctl(4, 0, 0, 0, 0) !== 0) process.exit(3);",
+					`fs.writeFileSync(${JSON.stringify(ready)}, "");`,
+					"const timer = setInterval(() => {",
+					`\tif (!fs.existsSync(${JSON.stringify(forkNow)})) return;`,
+					"\tclearInterval(timer);",
+					`\tconst child = Bun.spawn(["/bin/sleep", ${JSON.stringify(uniqueSleep())}], { detached: true, stdin: "ignore", stdout: "ignore", stderr: "ignore" });`,
+					"\tchild.unref();",
+					`\tfs.writeFileSync(${JSON.stringify(childPidFile)}, String(child.pid));`,
+					"\tprocess.exit(0);",
+					"}, 20);",
+				].join("\n"),
+			);
+			const script = path.join(dir, "crash-carrier.ts");
+			const registryModule = path.join(import.meta.dir, "../src/session/owned-job-registry.ts");
+			await Bun.write(
+				script,
+				[
+					`import { OwnedJobRegistry, ownerMarkerEnv, ownerToken } from ${JSON.stringify(registryModule)};`,
+					`const registry = new OwnedJobRegistry({ getSessionFile: () => ${JSON.stringify(sessionFile)}, getSessionId: () => "crashed", pollIntervalMs: 0 });`,
+					`const carrier = Bun.spawn([process.execPath, ${JSON.stringify(carrier)}], { env: { ...process.env, ...ownerMarkerEnv() }, detached: true, stdin: "ignore", stdout: "ignore", stderr: "inherit" });`,
+					"carrier.unref();",
+					`registry.registerProcess({ kind: "process", pid: carrier.pid, command: "carrier" });`,
+					"console.log(JSON.stringify({ carrierPid: carrier.pid, token: ownerToken() }));",
+					`process.kill(process.pid, "SIGKILL");`,
+				].join("\n"),
+			);
+			const agent = Bun.spawn([process.execPath, script], { stdout: "pipe", stderr: "inherit" });
+			const { carrierPid, token } = JSON.parse((await new Response(agent.stdout).text()).trim()) as {
+				carrierPid: number;
+				token: string;
+			};
+			spawned.push(carrierPid);
+			expect(await agent.exited).not.toBe(0);
+			await eventually(() => fs.existsSync(ready), "the carrier to hide its environment");
+			// Precondition: the carrier's environment really cannot be read.
+			expect(natives.scanProcessesByEnv("OMP_OWNER", [token], "0").opaque.map(proc => proc.pid)).toContain(
+				carrierPid,
+			);
+
+			registry.ensureHeader();
+			expect(registry.liveProcessCount()).toBe(1);
+			registry.scanOwnedProcesses();
+			registry.scanOwnedProcesses();
+			// The carrier hands the token to a child and exits.
+			fs.writeFileSync(forkNow, "");
+			await eventually(
+				() => fs.existsSync(childPidFile) && fs.readFileSync(childPidFile, "utf8") !== "",
+				"the fork",
+			);
+			const childPid = Number(fs.readFileSync(childPidFile, "utf8"));
+			spawned.push(childPid);
+			await eventually(() => ownedProcessState(carrierPid, null) === "gone", "the carrier to exit");
+			expect(registry.scanOwnedProcesses().discovered).toBe(1);
+			expect(registry.openJobs()).toContainEqual(expect.objectContaining({ pid: childPid, discovered: true }));
+			expect(registry.liveProcessCount()).toBe(1);
 		},
 	);
 });

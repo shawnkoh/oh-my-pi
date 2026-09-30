@@ -516,6 +516,8 @@ export class OwnedJobRegistry {
 	readonly #foreignInvocations = new Map<string, InvocationIdentity>();
 	/** Identifies this registry's own headers in a file it reads back. */
 	readonly #writerId = crypto.randomUUID();
+	/** Taken-over tokens the previous owner scan found prunable; pruned if the next agrees. */
+	#prunable = new Set<string>();
 	#monitor: NodeJS.Timeout | undefined;
 	#closed = false;
 	#ptyRuns = 0;
@@ -743,6 +745,7 @@ export class OwnedJobRegistry {
 			scan = scanProcessesByEnv(OWNER_MARKER_ENV, tokens, since);
 		} catch (error) {
 			logger.warn("Owner-marker scan failed", { error: String(error) });
+			this.#prunable.clear();
 			return { supported: false, sound: false, scanned: 0, discovered: 0, opaque: [] };
 		}
 		let discovered = 0;
@@ -763,23 +766,42 @@ export class OwnedJobRegistry {
 			.filter(proc => !this.#tracks(proc.pid, proc.startId ?? null))
 			.map(proc => ({ pid: proc.pid, command: proc.command }));
 		const sound = scan.supported && !scan.hidden && opaque.length === 0;
-		if (sound) this.#pruneInheritedMarkers(scan);
+		// Pruning needs the raw scan clean: a tracked process whose environment cannot be read
+		// is counted, but it may still carry a token and hand it to a child later.
+		if (scan.supported && !scan.hidden && scan.opaque.length === 0) this.#pruneInheritedMarkers(scan);
+		else this.#prunable.clear();
 		return { supported: scan.supported, sound, scanned: scan.scanned, discovered, opaque };
 	}
 
 	/**
 	 * Stop scanning for a taken-over token once nothing can carry it any more: its invocation
-	 * is gone and a sound scan found no live process with it. Keeps headers from growing with
-	 * every resume. The token stays in the header that issued it, so consumers still scan it.
+	 * is gone, no open record was adopted from that invocation, and two consecutive scans that
+	 * examined every candidate process (none unreadable, tracked or not) found no process with
+	 * it. Two scans, because a carrier can fork and exit between one scan's process listing and
+	 * its environment reads. Keeps headers from growing with every resume. The token stays in
+	 * the header that issued it, so consumers still scan it.
 	 */
 	#pruneInheritedMarkers(scan: MarkedProcessScan): void {
 		const carried = new Set(scan.processes.map(proc => proc.token));
+		const prunable = new Set<string>();
 		for (const token of this.#inheritedMarkers.keys()) {
 			if (carried.has(token)) continue;
 			const issuer = tokenInvocation(token);
-			if (!issuer || issuer.pid === process.pid) continue;
-			if (ownedProcessState(issuer.pid, issuer.startId) === "gone") this.#inheritedMarkers.delete(token);
+			if (!issuer || issuer.pid === process.pid || this.#holdsWorkAdoptedFrom(issuer)) continue;
+			if (ownedProcessState(issuer.pid, issuer.startId) !== "gone") continue;
+			if (this.#prunable.has(token)) this.#inheritedMarkers.delete(token);
+			else prunable.add(token);
 		}
+		this.#prunable = prunable;
+	}
+
+	/** Whether an open record was taken over from the invocation `issuer`. */
+	#holdsWorkAdoptedFrom(issuer: { pid: number; startId: string | null }): boolean {
+		for (const open of this.#open.values()) {
+			const from = open.record.adoptedFrom;
+			if (from && from.pid === issuer.pid && from.startId === issuer.startId) return true;
+		}
+		return false;
 	}
 
 	#tracks(pid: number, startId: string | null): boolean {

@@ -513,8 +513,10 @@ and hang-up capture) — and takes it over:
   live process in `detachedJobs`, so no quiesce passes while it can still start work;
 - their owner tokens go into `inheritedOwnerMarkers` and are scanned from then on,
   counting unexaminable processes started since the earliest of those invocations; a
-  token stops being copied into new headers once its invocation is gone and a sound scan
-  finds no process carrying it (the header that issued it still names it);
+  token stops being copied into new headers only when its invocation is gone, no open
+  record was adopted from that invocation, and two consecutive scans that could examine
+  every candidate process — tracked or not — found none carrying it (the header that
+  issued it still names it);
 - their incomplete state — a header that is not exactly `complete: true` with no reasons,
   an `incomplete` record, an in-process job still open once its invocation is gone, an
   unparseable line — makes this invocation incomplete too (`inherited: <reason>`).
