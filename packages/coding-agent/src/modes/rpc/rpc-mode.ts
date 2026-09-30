@@ -1120,6 +1120,9 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
 		const id = command.id;
+		// A malformed security flag fails closed instead of falling back to parsing.
+		if ("literal" in command && command.literal !== undefined && typeof command.literal !== "boolean")
+			return error(id, command.type, "literal must be a boolean");
 
 		switch (command.type) {
 			case "negotiate_protocol": {
@@ -1137,6 +1140,23 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				// cannot start its run ahead of the prompt's event-stream position.
 				const ticket = promptResults.begin(id);
 				try {
+					if (command.literal === true) {
+						// Literal input never reaches skill, builtin, extension, custom or
+						// template dispatch: the exact text is the user's message.
+						watchAndReportPromptResult({
+							ticket,
+							startPrompt: () =>
+								session.prompt(command.message, {
+									images: command.images,
+									streamingBehavior: command.streamingBehavior,
+									literal: true,
+								}),
+							results: promptResults,
+							onError: onPromptError(id, "prompt"),
+							extensionUserMessageTracker,
+						});
+						return success(id, "prompt");
+					}
 					const skillResult = await dispatchRpcSkillPrompt({
 						ticket,
 						session,
@@ -1220,12 +1240,12 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			}
 
 			case "steer": {
-				await session.steer(command.message, command.images);
+				await session.steer(command.message, command.images, { literal: command.literal === true });
 				return success(id, "steer");
 			}
 
 			case "follow_up": {
-				await session.followUp(command.message, command.images);
+				await session.followUp(command.message, command.images, { literal: command.literal === true });
 				return success(id, "follow_up");
 			}
 
@@ -1251,7 +1271,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				// After the abort so the aborted run's terminal agent_end cannot settle this prompt.
 				watchAndReportPromptResult({
 					ticket: promptResults.begin(id),
-					startPrompt: () => session.prompt(command.message, { images: command.images }),
+					startPrompt: () =>
+						session.prompt(command.message, { images: command.images, literal: command.literal === true }),
 					results: promptResults,
 					onError: onPromptError(id, "abort_and_prompt"),
 					extensionUserMessageTracker,

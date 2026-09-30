@@ -6885,7 +6885,8 @@ export class AgentSession implements SettingsScope {
 		submittedAt: number,
 		outcome: PromptDispatchOutcome,
 	): Promise<boolean> {
-		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
+		const literal = options?.literal === true;
+		const expandPromptTemplates = !literal && (options?.expandPromptTemplates ?? true);
 		// Slash/custom-command handling below rewrites `text`; keep the original
 		// so a dropped prompt is handed back exactly as the user typed it.
 		const typedText = text;
@@ -6916,7 +6917,7 @@ export class AgentSession implements SettingsScope {
 
 		// Expand file-based prompt templates if requested
 		const templated = expandPromptTemplates ? expandPromptTemplate(text, [...this.#promptTemplates]) : text;
-		const expandedText = options?.synthetic ? templated : this.#modelMentions.expandMentions(templated);
+		const expandedText = options?.synthetic || literal ? templated : this.#modelMentions.expandMentions(templated);
 
 		// Magic keywords (see modes/magic-keywords.ts): append hidden system notices after the
 		// user's message that steer this turn. User-authored prompts only — synthetic /
@@ -7756,11 +7757,12 @@ export class AgentSession implements SettingsScope {
 	 * Queue a steering message to interrupt the agent mid-run.
 	 */
 	async steer(text: string, images?: ImageContent[], options?: SteerOptions): Promise<void> {
-		if (text.startsWith("/")) {
+		const literal = options?.literal === true;
+		if (!literal && text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
 
-		const expandedText = expandPromptTemplate(text, [...this.#promptTemplates]);
+		const expandedText = literal ? text : expandPromptTemplate(text, [...this.#promptTemplates]);
 		// Stamp before image preprocessing so a queued image steer measures from
 		// the operator's submission, not after the vision-model description.
 		const submittedAt = Date.now();
@@ -7779,12 +7781,15 @@ export class AgentSession implements SettingsScope {
 	 * flipping advisor auto-resume.
 	 */
 	async followUp(text: string, images?: ImageContent[], options?: FollowUpOptions): Promise<void> {
-		if (text.startsWith("/")) {
+		const literal = options?.literal === true;
+		if (!literal && text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
 
 		const expandedText =
-			options?.expandPromptTemplates === false ? text : expandPromptTemplate(text, [...this.#promptTemplates]);
+			literal || options?.expandPromptTemplates === false
+				? text
+				: expandPromptTemplate(text, [...this.#promptTemplates]);
 		// Stamp before image preprocessing so a queued image follow-up measures
 		// from the operator's submission, not after the vision-model description.
 		const submittedAt = Date.now();
