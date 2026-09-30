@@ -13,6 +13,7 @@ import type { Message } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockHandler, type MockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { LoadedCustomCommand } from "@oh-my-pi/pi-coding-agent/extensibility/custom-commands/types";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -108,6 +109,7 @@ describe("external delivery (session)", () => {
 		extensionRunner?: ExtensionRunner;
 		compaction?: boolean;
 		autoContinue?: boolean;
+		customCommands?: LoadedCustomCommand[];
 	}): { mock: MockModel; agent: Agent; session: AgentSession } {
 		// Exhaustion falls back to a plain reply: an unscripted call must never
 		// become a provider error whose retry backoff would outlive the test.
@@ -130,6 +132,7 @@ describe("external delivery (session)", () => {
 		session = new AgentSession({
 			agent,
 			sessionManager: options?.sessionManager ?? SessionManager.inMemory(tempDir.path()),
+			customCommands: options?.customCommands,
 			settings,
 			modelRegistry: new ModelRegistry(authStorage),
 			toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
@@ -678,6 +681,42 @@ describe("external delivery (session)", () => {
 			expect(providerRoles).toContain("developer");
 		});
 
+		it("engine context resent through the session's own senders keeps sole (M2)", async () => {
+			const slow = slowTool();
+			const { mock, session: s } = makeSession({ tools: [slow.tool] });
+			const now = Date.now();
+			s.setGoalModeState({
+				enabled: true,
+				mode: "active",
+				goal: {
+					id: "goal-1",
+					objective: "finish",
+					status: "active",
+					tokensUsed: 0,
+					timeUsedSeconds: 0,
+					createdAt: now,
+					updatedAt: now,
+				},
+			});
+			mock.push(toolCall("slow"));
+			mock.push({ content: ["done"] });
+			const handle = s.deliverExternalMessage(card("only-peer"), { mode: "aside" });
+			await handle.accepted;
+			await slow.started;
+			// The goal frame is rebuilt and resent through sendCustomMessage-style
+			// plumbing mid-run: a real engine creation site, not a synthetic event.
+			await s.sendGoalModeContext({ deliverAs: "steer" });
+			slow.release();
+			const settled = await handle.settled;
+			expect(settled.outcome).toBe("text");
+			expect(settled.sole).toBe(true);
+			expect(settled.interactive).toBe(false);
+			// The frame did reach the provider (it is context, not an input).
+			const texts = mock.calls.flatMap((_, index) => userTexts(mock, index));
+			expect(mock.calls.length).toBe(2);
+			expect(texts.some(text => text.includes("only-peer"))).toBe(true);
+		});
+
 		it("an engine-injected record before the first assistant message keeps sole and quiet privilege", async () => {
 			const { mock, session: s } = makeSession();
 			mock.push({ content: [{ type: "thinking", thinking: "noted", thinkingSignature: "sig" }] });
@@ -960,6 +999,133 @@ describe("external delivery (session)", () => {
 			if (!holder.acceptance) throw new Error("handler never delivered");
 			const settled = await holder.acceptance.settled;
 			expect(settled.included).toBe(true);
+		});
+
+		it("a delivery during a custom slash command that produces prompt text does not race that prompt into AgentBusyError (M1)", async () => {
+			const inCommand = Promise.withResolvers<void>();
+			const releaseCommand = Promise.withResolvers<void>();
+			const { mock, session: s } = makeSession({
+				customCommands: [
+					{
+						path: "gitstat.ts",
+						resolvedPath: "/virtual/gitstat.ts",
+						source: "project",
+						command: {
+							name: "gitstat",
+							description: "produces prompt text after an await",
+							execute: async () => {
+								inCommand.resolve();
+								await releaseCommand.promise;
+								return "summarize the repository status";
+							},
+						},
+					},
+				],
+			});
+			mock.push({ content: ["status summarized"] });
+			mock.push({ content: ["delivery handled"] });
+			const operatorTurn = s.prompt("/gitstat");
+			await inCommand.promise;
+			// The command is still producing its text: a delivery must not wake a
+			// run the returning prompt would then collide with.
+			const handle = s.deliverExternalMessage(card("mid-command"), { mode: "aside" });
+			for (let i = 0; i < 5; i++) await setImmediate();
+			expect(s.isStreaming).toBe(false);
+			expect(handle.state()).toBe("queued");
+			releaseCommand.resolve();
+			await expect(operatorTurn).resolves.toBe(true);
+			const settled = await handle.settled;
+			expect(settled.included).toBe(true);
+			await s.waitForIdle();
+			const texts = mock.calls.flatMap((_, index) => userTexts(mock, index));
+			expect(texts).toContain("summarize the repository status");
+			expect(texts).toContain("mid-command");
+		});
+
+		// P1: a slash-prefixed prompt issued during a manual-compaction wait, with a
+		// delivery arriving during that wait, must never be lost to the wake the
+		// parked delivery starts (the window is released only for a matched
+		// extension command).
+		async function slashPromptDuringCompaction(text: string, expectedText: string) {
+			const modelRegistry = new ModelRegistry(authStorage);
+			const compactStarted = Promise.withResolvers<void>();
+			const compactGate = Promise.withResolvers<void>();
+			const sessionManager = SessionManager.inMemory(tempDir.path());
+			const runtime = new ExtensionRuntime();
+			const extension = await loadExtensionFromFactory(
+				pi => {
+					pi.on("session_before_compact", async event => {
+						compactStarted.resolve();
+						await compactGate.promise;
+						return {
+							compaction: {
+								summary: "compacted",
+								shortSummary: undefined,
+								firstKeptEntryId: event.preparation.firstKeptEntryId,
+								tokensBefore: event.preparation.tokensBefore,
+								details: {},
+							},
+						};
+					});
+				},
+				tempDir.path(),
+				new EventBus(),
+				runtime,
+				"parked-compaction-slash",
+			);
+			const extensionRunner = new ExtensionRunner(
+				[extension],
+				runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const { mock, session: s } = makeSession({
+				sessionManager,
+				extensionRunner,
+				compaction: true,
+				customCommands: [
+					{
+						path: "gitstat.ts",
+						resolvedPath: "/virtual/gitstat.ts",
+						source: "project",
+						command: {
+							name: "gitstat",
+							description: "produces prompt text",
+							execute: async () => "summarize the repository status",
+						},
+					},
+				],
+			});
+			mock.push({ content: ["seed"] });
+			await s.prompt("seed turn");
+			const compaction = s.compact();
+			await compactStarted.promise;
+			const operatorTurn = s.prompt(text);
+			await setImmediate();
+			expect(s.hasPendingTurnDispatch).toBe(true);
+			mock.push({ content: ["turn two"] });
+			mock.push({ content: ["turn three"] });
+			const handle = s.deliverExternalMessage(card("during-compaction"), { mode: "aside" });
+			for (let i = 0; i < 5; i++) await setImmediate();
+			expect(handle.state()).toBe("queued");
+			compactGate.resolve();
+			await compaction;
+			await expect(operatorTurn).resolves.toBe(true);
+			const settled = await handle.settled;
+			expect(settled.included).toBe(true);
+			await s.waitForIdle();
+			const texts = mock.calls.slice(1).flatMap((_, index) => userTexts(mock, index + 1));
+			expect(texts).toContain("during-compaction");
+			expect(texts.some(t => t.includes(expectedText))).toBe(true);
+		}
+
+		it("a custom slash command issued during a manual-compaction wait survives a delivery that arrives meanwhile (P1)", async () => {
+			await slashPromptDuringCompaction("/gitstat", "summarize the repository status");
+		});
+
+		it("non-command slash text issued during a manual-compaction wait survives a delivery that arrives meanwhile (P1)", async () => {
+			await slashPromptDuringCompaction("/nosuch operator turn", "/nosuch operator turn");
 		});
 
 		it("a steer delivered in a prompt's dispatch window folds into or follows that turn (no AgentBusyError)", async () => {
