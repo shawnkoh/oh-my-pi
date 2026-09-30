@@ -126,15 +126,17 @@ Important edge behavior from runtime:
 
 ### Prompting
 
-- `{ id?, type: "prompt", message: string, images?: ImageContent[], streamingBehavior?: "steer" | "followUp" }`
-- `{ id?, type: "steer", message: string, images?: ImageContent[] }`
-- `{ id?, type: "follow_up", message: string, images?: ImageContent[] }`
+- `{ id?, type: "prompt", message: string, images?: ImageContent[], streamingBehavior?: "steer" | "followUp", literal?: boolean }`
+- `{ id?, type: "steer", message: string, images?: ImageContent[], literal?: boolean }`
+- `{ id?, type: "follow_up", message: string, images?: ImageContent[], literal?: boolean }`
 - `{ id?, type: "remove_queued_message", message: string, queue: "steering" | "followUp" }`
 - `{ id?, type: "promote_queued_message", message: string }`
 - `{ id?, type: "abort" }`
-- `{ id?, type: "abort_and_prompt", message: string, images?: ImageContent[] }`
+- `{ id?, type: "abort_and_prompt", message: string, images?: ImageContent[], literal?: boolean }`
 - `{ id?, type: "new_session", parentSession?: string }`
 - `{ id?, type: "open_session", sessionDir: string }`
+
+With `literal: true` (capability `literal-input/1`) the message is the user's text exactly: no slash, skill, builtin, extension or custom command runs, no prompt template expands and model mentions are not rewritten. Hosts that let remote users converse, but not administer the session through message text, should always send it. It governs command parsing only: the model's tools behave as usual, and per-turn text features that are not commands still read the message (magic keywords such as `ultrathink`, a `+Nk` turn budget, eager todo/task preludes). A non-boolean `literal` is refused with an error response.
 
 ### Protocol
 

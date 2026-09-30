@@ -29,14 +29,23 @@ export type RpcCommand =
 	// Protocol
 	| { id?: string; type: "negotiate_protocol"; protocolVersion: number }
 
-	// Prompting
-	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
-	| { id?: string; type: "steer"; message: string; images?: ImageContent[] }
-	| { id?: string; type: "follow_up"; message: string; images?: ImageContent[] }
+	// Prompting. `literal: true` delivers `message` verbatim as the user's text:
+	// no slash/skill/builtin/extension/custom command dispatch, template or
+	// model-mention expansion (capability `literal-input/1`).
+	| {
+			id?: string;
+			type: "prompt";
+			message: string;
+			images?: ImageContent[];
+			streamingBehavior?: "steer" | "followUp";
+			literal?: boolean;
+	  }
+	| { id?: string; type: "steer"; message: string; images?: ImageContent[]; literal?: boolean }
+	| { id?: string; type: "follow_up"; message: string; images?: ImageContent[]; literal?: boolean }
 	| { id?: string; type: "remove_queued_message"; message: string; queue: "steering" | "followUp" }
 	| { id?: string; type: "promote_queued_message"; message: string }
 	| { id?: string; type: "abort" }
-	| { id?: string; type: "abort_and_prompt"; message: string; images?: ImageContent[] }
+	| { id?: string; type: "abort_and_prompt"; message: string; images?: ImageContent[]; literal?: boolean }
 	| { id?: string; type: "new_session"; parentSession?: string }
 	| { id?: string; type: "open_session"; sessionDir: string }
 
@@ -206,6 +215,9 @@ export interface RpcOpenSessionResult {
 	sessionFile?: string;
 }
 
+/** Ready-frame capability: `prompt`/`steer`/`follow_up`/`abort_and_prompt` accept `literal: true`. */
+export const LITERAL_INPUT_CAPABILITY = "literal-input/1";
+
 export interface RpcReadyFrame {
 	type: "ready";
 	protocolVersion: 1;
@@ -221,7 +233,7 @@ export interface RpcReadyFrame {
  * (`name/major`). Features that change behavior for a host also require the
  * host to opt in; the entry here only says the engine supports them.
  */
-export const RPC_ENGINE_CAPABILITIES: readonly string[] = [];
+export const RPC_ENGINE_CAPABILITIES: readonly string[] = [LITERAL_INPUT_CAPABILITY];
 
 export interface RpcChunkFrame {
 	type: "rpc_chunk";
