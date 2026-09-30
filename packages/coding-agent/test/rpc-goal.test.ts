@@ -294,7 +294,23 @@ describe("RpcGoalController continuation gate", () => {
 			getEnabledToolNames: () => ["read"],
 			setActiveToolsByName: async () => {},
 			getTodoPhases: () => [],
-			goalRuntime: { buildContinuationPrompt: () => "continue", clearAccounting: () => {} },
+			goalRuntime: {
+				buildContinuationPrompt: () => "continue",
+				clearAccounting: () => {},
+				createGoal: async ({ objective }: { objective: string }): Promise<GoalModeState> => ({
+					enabled: true,
+					mode: "active",
+					goal: {
+						id: "g2",
+						objective,
+						status: "active",
+						tokensUsed: 0,
+						timeUsedSeconds: 0,
+						createdAt: 0,
+						updatedAt: 0,
+					},
+				}),
+			},
 			promptCustomMessage: (message: { customType: string }) => admit(message.customType),
 			waitForIdle: () => idle.promise,
 		};
@@ -444,7 +460,8 @@ describe("RpcGoalController continuation gate", () => {
 	test("a goal completed while a switch is pending is journaled in its own session", async () => {
 		const { session, controller, transcript, journal } = fakeSession(async () => true);
 		await controller.beginSessionChange();
-		// The goal tool completes the goal while a before-switch hook is still pending.
+		// The goal tool completes the goal while a before-switch hook is still pending; the records
+		// are journaled synchronously at that yield, before the switch can commit.
 		const current = session.getGoalModeState();
 		session.setGoalModeState(current && { ...current, enabled: false, mode: "exiting", reason: "completed" });
 		controller.observe(agentEnd);
@@ -460,5 +477,23 @@ describe("RpcGoalController continuation gate", () => {
 		await controller.beginSessionChange();
 		expect(controller.continuationPending).toBe(false);
 		await controller.endSessionChange();
+	});
+
+	test("a goal created while a session change is in progress is held, not reported settled", async () => {
+		const admitted: string[] = [];
+		const { session, controller } = fakeSession(async customType => {
+			admitted.push(customType);
+			return true;
+		});
+		session.setGoalModeState(undefined);
+		await controller.beginSessionChange();
+		expect(controller.continuationPending).toBe(false);
+		await controller.handle({ op: "create", objective: "during the change" });
+		expect(controller.continuationPending).toBe(true);
+		await nextMacrotask();
+		expect(admitted).toEqual([]);
+		await controller.endSessionChange();
+		await nextMacrotask();
+		expect(admitted).toEqual(["goal-continuation"]);
 	});
 });

@@ -67,7 +67,7 @@ export class RpcGoalController {
 	#continuationGeneration = 0;
 	/** Tool-set restoration triggered by session events; commands and reads wait for it. */
 	#exitTask: Promise<void> = Promise.resolve();
-	/** Session changes in progress; goal turns and exits wait for them to end. */
+	/** Session changes in progress; goal turns are held until they end. */
 	#sessionChanges = 0;
 	/** Transcript (session manager) id when the outermost in-progress change began. */
 	#sessionBeforeChange: string | undefined;
@@ -243,16 +243,9 @@ export class RpcGoalController {
 		if (previousTools) await this.#session.setActiveToolsByName(previousTools);
 	}
 
-	/**
-	 * @param transcriptId the transcript the goal completed in. If a session change
-	 *   switched away before this ran, its journal records are not written into the
-	 *   new session, and the new session's goal state is left for reconcile.
-	 */
-	async #completeExit(transcriptId: string): Promise<void> {
-		if (this.#session.sessionManager.getSessionId() !== transcriptId) return;
+	/** Write the completion records into the current transcript and clear goal state. Synchronous. */
+	#journalCompletion(): void {
 		const state = this.#session.getGoalModeState();
-		// Journal and clear first, synchronously, so the records land in the session
-		// that completed the goal even if a session change follows; then restore tools.
 		this.#session.setGoalModeState(undefined);
 		this.#session.sessionManager.appendModeChange("none");
 		this.#session.sessionManager.appendCustomEntry("goal-completed", {
@@ -261,7 +254,6 @@ export class RpcGoalController {
 			tokenBudget: state?.goal.tokenBudget,
 			timeUsedSeconds: state?.goal.timeUsedSeconds,
 		});
-		await this.#exit();
 	}
 
 	#resetContinuation(): void {
@@ -279,8 +271,12 @@ export class RpcGoalController {
 		// session itself keeps both across a switch, so clear them here first.
 		this.#continuationScheduled = false;
 		this.#continuationGeneration++;
+		const transcriptId = this.#session.sessionManager.getSessionId();
+		// A later reconcile (another change finished meanwhile) owns the state from here.
+		const superseded = () => this.#session.sessionManager.getSessionId() !== transcriptId;
 		await this.#exitTask;
 		await this.#exit();
+		if (superseded()) return;
 		this.#session.setGoalModeState(undefined);
 		const context = this.#session.sessionManager.buildSessionContext();
 		const runtime = this.#session.goalRuntime;
@@ -296,7 +292,7 @@ export class RpcGoalController {
 		}
 		this.#session.setGoalModeState({ enabled: context.mode === "goal", mode: "active", goal });
 		const restored = await runtime.onThreadResumed();
-		if (!restored?.goal) return;
+		if (!restored?.goal || superseded()) return;
 		const previousTools = this.#session.getEnabledToolNames();
 		this.#previousTools = previousTools;
 		await this.#session.setActiveToolsByName([...new Set([...previousTools, "goal"])]);
@@ -330,13 +326,10 @@ export class RpcGoalController {
 			this.#previousContinuationActivity = activity;
 		}
 		if (this.#session.getGoalModeState()?.mode === "exiting") {
-			const transcriptId = this.#session.sessionManager.getSessionId();
-			this.#queueExit(() => this.#completeExit(transcriptId));
-			return;
-		}
-		if (this.#sessionChanges > 0) {
-			// Held until the change ends; a same-session change resumes it.
-			if (this.#continuationWanted()) this.#heldDuringChange = true;
+			// Journal now, while the transcript is certainly the one that completed the
+			// goal; only the tool-set restore is queued (a later reconcile also restores it).
+			this.#journalCompletion();
+			this.#queueExit(() => this.#exit());
 			return;
 		}
 		this.#scheduleContinuation();
@@ -366,7 +359,12 @@ export class RpcGoalController {
 	 * an abort, disposal, pause, plan mode, or another turn starting meanwhile drops it.
 	 */
 	#scheduleContinuation(): void {
-		if (this.#sessionChanges > 0 || this.#continuationScheduled || !this.#continuationWanted()) return;
+		if (this.#sessionChanges > 0) {
+			// Held until the change ends; a same-session change resumes it.
+			if (this.#continuationWanted()) this.#heldDuringChange = true;
+			return;
+		}
+		if (this.#continuationScheduled || !this.#continuationWanted()) return;
 		this.#continuationScheduled = true;
 		const generation = this.#continuationGeneration;
 		void (async () => {
