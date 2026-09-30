@@ -10,6 +10,7 @@ import {
 	ownedProcessState,
 	ownerToken,
 	parseOwnedJobRegistry,
+	SCAN_SETTLE_ROUNDS,
 	verifyOwnedJobRegistry,
 } from "@oh-my-pi/pi-coding-agent/session/owned-job-registry";
 import * as natives from "@oh-my-pi/pi-natives";
@@ -736,15 +737,19 @@ describe.skipIf(process.platform === "win32")("owned-job registry", () => {
 
 	it("never reads a header as complete unless `complete` is exactly true with no reasons", () => {
 		const pid = 0x7ffffff4;
-		for (const override of [
-			{ complete: false, incompleteReasons: [] },
-			{ complete: true, incompleteReasons: ["x"] },
-			{ complete: "false" },
-			{ complete: 1 },
-		]) {
+		const cases: Array<[Record<string, unknown>, string]> = [
+			[{ complete: false, incompleteReasons: [] }, "invocation incomplete"],
+			[{ complete: true, incompleteReasons: ["x"] }, "x"],
+			[{ complete: "false" }, "registry has a malformed invocation header"],
+			[{ complete: 1 }, "registry has a malformed invocation header"],
+		];
+		for (const [override, reason] of cases) {
 			const file = path.join(tempDir.path(), "crafted.jobs.jsonl");
 			fs.writeFileSync(file, `${JSON.stringify({ ...header(pid, "5"), ...override })}\n`);
-			expect(verifyOwnedJobRegistry(file).status).toBe("unknown");
+			const verdict = verifyOwnedJobRegistry(file);
+			expect(verdict.status).toBe("unknown");
+			// The header itself is the reason (the scan cannot be sound on every platform).
+			expect(verdict.reasons).toContain(reason);
 		}
 		// A resume over such a file does not claim completeness either.
 		fs.writeFileSync(
@@ -1048,5 +1053,129 @@ describe.skipIf(process.platform === "win32")("owned-job registry", () => {
 		fs.writeFileSync(ownedJobRegistryPath(sessionFile), `${JSON.stringify(first)}\n${JSON.stringify(again)}\n`);
 		registry.ensureHeader();
 		expect(registry.incompleteReasons).toContain("inherited: x");
+	});
+
+	it("repeats the scan while a counted process vanished before the count, and reports an answer that never settles as unsound", () => {
+		registry.ensureHeader();
+		const fake = new Set<number>();
+		let nextPid = 0x7fff0000;
+		const realIdentity = natives.processIdentity;
+		vi.spyOn(natives, "processIdentity").mockImplementation(pid =>
+			fake.has(pid) ? { state: "gone" } : realIdentity(pid),
+		);
+		let vanishingRounds = 1;
+		// Each vanishing round the scan finds a marked process that is gone by the count.
+		const scan = vi.spyOn(natives, "scanProcessesByEnv").mockImplementation(() => {
+			if (vanishingRounds === 0) return cleanScan();
+			vanishingRounds--;
+			const pid = nextPid++;
+			fake.add(pid);
+			return {
+				...cleanScan(),
+				processes: [{ pid, ppid: 1, startId: "7", command: "carrier", token: ownerToken() }],
+			};
+		});
+		try {
+			let result = registry.scanAndCount();
+			expect(scan).toHaveBeenCalledTimes(2);
+			expect(result).toMatchObject({ live: 0, scan: { sound: true, discovered: 1 } });
+			scan.mockClear();
+			vanishingRounds = Number.POSITIVE_INFINITY;
+			result = registry.scanAndCount();
+			expect(scan).toHaveBeenCalledTimes(SCAN_SETTLE_ROUNDS);
+			expect(result.scan.sound).toBe(false);
+		} finally {
+			vi.restoreAllMocks();
+		}
+	});
+
+	it("breaks the run of clean scans a prune needs on any unclean scan", () => {
+		const pid = 0x7ffffffb;
+		const token = `omp1:${pid}:5`;
+		fs.writeFileSync(ownedJobRegistryPath(sessionFile), `${JSON.stringify(header(pid, "5"))}\n`);
+		registry.ensureHeader();
+		const unreadable: natives.MarkedProcess = { pid: 0x7ffffffc, ppid: 1, startId: "9", command: "hidden" };
+		const scan = vi.spyOn(natives, "scanProcessesByEnv").mockReturnValue(cleanScan());
+		try {
+			registry.scanOwnedProcesses();
+			scan.mockReturnValue(cleanScan([unreadable]));
+			registry.scanOwnedProcesses();
+			scan.mockReturnValue(cleanScan());
+			registry.scanOwnedProcesses();
+			expect(tokensOnNextBind()).toContain(token);
+			registry.scanOwnedProcesses();
+			expect(tokensOnNextBind()).not.toContain(token);
+		} finally {
+			vi.restoreAllMocks();
+		}
+	});
+
+	it("never prunes a taken-over token a live process still carries", () => {
+		const pid = 0x7ffffffd;
+		const token = `omp1:${pid}:5`;
+		fs.writeFileSync(ownedJobRegistryPath(sessionFile), `${JSON.stringify(header(pid, "5"))}\n`);
+		registry.ensureHeader();
+		const child = Bun.spawn(["/bin/sleep", uniqueSleep()], { stdout: "ignore", stderr: "ignore" });
+		spawned.push(child.pid);
+		const carrier: natives.MarkedProcess = {
+			pid: child.pid,
+			ppid: process.pid,
+			startId: processIdentity(child.pid).startId,
+			command: "sleep",
+			token,
+		};
+		const scan = vi.spyOn(natives, "scanProcessesByEnv").mockReturnValue({ ...cleanScan(), processes: [carrier] });
+		try {
+			registry.scanOwnedProcesses();
+			registry.scanOwnedProcesses();
+			registry.scanOwnedProcesses();
+			expect(tokensOnNextBind()).toContain(token);
+			scan.mockReturnValue(cleanScan());
+			registry.scanOwnedProcesses();
+			registry.scanOwnedProcesses();
+			expect(tokensOnNextBind()).not.toContain(token);
+		} finally {
+			vi.restoreAllMocks();
+		}
+	});
+
+	it("takes over the same writer's header in every file it binds", () => {
+		const pid = 0x7ffffffe;
+		const first = path.join(tempDir.path(), "2026-01-05_a.jsonl");
+		const second = path.join(tempDir.path(), "2026-01-05_b.jsonl");
+		fs.writeFileSync(ownedJobRegistryPath(first), `${JSON.stringify({ ...header(pid, "5"), writer: "w" })}\n`);
+		const incomplete = { ...header(pid, "5"), writer: "w", complete: false, incompleteReasons: ["y"] };
+		fs.writeFileSync(ownedJobRegistryPath(second), `${JSON.stringify(incomplete)}\n`);
+		sessionFile = first;
+		registry.ensureHeader();
+		expect(registry.complete).toBe(true);
+		sessionFile = second;
+		registry.ensureHeader();
+		expect(registry.incompleteReasons).toContain("inherited: y");
+	});
+
+	it("reads a registry file rewritten in place again from the start", () => {
+		registry.ensureHeader();
+		registry.scanOwnedProcesses();
+		const file = ownedJobRegistryPath(sessionFile);
+		const { ino, size } = fs.statSync(file);
+		const child = Bun.spawn(["/bin/sleep", uniqueSleep()], { stdout: "ignore", stderr: "ignore" });
+		spawned.push(child.pid);
+		const foreign = JSON.stringify(header(child.pid, processIdentity(child.pid).startId!));
+		// Truncated and rewritten through the same inode, at least as long as what was read.
+		fs.writeFileSync(file, `${foreign.padEnd(size)}\n`);
+		expect(fs.statSync(file).ino).toBe(ino);
+		registry.scanOwnedProcesses();
+		expect(registry.liveProcessCount()).toBe(1);
+		expect(registry.incompleteReasons).toContain("the registry file was rewritten while this invocation had it open");
+	});
+
+	it("stops vouching once a registry file it read is removed", () => {
+		registry.ensureHeader();
+		registry.scanOwnedProcesses();
+		expect(registry.complete).toBe(true);
+		fs.rmSync(ownedJobRegistryPath(sessionFile));
+		registry.scanOwnedProcesses();
+		expect(registry.incompleteReasons).toContain("a registry file this invocation read was removed");
 	});
 });

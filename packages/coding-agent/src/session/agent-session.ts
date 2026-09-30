@@ -2972,10 +2972,18 @@ export class AgentSession implements SettingsScope {
 			counts.queuedInput += delivery.queued + (delivery.delivering ? 1 : 0);
 		}
 		counts.retainedJobs = retainedShellWorkCount();
-		// Scan first: marked processes nobody tracked yet are recorded, then counted below.
+		// Scan first: marked processes nobody tracked yet are recorded, then counted. The two
+		// are repeated while a counted process exited in between (it may have handed its
+		// marker to a child the scan missed).
 		const registry = this.ownedJobRegistry;
-		if (scan) this.#lastOwnerScan = registry?.scanOwnedProcesses() ?? null;
-		counts.detachedJobs = registry?.liveProcessCount() ?? 0;
+		if (scan && registry) {
+			const { scan: summary, live } = registry.scanAndCount();
+			this.#lastOwnerScan = summary;
+			counts.detachedJobs = live;
+		} else {
+			if (scan) this.#lastOwnerScan = null;
+			counts.detachedJobs = registry?.liveProcessCount() ?? 0;
+		}
 		counts.compacting = this.isCompacting ? 1 : 0;
 		counts.handoff = this.isGeneratingHandoff ? 1 : 0;
 		// Everything waitForIdle() waits on is outstanding work too: persistence and extension

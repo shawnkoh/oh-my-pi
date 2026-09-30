@@ -13,7 +13,13 @@ import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensi
 import type { ExtensionFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { type OwnedJobRecord, ownedJobRegistryPath } from "@oh-my-pi/pi-coding-agent/session/owned-job-registry";
+import {
+	type OwnedJobRecord,
+	ownedJobRegistryPath,
+	ownedProcessState,
+	ownerMarkerEnv,
+} from "@oh-my-pi/pi-coding-agent/session/owned-job-registry";
+import * as natives from "@oh-my-pi/pi-natives";
 import {
 	AdmissionClosedError,
 	type QuiesceRequest,
@@ -451,6 +457,70 @@ describe("AgentSession quiesce-and-exit", () => {
 			vi.restoreAllMocks();
 		}
 	});
+
+	it.skipIf(process.platform !== "linux")(
+		"never quiesces while a tracked process hands its owner marker to a child between the scan and the count",
+		async () => {
+			const s = createSession();
+			await s.prompt("materialize the transcript");
+			const dir = tempDir.path();
+			const trigger = path.join(dir, "fork-now");
+			const childFile = path.join(dir, "child-pid");
+			const carrierScript = path.join(dir, "carrier.ts");
+			const sleepSeconds = String(5000 + Math.floor(Math.random() * 4000));
+			await Bun.write(
+				carrierScript,
+				[
+					`import * as fs from "node:fs";`,
+					"const timer = setInterval(() => {",
+					`\tif (!fs.existsSync(${JSON.stringify(trigger)})) return;`,
+					"\tclearInterval(timer);",
+					`\tconst child = Bun.spawn(["/bin/sleep", ${JSON.stringify(sleepSeconds)}], { detached: true, stdin: "ignore", stdout: "ignore", stderr: "ignore" });`,
+					"\tchild.unref();",
+					`\tfs.writeFileSync(${JSON.stringify(childFile)}, String(child.pid));`,
+					"\tprocess.exit(0);",
+					"}, 5);",
+				].join("\n"),
+			);
+			const carrier = Bun.spawn([process.execPath, carrierScript], {
+				env: { ...process.env, ...ownerMarkerEnv() },
+				stdin: "ignore",
+				stdout: "ignore",
+				stderr: "inherit",
+			});
+			let childPid: number | undefined;
+			try {
+				const registry = s.ownedJobRegistry!;
+				registry.registerProcess({ kind: "process", pid: carrier.pid, command: "carrier" });
+				const req = request(s);
+				// Only the timing is forced: right after the quiesce's own scan returns, the carrier
+				// forks a marked child and exits, before the processes are counted.
+				const realScan = natives.scanProcessesByEnv;
+				let armed = true;
+				vi.spyOn(natives, "scanProcessesByEnv").mockImplementation((name, tokens, since) => {
+					const result = realScan(name, tokens, since);
+					if (!armed) return result;
+					armed = false;
+					fs.writeFileSync(trigger, "");
+					const deadline = Date.now() + 10_000;
+					while (
+						!(fs.existsSync(childFile) && fs.readFileSync(childFile, "utf8") !== "") ||
+						ownedProcessState(carrier.pid, null) !== "gone"
+					) {
+						if (Date.now() > deadline) throw new Error("the carrier never forked and exited");
+						Bun.sleepSync(5);
+					}
+					childPid = Number(fs.readFileSync(childFile, "utf8"));
+					return result;
+				});
+				expect(s.quiesceForExit(req)).toMatchObject({ status: "refused", reason: "work_active" });
+				expect(registry.openJobs()).toContainEqual(expect.objectContaining({ pid: childPid, discovered: true }));
+			} finally {
+				carrier.kill("SIGKILL");
+				if (childPid !== undefined) process.kill(childPid, "SIGKILL");
+			}
+		},
+	);
 
 	it("starts no scheduled continuation after a pass", async () => {
 		const s = createSession();

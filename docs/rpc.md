@@ -518,8 +518,11 @@ and hang-up capture), for every file it has bound, not only the current one — 
 it over into the current file. It reads only whole lines: an unterminated last line that
 stays the same across two reads while no other invocation of the file is running is a
 record its writer died writing, and makes this invocation incomplete. A registry file
-replaced by another file (a different inode) also makes it incomplete, and is read again
-from the start. What it takes over:
+replaced by another file (a different inode), or truncated or rewritten in place (the
+last 512 bytes it consumed are no longer where it read them), also makes it incomplete
+and is read again from the start; a registry file it read that has since been removed
+makes it incomplete. What it takes over, separately for every file it reads and every
+read of a file from its start:
 - every open process record that is not provably gone is re-appended under this
   invocation with `adoptedFrom` and counted in `detachedJobs`;
 - another invocation still running (or one whose identity cannot be read) counts as one
@@ -528,8 +531,11 @@ from the start. What it takes over:
   counting unexaminable processes started since the earliest of those invocations; a
   token stops being copied into new headers only when its invocation is gone, no open
   record was adopted from that invocation, and two consecutive scans that could examine
-  every candidate process — tracked or not — found none carrying it (the header that
-  issued it still names it);
+  every candidate process — tracked or not — found none carrying it, with no counted
+  process exiting between those scans and their counts (the header that issued it still
+  names it, so consumers keep scanning it). Two scans that each miss a carrier that
+  forks and exits during its own scan could still drop a token whose child lives; only
+  this invocation's later headers and attestations lose it;
 - their incomplete state — a header that is not exactly `complete: true` with no reasons
   (every header, including a writer's repeated one), an `incomplete` record, an
   in-process job still open once its invocation is gone, an unparseable line — makes
@@ -560,11 +566,15 @@ daemon broker gets none). Each `invocation` header records `ownerMarker: { env:
 the shell keeps its environment, so `attest`, `quiesce_and_exit` and a hang-up capture
 scan processes that run as (or were started by) this user — real, effective or saved uid
 — for the token, record every live marked process the registry did not track as a
-`start` record with `discovered: true`, and count it in `detachedJobs`. `ownerScan` is
-`{ supported, sound, scanned, discovered, opaque }`: `opaque` lists candidate processes
-started since the invocation began whose environment could not be examined (including
-setuid descendants), which could hide the marker; `sound` is false if any exist, or if
-the OS hides processes from the scan (Linux `/proc` mounted with `hidepid`).
+`start` record with `discovered: true`, and count it in `detachedJobs`. A counted
+process (or another invocation) that exits between the scan and the count may have
+handed the marker to a child the scan did not see, so the scan and count are repeated
+while that happens; after 3 rounds that never settle, `sound` is false. `ownerScan` is
+`{ supported, sound, scanned, discovered, opaque }` (`discovered` summed over the
+rounds): `opaque` lists candidate processes started since the invocation began whose
+environment could not be examined (including setuid descendants), which could hide the
+marker; `sound` is false if any exist, if the OS hides processes from the scan (Linux
+`/proc` mounted with `hidepid`), or if the rounds never settled.
 
 Limits — the classes that can read as clear on Linux, where the scan is otherwise sound,
 so a consumer must keep its own host process census as a required cross-check:

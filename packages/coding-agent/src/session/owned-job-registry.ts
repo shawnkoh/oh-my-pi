@@ -167,12 +167,18 @@ interface RegistryFileRead {
 	/** Bytes consumed: every whole line before this offset has been fed to `reader`. */
 	offset: number;
 	problemsSeen: number;
+	/** Last bytes consumed (at most {@link CONSUMED_TAIL_BYTES}); a rewrite in place changes them. */
+	tail: Buffer;
+	/** Unique per read of a file from its start; scopes what was taken over from it. */
+	generation: number;
 	/** `dev:ino` of the file when last read; a change means it was replaced. */
 	identity?: string;
 	/** File size at the previous read when it ended in an unterminated line. */
 	tornAtSize?: number;
 }
 
+/** How many of the last consumed bytes a reader re-checks to detect a rewrite in place. */
+const CONSUMED_TAIL_BYTES = 512;
 export interface OwnedProcessInput {
 	kind: "process" | "service" | "internal";
 	pid: number;
@@ -264,7 +270,9 @@ export interface OwnerScanSummary {
 	/**
 	 * True when every same-user process that could carry this invocation's marker was
 	 * examined: none started since this invocation began had an unreadable or empty
-	 * environment (other than processes the registry already tracks by pid).
+	 * environment (other than processes the registry already tracks by pid). From
+	 * {@link OwnedJobRegistry.scanAndCount}, also false when counted processes kept exiting
+	 * between scan and count.
 	 */
 	sound: boolean;
 	scanned: number;
@@ -521,6 +529,8 @@ function tokenInvocation(token: string): { pid: number; startId: string | null }
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
+/** Scan-and-count rounds before an answer that never settled is reported unsound. */
+export const SCAN_SETTLE_ROUNDS = 3;
 
 export class OwnedJobRegistry {
 	static #instance: OwnedJobRegistry | undefined;
@@ -554,6 +564,10 @@ export class OwnedJobRegistry {
 	readonly #writerId = crypto.randomUUID();
 	/** Taken-over tokens the previous owner scan found prunable; pruned if the next agrees. */
 	#prunable = new Set<string>();
+	/** Counted processes and other invocations found gone so far (see {@link scanAndCount}). */
+	#vanished = 0;
+	/** Reads started so far (see {@link RegistryFileRead.generation}). */
+	#readGenerations = 0;
 	#monitor: NodeJS.Timeout | undefined;
 	#closed = false;
 	#ptyRuns = 0;
@@ -736,6 +750,7 @@ export class OwnedJobRegistry {
 			if (ownedProcessState(invocation.pid, invocation.startId) === "gone") {
 				this.#foreignInvocations.delete(key);
 				foreignEnded = true;
+				this.#vanished++;
 			} else {
 				alive++;
 			}
@@ -744,10 +759,39 @@ export class OwnedJobRegistry {
 		if (foreignEnded) this.refresh();
 		for (const [jobId, open] of this.#open) {
 			if (open.record.inProcess) continue;
-			if (ownedProcessState(open.record.pid, open.record.startId) === "gone") this.end(jobId, "exited");
-			else if (open.record.kind !== "internal") alive++;
+			if (ownedProcessState(open.record.pid, open.record.startId) === "gone") {
+				if (open.record.kind !== "internal") this.#vanished++;
+				this.end(jobId, "exited");
+			} else if (open.record.kind !== "internal") {
+				alive++;
+			}
 		}
 		return alive;
+	}
+
+	/**
+	 * Owner scan, then {@link liveProcessCount}, as one consistent answer. A tracked process (or
+	 * another invocation) that exits between the two can have handed the owner marker to a
+	 * child the scan did not see yet, so the round is repeated while anything counted at scan
+	 * time vanished before the count. After {@link SCAN_SETTLE_ROUNDS} unsettled rounds the
+	 * scan is reported unsound. Taken-over tokens are pruned only on a settled round.
+	 */
+	scanAndCount(): { scan: OwnerScanSummary; live: number } {
+		let discovered = 0;
+		for (let round = 1; ; round++) {
+			const vanishedBefore = this.#vanished;
+			const { summary, raw } = this.#scan();
+			discovered += summary.discovered;
+			const live = this.liveProcessCount();
+			if (this.#vanished === vanishedBefore) {
+				this.#pruneAfter(raw);
+				return { scan: { ...summary, discovered }, live };
+			}
+			this.#prunable.clear();
+			if (round === SCAN_SETTLE_ROUNDS) {
+				return { scan: { ...summary, sound: false, discovered }, live };
+			}
+		}
 	}
 
 	/**
@@ -768,9 +812,16 @@ export class OwnedJobRegistry {
 	 * Scan same-user processes for this invocation's owner marker and every marker it took
 	 * over from other invocations of a bound file. Every live marked process the registry
 	 * does not already track is recorded as a discovered `process` (and is then counted by
-	 * {@link liveProcessCount}). Synchronous; a few tens of milliseconds.
+	 * {@link liveProcessCount}). Synchronous; a few tens of milliseconds. Use
+	 * {@link scanAndCount} when the count must agree with the scan.
 	 */
 	scanOwnedProcesses(): OwnerScanSummary {
+		const { summary, raw } = this.#scan();
+		this.#pruneAfter(raw);
+		return summary;
+	}
+
+	#scan(): { summary: OwnerScanSummary; raw: MarkedProcessScan | undefined } {
 		this.refresh();
 		const invocation = currentInvocation();
 		const inherited = [...this.#inheritedMarkers.values()];
@@ -781,8 +832,7 @@ export class OwnedJobRegistry {
 			scan = scanProcessesByEnv(OWNER_MARKER_ENV, tokens, since);
 		} catch (error) {
 			logger.warn("Owner-marker scan failed", { error: String(error) });
-			this.#prunable.clear();
-			return { supported: false, sound: false, scanned: 0, discovered: 0, opaque: [] };
+			return { summary: { supported: false, sound: false, scanned: 0, discovered: 0, opaque: [] }, raw: undefined };
 		}
 		let discovered = 0;
 		for (const proc of scan.processes) {
@@ -802,11 +852,17 @@ export class OwnedJobRegistry {
 			.filter(proc => !this.#tracks(proc.pid, proc.startId ?? null))
 			.map(proc => ({ pid: proc.pid, command: proc.command }));
 		const sound = scan.supported && !scan.hidden && opaque.length === 0;
-		// Pruning needs the raw scan clean: a tracked process whose environment cannot be read
-		// is counted, but it may still carry a token and hand it to a child later.
-		if (scan.supported && !scan.hidden && scan.opaque.length === 0) this.#pruneInheritedMarkers(scan);
+		return { summary: { supported: scan.supported, sound, scanned: scan.scanned, discovered, opaque }, raw: scan };
+	}
+
+	/**
+	 * Pruning needs the raw scan clean: a tracked process whose environment cannot be read is
+	 * counted, but it may still carry a token and hand it to a child later. Any other scan
+	 * breaks the run of consecutive clean scans.
+	 */
+	#pruneAfter(scan: MarkedProcessScan | undefined): void {
+		if (scan?.supported && !scan.hidden && scan.opaque.length === 0) this.#pruneInheritedMarkers(scan);
 		else this.#prunable.clear();
-		return { supported: scan.supported, sound, scanned: scan.scanned, discovered, opaque };
 	}
 
 	/**
@@ -941,36 +997,41 @@ export class OwnedJobRegistry {
 	/**
 	 * Parse what `file` gained since the last read (everything on the first read) and take
 	 * over what other writers put there. Only whole lines are consumed; a line another process
-	 * is still appending is read next time. A file replaced by another one is read again from
-	 * the start. Returns the records to adopt.
+	 * is still appending is read next time. A file replaced by another one, or truncated or
+	 * rewritten in place, is read again from the start; a file that was read and then removed
+	 * makes the registry incomplete. Returns the records to adopt.
 	 */
 	#readTail(file: string): OwnedJobStartRecord[] {
-		let state = this.#readers.get(file);
-		if (!state) {
-			state = { reader: new RegistryReader(), offset: 0, problemsSeen: 0 };
-			this.#readers.set(file, state);
-		}
+		let state = this.#readers.get(file) ?? this.#newRead(file);
 		let fd: number;
 		try {
 			fd = fs.openSync(file, "r");
 		} catch (error) {
 			if (!isEnoent(error)) this.#noteIncomplete("a registry file could not be read");
+			// Records this reader consumed (this invocation's own included) are gone with it.
+			else if (state.identity !== undefined) {
+				this.#noteIncomplete("a registry file this invocation read was removed");
+			}
 			return [];
 		}
 		try {
 			const stat = fs.fstatSync(fd);
 			state = this.#checkFileIdentity(file, state, stat);
 			const size = stat.size;
-			if (size < state.offset) {
-				this.#noteIncomplete("the registry file shrank while this invocation had it open");
-				state.offset = size;
-			} else if (size > state.offset) {
+			if (state.offset > 0 && !this.#stillHoldsConsumed(fd, state, size)) {
+				// Truncated or rewritten in place: what was consumed may no longer be in the file.
+				this.#noteIncomplete("the registry file was rewritten while this invocation had it open");
+				state = this.#newRead(file, state.identity);
+			}
+			if (size > state.offset) {
 				const bytes = Buffer.allocUnsafe(size - state.offset);
 				const read = fs.readSync(fd, bytes, 0, bytes.byteLength, state.offset);
 				const complete = bytes.subarray(0, read).lastIndexOf(0x0a) + 1;
 				if (complete > 0) {
 					state.reader.feed(bytes.subarray(0, complete).toString("utf8"));
 					state.offset += complete;
+					const consumed = Buffer.concat([state.tail, bytes.subarray(0, complete)]);
+					state.tail = Buffer.from(consumed.subarray(Math.max(0, consumed.byteLength - CONSUMED_TAIL_BYTES)));
 				}
 			}
 			const torn = size > state.offset;
@@ -987,14 +1048,37 @@ export class OwnedJobRegistry {
 		} finally {
 			fs.closeSync(fd);
 		}
-		const { reader } = state;
+		const { reader, generation } = state;
 		for (const problem of reader.problems.slice(state.problemsSeen)) this.#noteIncomplete(inheritedReason(problem));
 		state.problemsSeen = reader.problems.length;
 		const adopted: OwnedJobStartRecord[] = [];
 		reader.segments.forEach((segment, index) => {
-			if (segment.header.writer !== this.#writerId) adopted.push(...this.#takeOver(segment, index));
+			if (segment.header.writer !== this.#writerId)
+				adopted.push(...this.#takeOver(segment, `${generation}:${index}`));
 		});
 		return adopted;
+	}
+
+	/** Whether the last bytes this reader consumed are still where it read them. */
+	#stillHoldsConsumed(fd: number, state: RegistryFileRead, size: number): boolean {
+		if (size < state.offset) return false;
+		const length = state.tail.byteLength;
+		const current = Buffer.alloc(length);
+		return fs.readSync(fd, current, 0, length, state.offset - length) === length && current.equals(state.tail);
+	}
+
+	/** A fresh read of `file` from its start, with its own take-over scope. */
+	#newRead(file: string, identity?: string): RegistryFileRead {
+		const state: RegistryFileRead = {
+			reader: new RegistryReader(),
+			offset: 0,
+			problemsSeen: 0,
+			tail: Buffer.alloc(0),
+			generation: ++this.#readGenerations,
+			identity,
+		};
+		this.#readers.set(file, state);
+		return state;
 	}
 
 	/**
@@ -1006,8 +1090,7 @@ export class OwnedJobRegistry {
 		const identity = `${stat.dev}:${stat.ino}`;
 		if (state.identity !== undefined && state.identity !== identity) {
 			this.#noteIncomplete("the registry file was replaced while this invocation had it open");
-			state = { reader: new RegistryReader(), offset: 0, problemsSeen: 0 };
-			this.#readers.set(file, state);
+			return this.#newRead(file, identity);
 		}
 		state.identity = identity;
 		return state;
@@ -1031,14 +1114,15 @@ export class OwnedJobRegistry {
 	 * - while it is still running (or cannot be examined) it counts as live work;
 	 * - every open OS-process record that is not provably gone is returned for adoption
 	 *   (re-appended under this invocation with `adoptedFrom`).
-	 * Idempotent per segment (`index` in file order) and record: re-reading acts only on what
-	 * is new.
+	 * Idempotent per segment and record within one read of one file (`scope`: the read's
+	 * generation and the segment's index): re-reading acts only on what is new, and the same
+	 * writer's segment in another file, or in a file read again from its start, is its own.
 	 */
-	#takeOver(segment: RegistrySegment, index: number): OwnedJobStartRecord[] {
+	#takeOver(segment: RegistrySegment, scope: string): OwnedJobStartRecord[] {
 		const me = currentInvocation();
 		const writer = segment.header.invocation;
 		const key = `${writer.pid}:${writer.startId ?? "unknown"}:${segment.header.writer ?? ""}`;
-		const segmentKey = `${key}:${index}`;
+		const segmentKey = `${scope}:${key}`;
 		if (!this.#handledForeign.has(segmentKey)) {
 			this.#handledForeign.add(segmentKey);
 			const ownToken = ownerToken();
