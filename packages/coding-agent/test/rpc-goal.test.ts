@@ -231,6 +231,39 @@ describe("RPC goal command", () => {
 		expect(fresh.dumpTools?.map(tool => tool.name)).not.toContain("goal");
 	}, 30_000);
 
+	test("an extension session change aborts the detached run's prompt; the command's own result is unaffected", async () => {
+		const rpc = await start({ continuation: false, script: "slow" });
+		const results = new Map<string, string>();
+		const unsubscribe = rpc.onPromptResult(result => {
+			if (result.id) results.set(result.id, result.status);
+		});
+		const started = Promise.withResolvers<void>();
+		const unsubscribeEvents = rpc.onEvent(event => {
+			if (event.type === "agent_start") started.resolve();
+		});
+		try {
+			const first = await rpc.prompt("first, stalls");
+			await withTimeout(started.promise, 10_000, "First run never started");
+			// The command then starts a run of its own in the new session.
+			await rpc.promptAndWait("/goaltest-new-session hello from the new session");
+			// The detached run never yields; its prompt must still be closed, as aborted.
+			await withTimeout(
+				(async () => {
+					while (!results.has(first)) await Bun.sleep(20);
+				})(),
+				10_000,
+				"The detached run's prompt was never reported",
+			);
+			expect(results.get(first)).toBe("aborted");
+			const state = await rpc.getState();
+			expect(state.isSettled).toBe(true);
+		} finally {
+			unsubscribe();
+			unsubscribeEvents();
+		}
+		expect([...results.values()].filter(status => status !== "aborted")).toEqual(["completed"]);
+	}, 30_000);
+
 	test("prompt_result reports the session unsettled when a goal continuation follows the prompt", async () => {
 		const rpc = await start({ continuation: true, script: "idle" });
 		const firstSettle = Promise.withResolvers<void>();

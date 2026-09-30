@@ -1035,11 +1035,19 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		// Extension-initiated session changes get the same goal quiesce/reattach as the commands below.
 		wrapSessionChange: async <T extends { cancelled: boolean }>(change: () => Promise<T>): Promise<T> => {
 			await goalController.beginSessionChange();
+			let result: T | undefined;
 			try {
-				return await change();
+				result = await change();
+				return result;
 			} finally {
 				// Reattaches only if the session actually changed, then re-checks settlement.
 				await goalController.endSessionChange();
+				if (result && !result.cancelled) {
+					// As for the host's own session commands: the detached run never yields,
+					// so close the prompts it was answering and re-check settlement.
+					promptResults.abortOpen();
+					void settleWatcher.check();
+				}
 			}
 		},
 		reportSendError: (action, err) => {

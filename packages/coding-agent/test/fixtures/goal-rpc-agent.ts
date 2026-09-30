@@ -44,9 +44,10 @@ const { session } = await createAgentSession({
 	extensions: [
 		pi => {
 			pi.registerCommand("goaltest-new-session", {
-				description: "start a new session from an extension",
-				handler: async (_args, ctx) => {
+				description: "start a new session from an extension; any argument text is then sent as a prompt",
+				handler: async (args, ctx) => {
 					await ctx.newSession();
+					if (args.trim()) pi.sendUserMessage(args.trim());
 				},
 			});
 			pi.registerCommand("goaltest-navigate-here", {

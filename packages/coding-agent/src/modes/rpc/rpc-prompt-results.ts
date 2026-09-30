@@ -111,14 +111,17 @@ export class RpcPromptResults {
 	}
 
 	/**
-	 * Mark every open prompt aborted after a session transition. Transitions
-	 * detach the agent before aborting it, so the interrupted run never
-	 * publishes a terminal `agent_end` for them.
+	 * Mark every open prompt aborted after a session transition (host command or
+	 * extension). Transitions detach the agent before aborting it, so the
+	 * interrupted run never publishes a terminal `agent_end` for them.
 	 */
 	abortOpen(): void {
 		for (const [ticket, open] of this.#open) {
 			if (open.waiting) this.#report(ticket, true, { status: "aborted" });
-			else open.ownOutcome ??= { status: "aborted" };
+			// Only a prompt whose run already started was detached. A command still
+			// running (for example the extension command that made the change) keeps
+			// its ticket for the run it starts in the new session.
+			else if (this.#agentStarts > open.startsAtBegin) open.ownOutcome ??= { status: "aborted" };
 		}
 	}
 
