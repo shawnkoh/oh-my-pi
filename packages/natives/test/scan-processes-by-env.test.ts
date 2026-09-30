@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { processStartTime, scanProcessesByEnv } from "../native/index.js";
+import { processIdentity, processStartTime, scanProcessesByEnv } from "../native/index.js";
 
 function isAlive(pid: number): boolean {
 	try {
@@ -54,6 +54,7 @@ describe.skipIf(process.platform === "win32")("scanProcessesByEnv", () => {
 			expect(found.ppid).not.toBe(launcherPid);
 			expect(found.startTime).toBeNumber();
 			expect(processStartTime(pid)).toBe(found.startTime!);
+			expect(found.startId).toBe(processIdentity(pid).startId!);
 			expect(scanProcessesByEnv("OMP_OWNER", `${token}0`).processes).toEqual([]);
 		} finally {
 			if (isAlive(pid)) process.kill(pid, "SIGKILL");
@@ -62,19 +63,31 @@ describe.skipIf(process.platform === "win32")("scanProcessesByEnv", () => {
 
 	it("sees a marked /bin/sleep daemon on Linux; macOS withholds its environment", async () => {
 		const token = `omp1:sleep:${process.pid}`;
+		// Every process the launcher starts is newer than this test process.
+		const since = processIdentity(process.pid).startId!;
 		// `$!` is the sleeper's pid: the forked child that execs /bin/sleep.
-		const { pid } = await launchDetached("( /bin/sleep 30 </dev/null >/dev/null & echo $! ) ; exit 0", token);
+		const { pid } = await launchDetached("( /bin/sleep 7414 </dev/null >/dev/null & echo $! ) ; exit 0", token);
 		try {
 			expect(isAlive(pid)).toBe(true);
-			const scan = scanProcessesByEnv("OMP_OWNER", token);
+			const scan = scanProcessesByEnv("OMP_OWNER", token, since);
 			if (process.platform === "darwin") {
 				expect(scan.processes.map(entry => entry.pid)).not.toContain(pid);
 				expect(scan.redacted).toBeGreaterThan(0);
+				// Hidden, but started after `since`: listed as opaque with its start id.
+				const opaque = scan.opaque.find(entry => entry.pid === pid);
+				expect(opaque?.startId).toBe(processIdentity(pid).startId!);
+				// A later `since` excludes it.
+				const later = scanProcessesByEnv("OMP_OWNER", token, (BigInt(opaque!.startId!) + 1n).toString());
+				expect(later.opaque.map(entry => entry.pid)).not.toContain(pid);
 			} else {
 				expect(scan.processes.map(entry => entry.pid)).toContain(pid);
 			}
 		} finally {
 			if (isAlive(pid)) process.kill(pid, "SIGKILL");
 		}
+	});
+
+	it("rejects an opaqueSince that is not a start id", () => {
+		expect(() => scanProcessesByEnv("OMP_OWNER", "x", "1.5")).toThrow(/opaqueSince/);
 	});
 });

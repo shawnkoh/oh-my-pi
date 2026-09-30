@@ -247,6 +247,11 @@ mod platform {
 		pub fn start_time_unix_secs(&self) -> Option<u64> {
 			start_ticks_to_unix_secs(self.start_time)
 		}
+
+		/// `/proc/<pid>/stat` start ticks since boot, pinned at open.
+		pub const fn start_id(&self) -> u64 {
+			self.start_time
+		}
 	}
 
 	/// Convert a `/proc/<pid>/stat` start tick count to Unix epoch seconds
@@ -316,21 +321,47 @@ mod platform {
 		parse_stat(&content).map(|stat| stat.start_ticks)
 	}
 
+	/// Process group of `pid`, zombies included (their `stat` stays readable
+	/// until reaped).
+	pub fn process_group_of(pid: i32) -> Option<i32> {
+		let content = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+		parse_stat(&content)
+			.map(|stat| stat.pgrp)
+			.filter(|pgrp| *pgrp > 0)
+	}
+
+	pub fn process_identity(pid: i32) -> super::ProcessIdentity {
+		match fs::read_to_string(format!("/proc/{pid}/stat")) {
+			Ok(content) => match parse_stat(&content) {
+				Some(stat) if matches!(stat.state, 'Z' | 'X') => super::ProcessIdentity::GONE,
+				Some(stat) => super::ProcessIdentity::running(
+					stat.start_ticks,
+					start_ticks_to_unix_secs(stat.start_ticks),
+				),
+				None => super::unreadable_unless_gone(pid),
+			},
+			Err(err) if matches!(err.raw_os_error(), Some(libc::EACCES | libc::EPERM)) => {
+				super::ProcessIdentity::UNREADABLE
+			},
+			// ENOENT/ESRCH usually mean gone, but `hidepid` hides live processes
+			// the same way: let `kill(pid, 0)` decide.
+			Err(_) => super::unreadable_unless_gone(pid),
+		}
+	}
+
 	/// Effective uid from the `Uid:` line of `/proc/<pid>/status`.
 	fn status_effective_uid(status: &str) -> Option<libc::uid_t> {
 		let ids = status.lines().find_map(|line| line.strip_prefix("Uid:"))?;
 		ids.split_whitespace().nth(1)?.parse().ok()
 	}
 
-	pub fn scan_processes_by_env(
-		name: &str,
-		token: &str,
-		opaque_since: Option<u64>,
-	) -> super::MarkedProcessScan {
+	/// Calls `visit` with the pid and parsed stat of every live (non-zombie)
+	/// process owned by the caller's effective uid, except the caller itself.
+	/// Returns false when the process table (`/proc`) cannot be listed.
+	fn for_each_same_user_process(mut visit: impl FnMut(i32, &Stat<'_>)) -> bool {
 		let Ok(entries) = fs::read_dir("/proc") else {
-			return super::MarkedProcessScan::default();
+			return false;
 		};
-		let mut scan = super::MarkedProcessScan { supported: true, ..Default::default() };
 		// SAFETY: `geteuid` takes no arguments and cannot fail.
 		let euid = unsafe { libc::geteuid() };
 		let self_pid = std::process::id();
@@ -345,6 +376,9 @@ mod platform {
 			if pid == self_pid {
 				continue;
 			}
+			let Ok(pid) = i32::try_from(pid) else {
+				continue;
+			};
 			// `status` and `stat` are world-readable; failing to read them
 			// means the process exited.
 			let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else {
@@ -359,32 +393,53 @@ mod platform {
 			let Some(stat) = parse_stat(&stat_content) else {
 				continue;
 			};
-			// Zombies have released their memory, so no environment remains.
 			if matches!(stat.state, 'Z' | 'X') {
 				continue;
 			}
+			visit(pid, &stat);
+		}
+		true
+	}
+
+	/// Live same-user processes (except the caller) whose process group is in
+	/// `groups` as `(pid, pgid)`, or `None` when the process table cannot be
+	/// listed.
+	pub fn list_group_members(groups: &HashSet<i32>) -> Option<Vec<(i32, i32)>> {
+		let mut members = Vec::new();
+		for_each_same_user_process(|pid, stat| {
+			if groups.contains(&stat.pgrp) {
+				members.push((pid, stat.pgrp));
+			}
+		})
+		.then_some(members)
+	}
+
+	pub fn scan_processes_by_env(
+		name: &str,
+		token: &str,
+		opaque_since: Option<u64>,
+	) -> super::MarkedProcessScan {
+		let mut scan = super::MarkedProcessScan { supported: true, ..Default::default() };
+		let listed = for_each_same_user_process(|pid, stat| {
+			// Zombies, skipped by the walk, have released their memory, so no
+			// environment remains.
 			scan.scanned += 1;
-			let Ok(pid) = i32::try_from(pid) else {
-				continue;
-			};
 			let entry = super::MarkedProcess {
 				pid,
 				ppid: stat.ppid,
 				pgid: Some(stat.pgrp).filter(|pgrp| *pgrp > 0),
 				start_time: start_ticks_to_unix_secs(stat.start_ticks),
+				start_id: Some(stat.start_ticks),
 				command: stat.comm.to_owned(),
 			};
-			let environ = match fs::read(format!("/proc/{pid}/environ")) {
-				Ok(environ) => environ,
-				Err(_) => {
-					// Non-dumpable processes (setuid launches, `PR_SET_DUMPABLE 0`)
-					// deny the read; a vanished directory means it simply exited.
-					if fs::exists(format!("/proc/{pid}")).unwrap_or(true) {
-						scan.unreadable += 1;
-						scan.push_opaque(entry, opaque_since);
-					}
-					continue;
-				},
+			let Ok(environ) = fs::read(format!("/proc/{pid}/environ")) else {
+				// Non-dumpable processes (setuid launches, `PR_SET_DUMPABLE 0`)
+				// deny the read; a vanished directory means it simply exited.
+				if fs::exists(format!("/proc/{pid}")).unwrap_or(true) {
+					scan.unreadable += 1;
+					scan.push_opaque(entry, opaque_since);
+				}
+				return;
 			};
 			let mut env = environ
 				.split(|byte| *byte == 0)
@@ -392,14 +447,17 @@ mod platform {
 			let Some(first) = env.next() else {
 				scan.redacted += 1;
 				scan.push_opaque(entry, opaque_since);
-				continue;
+				return;
 			};
-			if !super::env_has_token(std::iter::once(first).chain(env), name, token) {
-				continue;
+			if super::env_has_token(std::iter::once(first).chain(env), name, token) {
+				scan.processes.push(entry);
 			}
-			scan.processes.push(entry);
+		});
+		if listed {
+			scan
+		} else {
+			super::MarkedProcessScan::default()
 		}
-		scan
 	}
 
 	fn open_pidfd(pid: i32) -> Option<Arc<OwnedFd>> {
@@ -506,6 +564,11 @@ mod platform {
 		#[allow(clippy::unnecessary_wraps, reason = "matches the fallible Linux/Windows signature")]
 		pub const fn start_time_unix_secs(&self) -> Option<u64> {
 			Some(self.start_tvsec)
+		}
+
+		/// Start microseconds since the epoch, pinned at open.
+		pub const fn start_id(&self) -> u64 {
+			start_id(self.start_tvsec, self.start_tvusec)
 		}
 
 		pub const fn pid(&self) -> i32 {
@@ -643,29 +706,28 @@ mod platform {
 
 	const PROC_PIDPATHINFO_MAXSIZE: usize = 4096;
 
-	/// Snapshot every pid currently visible to `proc_listallpids`. macOS
-	/// silently truncates the second call to the supplied buffer size even
-	/// when the sizing query reports more PIDs available, so the buffer is
-	/// padded well beyond the reported count.
-	fn snapshot_all_pids() -> Vec<i32> {
+	/// Snapshot every pid currently visible to `proc_listallpids`, or `None`
+	/// when the table cannot be listed. macOS silently truncates the second
+	/// call to the supplied buffer size even when the sizing query reports
+	/// more PIDs available, so the buffer is padded well beyond the reported
+	/// count.
+	fn snapshot_all_pids() -> Option<Vec<i32>> {
 		// SAFETY: Passing a null buffer with size 0 is the documented libproc
 		// query form for obtaining the PID count; libproc
 		// does not dereference the null pointer in this mode.
 		let reported = unsafe { proc_listallpids(ptr::null_mut(), 0) };
-		let Some((cap, byte_capacity)) = super::macos_pid_buffer_size(reported) else {
-			return Vec::new();
-		};
+		let (cap, byte_capacity) = super::macos_pid_buffer_size(reported)?;
 		let mut buffer = vec![0i32; cap];
 		// SAFETY: `buffer` is valid for `buffer.len() * size_of::<i32>()` bytes
 		// and is properly aligned for `i32`; libproc writes at most the
 		// supplied size.
 		let actual = unsafe { proc_listallpids(buffer.as_mut_ptr(), byte_capacity) };
 		if actual <= 0 {
-			return Vec::new();
+			return None;
 		}
 		let pid_count = (actual as usize).min(buffer.len());
 		buffer.truncate(pid_count);
-		buffer
+		Some(buffer)
 	}
 
 	/// Build a `ppid -> [pids]` map from a one-shot scan of `proc_listallpids`.
@@ -673,7 +735,7 @@ mod platform {
 	/// Used as the foundation of `Process::children` and `Process::descendants`
 	/// on macOS where `proc_listchildpids` returns no children for self-queries.
 	pub(super) fn build_process_tree() -> HashMap<i32, Vec<i32>> {
-		let pids = snapshot_all_pids();
+		let pids = snapshot_all_pids().unwrap_or_default();
 		let mut tree: HashMap<i32, Vec<i32>> = HashMap::with_capacity(pids.len() / 2);
 		for pid in pids {
 			if pid <= 0 {
@@ -695,7 +757,7 @@ mod platform {
 
 	/// Find processes whose libproc-reported executable path equals `target`.
 	pub fn find_by_path(target: &str) -> Vec<Process> {
-		let pids = snapshot_all_pids();
+		let pids = snapshot_all_pids().unwrap_or_default();
 		let mut path_buf = vec![0u8; PROC_PIDPATHINFO_MAXSIZE];
 		let mut matches = Vec::new();
 		for pid in pids {
@@ -732,7 +794,14 @@ mod platform {
 		matches
 	}
 
+	/// `proc_bsdinfo` of a live (non-zombie) `pid`.
 	fn read_bsdinfo(pid: i32) -> Option<libc::proc_bsdinfo> {
+		read_bsdinfo_with(pid, 0).ok()
+	}
+
+	/// `PROC_PIDTBSDINFO` for `pid`; errors carry the errno. `arg` 1 also
+	/// finds zombies (xnu's `findzomb`), which `arg` 0 reports as missing.
+	fn read_bsdinfo_with(pid: i32, arg: u64) -> Result<libc::proc_bsdinfo, i32> {
 		// SAFETY: `proc_bsdinfo` is a plain C data struct. Zero initialization is
 		// valid because every field is an integer or fixed-size integer array,
 		// and libproc fully overwrites the fields it reports on a successful
@@ -746,15 +815,89 @@ mod platform {
 			libc::proc_pidinfo(
 				pid,
 				libc::PROC_PIDTBSDINFO,
-				0,
+				arg,
 				(&raw mut info).cast::<std::ffi::c_void>(),
 				size_of::<libc::proc_bsdinfo>() as i32,
 			)
 		};
 		if actual < size_of::<libc::proc_bsdinfo>() as i32 {
-			return None;
+			return Err(if actual <= 0 { last_errno() } else { libc::EIO });
 		}
-		Some(info)
+		Ok(info)
+	}
+
+	/// Start microseconds since the epoch: the macOS start id.
+	const fn start_id(tvsec: u64, tvusec: u64) -> u64 {
+		tvsec.saturating_mul(1_000_000).saturating_add(tvusec)
+	}
+
+	/// Process group of `pid`, zombies included.
+	pub fn process_group_of(pid: i32) -> Option<i32> {
+		let info = read_bsdinfo_with(pid, 1).ok()?;
+		i32::try_from(info.pbi_pgid).ok().filter(|pgid| *pgid > 0)
+	}
+
+	pub fn process_identity(pid: i32) -> super::ProcessIdentity {
+		match read_bsdinfo_with(pid, 0) {
+			Ok(info) if info.pbi_status == libc::SZOMB => super::ProcessIdentity::GONE,
+			Ok(info) if i32::try_from(info.pbi_pid).ok() == Some(pid) => {
+				super::ProcessIdentity::running(
+					start_id(info.pbi_start_tvsec, info.pbi_start_tvusec),
+					Some(info.pbi_start_tvsec),
+				)
+			},
+			Ok(_) => super::ProcessIdentity::UNREADABLE,
+			Err(libc::ESRCH) => {
+				// A zombie is invisible to the plain lookup; the zombie-aware one
+				// tells it apart from a live process we may not inspect.
+				if read_bsdinfo_with(pid, 1).is_ok_and(|info| info.pbi_status == libc::SZOMB) {
+					super::ProcessIdentity::GONE
+				} else {
+					super::unreadable_unless_gone(pid)
+				}
+			},
+			Err(_) => super::unreadable_unless_gone(pid),
+		}
+	}
+
+	/// Calls `visit` with the pid and `proc_bsdinfo` of every live (non-zombie)
+	/// process owned by the caller's effective uid, except the caller itself.
+	/// Returns false when the process table cannot be listed.
+	fn for_each_same_user_process(mut visit: impl FnMut(i32, &libc::proc_bsdinfo)) -> bool {
+		let Some(pids) = snapshot_all_pids() else {
+			return false;
+		};
+		// SAFETY: `geteuid`/`getpid` take no arguments and cannot fail.
+		let (euid, self_pid) = unsafe { (libc::geteuid(), libc::getpid()) };
+		for pid in pids {
+			if pid <= 0 || pid == self_pid {
+				continue;
+			}
+			// Fails for exited processes and zombies (and for some other users'
+			// processes, which are filtered out anyway).
+			let Some(info) = read_bsdinfo(pid) else {
+				continue;
+			};
+			if info.pbi_uid == euid {
+				visit(pid, &info);
+			}
+		}
+		true
+	}
+
+	/// Live same-user processes (except the caller) whose process group is in
+	/// `groups` as `(pid, pgid)`, or `None` when the process table cannot be
+	/// listed.
+	pub fn list_group_members(groups: &HashSet<i32>) -> Option<Vec<(i32, i32)>> {
+		let mut members = Vec::new();
+		for_each_same_user_process(|pid, info| {
+			if let Ok(pgid) = i32::try_from(info.pbi_pgid)
+				&& groups.contains(&pgid)
+			{
+				members.push((pid, pgid));
+			}
+		})
+		.then_some(members)
 	}
 
 	fn process_args(pid: i32) -> Vec<String> {
@@ -884,28 +1027,16 @@ mod platform {
 		opaque_since: Option<u64>,
 	) -> super::MarkedProcessScan {
 		let mut scan = super::MarkedProcessScan { supported: true, ..Default::default() };
-		// SAFETY: `geteuid`/`getpid` take no arguments and cannot fail.
-		let (euid, self_pid) = unsafe { (libc::geteuid(), libc::getpid()) };
 		let mut buffer = Vec::new();
-		for pid in snapshot_all_pids() {
-			if pid <= 0 || pid == self_pid {
-				continue;
-			}
-			// Fails for exited processes and zombies (and for some other users'
-			// processes, which are filtered out anyway).
-			let Some(info) = read_bsdinfo(pid) else {
-				continue;
-			};
-			if info.pbi_uid != euid {
-				continue;
-			}
+		let listed = for_each_same_user_process(|pid, info| {
 			scan.scanned += 1;
 			let entry = super::MarkedProcess {
 				pid,
 				ppid: i32::try_from(info.pbi_ppid).unwrap_or(0),
 				pgid: i32::try_from(info.pbi_pgid).ok().filter(|pgid| *pgid > 0),
 				start_time: Some(info.pbi_start_tvsec),
-				command: bsdinfo_command(&info),
+				start_id: Some(start_id(info.pbi_start_tvsec, info.pbi_start_tvusec)),
+				command: bsdinfo_command(info),
 			};
 			let Ok(len) = read_procargs(pid, &mut buffer) else {
 				let still_live = read_bsdinfo(pid).is_some_and(|now| {
@@ -916,12 +1047,12 @@ mod platform {
 					scan.unreadable += 1;
 					scan.push_opaque(entry, opaque_since);
 				}
-				continue;
+				return;
 			};
 			let Some((_, env_region)) = split_procargs(&buffer[..len]) else {
 				scan.unreadable += 1;
 				scan.push_opaque(entry, opaque_since);
-				continue;
+				return;
 			};
 			// The kernel withholds the environment of Apple platform binaries
 			// (`/bin/sh`, `zsh`, `sleep`, …) from non-root callers: the block
@@ -932,14 +1063,17 @@ mod platform {
 			let Some(first) = env.next() else {
 				scan.redacted += 1;
 				scan.push_opaque(entry, opaque_since);
-				continue;
+				return;
 			};
-			if !super::env_has_token(std::iter::once(first).chain(env), name, token) {
-				continue;
+			if super::env_has_token(std::iter::once(first).chain(env), name, token) {
+				scan.processes.push(entry);
 			}
-			scan.processes.push(entry);
+		});
+		if listed {
+			scan
+		} else {
+			super::MarkedProcessScan::default()
 		}
-		scan
 	}
 }
 #[cfg(target_os = "windows")]
@@ -1029,6 +1163,7 @@ mod platform {
 	const PROCESS_REFERENCE_ACCESS: u32 =
 		PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE;
 	const WAIT_OBJECT_0: u32 = 0;
+	const ERROR_INVALID_PARAMETER: u32 = 87;
 
 	#[link(name = "kernel32")]
 	unsafe extern "system" {
@@ -1060,6 +1195,7 @@ mod platform {
 			lpNumberOfBytesRead: *mut usize,
 		) -> i32;
 		fn LocalFree(hMem: Handle) -> Handle;
+		fn GetLastError() -> u32;
 	}
 
 	#[link(name = "shell32")]
@@ -1130,11 +1266,58 @@ mod platform {
 		/// Start time pinned at open, in Unix epoch seconds (floor). The
 		/// creation `FILETIME` counts 100ns intervals since 1601-01-01 UTC.
 		pub const fn start_time_unix_secs(&self) -> Option<u64> {
-			const FILETIME_TICKS_PER_SEC: u64 = 10_000_000;
-			const UNIX_EPOCH_OFFSET_SECS: u64 = 11_644_473_600;
-			(self.creation_time / FILETIME_TICKS_PER_SEC).checked_sub(UNIX_EPOCH_OFFSET_SECS)
+			filetime_to_unix_secs(self.creation_time)
 		}
 
+		/// Raw creation `FILETIME`, pinned at open.
+		pub const fn start_id(&self) -> u64 {
+			self.creation_time
+		}
+	}
+
+	/// A creation `FILETIME` (100ns intervals since 1601-01-01 UTC) as Unix
+	/// epoch seconds (floor).
+	const fn filetime_to_unix_secs(filetime: u64) -> Option<u64> {
+		const FILETIME_TICKS_PER_SEC: u64 = 10_000_000;
+		const UNIX_EPOCH_OFFSET_SECS: u64 = 11_644_473_600;
+		(filetime / FILETIME_TICKS_PER_SEC).checked_sub(UNIX_EPOCH_OFFSET_SECS)
+	}
+
+	pub fn process_identity(pid: i32) -> super::ProcessIdentity {
+		let Ok(pid_u32) = u32::try_from(pid) else {
+			return super::ProcessIdentity::GONE;
+		};
+		let Some(handle) = open_process(pid_u32, PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE)
+		else {
+			// SAFETY: reads this thread's last-error value; no arguments.
+			let error = unsafe { GetLastError() };
+			// `OpenProcess` rejects a pid naming no process object with
+			// ERROR_INVALID_PARAMETER; anything else (access denied, …) leaves
+			// a live process we cannot inspect.
+			return if error == ERROR_INVALID_PARAMETER {
+				super::ProcessIdentity::GONE
+			} else {
+				super::ProcessIdentity::UNREADABLE
+			};
+		};
+		// SAFETY: `handle` was opened with `SYNCHRONIZE`; zero timeout probes.
+		if unsafe { WaitForSingleObject(handle.as_raw(), 0) } == WAIT_OBJECT_0 {
+			// Exited; the object lingers only because a handle is still open.
+			return super::ProcessIdentity::GONE;
+		}
+		match process_creation_time(handle.as_raw()) {
+			Some(created) => super::ProcessIdentity::running(created, filetime_to_unix_secs(created)),
+			None => super::ProcessIdentity::UNREADABLE,
+		}
+	}
+
+	/// Windows has no process groups: every group is empty.
+	#[allow(clippy::unnecessary_wraps, reason = "matches the fallible Unix signature")]
+	pub const fn list_group_members(_groups: &HashSet<i32>) -> Option<Vec<(i32, i32)>> {
+		Some(Vec::new())
+	}
+
+	impl Process {
 		pub const fn pid(&self) -> i32 {
 			self.pid
 		}
@@ -1560,6 +1743,71 @@ pub fn process_start_time(pid: i32) -> Option<u64> {
 	Process::from_pid(pid)?.start_time_unix_secs()
 }
 
+/// Whether a pid names a live process; see [`ProcessIdentity`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityState {
+	/// The process exists and is not a zombie.
+	Running,
+	/// No such process, or only a zombie/dead entry remains.
+	Gone,
+	/// The process exists (or cannot be proven gone) but its identity cannot
+	/// be read: permission denied, `hidepid`, non-dumpable, …
+	Unreadable,
+}
+
+/// Clock-independent identity of a process at one moment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessIdentity {
+	pub state:      IdentityState,
+	/// Opaque start identity, `Some` exactly when `state` is `Running`; see
+	/// [`Process::start_id`]. Equal values on one host and boot mean the same
+	/// process; values of one host and boot also order by start.
+	pub start_id:   Option<u64>,
+	/// Display only: start time in Unix epoch seconds (floor), when running
+	/// and readable.
+	pub start_time: Option<u64>,
+}
+
+impl ProcessIdentity {
+	const GONE: Self = Self { state: IdentityState::Gone, start_id: None, start_time: None };
+	const UNREADABLE: Self =
+		Self { state: IdentityState::Unreadable, start_id: None, start_time: None };
+
+	const fn running(start_id: u64, start_time: Option<u64>) -> Self {
+		Self { state: IdentityState::Running, start_id: Some(start_id), start_time }
+	}
+}
+
+/// Current identity of `pid`.
+///
+/// Running with its start id, gone (no such process, or a zombie), or
+/// unreadable (present but its start cannot be read). Unlike
+/// [`Process::from_pid`], a read failure is never mistaken for the process
+/// having exited.
+#[must_use]
+pub fn process_identity(pid: i32) -> ProcessIdentity {
+	if pid <= 0 {
+		return ProcessIdentity::GONE;
+	}
+	platform::process_identity(pid)
+}
+
+/// `Unreadable` when `pid` still exists — `kill(pid, 0)` succeeds or is
+/// refused with `EPERM` — else `Gone`. For callers that could not read the
+/// process at all.
+#[cfg(unix)]
+fn unreadable_unless_gone(pid: i32) -> ProcessIdentity {
+	// SAFETY: `kill` takes integers by value; signal 0 only probes existence
+	// and permission.
+	let exists = unsafe { libc::kill(pid, 0) } == 0
+		|| std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+	if exists {
+		ProcessIdentity::UNREADABLE
+	} else {
+		ProcessIdentity::GONE
+	}
+}
+
 /// A live process whose environment carries a marker token; see
 /// [`scan_processes_by_env`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1571,6 +1819,9 @@ pub struct MarkedProcess {
 	/// OS start time, Unix epoch seconds (floor) — the value
 	/// [`process_start_time`] returns for the same process.
 	pub start_time: Option<u64>,
+	/// Opaque start identity — the value [`process_identity`] reports for
+	/// the same process.
+	pub start_id:   Option<u64>,
 	/// Executable name (best effort, may be truncated by the OS).
 	pub command:    String,
 }
@@ -1592,9 +1843,10 @@ pub struct MarkedProcessScan {
 	/// `zsh`, `sleep`, …), so a marker on such a process is invisible and lands
 	/// here; a process started with an empty environment is counted too.
 	pub redacted:   u32,
-	/// The unreadable and redacted processes started at or after the caller's
-	/// `opaque_since` (empty when none was given): the ones that could carry a
-	/// marker set no earlier than that instant without the scan seeing it.
+	/// The unreadable and redacted processes whose start id is at or after the
+	/// caller's `opaque_since` (empty when none was given): the ones that could
+	/// carry a marker set no earlier than that instant without the scan seeing
+	/// it.
 	pub opaque:     Vec<MarkedProcess>,
 }
 
@@ -1602,7 +1854,7 @@ impl MarkedProcessScan {
 	#[cfg(unix)]
 	fn push_opaque(&mut self, entry: MarkedProcess, since: Option<u64>) {
 		if let Some(since) = since
-			&& entry.start_time.is_none_or(|start| start >= since)
+			&& entry.start_id.is_none_or(|start| start >= since)
 		{
 			self.opaque.push(entry);
 		}
@@ -1616,11 +1868,12 @@ impl MarkedProcessScan {
 /// Environments are read as the kernel exposes them: the block the process
 /// was exec'd with, not later `setenv` changes.
 ///
-/// `opaque_since` (Unix epoch seconds) selects which processes whose
-/// environment could not be examined are listed in
-/// [`MarkedProcessScan::opaque`]: those started at or after it (or with an
-/// unknown start time). A marker set at that instant cannot be inherited by an
-/// older process, so only these can hide one.
+/// `opaque_since` is a start id ([`ProcessIdentity::start_id`] of this host
+/// and boot: Linux start ticks, macOS start microseconds) selecting which
+/// processes whose environment could not be examined are listed in
+/// [`MarkedProcessScan::opaque`]: those whose start id is at or after it (or
+/// unknown). A marker set at that instant cannot be inherited by an older
+/// process, so only these can hide one.
 #[must_use]
 pub fn scan_processes_by_env(
 	name: &str,
@@ -1679,6 +1932,15 @@ impl Process {
 	)]
 	pub fn start_time_unix_secs(&self) -> Option<u64> {
 		self.inner.start_time_unix_secs()
+	}
+
+	/// Opaque start identity pinned when the reference was opened — the value
+	/// [`process_identity`] reports as `start_id`: Linux `/proc/<pid>/stat`
+	/// start ticks since boot, macOS start microseconds, Windows creation
+	/// `FILETIME`. Independent of wall-clock changes.
+	#[must_use]
+	pub const fn start_id(&self) -> u64 {
+		self.inner.start_id()
 	}
 
 	/// Parent process id for this process, when available.
@@ -2102,24 +2364,54 @@ struct OwnedSpawn {
 
 /// The real process of a reparented launch (`nohup cmd &`), identity-pinned at
 /// report time. Informational only: never part of the teardown set.
+#[derive(Clone)]
 struct ReparentedSpawn {
 	process: Process,
 	pgid:    Option<i32>,
+}
+
+/// A launched process whose identity could not be pinned although it had not
+/// provably exited. Reported by raw pid, without a start identity, and makes
+/// the run's survivor list incomplete while the pid is still in use.
+#[derive(Clone, Copy)]
+struct UnpinnedSpawn {
+	pid:        i32,
+	pgid:       Option<i32>,
+	reparented: bool,
 }
 
 /// A process a shell run launched that was still alive when the run resolved.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SpawnedProcess {
 	/// OS process id.
-	pub pid:        i32,
+	pub pid:          i32,
 	/// Process group id when known; for reparented launches the detached
 	/// session/process-group id.
-	pub pgid:       Option<i32>,
+	pub pgid:         Option<i32>,
 	/// OS start time in Unix epoch seconds (floor), pinned when the process
-	/// was recorded. `None` only when the platform could not report it.
-	pub start_time: Option<u64>,
+	/// was recorded. `None` when the process could not be identity-pinned.
+	pub start_time:   Option<u64>,
+	/// Opaque start identity ([`Process::start_id`]) pinned when the process
+	/// was recorded. `None` when the process could not be identity-pinned.
+	#[serde(default)]
+	pub start_id:     Option<u64>,
 	/// True for the real process of a reparented launch (e.g. `nohup cmd &`).
-	pub reparented: bool,
+	pub reparented:   bool,
+	/// True for a live same-user member of a process group an owned spawn
+	/// created, found by enumerating the group rather than reported at spawn
+	/// (e.g. the sleep `sh -c '/bin/sleep 60 &'` leaves in the dead sh's group).
+	#[serde(default)]
+	pub group_member: bool,
+}
+
+/// What [`SpawnRegistry::survivors`] found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Survivors {
+	pub processes: Vec<SpawnedProcess>,
+	/// False when the run may have left a process `processes` does not name:
+	/// a launch could not be identity-pinned, a reparented launch went
+	/// unreported, or process-group enumeration failed.
+	pub complete:  bool,
 }
 
 /// Per-run record of the OS processes a single shell command launched,
@@ -2148,6 +2440,14 @@ struct RegistryState {
 	reparented:               Vec<ReparentedSpawn>,
 	/// Sweep watermark for `reparented`, same scheme as `next_sweep_at`.
 	next_reparented_sweep_at: usize,
+	/// Launches that could not be identity-pinned but had not provably exited.
+	unpinned:                 Vec<UnpinnedSpawn>,
+	/// Process groups owned spawns created (each led by the spawn's pid),
+	/// enumerated for leftover members when the run resolves.
+	groups:                   HashSet<i32>,
+	/// A launch whose real process was never reported (e.g. a reparented
+	/// launch whose report pipe was clobbered).
+	unreported:               bool,
 }
 
 #[derive(Default)]
@@ -2182,19 +2482,30 @@ impl SpawnRegistry {
 	///
 	/// The `Process` handle MUST be opened by the caller *immediately* after
 	/// the child's pid becomes visible, so identity is pinned before any race
-	/// with pid recycling can start. When the pin fails (child already exited
-	/// before we could `Process::from_pid`) the entry becomes a no-op at
-	/// termination time — there is nothing left to signal.
+	/// with pid recycling can start. When the pin fails the entry is a no-op at
+	/// termination time; unless `pid` has provably exited, it is also kept as
+	/// an unpinned survivor that makes [`SpawnRegistry::survivors`] incomplete.
 	///
 	/// Exited entries are swept opportunistically once the recorded vec
 	/// crosses the next-sweep watermark, so long-running loops of short
 	/// external commands cannot exhaust the process' FD/handle limit by
 	/// retaining one owned handle per historical spawn.
-	pub fn record(&self, pgid: Option<i32>, process: Option<Process>) {
+	pub fn record(&self, pid: i32, pgid: Option<i32>, process: Option<Process>) {
+		let unpinned = process.is_none() && !is_gone(pid);
+		let group = created_group(pid, pgid);
 		let mut state = self.state.lock();
+		if unpinned {
+			state
+				.unpinned
+				.push(UnpinnedSpawn { pid, pgid, reparented: false });
+		}
+		if let Some(group) = group {
+			state.groups.insert(group);
+		}
 		state.spawned.push(OwnedSpawn { process, pgid });
 		if state.spawned.len() >= state.next_sweep_at.max(Self::PRUNE_THRESHOLD) {
 			prune_exited(&mut state.spawned);
+			state.groups.retain(|group| process_group_alive(*group));
 			// Schedule the next sweep `PRUNE_THRESHOLD` further records away.
 			// Comparing against the post-sweep live-set size (not the pre-sweep
 			// length) bounds the sweep frequency when many entries survive:
@@ -2210,8 +2521,15 @@ impl SpawnRegistry {
 	/// pinned before the pid can be recycled; a process that already exited is
 	/// dropped. These entries are reported by [`SpawnRegistry::survivors`] but
 	/// never signalled: reparented launches must outlive the run's teardown.
-	pub fn record_reparented(&self, pgid: Option<i32>, process: Option<Process>) {
+	pub fn record_reparented(&self, pid: i32, pgid: Option<i32>, process: Option<Process>) {
 		let Some(process) = process else {
+			if !is_gone(pid) {
+				self
+					.state
+					.lock()
+					.unpinned
+					.push(UnpinnedSpawn { pid, pgid, reparented: true });
+			}
 			return;
 		};
 		let mut state = self.state.lock();
@@ -2224,32 +2542,55 @@ impl SpawnRegistry {
 		}
 	}
 
+	/// Record a launch whose real process was never reported — a reparented
+	/// launch whose report did not arrive, or one that fired no spawn hook —
+	/// so [`SpawnRegistry::survivors`] reports itself incomplete.
+	pub fn record_unreported(&self) {
+		self.state.lock().unreported = true;
+	}
+
 	/// Processes recorded so far that are still alive — the identity pinned at
-	/// spawn time still matches, so a recycled pid is never reported. Owned
-	/// children come first in spawn order, then reparented launches.
+	/// spawn time still matches, so a recycled pid is never reported; zombies
+	/// are not alive. Owned children come first in spawn order, then
+	/// reparented launches, then unpinned launches whose pid is still in use,
+	/// then leftover members of process groups owned spawns created.
 	#[must_use]
-	pub fn survivors(&self) -> Vec<SpawnedProcess> {
-		let state = self.state.lock();
-		let owned = state.spawned.iter().filter_map(|entry| {
+	pub fn survivors(&self) -> Survivors {
+		let (spawned, reparented, unpinned, groups, unreported) = {
+			let state = self.state.lock();
+			(
+				state.spawned.clone(),
+				state.reparented.clone(),
+				state.unpinned.clone(),
+				state.groups.clone(),
+				state.unreported,
+			)
+		};
+		let mut complete = !unreported;
+		let owned = spawned.iter().filter_map(|entry| {
 			let process = entry.process.as_ref()?;
-			(process.status() == ProcessStatus::Running).then(|| SpawnedProcess {
-				pid:        process.pid(),
-				pgid:       process.group_id().or(entry.pgid),
-				start_time: process.start_time_unix_secs(),
-				reparented: false,
-			})
+			(process.status() == ProcessStatus::Running)
+				.then(|| pinned_survivor(process, process.group_id().or(entry.pgid), false))
 		});
-		let reparented = state
-			.reparented
+		let reparented = reparented
 			.iter()
 			.filter(|entry| entry.process.status() == ProcessStatus::Running)
 			.map(|entry| SpawnedProcess {
-				pid:        entry.process.pid(),
-				pgid:       entry.pgid,
-				start_time: entry.process.start_time_unix_secs(),
 				reparented: true,
+				..pinned_survivor(&entry.process, entry.pgid, false)
 			});
-		owned.chain(reparented).collect()
+		let mut processes: Vec<SpawnedProcess> = owned.chain(reparented).collect();
+		for entry in unpinned {
+			if !is_gone(entry.pid) {
+				complete = false;
+				processes.push(unpinned_survivor(entry.pid, entry.pgid, entry.reparented, false));
+			}
+		}
+
+		if !push_group_members(groups, &mut processes) {
+			complete = false;
+		}
+		Survivors { processes, complete }
 	}
 
 	/// Build the kill set from the processes recorded so far. Re-read on every
@@ -2359,6 +2700,91 @@ const fn platform_process_group_alive(_pgid: i32) -> bool {
 	false
 }
 
+/// True when `pid` provably names no live process (absent or a zombie).
+fn is_gone(pid: i32) -> bool {
+	process_identity(pid).state == IdentityState::Gone
+}
+
+/// The process group `pid` created at spawn — `pid` itself when the child
+/// leads its own group — or `None` when it joined an existing one (including
+/// the host's). The child is still unreaped when the spawn hook runs, so its
+/// pid cannot have been recycled yet; the group is read zombie-aware because
+/// a short-lived child (`sh -c 'cmd &'`) may already have exited.
+#[cfg(unix)]
+fn created_group(pid: i32, pgid: Option<i32>) -> Option<i32> {
+	if pid <= 0 || is_self_process_group(pid) {
+		return None;
+	}
+	if pgid == Some(pid) || platform::process_group_of(pid) == Some(pid) {
+		Some(pid)
+	} else {
+		None
+	}
+}
+
+#[cfg(not(unix))]
+const fn created_group(_pid: i32, _pgid: Option<i32>) -> Option<i32> {
+	None
+}
+
+fn pinned_survivor(process: &Process, pgid: Option<i32>, group_member: bool) -> SpawnedProcess {
+	SpawnedProcess {
+		pid: process.pid(),
+		pgid,
+		start_time: process.start_time_unix_secs(),
+		start_id: Some(process.start_id()),
+		reparented: false,
+		group_member,
+	}
+}
+
+const fn unpinned_survivor(
+	pid: i32,
+	pgid: Option<i32>,
+	reparented: bool,
+	group_member: bool,
+) -> SpawnedProcess {
+	SpawnedProcess { pid, pgid, start_time: None, start_id: None, reparented, group_member }
+}
+
+/// Append the live same-user members of the still-populated `groups` that
+/// `processes` does not already name, flagged `group_member`. Returns false
+/// when the listing failed or a member could not be identity-pinned.
+fn push_group_members(groups: HashSet<i32>, processes: &mut Vec<SpawnedProcess>) -> bool {
+	let groups: HashSet<i32> = groups
+		.into_iter()
+		.filter(|group| !is_self_process_group(*group) && process_group_alive(*group))
+		.collect();
+	if groups.is_empty() {
+		return true;
+	}
+	let Some(members) = platform::list_group_members(&groups) else {
+		return false;
+	};
+	let mut complete = true;
+	let mut listed: HashSet<i32> = processes.iter().map(|entry| entry.pid).collect();
+	for (pid, group) in members {
+		if !listed.insert(pid) {
+			continue;
+		}
+		match Process::from_pid(pid) {
+			// Re-check membership on the pinned reference: the pid may have been
+			// recycled since the listing.
+			Some(process) => {
+				if process.status() == ProcessStatus::Running && process.group_id() == Some(group) {
+					processes.push(pinned_survivor(&process, Some(group), true));
+				}
+			},
+			None if !is_gone(pid) => {
+				complete = false;
+				processes.push(unpinned_survivor(pid, Some(group), false, true));
+			},
+			None => {},
+		}
+	}
+	complete
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -2388,24 +2814,33 @@ mod tests {
 			.expect("spawn sleep");
 		let pid = i32::try_from(child.id()).expect("child pid fits in i32");
 		let registry = SpawnRegistry::new();
-		registry.record_reparented(Some(pid), Process::from_pid(pid));
+		registry.record_reparented(pid, Some(pid), Process::from_pid(pid));
 
 		let targets_empty = registry.build_targets().is_empty();
 		let survivors = registry.survivors();
 		let fresh_start = process_start_time(pid);
+		let fresh_id = process_identity(pid).start_id;
 		let _ = child.kill();
 		let _ = child.wait();
 		let after_exit = registry.survivors();
 
 		assert!(targets_empty, "a reparented launch must never be signalled by teardown");
-		assert!(fresh_start.is_some());
-		assert_eq!(survivors, vec![SpawnedProcess {
-			pid,
-			pgid: Some(pid),
-			start_time: fresh_start,
-			reparented: true,
-		}]);
-		assert!(after_exit.is_empty(), "an exited launch must not be reported: {after_exit:?}");
+		assert!(fresh_start.is_some() && fresh_id.is_some());
+		assert_eq!(survivors, Survivors {
+			processes: vec![SpawnedProcess {
+				pid,
+				pgid: Some(pid),
+				start_time: fresh_start,
+				start_id: fresh_id,
+				reparented: true,
+				group_member: false,
+			}],
+			complete:  true,
+		});
+		assert!(
+			after_exit.processes.is_empty() && after_exit.complete,
+			"an exited launch must not be reported: {after_exit:?}"
+		);
 	}
 
 	/// The harness pid must be the only protected pid. Including its recorded
@@ -2593,7 +3028,7 @@ mod tests {
 
 		let registry = SpawnRegistry::new();
 		let pinned = Process::from_pid(long_pid).expect("pin child at record time");
-		registry.record(None, Some(pinned));
+		registry.record(long_pid, None, Some(pinned));
 
 		let live_targets = registry.build_targets();
 		assert!(
@@ -2690,7 +3125,7 @@ mod tests {
 				}
 				thread::sleep(Duration::from_millis(5));
 			}
-			registry.record(None, pinned);
+			registry.record(pid, None, pinned);
 		}
 
 		let retained = registry.state.lock().spawned.len();
@@ -2728,7 +3163,7 @@ mod tests {
 		// (pinning ourselves) so the pruner has nothing to remove.
 		let fill = SpawnRegistry::PRUNE_THRESHOLD + 10;
 		for _ in 0..fill {
-			registry.record(None, Process::from_pid(self_pid));
+			registry.record(self_pid, None, Process::from_pid(self_pid));
 		}
 		let after_fill = registry.state.lock().spawned.len();
 		assert_eq!(after_fill, fill, "live-only entries must not be pruned during warm-up");
@@ -2741,7 +3176,7 @@ mod tests {
 		// every one of these records.
 		let extra = 20;
 		for _ in 0..extra {
-			registry.record(None, Process::from_pid(self_pid));
+			registry.record(self_pid, None, Process::from_pid(self_pid));
 		}
 		let after_extra = registry.state.lock().spawned.len();
 		assert_eq!(
@@ -2782,7 +3217,10 @@ mod tests {
 			time::{Duration, Instant},
 		};
 
-		use super::super::{MarkedProcess, process_start_time, scan_processes_by_env};
+		use super::super::{
+			MarkedProcess, MarkedProcessScan, process_identity, process_start_time,
+			scan_processes_by_env,
+		};
 
 		const SLEEPER_TEST: &str = "process::tests::marker_scan::marker_scan_sleeper";
 		const SLEEPER_ENV: &str = "PI_SHELL_MARKER_SCAN_SLEEPER";
@@ -2866,6 +3304,8 @@ mod tests {
 			assert_eq!(entry.ppid, self_pid);
 			assert!(entry.start_time.is_some());
 			assert_eq!(entry.start_time, process_start_time(pid));
+			assert!(entry.start_id.is_some());
+			assert_eq!(entry.start_id, process_identity(pid).start_id);
 			// SAFETY: `getpgid` takes a scalar and touches no caller memory.
 			assert_eq!(entry.pgid, Some(unsafe { libc::getpgid(pid) }));
 			assert!(!entry.command.is_empty());
@@ -2967,6 +3407,199 @@ mod tests {
 			let daemon_sid = unsafe { libc::getsid(daemon.pid) };
 			assert_eq!(daemon_sid, launcher_pid, "the daemon left our session");
 			assert_eq!(daemon.start_time, process_start_time(daemon.pid));
+		}
+
+		/// `opaque_since` is a start id: an unexaminable process is listed when
+		/// its start id is at or after it, or unknown, and never without one.
+		#[test]
+		fn opaque_selection_compares_start_ids() {
+			let entry = |pid, start_id| MarkedProcess {
+				pid,
+				ppid: 1,
+				pgid: None,
+				start_time: Some(0),
+				start_id,
+				command: String::new(),
+			};
+			let mut scan = MarkedProcessScan::default();
+			for since in [None, Some(100)] {
+				scan.push_opaque(entry(1, Some(99)), since);
+				scan.push_opaque(entry(2, Some(100)), since);
+				scan.push_opaque(entry(3, Some(101)), since);
+				scan.push_opaque(entry(4, None), since);
+			}
+			let listed: Vec<i32> = scan.opaque.iter().map(|entry| entry.pid).collect();
+			assert_eq!(listed, [2, 3, 4]);
+		}
+	}
+
+	#[cfg(unix)]
+	mod identity {
+		use std::{
+			process::{Child, Command, Stdio},
+			time::{Duration, Instant},
+		};
+
+		use super::super::{
+			IdentityState, Process, ProcessIdentity, SpawnRegistry, process_identity,
+		};
+
+		fn sleep_child(seconds: &str) -> (Child, i32) {
+			let child = Command::new("/bin/sleep")
+				.arg(seconds)
+				.stdin(Stdio::null())
+				.stdout(Stdio::null())
+				.stderr(Stdio::null())
+				.spawn()
+				.expect("spawn sleep");
+			let pid = i32::try_from(child.id()).expect("pid fits in i32");
+			(child, pid)
+		}
+
+		fn wait_for_state(pid: i32, state: IdentityState) -> ProcessIdentity {
+			let deadline = Instant::now() + Duration::from_secs(10);
+			loop {
+				let identity = process_identity(pid);
+				if identity.state == state || Instant::now() >= deadline {
+					return identity;
+				}
+				std::thread::sleep(Duration::from_millis(10));
+			}
+		}
+
+		#[test]
+		fn running_process_has_a_stable_start_id_distinct_from_others() {
+			let self_pid = i32::try_from(std::process::id()).expect("pid fits in i32");
+			let first = process_identity(self_pid);
+			assert_eq!(first.state, IdentityState::Running);
+			assert!(first.start_id.is_some() && first.start_time.is_some());
+			assert_eq!(process_identity(self_pid), first, "two reads agree");
+
+			let (mut child, pid) = sleep_child("7381");
+			let child_identity = process_identity(pid);
+			let pinned = Process::from_pid(pid).map(|process| process.start_id());
+			let _ = child.kill();
+			let _ = child.wait();
+
+			assert_eq!(child_identity.state, IdentityState::Running);
+			assert_ne!(child_identity.start_id, first.start_id, "a new process has a new start id");
+			assert_eq!(pinned, child_identity.start_id, "a pinned reference reports the same id");
+		}
+
+		#[test]
+		fn reaped_process_is_gone() {
+			let (mut child, pid) = sleep_child("7382");
+			let _ = child.kill();
+			let _ = child.wait();
+			let identity = process_identity(pid);
+			assert_eq!(identity, ProcessIdentity {
+				state:      IdentityState::Gone,
+				start_id:   None,
+				start_time: None,
+			});
+		}
+
+		/// An exited but unreaped child (a zombie) still occupies its pid, yet it
+		/// is gone for identity purposes.
+		#[test]
+		fn unreaped_zombie_is_gone() {
+			let mut child = Command::new("/bin/sh")
+				.arg("-c")
+				.arg("exit 0")
+				.stdin(Stdio::null())
+				.spawn()
+				.expect("spawn sh");
+			let pid = i32::try_from(child.id()).expect("pid fits in i32");
+			let identity = wait_for_state(pid, IdentityState::Gone);
+			// SAFETY: `kill` with signal 0 only probes; the unreaped zombie keeps
+			// the pid, so this cannot reach another process.
+			let zombie_present = unsafe { libc::kill(pid, 0) } == 0;
+			let _ = child.wait();
+
+			assert!(zombie_present, "the child must still be an unreaped zombie");
+			assert_eq!(identity.state, IdentityState::Gone);
+			assert_eq!(identity.start_id, None);
+		}
+
+		/// pid 1 belongs to root: readable (Linux `/proc`) or not, it is never
+		/// mistaken for gone.
+		#[test]
+		fn other_users_process_is_not_gone() {
+			let identity = process_identity(1);
+			assert_ne!(identity.state, IdentityState::Gone, "{identity:?}");
+			assert_eq!(identity.start_id.is_some(), identity.state == IdentityState::Running);
+		}
+
+		#[test]
+		fn unreported_launch_makes_survivors_incomplete() {
+			let registry = SpawnRegistry::new();
+			assert!(registry.survivors().complete);
+			registry.record_unreported();
+			let survivors = registry.survivors();
+			assert!(!survivors.complete);
+			assert!(survivors.processes.is_empty());
+		}
+
+		/// An owned spawn whose pin failed while it was alive is still reported —
+		/// by pid, without a start identity — and marks the list incomplete until
+		/// its pid is gone.
+		#[test]
+		fn unpinned_live_spawn_is_reported_without_identity() {
+			let (mut child, pid) = sleep_child("7383");
+			let registry = SpawnRegistry::new();
+			registry.record(pid, None, None);
+			let live = registry.survivors();
+			let _ = child.kill();
+			let _ = child.wait();
+			let after_exit = registry.survivors();
+
+			assert!(!live.complete);
+			let [entry] = live.processes.as_slice() else {
+				panic!("expected the unpinned child, got {live:?}");
+			};
+			assert_eq!(entry.pid, pid);
+			assert_eq!((entry.start_id, entry.start_time), (None, None));
+			assert!(!entry.reparented && !entry.group_member);
+			assert!(after_exit.complete && after_exit.processes.is_empty(), "{after_exit:?}");
+		}
+
+		/// A process left in the group an owned spawn created is reported as a
+		/// group member once the spawn itself has exited.
+		#[test]
+		fn leftover_member_of_owned_group_is_reported() {
+			use std::os::unix::process::CommandExt as _;
+
+			let registry = SpawnRegistry::new();
+			let mut leader = Command::new("/bin/sleep")
+				.arg("7384")
+				.process_group(0)
+				.stdin(Stdio::null())
+				.spawn()
+				.expect("spawn leader");
+			let leader_pid = i32::try_from(leader.id()).expect("pid fits in i32");
+			let mut member = Command::new("/bin/sleep")
+				.arg("7385")
+				.process_group(leader_pid)
+				.stdin(Stdio::null())
+				.spawn()
+				.expect("spawn member");
+			let member_pid = i32::try_from(member.id()).expect("pid fits in i32");
+			registry.record(leader_pid, None, Process::from_pid(leader_pid));
+			let _ = leader.kill();
+			let _ = leader.wait();
+			let survivors = registry.survivors();
+			let member_identity = process_identity(member_pid);
+			let _ = member.kill();
+			let _ = member.wait();
+
+			assert!(survivors.complete, "{survivors:?}");
+			let [entry] = survivors.processes.as_slice() else {
+				panic!("expected only the group member, got {survivors:?}");
+			};
+			assert_eq!(entry.pid, member_pid);
+			assert_eq!(entry.pgid, Some(leader_pid));
+			assert!(entry.group_member && !entry.reparented);
+			assert_eq!(entry.start_id, member_identity.start_id);
 		}
 	}
 }

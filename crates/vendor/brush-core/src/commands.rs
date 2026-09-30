@@ -812,11 +812,15 @@ pub(crate) fn execute_external_command(
 			// cleanup, so they are intentionally left unowned. Their real
 			// (grandchild) process is reported through the separate
 			// `on_reparented_spawn` hook instead; on Unix the intermediate `pid`
-			// here has already exited.
+			// here has already exited. A launch whose real process cannot be
+			// named goes to `on_unreported_spawn`.
 			if let Some(observer) = context.params.spawn_observer() {
 				if let Some(receiver) = reparented_pid_receiver.take() {
-					if let Some((grandchild_pid, grandchild_pgid)) = receiver.receive() {
-						observer.on_reparented_spawn(grandchild_pid, Some(grandchild_pgid));
+					match receiver.receive() {
+						Some((grandchild_pid, grandchild_pgid)) => {
+							observer.on_reparented_spawn(grandchild_pid, Some(grandchild_pgid));
+						},
+						None => observer.on_unreported_spawn(),
 					}
 				} else if let Some(pid) = pid {
 					if !context.params.detach_reparent {
@@ -826,7 +830,14 @@ pub(crate) fn execute_external_command(
 						// long-lived process. Still unowned, so report it through
 						// the reparented hook rather than the teardown one.
 						observer.on_reparented_spawn(pid, actual_pgid);
+					} else {
+						// Unix reparenting launch without a report channel: either
+						// the channel could not be created, or terminal stdin kept
+						// the launch from detaching at all (`nohup cmd </dev/tty &`).
+						observer.on_unreported_spawn();
 					}
+				} else {
+					observer.on_unreported_spawn();
 				}
 			}
 

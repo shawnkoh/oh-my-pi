@@ -131,10 +131,17 @@ pub struct ReparentedPidReceiver {
 }
 
 impl ReparentedPidReceiver {
+	/// Lowest descriptor number for the write end the intermediate child
+	/// inherits: above the range user redirections (`3>…`, `51>…`) and the
+	/// shell's own low descriptors occupy, so a child fd mapping's `dup2` does
+	/// not close it before the intermediate reports.
+	const REPORT_FD_FLOOR: libc::c_int = 512;
+
 	fn new() -> Option<Self> {
 		use std::os::fd::AsRawFd;
 
 		let (read, write) = cloexec_pipe()?;
+		let write = high_cloexec_fd(write, Self::REPORT_FD_FLOOR);
 		// Non-blocking read end: see the type docs.
 		// SAFETY: `read` is an open descriptor owned by this process.
 		let flags = unsafe { libc::fcntl(read.as_raw_fd(), libc::F_GETFL) };
@@ -146,7 +153,7 @@ impl ReparentedPidReceiver {
 		}
 		// Record the write end's identity so the intermediate can detect the
 		// descriptor number having been clobbered by a child fd mapping
-		// (`inject_fds` runs its `dup2`s before this hook).
+		// (`inject_fds` runs its `dup2`s before this hook) that still reached it.
 		// SAFETY: `stat` is plain-old-data; zeroed is a valid initial value.
 		let mut stat: libc::stat = unsafe { std::mem::zeroed() };
 		// SAFETY: `write` is open and `stat` is a valid out-pointer.
@@ -211,6 +218,25 @@ fn cloexec_pipe() -> Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
 #[cfg(not(any(target_os = "macos", target_os = "ios")))]
 fn cloexec_pipe() -> Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
 	nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).ok()
+}
+
+/// Moves `fd` to the lowest free descriptor number at or above `floor`
+/// (`F_DUPFD_CLOEXEC`), closing the original. Keeps `fd` where it is when no
+/// such number is available (e.g. `RLIMIT_NOFILE` below `floor`).
+fn high_cloexec_fd(fd: std::os::fd::OwnedFd, floor: libc::c_int) -> std::os::fd::OwnedFd {
+	use std::os::fd::{AsRawFd, FromRawFd};
+
+	if fd.as_raw_fd() >= floor {
+		return fd;
+	}
+	// SAFETY: `fd` is open and owned; `F_DUPFD_CLOEXEC` returns a new
+	// descriptor or -1 and touches no caller memory.
+	let high = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, floor) };
+	if high < 0 {
+		return fd;
+	}
+	// SAFETY: `high` was just returned by `fcntl` and is owned by nobody else.
+	unsafe { std::os::fd::OwnedFd::from_raw_fd(high) }
 }
 
 fn pre_exec_take_foreground() -> Result<(), std::io::Error> {
@@ -316,5 +342,68 @@ fn report_reparented_pid(report: ReparentReportTarget, pid: libc::pid_t, pgid: l
 		} else {
 			return;
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::{
+		os::fd::{AsRawFd, FromRawFd, OwnedFd},
+		process::{Command, Stdio},
+	};
+
+	use command_fds::{CommandFdExt, FdMapping};
+
+	use super::{CommandSessionExt, ReparentedPidReceiver};
+
+	/// `/dev/null` at a descriptor number of at least `floor`, leaving the low
+	/// numbers free.
+	fn dev_null_at_or_above(floor: libc::c_int) -> OwnedFd {
+		let file = std::fs::File::open("/dev/null").expect("open /dev/null");
+		// SAFETY: `file` is open; `F_DUPFD_CLOEXEC` returns a new descriptor.
+		let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, floor) };
+		assert!(fd >= floor, "F_DUPFD_CLOEXEC failed");
+		// SAFETY: `fd` was just created and is owned by nobody else.
+		unsafe { OwnedFd::from_raw_fd(fd) }
+	}
+
+	/// A child fd mapping onto the number the report pipe was created at (a
+	/// user redirection like `51>/dev/null`) must not stop the intermediate
+	/// from reporting the reparented grandchild.
+	#[test]
+	fn report_survives_child_fd_mappings_over_low_descriptors() {
+		const LOW: std::ops::RangeInclusive<libc::c_int> = 3..=96;
+
+		// Mapping sources live high, so the report pipe is created at the
+		// lowest free descriptor — inside `LOW` — as in a host whose low
+		// numbers are free when the launch starts.
+		let mappings: Vec<FdMapping> = LOW
+			.map(|child_fd| FdMapping { parent_fd: dev_null_at_or_above(2048), child_fd })
+			.collect();
+		let probe = std::fs::File::open("/dev/null").expect("open /dev/null");
+		let pipe_would_land = probe.as_raw_fd();
+		drop(probe);
+		assert!(LOW.contains(&pipe_would_land), "lowest free fd {pipe_would_land} is not low");
+
+		let mut command = Command::new("/bin/sleep");
+		command
+			.arg("7405")
+			.stdin(Stdio::null())
+			.stdout(Stdio::null())
+			.stderr(Stdio::null());
+		command.fd_mappings(mappings).expect("fd mappings");
+		let receiver: Option<ReparentedPidReceiver> = command.detach_session_reparent();
+		let receiver = receiver.expect("report channel");
+		let mut intermediate = command.spawn().expect("spawn");
+		let _ = intermediate.wait();
+		let reported = receiver.receive();
+		if let Some((pid, _)) = reported {
+			// SAFETY: signals exactly the grandchild this test launched.
+			unsafe { libc::kill(pid, libc::SIGKILL) };
+		}
+
+		let (pid, pgid) = reported.expect("the grandchild must be reported");
+		assert!(pid > 0);
+		assert_eq!(pgid, i32::try_from(intermediate.id()).expect("pid fits in i32"));
 	}
 }

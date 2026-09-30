@@ -156,9 +156,15 @@ pub struct ShellRunResult {
 	pub working_dir:       Option<String>,
 	/// Processes this run launched that were still alive when it resolved
 	/// (identity-pinned), including the real process of reparented launches
-	/// such as `nohup cmd &`. Present on every result, possibly empty.
+	/// such as `nohup cmd &` and leftover members of process groups the run's
+	/// spawns created. Present on every result, possibly empty. A run that
+	/// fails with an error carries no list: its leftovers are unknown.
 	#[serde(default)]
 	pub spawned_processes: Vec<process::SpawnedProcess>,
+	/// False when the run may have left a process `spawned_processes` does not
+	/// name; see [`process::Survivors::complete`].
+	#[serde(default)]
+	pub spawned_complete:  bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -409,13 +415,15 @@ async fn run_shell_session(
 				*guard = None;
 			}
 			let _ = process_cancel_bridge.await;
+			let survivors = spawn_registry.survivors();
 			return Ok(ShellRunResult {
 				exit_code:         None,
 				cancelled:         matches!(reason, AbortReason::Signal),
 				timed_out:         matches!(reason, AbortReason::Timeout),
 				minimized:         None,
 				working_dir:       None,
-				spawned_processes: spawn_registry.survivors(),
+				spawned_processes: survivors.processes,
+				spawned_complete:  survivors.complete,
 			});
 		}
 	};
@@ -430,13 +438,15 @@ async fn run_shell_session(
 		*session.lock().await = None;
 	}
 	let (exec, minimized, working_dir) = res?;
+	let survivors = spawn_registry.survivors();
 	Ok(ShellRunResult {
 		exit_code: Some(exit_code(&exec)),
 		cancelled: false,
 		timed_out: false,
 		working_dir,
 		minimized,
-		spawned_processes: spawn_registry.survivors(),
+		spawned_processes: survivors.processes,
+		spawned_complete: survivors.complete,
 	})
 }
 
@@ -481,13 +491,15 @@ async fn run_shell_oneshot(
 				let _ = task.await;
 			}
 			let _ = process_cancel_bridge.await;
+			let survivors = spawn_registry.survivors();
 			return Ok(ShellExecuteResult {
 				exit_code:         None,
 				cancelled:         matches!(reason, AbortReason::Signal),
 				timed_out:         matches!(reason, AbortReason::Timeout),
 				minimized:         None,
 				working_dir:       None,
-				spawned_processes: spawn_registry.survivors(),
+				spawned_processes: survivors.processes,
+				spawned_complete:  survivors.complete,
 			});
 		},
 	};
@@ -497,13 +509,15 @@ async fn run_shell_oneshot(
 	let res = run_result
 		.unwrap_or_else(|err| Err(Error::msg(format!("Shell execution task failed: {err}"))));
 	let (exec, minimized, working_dir) = res?;
+	let survivors = spawn_registry.survivors();
 	Ok(ShellExecuteResult {
 		exit_code: Some(exit_code(&exec)),
 		cancelled: false,
 		timed_out: false,
 		working_dir,
 		minimized,
-		spawned_processes: spawn_registry.survivors(),
+		spawned_processes: survivors.processes,
+		spawned_complete: survivors.complete,
 	})
 }
 
@@ -549,13 +563,15 @@ async fn run_shell_oneshot_streams(
 				let _ = task.await;
 			}
 			let _ = process_cancel_bridge.await;
+			let survivors = spawn_registry.survivors();
 			return Ok(ShellExecuteResult {
 				exit_code: None,
 				cancelled: matches!(reason, AbortReason::Signal),
 				timed_out: matches!(reason, AbortReason::Timeout),
 				minimized: None,
 				working_dir: None,
-				spawned_processes: spawn_registry.survivors(),
+				spawned_processes: survivors.processes,
+				spawned_complete: survivors.complete,
 			});
 		},
 	};
@@ -565,13 +581,15 @@ async fn run_shell_oneshot_streams(
 	let res = run_result
 		.unwrap_or_else(|err| Err(Error::msg(format!("Shell execution task failed: {err}"))));
 	let (exec, working_dir) = res?;
+	let survivors = spawn_registry.survivors();
 	Ok(ShellExecuteResult {
 		exit_code: Some(exit_code(&exec)),
 		cancelled: false,
 		timed_out: false,
 		working_dir,
 		minimized: None,
-		spawned_processes: spawn_registry.survivors(),
+		spawned_processes: survivors.processes,
+		spawned_complete: survivors.complete,
 	})
 }
 
@@ -1649,14 +1667,18 @@ impl SpawnObserver for process::SpawnRegistry {
 		// to `build_targets` (as the old code did) let a recycled pid resolve
 		// to an unrelated process — issue #4605.
 		let process = process::Process::from_pid(pid);
-		self.record(pgid, process);
+		self.record(pid, pgid, process);
 	}
 
 	fn on_reparented_spawn(&self, pid: i32, pgid: Option<i32>) {
 		// Pinned immediately for the same pid-reuse reason as `on_spawn`, but
 		// recorded apart from the teardown set: reparented launches survive.
 		let process = process::Process::from_pid(pid);
-		self.record_reparented(pgid, process);
+		self.record_reparented(pid, pgid, process);
+	}
+
+	fn on_unreported_spawn(&self) {
+		self.record_unreported();
 	}
 }
 
@@ -6612,6 +6634,7 @@ replace = [{ pattern = "^.+$", replacement = "PWD" }]
 		kill_pid(bang);
 
 		assert_eq!(result.exit_code, Some(0));
+		assert!(result.spawned_complete);
 		let [entry] = spawned.as_slice() else {
 			panic!("expected exactly the background child, got {spawned:?}");
 		};
@@ -6663,6 +6686,7 @@ replace = [{ pattern = "^.+$", replacement = "PWD" }]
 		}
 
 		assert_eq!(result.exit_code, Some(0));
+		assert!(result.spawned_complete);
 		let [entry] = spawned.as_slice() else {
 			panic!("expected exactly the reparented grandchild, got {spawned:?}");
 		};
@@ -6707,6 +6731,92 @@ replace = [{ pattern = "^.+$", replacement = "PWD" }]
 			.expect("run foreground loop");
 		assert_eq!(result.exit_code, Some(0));
 		assert!(result.spawned_processes.is_empty(), "{:?}", result.spawned_processes);
+		assert!(result.spawned_complete);
+	}
+
+	#[cfg(unix)]
+	async fn run_with_bang(command: String) -> (ShellRunResult, i32) {
+		let shell = Shell::new(None);
+		let (tx, rx) = flume::unbounded::<String>();
+		let result = shell
+			.run(ShellRunOptions { command, ..Default::default() }, Some(tx), CancelToken::default())
+			.await
+			.expect("run");
+		let bang = recv_bang_pid(&rx).await;
+		(result, bang)
+	}
+
+	/// `sh -c 'cmd &'` exits at once, leaving `cmd` in the process group the
+	/// owned `sh` spawn created. The run reports that leftover as a group
+	/// member, identity-pinned.
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn run_reports_leftover_member_of_owned_process_group() {
+		let _guard = shell_test_lock().lock().await;
+		let (result, bang) = run_with_bang(
+			"/bin/sh -c '/bin/sleep 7401 >/dev/null 2>&1 & printf \"bang=%s\\n\" \"$!\"'".into(),
+		)
+		.await;
+		let fresh = process::process_identity(bang);
+		kill_pid(bang);
+
+		assert_eq!(result.exit_code, Some(0));
+		assert!(result.spawned_complete, "{result:?}");
+		let [entry] = result.spawned_processes.as_slice() else {
+			panic!("expected exactly the leftover sleep, got {:?}", result.spawned_processes);
+		};
+		assert_eq!(entry.pid, bang);
+		assert!(entry.group_member && !entry.reparented, "{entry:?}");
+		assert!(entry.pgid.is_some_and(|pgid| pgid != bang), "the dead sh leads the group");
+		assert_eq!(fresh.state, process::IdentityState::Running);
+		assert_eq!(entry.start_id, fresh.start_id);
+	}
+
+	/// A pseudo-terminal slave path, with the master kept open by the caller.
+	#[cfg(unix)]
+	fn open_pty() -> (std::os::fd::OwnedFd, String) {
+		use std::os::fd::FromRawFd as _;
+
+		// SAFETY: plain libc pty calls on a descriptor this function owns;
+		// `ptsname` is read before any other pty call can overwrite its buffer.
+		unsafe {
+			let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+			assert!(master >= 0, "posix_openpt failed");
+			let master_fd = std::os::fd::OwnedFd::from_raw_fd(master);
+			assert_eq!(libc::grantpt(master), 0);
+			assert_eq!(libc::unlockpt(master), 0);
+			let name = libc::ptsname(master);
+			assert!(!name.is_null());
+			let path = std::ffi::CStr::from_ptr(name)
+				.to_str()
+				.expect("pty path is UTF-8")
+				.to_owned();
+			(master_fd, path)
+		}
+	}
+
+	/// `nohup cmd <tty &`: terminal stdin keeps the launch from detaching, so
+	/// no reparent report can arrive and neither spawn hook names it. The run
+	/// must say its list may be incomplete.
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn nohup_with_terminal_stdin_marks_survivors_incomplete() {
+		let _guard = shell_test_lock().lock().await;
+		let (_master, slave) = open_pty();
+		let (result, bang) = run_with_bang(format!(
+			"nohup /bin/sleep 7403 <{slave} >/dev/null 2>&1 & printf 'bang=%s\\n' \"$!\""
+		))
+		.await;
+		let args = process::Process::from_pid(bang).map(|process| process.args());
+		if args
+			.as_deref()
+			.is_some_and(|args| args.last().map(String::as_str) == Some("7403"))
+		{
+			kill_pid(bang);
+		}
+
+		assert_eq!(result.exit_code, Some(0));
+		assert!(!result.spawned_complete, "{result:?}");
 	}
 
 	/// `nohup` with no operand mirrors coreutils: a `missing operand` diagnostic

@@ -208,30 +208,44 @@ impl From<CoreMinimizerResult> for MinimizerResult {
 #[napi(object)]
 pub struct SpawnedProcess {
 	/// OS process id.
-	pub pid:        i32,
+	pub pid:          i32,
 	/// Process group id when known (reparented launches: the detached
 	/// session/group id).
-	pub pgid:       Option<i32>,
+	pub pgid:         Option<i32>,
 	/// OS process start time, Unix epoch SECONDS (floor) — the same instant
-	/// `ps -o lstart` prints. Omitted only if unreadable.
-	pub start_time: Option<i64>,
+	/// `ps -o lstart` prints. Display only; omitted when the process could not
+	/// be identity-pinned.
+	pub start_time:   Option<i64>,
+	/// Opaque start identity pinned when the process was recorded — the same
+	/// value as `processIdentity(pid).startId`. Omitted when the process could
+	/// not be identity-pinned (then `spawnedComplete` is false).
+	pub start_id:     Option<String>,
 	/// True for a reparented launch (e.g. `nohup cmd &`): the real
 	/// double-forked descendant, not the dead intermediate.
-	pub reparented: bool,
+	pub reparented:   bool,
+	/// True for a live same-user member of a process group an owned spawn
+	/// created, found by enumerating the group (e.g. `sh -c '/bin/sleep 3202
+	/// &'` leaves the sleep in the dead sh's group).
+	pub group_member: Option<bool>,
 }
 
 impl From<pi_shell::process::SpawnedProcess> for SpawnedProcess {
 	fn from(value: pi_shell::process::SpawnedProcess) -> Self {
 		Self {
-			pid:        value.pid,
-			pgid:       value.pgid,
-			start_time: value.start_time.and_then(|secs| i64::try_from(secs).ok()),
-			reparented: value.reparented,
+			pid:          value.pid,
+			pgid:         value.pgid,
+			start_time:   value.start_time.and_then(|secs| i64::try_from(secs).ok()),
+			start_id:     value.start_id.map(|id| id.to_string()),
+			reparented:   value.reparented,
+			group_member: value.group_member.then_some(true),
 		}
 	}
 }
 
 /// Result of running a shell command.
+///
+/// A run that rejects (throws) carries no `spawnedProcesses`: what it left
+/// running is unknown.
 #[napi(object)]
 pub struct ShellRunResult {
 	/// Exit code when the command completes normally.
@@ -249,9 +263,16 @@ pub struct ShellRunResult {
 	/// Shell working directory after command completion.
 	pub working_dir:       Option<String>,
 	/// Processes this run launched that were still alive when it resolved,
-	/// identity-pinned (pid + start time), including the real process of
-	/// reparented launches such as `nohup cmd &`. Set on every result.
+	/// identity-pinned (pid + start id), including the real process of
+	/// reparented launches such as `nohup cmd &` and leftover members of
+	/// process groups the run's spawns created. Set on every result.
 	pub spawned_processes: Option<Vec<SpawnedProcess>>,
+	/// False when the run may have left a process the list does not contain:
+	/// an owned spawn could not be identity-pinned, a reparented launch fired
+	/// no report (report pipe missing/clobbered, or neither hook fired e.g.
+	/// `nohup cmd </dev/tty &`), or process-group enumeration failed. Set on
+	/// every result.
+	pub spawned_complete:  Option<bool>,
 }
 
 impl From<CoreShellRunResult> for ShellRunResult {
@@ -269,6 +290,7 @@ impl From<CoreShellRunResult> for ShellRunResult {
 					.map(Into::into)
 					.collect(),
 			),
+			spawned_complete:  Some(value.spawned_complete),
 		}
 	}
 }
@@ -626,6 +648,7 @@ mod tests {
 			minimized:         None,
 			working_dir:       None,
 			spawned_processes: None,
+			spawned_complete:  None,
 		});
 
 		time::timeout(
@@ -659,6 +682,7 @@ mod tests {
 			minimized:         None,
 			working_dir:       None,
 			spawned_processes: None,
+			spawned_complete:  None,
 		});
 		let started = time::Instant::now();
 		time::timeout(

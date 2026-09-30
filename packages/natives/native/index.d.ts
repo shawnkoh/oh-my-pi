@@ -2189,9 +2189,14 @@ export interface MarkedProcess {
   pgid?: number
   /**
    * OS start time, Unix epoch seconds (floor) — the same value as
-   * `processStartTime(pid)`.
+   * `processStartTime(pid)`. Display only.
    */
   startTime?: number
+  /**
+   * Opaque start identity — the same value as
+   * `processIdentity(pid).startId`.
+   */
+  startId?: string
   /** Executable name (best effort, may be truncated). */
   command: string
 }
@@ -2199,8 +2204,9 @@ export interface MarkedProcess {
 /** Result of `scanProcessesByEnv`. */
 export interface MarkedProcessScan {
   /**
-   * False on platforms without an implementation (Windows): callers must
-   * treat the result as unknown.
+   * False on platforms without an implementation (Windows), or when the
+   * process table could not be listed: callers must treat the result as
+   * unknown.
    */
   supported: boolean
   processes: Array<MarkedProcess>
@@ -2219,9 +2225,9 @@ export interface MarkedProcessScan {
    */
   redacted: number
   /**
-   * The unreadable and redacted processes started at or after `opaqueSince`
-   * (empty when it was not given): the only ones that could hide a marker set
-   * no earlier than that instant.
+   * The unreadable and redacted processes whose start id is at or after
+   * `opaqueSince` (empty when it was not given): the only ones that could
+   * hide a marker set no earlier than that instant.
    */
   opaque: Array<MarkedProcess>
 }
@@ -2527,12 +2533,40 @@ export interface PredictedWord {
   confidence: number
 }
 
+/** Current identity of `pid`; see `ProcessIdentity`. */
+export declare function processIdentity(pid: number): ProcessIdentity
+
+/** Clock-independent identity of a process at a moment. */
+export interface ProcessIdentity {
+  /**
+   * running: exists and is not a zombie. gone: no such process
+   * (ESRCH/ENOENT) or a zombie/dead entry. unreadable: exists (or cannot be
+   * proven gone) but its identity cannot be read (EPERM, hidepid,
+   * setuid/non-dumpable).
+   */
+  state: 'running' | 'gone' | 'unreadable'
+  /**
+   * Opaque start identity, decimal string, comparable only for equality
+   * (and numerically within one host+boot): Linux raw `/proc/<pid>/stat`
+   * field 22 (start ticks since boot), macOS
+   * `pbi_start_tvsec*1_000_000+pbi_start_tvusec`, Windows raw creation
+   * `FILETIME`. Present only when state === "running".
+   */
+  startId?: string
+  /**
+   * Display only: Unix epoch seconds (floor). Present only when
+   * state === "running".
+   */
+  startTime?: number
+}
+
 /**
  * OS start time of `pid` in Unix epoch seconds (floor), or null when the
  * process does not exist or cannot be read.
  *
- * Matches the instant `ps -o lstart` prints for the same process, so a
- * recorded `(pid, startTime)` pair detects pid reuse.
+ * Matches the instant `ps -o lstart` prints for the same process. Display
+ * helper: identify processes by `processIdentity(pid).startId`, which does
+ * not depend on the wall clock.
  */
 export declare function processStartTime(pid: number): number | null
 
@@ -2675,12 +2709,18 @@ export declare function renderMermaidAscii(text: string, options?: MermaidRender
 export declare function renderSnapcompactPng(text: string, options: SnapcompactRenderOptions): Promise<string>
 
 /**
+ * Live processes of the calling user whose environment carries a marker.
+ *
  * Every live process owned by the calling user (excluding the caller itself)
  * whose environment variable `name` is set and whose value, split on ',',
- * contains `token` exactly. `opaqueSince` (Unix epoch seconds) selects which
- * processes with an unexaminable environment are listed in `opaque`.
+ * contains `token` exactly. `opaqueSince` is a `startId` of this host and
+ * boot (compared numerically): processes with an unexaminable environment
+ * whose start id is at or after it are listed in `opaque`.
+ *
+ * # Errors
+ * Throws when `opaqueSince` is not a decimal start id.
  */
-export declare function scanProcessesByEnv(name: string, token: string, opaqueSince?: number | undefined | null): MarkedProcessScan
+export declare function scanProcessesByEnv(name: string, token: string, opaqueSince?: string | undefined | null): MarkedProcessScan
 
 /**
  * Search content for a pattern (one-shot, compiles pattern each time).
@@ -3103,7 +3143,12 @@ export interface ShellRunOptions {
   filesystem?: ShellFilesystem
 }
 
-/** Result of running a shell command. */
+/**
+ * Result of running a shell command.
+ *
+ * A run that rejects (throws) carries no `spawnedProcesses`: what it left
+ * running is unknown.
+ */
 export interface ShellRunResult {
   /** Exit code when the command completes normally. */
   exitCode?: number
@@ -3122,10 +3167,19 @@ export interface ShellRunResult {
   workingDir?: string
   /**
    * Processes this run launched that were still alive when it resolved,
-   * identity-pinned (pid + start time), including the real process of
-   * reparented launches such as `nohup cmd &`. Set on every result.
+   * identity-pinned (pid + start id), including the real process of
+   * reparented launches such as `nohup cmd &` and leftover members of
+   * process groups the run's spawns created. Set on every result.
    */
   spawnedProcesses?: Array<SpawnedProcess>
+  /**
+   * False when the run may have left a process the list does not contain:
+   * an owned spawn could not be identity-pinned, a reparented launch fired
+   * no report (report pipe missing/clobbered, or neither hook fired e.g.
+   * `nohup cmd </dev/tty &`), or process-group enumeration failed. Set on
+   * every result.
+   */
+  spawnedComplete?: boolean
 }
 
 /**
@@ -3212,14 +3266,27 @@ export interface SpawnedProcess {
   pgid?: number
   /**
    * OS process start time, Unix epoch SECONDS (floor) — the same instant
-   * `ps -o lstart` prints. Omitted only if unreadable.
+   * `ps -o lstart` prints. Display only; omitted when the process could not
+   * be identity-pinned.
    */
   startTime?: number
+  /**
+   * Opaque start identity pinned when the process was recorded — the same
+   * value as `processIdentity(pid).startId`. Omitted when the process could
+   * not be identity-pinned (then `spawnedComplete` is false).
+   */
+  startId?: string
   /**
    * True for a reparented launch (e.g. `nohup cmd &`): the real
    * double-forked descendant, not the dead intermediate.
    */
   reparented: boolean
+  /**
+   * True for a live same-user member of a process group an owned spawn
+   * created, found by enumerating the group (e.g. `sh -c '/bin/sleep 3202
+   * &'` leaves the sleep in the dead sh's group).
+   */
+  groupMember?: boolean
 }
 
 /** A misspelled span measured in JavaScript/UTF-16 code units. */
