@@ -724,13 +724,14 @@ describe("external delivery (session)", () => {
 	});
 
 	describe("interrupt and transition holds", () => {
-		it("Esc does not drop a queued owned steer: it is parked and re-offered with wakeAfterInterrupt", async () => {
+		it("Esc does not drop a queued owned steer: it is parked and wakes as soon as the abort settles (a steer always wakes)", async () => {
 			const slow = slowTool();
 			const { mock, session: s } = makeSession({ tools: [slow.tool] });
 			mock.push(toolCall("slow"));
 			const run = s.prompt("go");
 			await slow.started;
-			const handle = s.deliverExternalMessage(card("steer-me"), { mode: "steer", wakeAfterInterrupt: true });
+			// No wakeAfterInterrupt: the flag gates asides only; a steer always wakes.
+			const handle = s.deliverExternalMessage(card("steer-me"), { mode: "steer" });
 			await setImmediate();
 			expect(handle.state()).toBe("queued");
 			// Interactive Esc: clear the queues for the interrupt, then abort the run.

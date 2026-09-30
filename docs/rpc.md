@@ -228,7 +228,7 @@ correlate it via `id`. Ordering across concurrent commands is not guaranteed
 
 The bundled TypeScript `RpcClient.getMessages()` and Python `RpcClient.get_messages()` drain this paged endpoint automatically after negotiating v2. They retain the legacy monolithic command when connected to a v1 server, and on either `session_busy` or `stale_cursor` they discard partial pages and fall back to the legacy best-effort snapshot. Direct `getMessagesPage()` and `get_messages_page()` calls remain strict so incremental hosts never mix snapshots silently.
 
-### External delivery
+### External delivery commands
 
 - `{ id?, type: "deliver", record: CustomMessagePayload, options: { mode: "aside" | "steer", quiet?: true, wakeAfterInterrupt?: true, wakeInPlanMode?: true } }`
 - `{ id?, type: "cancel_delivery", deliveryId: string }`
@@ -744,12 +744,14 @@ sent as a fallback developer message.
   settles.
 - `steer` forces the next turn boundary and is never accepted as an aside.
 
-Idle in plan mode holds the record unless `wakeInPlanMode` is set; idle after
-an operator interrupt holds it unless `wakeAfterInterrupt` is set (the
-interrupt latch is not cleared). A record delivered while a submission has been
-admitted but not yet started, or while a session transition is open, is held
-and folds into or follows that turn rather than racing it. Pressing Esc in the
-interactive UI parks a queued record instead of dropping it.
+For `aside` only: idle in plan mode holds the record unless `wakeInPlanMode`
+is set; idle after an operator interrupt holds it unless `wakeAfterInterrupt`
+is set (the interrupt latch is not cleared). A `steer` always wakes. A record
+delivered while a prompt is waiting on manual-compaction cleanup or setting up
+its turn, or while a session transition is open, is held and folds into or
+follows that turn rather than racing it; a prompt that only runs an extension
+command does not hold it. Pressing Esc in the interactive UI parks a queued
+`steer` instead of dropping it; it wakes as soon as the abort settles.
 
 Receipts, one event each, all carrying `deliveryId`:
 
@@ -759,8 +761,11 @@ Receipts, one event each, all carrying `deliveryId`:
   when the owning evaluation ends. `included` is true only when exactly one
   stamped projection reached a main request that completed without error or
   abort. `sole` means no other queue-delivered input (prompt, steer, follow-up,
-  another record) joined the evaluation; engine-injected context such as
-  reminders, execution context or todo nudges does not count. `interactive`
+  another record, a hidden or synthetic prompt, a goal continuation, an
+  extension message, hook output) joined the evaluation; records the engine
+  injects on its own (soft-requirement reminders, execution additional
+  context, todo/context nudges, plan/goal context frames) do not count.
+  `interactive`
   means an operator-authored input joined. A delivery-owned evaluation may end
   quietly (thinking only, no visible text or tool call) and reports `quiet`
   without the usual empty-response retry.
