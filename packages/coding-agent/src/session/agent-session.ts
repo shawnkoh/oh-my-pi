@@ -7164,6 +7164,7 @@ export class AgentSession implements SettingsScope {
 	): Promise<boolean> {
 		// Expand file-based prompt templates if requested
 		const templated = expandPromptTemplates ? expandPromptTemplate(text, [...this.#promptTemplates]) : text;
+		const literal = options?.literal === true;
 		const expandedText = options?.synthetic || literal ? templated : this.#modelMentions.expandMentions(templated);
 
 		// Magic keywords (see modes/magic-keywords.ts): append hidden system notices after the
