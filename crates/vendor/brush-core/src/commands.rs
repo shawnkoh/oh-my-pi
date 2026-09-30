@@ -825,15 +825,18 @@ pub(crate) fn execute_external_command(
 				} else if let Some(pid) = pid {
 					if !context.params.detach_reparent {
 						observer.on_spawn(pid, actual_pgid);
-					} else if cfg!(not(unix)) {
-						// No reparenting primitive: the operand itself is the
-						// long-lived process. Still unowned, so report it through
-						// the reparented hook rather than the teardown one.
+					} else if cfg!(not(unix))
+						|| !matches!(session_action, ChildSessionAction::DetachSession)
+					{
+						// The operand itself is the long-lived process: there is no
+						// reparenting primitive (non-Unix), or terminal stdin kept
+						// the launch from detaching and double-forking (`nohup cmd
+						// </dev/tty &`). Still unowned, so report it through the
+						// reparented hook rather than the teardown one.
 						observer.on_reparented_spawn(pid, actual_pgid);
 					} else {
-						// Unix reparenting launch without a report channel: either
-						// the channel could not be created, or terminal stdin kept
-						// the launch from detaching at all (`nohup cmd </dev/tty &`).
+						// A double-forked launch without a report channel: `pid`
+						// is the intermediate, which has already exited.
 						observer.on_unreported_spawn();
 					}
 				} else {

@@ -6695,7 +6695,7 @@ replace = [{ pattern = "^.+$", replacement = "PWD" }]
 			(
 				process.as_ref().map(process::Process::status),
 				process.as_ref().and_then(process::Process::ppid),
-				process::process_start_time(pid),
+				process::process_identity(pid).start_time,
 				process.as_ref().map(process::Process::args),
 			)
 		});
@@ -6813,28 +6813,81 @@ replace = [{ pattern = "^.+$", replacement = "PWD" }]
 		}
 	}
 
+	/// Kills each reported pid still running `/bin/sleep <marker>`.
+	#[cfg(unix)]
+	fn kill_reported_sleeps(spawned: &[process::SpawnedProcess], marker: &str) {
+		for entry in spawned {
+			let is_marker_sleep = process::Process::from_pid(entry.pid)
+				.is_some_and(|process| process.args().last().map(String::as_str) == Some(marker));
+			if is_marker_sleep {
+				kill_pid(entry.pid);
+			}
+		}
+	}
+
 	/// `nohup cmd <tty &`: terminal stdin keeps the launch from detaching, so
-	/// no reparent report can arrive and neither spawn hook names it. The run
-	/// must say its list may be incomplete.
+	/// it does not double-fork and `$!` is the operand itself. The run reports
+	/// that pid, flagged `reparented` (unowned), and stays complete.
 	#[cfg(unix)]
 	#[tokio::test(flavor = "multi_thread")]
-	async fn nohup_with_terminal_stdin_marks_survivors_incomplete() {
+	async fn nohup_with_terminal_stdin_reports_the_operand() {
 		let _guard = shell_test_lock().lock().await;
 		let (_master, slave) = open_pty();
 		let (result, bang) = run_with_bang(format!(
 			"nohup /bin/sleep 7403 <{slave} >/dev/null 2>&1 & printf 'bang=%s\\n' \"$!\""
 		))
 		.await;
-		let args = process::Process::from_pid(bang).map(|process| process.args());
-		if args
-			.as_deref()
-			.is_some_and(|args| args.last().map(String::as_str) == Some("7403"))
-		{
-			kill_pid(bang);
-		}
+		kill_reported_sleeps(&result.spawned_processes, "7403");
 
 		assert_eq!(result.exit_code, Some(0));
-		assert!(!result.spawned_complete, "{result:?}");
+		assert!(result.spawned_complete, "{result:?}");
+		let [entry] = result.spawned_processes.as_slice() else {
+			panic!("expected exactly the operand, got {:?}", result.spawned_processes);
+		};
+		assert_eq!(entry.pid, bang);
+		assert!(entry.reparented && !entry.group_member, "{entry:?}");
+		assert!(entry.start_id.is_some(), "the operand was identity-pinned: {entry:?}");
+	}
+
+	/// `timeout` runs its command under its own spawn observer; every report
+	/// must still reach the run's registry — the real process of a `nohup cmd
+	/// &` (reparented hook) and the leftover of an exited `sh` (spawn hook).
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn run_reports_what_commands_under_timeout_left_behind() {
+		let _guard = shell_test_lock().lock().await;
+		let result = Shell::new(None)
+			.run(
+				ShellRunOptions {
+					command: "timeout 30 eval 'nohup /bin/sleep 7416 >/dev/null 2>&1 & /bin/sh -c \
+					          \"/bin/sleep 7417 >/dev/null 2>&1 &\"'"
+						.into(),
+					..Default::default()
+				},
+				None,
+				CancelToken::default(),
+			)
+			.await
+			.expect("run timeout");
+		let spawned = result.spawned_processes.clone();
+		let last_arg = |entry: &process::SpawnedProcess| {
+			process::Process::from_pid(entry.pid).and_then(|process| process.args().last().cloned())
+		};
+		let reparented = spawned
+			.iter()
+			.find(|entry| entry.reparented && last_arg(entry).as_deref() == Some("7416"))
+			.cloned();
+		let member = spawned
+			.iter()
+			.find(|entry| entry.group_member && last_arg(entry).as_deref() == Some("7417"))
+			.cloned();
+		kill_reported_sleeps(&spawned, "7416");
+		kill_reported_sleeps(&spawned, "7417");
+
+		assert_eq!(result.exit_code, Some(0));
+		assert!(result.spawned_complete, "{result:?}");
+		assert!(reparented.is_some(), "nohup's real process is missing: {spawned:?}");
+		assert!(member.is_some(), "the sh's leftover sleep is missing: {spawned:?}");
 	}
 
 	/// `nohup` with no operand mirrors coreutils: a `missing operand` diagnostic

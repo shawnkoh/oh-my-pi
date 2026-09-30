@@ -85,18 +85,17 @@ pub trait SpawnObserver: Send + Sync {
 	/// Reports the real process of a reparented launch (`detach_reparent`,
 	/// e.g. `nohup cmd &`): on Unix the double-forked descendant that `exec`s
 	/// the operand, not the short-lived intermediate the shell waits on, with
-	/// `pgid` its detached session/process-group id. Platforms without a
-	/// reparenting primitive report the operand process itself. These
+	/// `pgid` its detached session/process-group id. A launch that did not
+	/// detach (terminal stdin, `nohup cmd </dev/tty &`) and platforms without
+	/// a reparenting primitive report the operand process itself. These
 	/// processes are informational, not owned: they must not join the run's
 	/// teardown set.
 	fn on_reparented_spawn(&self, _pid: i32, _pgid: Option<i32>) {}
 
 	/// Reports a launch whose real process could not be named: a reparented
 	/// launch whose report never arrived (report channel unavailable or
-	/// clobbered), one that fired neither hook above (e.g. `nohup cmd
-	/// </dev/tty &`, whose terminal stdin keeps it from detaching), or a spawn
-	/// whose pid could not be read. Embedders should treat their record of
-	/// the run's processes as incomplete.
+	/// clobbered), or a spawn whose pid could not be read. Embedders should
+	/// treat their record of the run's processes as incomplete.
 	fn on_unreported_spawn(&self) {}
 }
 

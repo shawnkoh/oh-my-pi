@@ -119,11 +119,12 @@ struct ReparentReportTarget {
 ///
 /// The intermediate writes both ids into a `CLOEXEC` pipe before `_exit(0)`;
 /// the grandchild's copy closes on `exec`. `std::process::Command::spawn`
-/// only returns once every holder of its own `CLOEXEC` error pipe — which
-/// includes the intermediate — has exited or exec'd, so by the time
-/// [`ReparentedPidReceiver::receive`] runs the report is either fully buffered
-/// or will never arrive. The read end is non-blocking, so a missing report
-/// yields `None` instead of stalling the shell.
+/// normally returns only once the intermediate has exited, but not when a
+/// child fd mapping (a user redirection) landed on std's own error pipe in
+/// the child: then it returns as soon as the mapping runs, before the
+/// intermediate reports. [`ReparentedPidReceiver::receive`] therefore waits,
+/// bounded by [`ReparentedPidReceiver::REPORT_TIMEOUT`], for the report or for
+/// every write end to close.
 pub struct ReparentedPidReceiver {
 	read:   std::os::fd::OwnedFd,
 	write:  std::os::fd::OwnedFd,
@@ -136,6 +137,12 @@ impl ReparentedPidReceiver {
 	/// shell's own low descriptors occupy, so a child fd mapping's `dup2` does
 	/// not close it before the intermediate reports.
 	const REPORT_FD_FLOOR: libc::c_int = 512;
+
+	/// Upper bound on how long [`ReparentedPidReceiver::receive`] waits. The
+	/// intermediate reports right after its `fork`, so this only bounds a
+	/// launch stuck before `exec` or a write end some other concurrent fork
+	/// briefly holds.
+	const REPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 	fn new() -> Option<Self> {
 		use std::os::fd::AsRawFd;
@@ -169,11 +176,14 @@ impl ReparentedPidReceiver {
 	}
 
 	/// Returns the real reparented process' `(pid, pgid)` once the launch has
-	/// been spawned successfully, or `None` if it was not reported.
+	/// been spawned successfully, or `None` if it was not reported: every
+	/// write end closed without a report, or none arrived within
+	/// [`ReparentedPidReceiver::REPORT_TIMEOUT`].
 	pub fn receive(self) -> Option<(i32, i32)> {
 		use std::os::fd::AsRawFd;
 
 		drop(self.write);
+		let deadline = std::time::Instant::now() + Self::REPORT_TIMEOUT;
 		let mut buf = [0u8; 8];
 		let mut filled = 0;
 		while filled < buf.len() {
@@ -187,11 +197,28 @@ impl ReparentedPidReceiver {
 			};
 			if n > 0 {
 				filled += n.cast_unsigned();
-			} else if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-			{
 				continue;
-			} else {
+			}
+			if n == 0 {
+				// Every write end is closed: no (full) report will come.
 				return None;
+			}
+			match std::io::Error::last_os_error().kind() {
+				std::io::ErrorKind::Interrupted => {},
+				std::io::ErrorKind::WouldBlock => {
+					let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+					if remaining.is_zero() {
+						return None;
+					}
+					let timeout = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX).max(1);
+					let mut pollfd =
+						libc::pollfd { fd: self.read.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+					// SAFETY: `pollfd` is one initialized element and the descriptor
+					// is open; the next `read` decides what readiness meant, and a
+					// failed or interrupted poll just re-reads.
+					unsafe { libc::poll(&raw mut pollfd, 1, timeout) };
+				},
+				_ => return None,
 			}
 		}
 		let pid = i32::from_ne_bytes(buf[..4].try_into().ok()?);
@@ -405,5 +432,41 @@ mod tests {
 		let (pid, pgid) = reported.expect("the grandchild must be reported");
 		assert!(pid > 0);
 		assert_eq!(pgid, i32::try_from(intermediate.id()).expect("pid fits in i32"));
+	}
+
+	/// A mapping over std's own spawn-error pipe in the child lets `spawn`
+	/// return before the intermediate has reported; `receive`, called right
+	/// away as the shell does, must still get the report instead of flagging
+	/// the launch unreported.
+	#[test]
+	fn report_arrives_when_spawn_returns_before_the_intermediate_reports() {
+		const LOW: std::ops::RangeInclusive<libc::c_int> = 3..=96;
+
+		let mut missed = 0;
+		for _ in 0..20 {
+			let mappings: Vec<FdMapping> = LOW
+				.map(|child_fd| FdMapping { parent_fd: dev_null_at_or_above(2048), child_fd })
+				.collect();
+			let mut command = Command::new("/bin/sleep");
+			command
+				.arg("7.4061")
+				.stdin(Stdio::null())
+				.stdout(Stdio::null())
+				.stderr(Stdio::null());
+			command.fd_mappings(mappings).expect("fd mappings");
+			let receiver = command.detach_session_reparent().expect("report channel");
+			let mut intermediate = command.spawn().expect("spawn");
+			let reported = receiver.receive();
+			let _ = intermediate.wait();
+			match reported {
+				// SAFETY: signals exactly the grandchild this iteration launched.
+				Some((pid, _)) => unsafe {
+					libc::kill(pid, libc::SIGKILL);
+				},
+				None => missed += 1,
+			}
+		}
+
+		assert_eq!(missed, 0, "{missed} of 20 launches went unreported");
 	}
 }
