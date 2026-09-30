@@ -6849,6 +6849,36 @@ replace = [{ pattern = "^.+$", replacement = "PWD" }]
 		assert!(entry.start_id.is_some(), "the operand was identity-pinned: {entry:?}");
 	}
 
+	/// `nohup sh -c 'cmd &' &`: the reparented `sh` exits at once, leaving
+	/// `cmd` in the detached session's process group. The run reports `cmd` as
+	/// a member of that group.
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn run_reports_leftover_member_of_reparented_launch_group() {
+		let _guard = shell_test_lock().lock().await;
+		let root = unique_temp_dir("nohup-group");
+		let (result, bang) = run_with_bang(format!(
+			"nohup /bin/sh -c '/bin/sleep 7415 >/dev/null 2>&1 & echo $! >{pid}' >/dev/null 2>&1 & \
+			 while [ ! -s {pid} ]; do sleep 0.01; done; printf 'bang=%s\\n' \"$(cat {pid})\"",
+			pid = root.join("pid").display()
+		))
+		.await;
+		let fresh = process::process_identity(bang);
+		kill_reported_sleeps(&result.spawned_processes, "7415");
+		let _ = std::fs::remove_dir_all(&root);
+
+		assert_eq!(result.exit_code, Some(0));
+		assert!(result.spawned_complete, "{result:?}");
+		let entry = result
+			.spawned_processes
+			.iter()
+			.find(|entry| entry.pid == bang)
+			.unwrap_or_else(|| panic!("the orphaned sleep is missing: {result:?}"));
+		assert!(entry.group_member && !entry.reparented, "{entry:?}");
+		assert_eq!(fresh.state, process::IdentityState::Running);
+		assert_eq!(entry.start_id, fresh.start_id);
+	}
+
 	/// `timeout` runs its command under its own spawn observer; every report
 	/// must still reach the run's registry — the real process of a `nohup cmd
 	/// &` (reparented hook) and the leftover of an exited `sh` (spawn hook).

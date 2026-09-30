@@ -2199,6 +2199,11 @@ export interface MarkedProcess {
   startId?: string
   /** Executable name (best effort, may be truncated). */
   command: string
+  /**
+   * The first of the requested tokens (in request order) the process
+   * carries. Absent for `opaque` entries.
+   */
+  token?: string
 }
 
 /** Result of `scanProcessesByEnv`. */
@@ -2209,25 +2214,35 @@ export interface MarkedProcessScan {
    * unknown.
    */
   supported: boolean
+  /**
+   * True when the platform may hide processes of this user from the scan
+   * altogether (Linux `/proc` mounted with `hidepid` other than 0/off, or
+   * whose mount options cannot be read): the result is not a complete
+   * census, whatever `opaque` says. False on macOS.
+   */
+  hidden: boolean
   processes: Array<MarkedProcess>
-  /** Same-user processes examined. */
+  /**
+   * Candidate processes examined: those whose real, effective or saved uid
+   * is the caller's, or whose uids cannot be read.
+   */
   scanned: number
   /**
-   * Same-user processes that were alive but whose environment could not be
-   * read (not counting ones that exited mid-scan).
+   * Candidates that were alive but whose environment (or start time) could
+   * not be read (not counting ones that exited mid-scan).
    */
   unreadable: number
   /**
-   * Same-user processes whose environment came back empty. macOS withholds
-   * the environment of Apple platform binaries (`/bin/sh`, `zsh`,
+   * Candidates whose environment came back empty. macOS withholds the
+   * environment of Apple platform binaries (`/bin/sh`, `zsh`,
    * `/bin/sleep`, …), so a marker on such a process is not visible and it
    * is counted here instead.
    */
   redacted: number
   /**
    * The unreadable and redacted processes whose start id is at or after
-   * `opaqueSince` (empty when it was not given): the only ones that could
-   * hide a marker set no earlier than that instant.
+   * `opaqueSince`, or unknown (empty when `opaqueSince` was not given): the
+   * only ones that could hide a marker set no earlier than that instant.
    */
   opaque: Array<MarkedProcess>
 }
@@ -2701,16 +2716,19 @@ export declare function renderSnapcompactPng(text: string, options: SnapcompactR
 /**
  * Live processes of the calling user whose environment carries a marker.
  *
- * Every live process owned by the calling user (excluding the caller itself)
- * whose environment variable `name` is set and whose value, split on ',',
- * contains `token` exactly. `opaqueSince` is a `startId` of this host and
- * boot (compared numerically): processes with an unexaminable environment
- * whose start id is at or after it are listed in `opaque`.
+ * Every live process of the calling user (excluding the caller itself) whose
+ * environment variable `name` is set and whose value, split on ',', contains
+ * any of `tokens` exactly; no tokens match nothing. A process is the user's
+ * when its real, effective or saved uid is the caller's (so setuid launches
+ * count); one whose uids cannot be read is examined too. `opaqueSince` is a
+ * `startId` of this host and boot (compared numerically): processes with an
+ * unexaminable environment whose start id is at or after it, or unknown, are
+ * listed in `opaque`.
  *
  * # Errors
  * Throws when `opaqueSince` is not a decimal start id.
  */
-export declare function scanProcessesByEnv(name: string, token: string, opaqueSince?: string | undefined | null): MarkedProcessScan
+export declare function scanProcessesByEnv(name: string, tokens: Array<string>, opaqueSince?: string | undefined | null): MarkedProcessScan
 
 /**
  * Search content for a pattern (one-shot, compiles pattern each time).

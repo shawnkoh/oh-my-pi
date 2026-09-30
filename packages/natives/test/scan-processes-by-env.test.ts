@@ -34,8 +34,9 @@ async function launchDetached(script: string, owner: string, ...args: string[]) 
 }
 
 describe.skipIf(process.platform === "win32")("scanProcessesByEnv", () => {
-	it("finds a marked double-forked grandchild", async () => {
+	it("finds a marked double-forked grandchild and names the token it carries", async () => {
 		const token = `omp1:t:${process.pid}`;
+		const other = `omp1:other:${process.pid}`;
 		// `( cmd & )` forks twice and the subshell exits at once, so the sleeper
 		// is reparented. Bun is the sleeper because macOS withholds the
 		// environment of Apple platform binaries such as /bin/sleep. It prints its
@@ -47,15 +48,21 @@ describe.skipIf(process.platform === "win32")("scanProcessesByEnv", () => {
 		);
 		try {
 			expect(pid).toBeGreaterThan(0);
-			const scan = scanProcessesByEnv("OMP_OWNER", token);
+			const scan = scanProcessesByEnv("OMP_OWNER", [other, token]);
 			expect(scan.supported).toBe(true);
 			expect(scan.processes.map(entry => entry.pid)).toEqual([pid]);
 			const [found] = scan.processes;
+			// The requested token it carries, not the first one requested.
+			expect(found.token).toBe(token);
 			expect(found.ppid).not.toBe(launcherPid);
 			expect(found.startTime).toBeNumber();
 			expect(processIdentity(pid).startTime).toBe(found.startTime!);
 			expect(found.startId).toBe(processIdentity(pid).startId!);
-			expect(scanProcessesByEnv("OMP_OWNER", `${token}0`).processes).toEqual([]);
+			expect(scanProcessesByEnv("OMP_OWNER", [`${token}0`]).processes).toEqual([]);
+			// No tokens match nothing, but the scan still runs.
+			const empty = scanProcessesByEnv("OMP_OWNER", []);
+			expect(empty.processes).toEqual([]);
+			expect(empty.scanned).toBeGreaterThan(0);
 		} finally {
 			if (isAlive(pid)) process.kill(pid, "SIGKILL");
 		}
@@ -69,15 +76,16 @@ describe.skipIf(process.platform === "win32")("scanProcessesByEnv", () => {
 		const { pid } = await launchDetached("( /bin/sleep 7414 </dev/null >/dev/null & echo $! ) ; exit 0", token);
 		try {
 			expect(isAlive(pid)).toBe(true);
-			const scan = scanProcessesByEnv("OMP_OWNER", token, since);
+			const scan = scanProcessesByEnv("OMP_OWNER", [token], since);
 			if (process.platform === "darwin") {
 				expect(scan.processes.map(entry => entry.pid)).not.toContain(pid);
 				expect(scan.redacted).toBeGreaterThan(0);
 				// Hidden, but started after `since`: listed as opaque with its start id.
 				const opaque = scan.opaque.find(entry => entry.pid === pid);
 				expect(opaque?.startId).toBe(processIdentity(pid).startId!);
+				expect(opaque?.token).toBeUndefined();
 				// A later `since` excludes it.
-				const later = scanProcessesByEnv("OMP_OWNER", token, (BigInt(opaque!.startId!) + 1n).toString());
+				const later = scanProcessesByEnv("OMP_OWNER", [token], (BigInt(opaque!.startId!) + 1n).toString());
 				expect(later.opaque.map(entry => entry.pid)).not.toContain(pid);
 			} else {
 				expect(scan.processes.map(entry => entry.pid)).toContain(pid);
@@ -87,7 +95,11 @@ describe.skipIf(process.platform === "win32")("scanProcessesByEnv", () => {
 		}
 	});
 
+	it.skipIf(process.platform !== "darwin")("never reports macOS as hiding processes", () => {
+		expect(scanProcessesByEnv("OMP_OWNER", ["x"]).hidden).toBe(false);
+	});
+
 	it("rejects an opaqueSince that is not a start id", () => {
-		expect(() => scanProcessesByEnv("OMP_OWNER", "x", "1.5")).toThrow(/opaqueSince/);
+		expect(() => scanProcessesByEnv("OMP_OWNER", ["x"], "1.5")).toThrow(/opaqueSince/);
 	});
 });

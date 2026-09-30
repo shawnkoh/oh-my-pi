@@ -1,4 +1,7 @@
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { processIdentity, Shell } from "../native/index.js";
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -85,6 +88,33 @@ describe.skipIf(process.platform === "win32")("Shell spawnedProcesses", () => {
 			expect(entry.startId).toBe(processIdentity(bang).startId!);
 		} finally {
 			killReported(spawned.filter(entry => entry.pid === bang).map(entry => entry.pid));
+		}
+	});
+
+	it("reports a process a `nohup` launch left in its detached group", async () => {
+		// The reparented sh exits at once; its background sleep stays in the detached session's group.
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "natives-nohup-group-"));
+		const pidFile = path.join(dir, "pid");
+		try {
+			const { result, bang } = await runWithBang(
+				`nohup /bin/sh -c '/bin/sleep 7418 >/dev/null 2>&1 & echo $! >${pidFile}' >/dev/null 2>&1 & ` +
+					`while [ ! -s ${pidFile} ]; do sleep 0.01; done; printf 'bang=%s\\n' "$(cat ${pidFile})"`,
+			);
+			const spawned = result.spawnedProcesses ?? [];
+			try {
+				expect(result.exitCode).toBe(0);
+				const entry = spawned.find(candidate => candidate.pid === bang);
+				// Listed as a group member, or the run admits its list may be incomplete.
+				if (result.spawnedComplete) {
+					expect(entry?.groupMember).toBe(true);
+					expect(entry?.startId).toBe(processIdentity(bang).startId!);
+				}
+				expect(entry !== undefined || !result.spawnedComplete).toBe(true);
+			} finally {
+				killReported(spawned.filter(entry => entry.pid === bang).map(entry => entry.pid));
+			}
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
 

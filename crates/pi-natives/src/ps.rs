@@ -248,6 +248,9 @@ pub struct MarkedProcess {
 	pub start_id:   Option<String>,
 	/// Executable name (best effort, may be truncated).
 	pub command:    String,
+	/// The first of the requested tokens (in request order) the process
+	/// carries. Absent for `opaque` entries.
+	pub token:      Option<String>,
 }
 
 /// Result of `scanProcessesByEnv`.
@@ -257,20 +260,26 @@ pub struct MarkedProcessScan {
 	/// process table could not be listed: callers must treat the result as
 	/// unknown.
 	pub supported:  bool,
+	/// True when the platform may hide processes of this user from the scan
+	/// altogether (Linux `/proc` mounted with `hidepid` other than 0/off, or
+	/// whose mount options cannot be read): the result is not a complete
+	/// census, whatever `opaque` says. False on macOS.
+	pub hidden:     bool,
 	pub processes:  Vec<MarkedProcess>,
-	/// Same-user processes examined.
+	/// Candidate processes examined: those whose real, effective or saved uid
+	/// is the caller's, or whose uids cannot be read.
 	pub scanned:    u32,
-	/// Same-user processes that were alive but whose environment could not be
-	/// read (not counting ones that exited mid-scan).
+	/// Candidates that were alive but whose environment (or start time) could
+	/// not be read (not counting ones that exited mid-scan).
 	pub unreadable: u32,
-	/// Same-user processes whose environment came back empty. macOS withholds
-	/// the environment of Apple platform binaries (`/bin/sh`, `zsh`,
+	/// Candidates whose environment came back empty. macOS withholds the
+	/// environment of Apple platform binaries (`/bin/sh`, `zsh`,
 	/// `/bin/sleep`, …), so a marker on such a process is not visible and it
 	/// is counted here instead.
 	pub redacted:   u32,
 	/// The unreadable and redacted processes whose start id is at or after
-	/// `opaqueSince` (empty when it was not given): the only ones that could
-	/// hide a marker set no earlier than that instant.
+	/// `opaqueSince`, or unknown (empty when `opaqueSince` was not given): the
+	/// only ones that could hide a marker set no earlier than that instant.
 	pub opaque:     Vec<MarkedProcess>,
 }
 
@@ -282,23 +291,27 @@ fn to_napi(entry: core_process::MarkedProcess) -> MarkedProcess {
 		start_time: entry.start_time.and_then(|secs| i64::try_from(secs).ok()),
 		start_id:   entry.start_id.map(|id| id.to_string()),
 		command:    entry.command,
+		token:      entry.token,
 	}
 }
 
 /// Live processes of the calling user whose environment carries a marker.
 ///
-/// Every live process owned by the calling user (excluding the caller itself)
-/// whose environment variable `name` is set and whose value, split on ',',
-/// contains `token` exactly. `opaqueSince` is a `startId` of this host and
-/// boot (compared numerically): processes with an unexaminable environment
-/// whose start id is at or after it are listed in `opaque`.
+/// Every live process of the calling user (excluding the caller itself) whose
+/// environment variable `name` is set and whose value, split on ',', contains
+/// any of `tokens` exactly; no tokens match nothing. A process is the user's
+/// when its real, effective or saved uid is the caller's (so setuid launches
+/// count); one whose uids cannot be read is examined too. `opaqueSince` is a
+/// `startId` of this host and boot (compared numerically): processes with an
+/// unexaminable environment whose start id is at or after it, or unknown, are
+/// listed in `opaque`.
 ///
 /// # Errors
 /// Throws when `opaqueSince` is not a decimal start id.
 #[napi]
 pub fn scan_processes_by_env(
 	name: String,
-	token: String,
+	tokens: Vec<String>,
 	opaque_since: Option<String>,
 ) -> Result<MarkedProcessScan> {
 	let since = opaque_since
@@ -311,9 +324,11 @@ pub fn scan_processes_by_env(
 			})
 		})
 		.transpose()?;
-	let scan = core_process::scan_processes_by_env(&name, &token, since);
+	let tokens: Vec<&str> = tokens.iter().map(String::as_str).collect();
+	let scan = core_process::scan_processes_by_env(&name, &tokens, since);
 	Ok(MarkedProcessScan {
 		supported:  scan.supported,
+		hidden:     scan.hidden,
 		processes:  scan.processes.into_iter().map(to_napi).collect(),
 		scanned:    scan.scanned,
 		unreadable: scan.unreadable,
