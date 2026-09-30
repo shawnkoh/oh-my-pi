@@ -107,6 +107,7 @@ describe("external delivery (session)", () => {
 		sessionManager?: SessionManager;
 		extensionRunner?: ExtensionRunner;
 		compaction?: boolean;
+		autoContinue?: boolean;
 	}): { mock: MockModel; agent: Agent; session: AgentSession } {
 		// Exhaustion falls back to a plain reply: an unscripted call must never
 		// become a provider error whose retry backoff would outlive the test.
@@ -120,6 +121,8 @@ describe("external delivery (session)", () => {
 		});
 		const settings = Settings.isolated({
 			"compaction.enabled": options?.compaction === true,
+			"compaction.autoContinue": options?.autoContinue === true,
+			"compaction.asyncEnabled": false,
 			"compaction.keepRecentTokens": 1,
 			"todo.enabled": false,
 		});
@@ -1019,6 +1022,81 @@ describe("external delivery (session)", () => {
 	});
 
 	describe("quiet completion", () => {
+		it("a quiet completion's compaction check never auto-continues (N4)", async () => {
+			const modelRegistry = new ModelRegistry(authStorage);
+			const sessionManager = SessionManager.inMemory(tempDir.path());
+			const runtime = new ExtensionRuntime();
+			const extension = await loadExtensionFromFactory(
+				pi => {
+					pi.on("session_before_compact", async event => ({
+						compaction: {
+							summary: "compacted",
+							shortSummary: undefined,
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+							details: {},
+						},
+					}));
+				},
+				tempDir.path(),
+				new EventBus(),
+				runtime,
+				"quiet-compaction",
+			);
+			const extensionRunner = new ExtensionRunner(
+				[extension],
+				runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const slow = slowTool();
+			const { mock, session: s } = makeSession({
+				tools: [slow.tool],
+				sessionManager,
+				extensionRunner,
+				compaction: true,
+				autoContinue: true,
+			});
+			// An earlier evaluation ended aborted: the terminal-answer probe would
+			// otherwise read that stop and let a threshold compaction resume work.
+			mock.push(toolCall("slow"));
+			const run = s.prompt("go");
+			await slow.started;
+			const aborting = s.abort({ reason: USER_INTERRUPT_LABEL });
+			slow.release();
+			await aborting;
+			await run.catch(() => {});
+			await s.waitForIdle();
+			// Quiet delivery whose usage crosses the compaction threshold.
+			mock.push({
+				content: [{ type: "thinking", thinking: "noted", thinkingSignature: "sig" }],
+				usage: { input: 190_000, output: 100, totalTokens: 190_100 },
+			});
+			mock.push({ content: ["auto-continued — must not happen"] });
+			const compactions: string[] = [];
+			const agentStarts: number[] = [];
+			s.subscribe(event => {
+				if (event.type === "auto_compaction_end") compactions.push(event.aborted ? "aborted" : "ok");
+				if (event.type === "agent_start") agentStarts.push(Date.now());
+			});
+			const startsBefore = agentStarts.length;
+			const callsBefore = mock.calls.length;
+			const { settled } = await deliverAndSettle(s, card("quiet-big"), {
+				mode: "aside",
+				quiet: true,
+				wakeAfterInterrupt: true,
+			});
+			expect(settled.outcome).toBe("quiet");
+			await s.waitForIdle();
+			for (let i = 0; i < 10; i++) await setImmediate();
+			await s.waitForIdle();
+			expect(compactions).toEqual(["ok"]);
+			// Exactly the wake's own request: no auto-continue turn after the compaction.
+			expect(mock.calls.length - callsBefore).toBe(1);
+			expect(agentStarts.length - startsBefore).toBe(1);
+		});
+
 		it("predicate: thinking (any signature) and whitespace text are quiet; text/tool/image/redacted are not", () => {
 			const quiet = (content: unknown[]) => isQuietAssistantStop({ stopReason: "stop", content: content as never });
 			expect(quiet([])).toBe(true);
