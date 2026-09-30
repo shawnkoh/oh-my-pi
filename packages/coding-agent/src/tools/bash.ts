@@ -974,10 +974,13 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			if (!this.#launchEnabled) throw new ToolError("Service launch is disabled in this session.");
 			if (asyncRequested || rawTimeout !== undefined)
 				throw new ToolError("Service mode does not accept async or timeout; use ready.timeout for readiness.");
-		} else if (ready !== undefined) {
-			// Nothing can honour ready without a service to attach it to;
+		} else {
+			// Nothing can honour ready/sleepable without a service to attach them to;
 			// running the command the caller did ask for beats failing the call.
-			pendingNotices.push("Ignored ready: service-only, and no service name was given.");
+			if (ready !== undefined) pendingNotices.push("Ignored ready: service-only, and no service name was given.");
+			if (sleepable === true) {
+				pendingNotices.push("Ignored sleepable: service-only, and no service name was given.");
+			}
 		}
 		if (asyncRequested && !cfgAsyncEnabled.get(this.session.settings)) {
 			throw new ToolError("Async bash execution is disabled. Enable async.enabled to use async mode.");

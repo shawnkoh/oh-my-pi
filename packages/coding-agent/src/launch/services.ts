@@ -256,6 +256,11 @@ export async function startService(
 				registry.markIncomplete("service started without a reported pid");
 			}
 		}
+	} catch (error) {
+		// Aborted, timed out or failed in transit: the broker may still have started the
+		// service, and its pid was never reported.
+		registry?.markIncomplete("a service start ended without reporting its process");
+		throw error;
 	} finally {
 		if (pendingId) registry?.end(pendingId, "settled");
 	}

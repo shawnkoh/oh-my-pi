@@ -28,7 +28,7 @@
 | `async` | `boolean` | No | Background execution request. Present only when `async.enabled` is true for the session. Returns immediately with a job id instead of waiting; it does not change the effective deadline, including a disabled deadline from `timeout: 0`. |
 | `name` | `string` | No | Supervised service name (≤48 characters; project-unique). Present only when `launch.enabled` and the session can launch. A live name restarts using the new spec. Incompatible with `async` and `timeout`. |
 | `ready` | `{ log?: string; port?: number; host?: string; timeout?: number }` | No | Service readiness: output regex and/or TCP port must pass; host defaults to `127.0.0.1`, timeout to 30 seconds. Only with `name`. |
-| `sleepable` | `boolean` | No | Only with `name`. Marks the service as allowed to keep running while the session is suspended. Recorded once, at start, in the owned-job registry (`<session>.jobs.jsonl`); never changed later. Default `false`. |
+| `sleepable` | `boolean` | No | Only with `name`; without it the flag is ignored and the result says so. Marks the service as allowed to keep running while the session is suspended. Recorded once, at start, in the owned-job registry (`<session>.jobs.jsonl`); never changed later. It is independent of the service mode (`persist`/`session`/`detached`, changeable later through `proc://<name>/mode`), which decides when the broker stops the service; `sleepable` only tells a supervisor whether a live service may outlast a suspended session. Quiescence counts every live service as outstanding work regardless. Default `false`. |
 | `env` | `Record<string, string>` | No | Environment overrides for the service. Only with `name`. |
 
 Without `name`, `pty`, or a client terminal, commands run in the embedded POSIX-compatible brush shell, even when `shellPath` points to PowerShell or another external shell. `shellPath` selects the external shell for named services, supported terminal routes, and interactive `!` commands; a bash path may still supply environment and rc snapshots to the embedded session. To use PowerShell syntax in a plain tool call, invoke `pwsh -Command '...'` explicitly, quoting so brush preserves PowerShell's `$` variables.
@@ -206,6 +206,7 @@ Choose the setting by the desired outcome:
 - Background work / cancellation
   - Async and auto-background jobs continue after the initial tool return, until completion, cancellation, or their deadline (unless `timeout: 0` disabled it).
   - Cancellation aborts the native run; PTY overlay dismissal also kills the PTY.
+  - A shell `&` job still running when its command returns — an external child, or an in-process subshell/brace group such as `{ sleep 1; cmd; } &` — keeps its shell alive until the job ends (it is reaped every 5 seconds). The shell counts as outstanding work (`retainedJobs`) and holds an open `retained-shell` record in the owned-job registry for that time. A cancelled or timed-out run tears its shell down instead.
 
 ## Limits & Caps
 - Default timeout: `300s` (`TOOL_TIMEOUTS.bash.default` in `packages/coding-agent/src/tools/tool-timeouts.ts`).

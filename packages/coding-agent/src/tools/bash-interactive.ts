@@ -30,9 +30,11 @@ export async function runInteractiveBashPty(
 	},
 ): Promise<BashInteractiveResult> {
 	// A PTY run reports no spawned processes; only the owner-marker scan can find what it leaves
-	// behind, and outside Linux it cannot see platform shells' environments.
+	// behind, and outside Linux it cannot see platform shells' environments. The run itself is
+	// recorded so a crash mid-run leaves an open record.
+	const registry = OwnedJobRegistry.instance();
 	if (!OWNER_SCAN_COVERS_PLATFORM) {
-		OwnedJobRegistry.instance()?.markIncomplete("pty shell runs do not report spawned processes");
+		registry?.markIncomplete("pty shell runs do not report spawned processes");
 	}
 	const settings = await Settings.init();
 	// Load the xterm Terminal ctor here (async boundary) — the ui.custom factory below is sync.
@@ -44,6 +46,12 @@ export async function runInteractiveBashPty(
 		artifactId: options.artifactId,
 		headBytes: resolveOutputSinkHeadBytes(settings),
 		maxColumns: resolveOutputMaxColumns(settings),
+	});
+	const runJobId = registry?.registerInProcessJob({
+		jobId: `pty-run:${++ptyRunSequence}`,
+		kind: "shell-run",
+		command: options.command,
+		cwd: options.cwd,
 	});
 	try {
 		const result = await ui.custom<BashInteractiveResult>(
@@ -140,6 +148,9 @@ export async function runInteractiveBashPty(
 		);
 		return result;
 	} finally {
+		if (runJobId) registry?.end(runJobId, "settled");
 		await sink.dispose();
 	}
 }
+
+let ptyRunSequence = 0;
