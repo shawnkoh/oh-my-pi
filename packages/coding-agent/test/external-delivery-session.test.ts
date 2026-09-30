@@ -846,7 +846,7 @@ describe("external delivery (session)", () => {
 			await compactStarted.promise;
 			const operatorTurn = s.prompt("operator turn");
 			await setImmediate();
-			expect(s.hasAdmittedSubmission).toBe(true);
+			expect(s.hasPendingTurnDispatch).toBe(true);
 			expect(s.isStreaming).toBe(false);
 
 			mock.push({ content: ["turn two"] });
@@ -871,6 +871,151 @@ describe("external delivery (session)", () => {
 			expect(texts).toContain("folded");
 		});
 
+		it("a steer delivered while a prompt only runs an extension command is not stranded (N2)", async () => {
+			const modelRegistry = new ModelRegistry(authStorage);
+			const sessionManager = SessionManager.inMemory(tempDir.path());
+			const runtime = new ExtensionRuntime();
+			const inHandler = Promise.withResolvers<void>();
+			const releaseHandler = Promise.withResolvers<void>();
+			const extension = await loadExtensionFromFactory(
+				pi => {
+					// Handled entirely inside prompt(); starts no agent turn.
+					pi.registerCommand("noop", {
+						handler: async () => {
+							inHandler.resolve();
+							await releaseHandler.promise;
+						},
+					});
+				},
+				tempDir.path(),
+				new EventBus(),
+				runtime,
+				"noop-command",
+			);
+			const extensionRunner = new ExtensionRunner(
+				[extension],
+				runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const { mock, session: s } = makeSession({ sessionManager, extensionRunner });
+			mock.push({ content: ["acted on the steer"] });
+			const command = s.prompt("/noop");
+			await inHandler.promise;
+			expect(s.hasAdmittedSubmission).toBe(true);
+			const handle = s.deliverExternalMessage(card("steer-me"), { mode: "steer" });
+			releaseHandler.resolve();
+			await expect(command).resolves.toBe(false);
+			// The command started no run; the steer must still get its own turn.
+			const settled = await Promise.race([
+				handle.settled,
+				new Promise<never>((_, reject) => setTimeout(() => reject(new Error("steer stranded")), 3_000)),
+			]);
+			expect(settled.included).toBe(true);
+			expect(handle.state()).toBe("settled");
+			expect(s.listExternalDeliveries()).toEqual([]);
+		});
+
+		it("delivering from inside an extension command handler and awaiting the receipt does not deadlock (N3)", async () => {
+			const modelRegistry = new ModelRegistry(authStorage);
+			const sessionManager = SessionManager.inMemory(tempDir.path());
+			const runtime = new ExtensionRuntime();
+			const holder: { session?: AgentSession; acceptance?: DeliveryHandle } = {};
+			const extension = await loadExtensionFromFactory(
+				pi => {
+					pi.registerCommand("mail", {
+						handler: async () => {
+							if (!holder.session) throw new Error("session not ready");
+							holder.acceptance = holder.session.deliverExternalMessage(card("from-handler"), { mode: "aside" });
+							await holder.acceptance.accepted;
+						},
+					});
+				},
+				tempDir.path(),
+				new EventBus(),
+				runtime,
+				"mail-command",
+			);
+			const extensionRunner = new ExtensionRunner(
+				[extension],
+				runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const { mock, session: s } = makeSession({ sessionManager, extensionRunner });
+			holder.session = s;
+			mock.push({ content: ["hello from mail"] });
+			const command = s.prompt("/mail");
+			const result = await Promise.race([
+				command,
+				new Promise<never>((_, reject) => setTimeout(() => reject(new Error("handler deadlocked")), 3_000)),
+			]);
+			expect(result).toBe(false);
+			if (!holder.acceptance) throw new Error("handler never delivered");
+			const settled = await holder.acceptance.settled;
+			expect(settled.included).toBe(true);
+		});
+
+		it("a steer delivered in a prompt's dispatch window folds into or follows that turn (no AgentBusyError)", async () => {
+			const modelRegistry = new ModelRegistry(authStorage);
+			const compactStarted = Promise.withResolvers<void>();
+			const compactGate = Promise.withResolvers<void>();
+			const sessionManager = SessionManager.inMemory(tempDir.path());
+			const runtime = new ExtensionRuntime();
+			const extension = await loadExtensionFromFactory(
+				pi => {
+					pi.on("session_before_compact", async event => {
+						compactStarted.resolve();
+						await compactGate.promise;
+						return {
+							compaction: {
+								summary: "compacted",
+								shortSummary: undefined,
+								firstKeptEntryId: event.preparation.firstKeptEntryId,
+								tokensBefore: event.preparation.tokensBefore,
+								details: {},
+							},
+						};
+					});
+				},
+				tempDir.path(),
+				new EventBus(),
+				runtime,
+				"parked-compaction-steer",
+			);
+			const extensionRunner = new ExtensionRunner(
+				[extension],
+				runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const { mock, session: s } = makeSession({ sessionManager, extensionRunner, compaction: true });
+			mock.push({ content: ["seed"] });
+			await s.prompt("seed turn");
+			const compaction = s.compact();
+			await compactStarted.promise;
+			const operatorTurn = s.prompt("operator turn");
+			await setImmediate();
+			expect(s.hasPendingTurnDispatch).toBe(true);
+			mock.push({ content: ["turn two"] });
+			mock.push({ content: ["turn three"] });
+			const handle = s.deliverExternalMessage(card("steer-folded"), { mode: "steer" });
+			for (let i = 0; i < 5; i++) await setImmediate();
+			expect(handle.state()).toBe("queued");
+			expect(mock.calls).toHaveLength(1);
+			compactGate.resolve();
+			await compaction;
+			await expect(operatorTurn).resolves.toBe(true);
+			const settled = await handle.settled;
+			expect(settled.included).toBe(true);
+			await s.waitForIdle();
+			const texts = mock.calls.slice(1).flatMap((_, index) => userTexts(mock, index + 1));
+			expect(texts).toContain("operator turn");
+			expect(texts).toContain("steer-folded");
+		});
 	});
 
 	describe("quiet completion", () => {
