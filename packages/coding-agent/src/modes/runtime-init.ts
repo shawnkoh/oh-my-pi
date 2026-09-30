@@ -34,6 +34,12 @@ export interface InitializeExtensionsOptions {
 	trackExtensionSend?: (task: Promise<unknown>) => void;
 	/** Optional filter applied to tool names an extension activates. */
 	filterActiveTools?: (toolNames: string[]) => string[];
+	/**
+	 * Optional wrapper around extension-initiated session changes (new, branch,
+	 * navigate, switch), so the host can quiesce and reattach its own per-session
+	 * state exactly as it does for its own session-change commands.
+	 */
+	wrapSessionChange?: <T extends { cancelled: boolean }>(change: () => Promise<T>) => Promise<T>;
 }
 
 /**
@@ -56,6 +62,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 		trackAgentInvokingMessage,
 		trackExtensionSend,
 		filterActiveTools,
+		wrapSessionChange = change => change(),
 	} = options;
 	const shutdown = onShutdown ?? (() => {});
 
@@ -141,25 +148,29 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 		{
 			getContextUsage: () => session.getContextUsage(),
 			waitForIdle: () => session.agent.waitForIdle(),
-			newSession: async newOptions => {
-				const success = await session.newSession({ parentSession: newOptions?.parentSession });
-				if (success && newOptions?.setup) {
-					await newOptions.setup(session.sessionManager);
-				}
-				return { cancelled: !success };
-			},
-			branch: async entryId => {
-				const result = await session.branch(entryId);
-				return { cancelled: result.cancelled };
-			},
-			navigateTree: async (targetId, navOptions) => {
-				const result = await session.navigateTree(targetId, { summarize: navOptions?.summarize });
-				return { cancelled: result.cancelled };
-			},
-			switchSession: async sessionPath => {
-				const success = await session.switchSession(sessionPath);
-				return { cancelled: !success };
-			},
+			newSession: newOptions =>
+				wrapSessionChange(async () => {
+					const success = await session.newSession({ parentSession: newOptions?.parentSession });
+					if (success && newOptions?.setup) {
+						await newOptions.setup(session.sessionManager);
+					}
+					return { cancelled: !success };
+				}),
+			branch: entryId =>
+				wrapSessionChange(async () => {
+					const result = await session.branch(entryId);
+					return { cancelled: result.cancelled };
+				}),
+			navigateTree: (targetId, navOptions) =>
+				wrapSessionChange(async () => {
+					const result = await session.navigateTree(targetId, { summarize: navOptions?.summarize });
+					return { cancelled: result.cancelled };
+				}),
+			switchSession: sessionPath =>
+				wrapSessionChange(async () => {
+					const success = await session.switchSession(sessionPath);
+					return { cancelled: !success };
+				}),
 			reload: async () => {
 				await session.reload();
 			},
