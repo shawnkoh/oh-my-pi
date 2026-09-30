@@ -289,6 +289,12 @@ function isPageFallbackError(error: unknown): boolean {
 
 export class RpcClient {
 	#process: RpcAgentProcess | null = null;
+	#capabilities: readonly string[] = [];
+
+	/** Engine capabilities advertised on the ready frame; empty before start or on older engines. */
+	get capabilities(): readonly string[] {
+		return this.#capabilities;
+	}
 	#reaping: Promise<void> | null = null;
 	#eventListeners: RpcEventListener[] = [];
 	#sessionEventListeners: RpcSessionEventListener[] = [];
@@ -393,6 +399,9 @@ export class RpcClient {
 			for await (const line of lines) {
 				if (!readySettled && isRecord(line) && line.type === "ready") {
 					protocolV2Supported = supportsRpcProtocolV2(line);
+					this.#capabilities = Array.isArray(line.capabilities)
+						? line.capabilities.filter((entry): entry is string => typeof entry === "string")
+						: [];
 					readySettled = true;
 					readyResolve();
 					continue;

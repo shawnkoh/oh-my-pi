@@ -59,6 +59,7 @@ import {
 import { RpcSessionEventForwarder } from "./rpc-session-events";
 import { isRpcSessionSettled, RpcSessionSettleWatcher } from "./rpc-session-settle";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
+import { RPC_ENGINE_CAPABILITIES } from "./rpc-types";
 import type {
 	RpcCommand,
 	RpcExtensionUIRequest,
@@ -806,6 +807,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			supportedProtocolVersions: [1, 2],
 			maxFrameBytes: MAX_RPC_FRAME_BYTES,
 			maxReassembledFrameBytes: MAX_RPC_REASSEMBLED_BYTES,
+			capabilities: [...RPC_ENGINE_CAPABILITIES],
 		}),
 	);
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {

@@ -45,9 +45,12 @@ The initial ready frame uses protocol v1 and advertises the opt-in lossless tran
   "protocolVersion": 1,
   "supportedProtocolVersions": [1, 2],
   "maxFrameBytes": 1048576,
-  "maxReassembledFrameBytes": 67108864
+  "maxReassembledFrameBytes": 67108864,
+  "capabilities": []
 }
 ```
+
+`capabilities` lists versioned engine features (`name/major`) a host may rely on; older engines omit it. A capability that changes what the engine sends a host is enabled only after the host opts in, as its entry below describes.
 
 Clients that support protocol v2 SHOULD immediately send:
 

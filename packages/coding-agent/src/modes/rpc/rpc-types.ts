@@ -212,7 +212,16 @@ export interface RpcReadyFrame {
 	supportedProtocolVersions: [1, 2];
 	maxFrameBytes: number;
 	maxReassembledFrameBytes: number;
+	/** Engine features a host may rely on without probing (see {@link RPC_ENGINE_CAPABILITIES}). Absent on older engines. */
+	capabilities?: string[];
 }
+
+/**
+ * Capabilities advertised on the ready frame, one versioned name per feature
+ * (`name/major`). Features that change behavior for a host also require the
+ * host to opt in; the entry here only says the engine supports them.
+ */
+export const RPC_ENGINE_CAPABILITIES: readonly string[] = [];
 
 export interface RpcChunkFrame {
 	type: "rpc_chunk";
