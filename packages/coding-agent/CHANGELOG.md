@@ -2,11 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- Set `goal.toolDefault: true` to let agents start goal mode themselves in ordinary sessions; `--tools=...,goal` also exposes the tool explicitly while the default stays hidden ([#13877](https://github.com/can1357/oh-my-pi/pull/13877) by [@shawnkoh](https://github.com/shawnkoh))
+
 ## [18.4.6] - 2026-10-01
 
 ### Added
 
-- Set `goal.toolDefault: true` to let agents start goal mode themselves in ordinary sessions; `--tools=...,goal` also exposes the tool explicitly while the default stays hidden ([#13877](https://github.com/can1357/oh-my-pi/pull/13877) by [@shawnkoh](https://github.com/shawnkoh))
 - Added a live Background Jobs view that lets you monitor running background jobs without interrupting the transcript.
 - Added agent lineage navigation, making it easy to move between subagents and the main session from the composer header.
 - Added queued-message controls to the RPC clients and session API, including promotion of queued follow-ups to steering messages without duplicating text or losing attachments, plus explicit steering or follow-up behavior for prompts sent while the agent is busy.
