@@ -1110,6 +1110,79 @@ describe.skipIf(process.platform === "win32")("owned-job registry", () => {
 		}
 	});
 
+	it("repeats the scan when another invocation counted as live is gone by the count, and finds what it handed on", () => {
+		// A live process stands in for another invocation of the session file.
+		const other = Bun.spawn(["/bin/sleep", uniqueSleep()], { stdout: "ignore", stderr: "ignore" });
+		const handedOn = Bun.spawn(["/bin/sleep", uniqueSleep()], { stdout: "ignore", stderr: "ignore" });
+		spawned.push(other.pid, handedOn.pid);
+		const otherStartId = processIdentity(other.pid).startId!;
+		const token = `omp1:${other.pid}:${otherStartId}`;
+		fs.writeFileSync(ownedJobRegistryPath(sessionFile), `${JSON.stringify(header(other.pid, otherStartId))}\n`);
+		registry.ensureHeader();
+		expect(registry.liveProcessCount()).toBe(1);
+		const gone = new Set<number>();
+		const realIdentity = natives.processIdentity;
+		vi.spyOn(natives, "processIdentity").mockImplementation(pid =>
+			gone.has(pid) ? { state: "gone" } : realIdentity(pid),
+		);
+		let calls = 0;
+		// The other invocation exits right after the first scan, having handed its marker to a
+		// child that scan did not see yet.
+		const scan = vi.spyOn(natives, "scanProcessesByEnv").mockImplementation(() => {
+			if (++calls === 1) {
+				gone.add(other.pid);
+				return cleanScan();
+			}
+			const child = processIdentity(handedOn.pid);
+			return {
+				...cleanScan(),
+				processes: [{ pid: handedOn.pid, ppid: 1, startId: child.startId, command: "sleep", token }],
+			};
+		});
+		try {
+			const result = registry.scanAndCount();
+			expect(scan).toHaveBeenCalledTimes(2);
+			expect(result).toMatchObject({ live: 1, scan: { sound: true, discovered: 1 } });
+			expect(registry.openJobs()).toContainEqual(expect.objectContaining({ pid: handedOn.pid, discovered: true }));
+		} finally {
+			vi.restoreAllMocks();
+		}
+	});
+
+	it("breaks the run of clean scans a prune needs when a scan-and-count round did not settle", () => {
+		const pid = 0x7ffffff3;
+		const token = `omp1:${pid}:5`;
+		fs.writeFileSync(ownedJobRegistryPath(sessionFile), `${JSON.stringify(header(pid, "5"))}\n`);
+		registry.ensureHeader();
+		const fake = 0x7ffe0000;
+		const realIdentity = natives.processIdentity;
+		vi.spyOn(natives, "processIdentity").mockImplementation(queried =>
+			queried === fake ? { state: "gone" } : realIdentity(queried),
+		);
+		let vanishOnce = false;
+		// A clean scan whose count finds nothing gone, or (once) a marked process gone by the count.
+		const scan = vi.spyOn(natives, "scanProcessesByEnv").mockImplementation(() => {
+			if (!vanishOnce) return cleanScan();
+			vanishOnce = false;
+			return {
+				...cleanScan(),
+				processes: [{ pid: fake, ppid: 1, startId: "7", command: "carrier", token: ownerToken() }],
+			};
+		});
+		try {
+			registry.scanAndCount();
+			// Unsettled first round, then a settled one: that settled scan starts a new run.
+			vanishOnce = true;
+			registry.scanAndCount();
+			expect(scan).toHaveBeenCalledTimes(3);
+			expect(tokensOnNextBind()).toContain(token);
+			registry.scanAndCount();
+			expect(tokensOnNextBind()).not.toContain(token);
+		} finally {
+			vi.restoreAllMocks();
+		}
+	});
+
 	it("never prunes a taken-over token a live process still carries", () => {
 		const pid = 0x7ffffffd;
 		const token = `omp1:${pid}:5`;

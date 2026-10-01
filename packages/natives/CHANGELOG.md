@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `spawnedComplete` being `false` for every shell run that started an external command in OpenShell sandboxes, whose seccomp filter denies every process-group signal: whether such a command's process group is gone is now read from the process table
+- Fixed `pkill` reporting "signalling pid N failed" for every process where `pidfd_open` is unavailable (OpenShell sandboxes); it now signals by pid after re-checking that the pid still names the selected process
+
 ## [18.4.5] - 2026-09-30
 ### Added
 
@@ -11,6 +16,8 @@
 ### Fixed
 
 - Fixed macOS spell checking and Apple word completion adding a duplicate terminal icon to the Dock for every omp session ([#12491](https://github.com/can1357/oh-my-pi/issues/12491))
+- Fixed `spawnedComplete` being `false` for every shell run that left a process alive on Linux where `pidfd_open` is unavailable, such as OpenShell sandboxes whose seccomp filter fails it with `ENOSYS`: processes are now identified by their `/proc` start time there, are reported with their `startId`, and can still be signalled
+- Fixed `Shell.run` hanging forever with its command's process left a zombie on Linux where `pidfd_open` is unavailable (OpenShell sandboxes), once the host had spawned a subprocess of its own; waiting now retries reaping every 100 ms
 - Fixed `computer.windows()` on macOS marking every window of the frontmost app as focused. One window is marked now: the app's accessibility focused window, or its frontmost window when Accessibility permission is not granted. With the permission, `computer.focusedWindow()` no longer returns a floating panel such as TextEdit's Fonts panel in front of the document ([#13673](https://github.com/can1357/oh-my-pi/pull/13673) by [@will-bogusz](https://github.com/will-bogusz)).
 - Fixed non-Latin prompts that quote code in backticks or fences losing most of their prose score, which made the typing predictor's vocabulary refuse to learn them ([#13758](https://github.com/can1357/oh-my-pi/pull/13758) by [@jchanghong023](https://github.com/jchanghong023)).
 - Fixed `computer.window(...).ax()` leaving out everything inside an unnamed container. On macOS, Reminders, Contacts, Notes and Font Book windows showed only their toolbar and window buttons, and Calendar lost its month grid; Windows and Linux trees now also keep content under unnamed containers such as custom panes, lists and fillers ([#13822](https://github.com/can1357/oh-my-pi/pull/13822) by [@will-bogusz](https://github.com/will-bogusz)).
