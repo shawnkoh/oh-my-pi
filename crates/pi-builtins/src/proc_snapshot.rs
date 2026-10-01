@@ -253,15 +253,35 @@ mod proc_snapshot {
 			}
 		}
 
+		/// Sends `signal` (with `queue` as `sigqueue` data) to this process only
+		/// while its pid still names the process this snapshot saw. Through a
+		/// pidfd where `pidfd_open` works; otherwise (kernels before 5.3, or a
+		/// seccomp sandbox that fails the call, as OpenShell's does with
+		/// `ENOSYS`) by pid, after re-checking the start time and refusing a
+		/// zombie, whose pid could be recycled the moment it is reaped.
 		pub fn signal(&self, signal: i32, queue: Option<i32>) -> bool {
 			if signal == 0 {
 				return read_stat(self.pid).is_some_and(|stat| stat.start_time == self.stat.start_time);
 			}
-			let Some(pidfd) = open_pidfd(self.pid) else {
-				return false;
+			self.signal_through(open_pidfd(self.pid), signal, queue)
+		}
+
+		fn signal_through(
+			&self,
+			pidfd: Result<OwnedFd, PidfdError>,
+			signal: i32,
+			queue: Option<i32>,
+		) -> bool {
+			let pidfd = match pidfd {
+				Ok(pidfd) => Some(pidfd),
+				Err(PidfdError::Unavailable) => None,
+				Err(PidfdError::NoProcess) => return false,
 			};
-			if read_stat(self.pid).is_none_or(|stat| stat.start_time != self.stat.start_time) {
-				return false;
+			match read_stat(self.pid) {
+				Some(stat)
+					if stat.start_time == self.stat.start_time
+						&& (pidfd.is_some() || stat.state != 'Z') => {},
+				_ => return false,
 			}
 			if let Some(value) = queue {
 				let mut value_arg = libc::sigval { sival_ptr: std::ptr::null_mut() };
@@ -272,6 +292,10 @@ mod proc_snapshot {
 					return libc::sigqueue(self.pid, signal, value_arg) == 0;
 				}
 			}
+			let Some(pidfd) = pidfd else {
+				// SAFETY: `kill` takes integers by value and touches no caller memory.
+				return unsafe { libc::kill(self.pid, signal) } == 0;
+			};
 			// SAFETY: pidfd is valid and pidfd_send_signal reads no optional pointers.
 			unsafe {
 				libc::syscall(
@@ -307,13 +331,26 @@ mod proc_snapshot {
 		}
 	}
 
-	fn open_pidfd(pid: i32) -> Option<OwnedFd> {
+	/// Why `pidfd_open` gave no descriptor.
+	enum PidfdError {
+		/// No process has the pid (`ESRCH`, or `EINVAL` for an invalid one).
+		NoProcess,
+		/// The kernel or a sandbox does not provide pidfds (`ENOSYS`, `EPERM`),
+		/// or one could not be allocated.
+		Unavailable,
+	}
+
+	fn open_pidfd(pid: i32) -> Result<OwnedFd, PidfdError> {
 		// SAFETY: pidfd_open takes scalar arguments and returns a new owned fd.
 		let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
-		(fd >= 0).then(|| {
-			// SAFETY: successful pidfd_open returned a uniquely owned descriptor.
-			unsafe { OwnedFd::from_raw_fd(fd) }
-		})
+		if fd < 0 {
+			return Err(match std::io::Error::last_os_error().raw_os_error() {
+				Some(libc::ESRCH | libc::EINVAL) => PidfdError::NoProcess,
+				_ => PidfdError::Unavailable,
+			});
+		}
+		// SAFETY: successful pidfd_open returned a uniquely owned descriptor.
+		Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 	}
 
 	/// Lists every thread of each process, main thread first.
@@ -423,6 +460,54 @@ mod proc_snapshot {
 		u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
 			.ok()
 			.filter(|v| *v > 0)
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use std::{os::unix::process::ExitStatusExt as _, process::Command, time::Duration};
+
+		use super::{PidfdError, ProcInfo, read_stat};
+
+		/// Without a pidfd a snapshot signals its process by pid, and only while
+		/// that pid still names the process it saw: never a pid whose start time
+		/// differs (a recycled pid), never a zombie.
+		#[test]
+		fn signals_without_pidfd_only_the_process_it_saw() {
+			let unavailable = || Err(PidfdError::Unavailable);
+			let mut child = Command::new("sleep")
+				.arg("7541")
+				.spawn()
+				.expect("spawn sleep");
+			let pid = i32::try_from(child.id()).expect("child pid fits in i32");
+			let mut recycled = ProcInfo::from_pid(pid).expect("snapshot of a live child");
+			recycled.stat.start_time += 1;
+			let delivered_to_recycled = recycled.signal_through(unavailable(), libc::SIGKILL, None);
+			std::thread::sleep(Duration::from_millis(50));
+			let survived = child.try_wait().expect("child status").is_none();
+			let current = ProcInfo::from_pid(pid).expect("snapshot of a live child");
+			let delivered = current.signal_through(unavailable(), libc::SIGKILL, None);
+			let status = child.wait().expect("reap child");
+
+			let mut exits = Command::new("sleep")
+				.arg("7542")
+				.spawn()
+				.expect("spawn sleep");
+			let zombie = i32::try_from(exits.id()).expect("child pid fits in i32");
+			let snapshot = ProcInfo::from_pid(zombie).expect("snapshot of a live child");
+			exits.kill().expect("kill child");
+			let deadline = std::time::Instant::now() + Duration::from_secs(5);
+			while read_stat(zombie).is_some_and(|stat| stat.state != 'Z') {
+				assert!(std::time::Instant::now() < deadline, "child never became a zombie");
+				std::thread::sleep(Duration::from_millis(5));
+			}
+			let delivered_to_zombie = snapshot.signal_through(unavailable(), libc::SIGTERM, None);
+			let _ = exits.wait();
+
+			assert!(!delivered_to_recycled && survived, "a pid with another start time was signalled");
+			assert!(delivered, "the process the snapshot saw must be signalled");
+			assert_eq!(status.signal(), Some(libc::SIGKILL));
+			assert!(!delivered_to_zombie, "a zombie must never be signalled by pid");
+		}
 	}
 }
 #[cfg(target_os = "macos")]
