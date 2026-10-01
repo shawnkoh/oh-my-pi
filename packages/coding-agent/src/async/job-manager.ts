@@ -229,6 +229,14 @@ export interface AsyncJobFilter {
 	ownerId: string | undefined;
 }
 
+/** Synchronous lifecycle notifications for every job the manager runs. */
+export interface AsyncJobObserver {
+	/** Called before {@link AsyncJobManager.register} returns. */
+	registered?(job: AsyncJob): void;
+	/** Called once the job body has settled (completed, failed, or cancelled). */
+	settled?(job: AsyncJob): void;
+}
+
 export class AsyncJobManager {
 	static #instance: AsyncJobManager | undefined;
 
@@ -248,6 +256,7 @@ export class AsyncJobManager {
 	}
 
 	readonly #jobs = new Map<string, AsyncJob>();
+	readonly #observers = new Set<AsyncJobObserver>();
 	readonly #deliveries: AsyncJobDelivery[] = [];
 	readonly #inFlightDeliveries: AsyncJobDelivery[] = [];
 	readonly #suppressedDeliveries = new Set<string>();
@@ -378,6 +387,7 @@ export class AsyncJobManager {
 				});
 			}
 		};
+		this.#notify("registered", job);
 		job.promise = (async () => {
 			try {
 				const outcome = await run({
@@ -411,10 +421,29 @@ export class AsyncJobManager {
 			}
 			if (this.#releasedForegroundJobs.has(id)) this.#discardForegroundJob(id);
 			else this.#scheduleEviction(id);
+			this.#notify("settled", job);
 		})();
 
 		this.#jobs.set(id, job);
 		return id;
+	}
+
+	/** Observe job registration and settlement for every owner. Returns an unsubscribe function. */
+	observe(observer: AsyncJobObserver): () => void {
+		this.#observers.add(observer);
+		return () => {
+			this.#observers.delete(observer);
+		};
+	}
+
+	#notify(event: keyof AsyncJobObserver, job: AsyncJob): void {
+		for (const observer of this.#observers) {
+			try {
+				observer[event]?.(job);
+			} catch (error) {
+				logger.warn("Async job observer failed", { jobId: job.id, event, error: String(error) });
+			}
+		}
 	}
 
 	/**

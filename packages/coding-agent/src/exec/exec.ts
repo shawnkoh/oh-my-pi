@@ -1,7 +1,8 @@
 /**
- * Shared command execution utilities for hooks and custom tools.
+ * Shared command execution utilities for hooks, custom tools and extensions (`pi.exec`).
  */
 import { ptree } from "@oh-my-pi/pi-utils";
+import { ownerMarkerEnv } from "../session/owned-job-registry";
 
 /**
  * Options for executing shell commands.
@@ -27,7 +28,8 @@ export interface ExecResult {
 
 /**
  * Execute a shell command and return stdout/stderr/code.
- * Supports timeout and abort signal.
+ * Supports timeout and abort signal. The child inherits this invocation's owner marker
+ * (`OMP_OWNER`), so anything it leaves running is found by the owned-job scan.
  */
 export async function execCommand(
 	command: string,
@@ -37,6 +39,7 @@ export async function execCommand(
 ): Promise<ExecResult> {
 	const result = await ptree.exec([command, ...args], {
 		cwd,
+		env: { ...process.env, ...ownerMarkerEnv() },
 		signal: options?.signal,
 		timeout: options?.timeout,
 		allowNonZero: true,
