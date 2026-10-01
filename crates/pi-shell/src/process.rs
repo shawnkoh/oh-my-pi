@@ -3081,8 +3081,25 @@ enum GroupSignalAnswer {
 	Delivered,
 	/// `EPERM`.
 	NotPermitted,
-	/// Any other failure (`ESRCH`: no such group).
+	/// `ESRCH`: no process is in the group.
 	NoGroup,
+	/// Any other failure. It says nothing about the group's members, so the
+	/// group is never taken for gone on it.
+	Unexplained,
+}
+
+/// Classify the result of `kill(-pgid, 0)`: its return value and, when it
+/// failed, the `errno` it left.
+#[cfg(unix)]
+const fn group_signal_answer(ret: i32, errno: Option<i32>) -> GroupSignalAnswer {
+	if ret == 0 {
+		return GroupSignalAnswer::Delivered;
+	}
+	match errno {
+		Some(libc::EPERM) => GroupSignalAnswer::NotPermitted,
+		Some(libc::ESRCH) => GroupSignalAnswer::NoGroup,
+		_ => GroupSignalAnswer::Unexplained,
+	}
 }
 
 #[cfg(unix)]
@@ -3090,22 +3107,24 @@ fn platform_process_group_alive(pgid: i32) -> bool {
 	// SAFETY: `kill` takes integer identifiers by value and does not access
 	// caller-owned memory. A negative pid targets the process group; signal 0
 	// only runs the existence/permission checks.
-	let answer = if unsafe { libc::kill(-pgid, 0) } == 0 {
-		GroupSignalAnswer::Delivered
-	} else if std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) {
-		GroupSignalAnswer::NotPermitted
+	let ret = unsafe { libc::kill(-pgid, 0) };
+	let errno = if ret == 0 {
+		None
 	} else {
-		GroupSignalAnswer::NoGroup
+		std::io::Error::last_os_error().raw_os_error()
 	};
-	group_alive_from(answer, group_signals_blocked, || listed_or_unprovable_group(pgid))
+	group_alive_from(group_signal_answer(ret, errno), group_signals_blocked, || {
+		listed_or_unprovable_group(pgid)
+	})
 }
 
-/// Group liveness from `kill(-pgid, 0)`'s answer. `EPERM` is the kernel's exact
-/// "a member exists that is not ours to signal" unless `signals_blocked` says
-/// every group signal is refused here; then only the process table can tell,
-/// through `listed`. One listing can miss a member that forks a child and is
-/// reaped mid-pass, so the group counts as gone only when two listings in a
-/// row find no member.
+/// Group liveness from `kill(-pgid, 0)`'s answer. Only `ESRCH` makes a group
+/// gone. `EPERM` is the kernel's exact "a member exists that is not ours to
+/// signal" unless `signals_blocked` says every group signal is refused here;
+/// then only the process table can tell, through `listed`. One listing can miss
+/// a member that forks a child and is reaped mid-pass, so the group counts as
+/// gone only when two listings in a row find no member. Any other failure keeps
+/// the group alive (unprovable).
 #[cfg(unix)]
 fn group_alive_from(
 	answer: GroupSignalAnswer,
@@ -3113,7 +3132,7 @@ fn group_alive_from(
 	mut listed: impl FnMut() -> bool,
 ) -> bool {
 	match answer {
-		GroupSignalAnswer::Delivered => true,
+		GroupSignalAnswer::Delivered | GroupSignalAnswer::Unexplained => true,
 		GroupSignalAnswer::NoGroup => false,
 		GroupSignalAnswer::NotPermitted => !signals_blocked() || listed() || listed(),
 	}
@@ -3473,6 +3492,38 @@ mod tests {
 		let never = || -> bool { panic!("must not be consulted") };
 		assert!(group_alive_from(GroupSignalAnswer::Delivered, never, never));
 		assert!(!group_alive_from(GroupSignalAnswer::NoGroup, never, never));
+		assert!(group_alive_from(GroupSignalAnswer::Unexplained, never, never));
+	}
+
+	/// Only `ESRCH` says a group has no member. `EPERM` is its own answer, and
+	/// any other failure (a sandbox refusing with `EACCES` or `ENOSYS`, no
+	/// errno at all) is unexplained, which keeps the group alive.
+	#[cfg(unix)]
+	#[test]
+	fn only_esrch_from_a_group_signal_means_the_group_is_gone() {
+		assert_eq!(group_signal_answer(0, None), GroupSignalAnswer::Delivered);
+		assert_eq!(group_signal_answer(-1, Some(libc::EPERM)), GroupSignalAnswer::NotPermitted);
+		assert_eq!(group_signal_answer(-1, Some(libc::ESRCH)), GroupSignalAnswer::NoGroup);
+		for errno in [Some(libc::EACCES), Some(libc::ENOSYS), Some(libc::EINVAL), None] {
+			assert_eq!(
+				group_signal_answer(-1, errno),
+				GroupSignalAnswer::Unexplained,
+				"errno {errno:?}"
+			);
+		}
+	}
+
+	/// On an ordinary, unfiltered thread group signals are not blocked: the real
+	/// probe of our own group succeeds, so `EPERM` keeps meaning a member
+	/// exists.
+	#[cfg(unix)]
+	#[test]
+	fn group_signals_are_not_blocked_on_an_unfiltered_thread() {
+		// A fresh thread: its cached answer comes from its own probe.
+		let blocked = std::thread::spawn(group_signals_blocked)
+			.join()
+			.expect("probe thread");
+		assert!(!blocked, "an unfiltered thread must not see group signals blocked");
 	}
 
 	/// OpenShell's workload filter fails every process-group signal with
