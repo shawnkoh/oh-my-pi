@@ -142,6 +142,14 @@ describe.skipIf(process.platform === "win32")("Shell spawnedProcesses", () => {
 		expect(result.spawnedComplete).toBe(true);
 	});
 
+	it("finishes a run after the host itself spawned a subprocess", async () => {
+		// Without pidfd_open (OpenShell) a child is reaped on SIGCHLD; once Bun has spawned a
+		// process of its own that signal can be lost, and the run must still complete.
+		Bun.spawnSync(["/bin/sh", "-c", "true"]);
+		const result = await new Shell({}).run({ command: "/bin/sh -c 'exit 3'" });
+		expect(result.exitCode).toBe(3);
+	});
+
 	/**
 	 * A script that makes itself non-dumpable (its environment unreadable to us), then writes
 	 * its pid to the file named by its first argument and stays up.
