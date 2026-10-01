@@ -564,6 +564,18 @@ describe("AgentSession quiesce-and-exit", () => {
 		expect(s.quiesceForExit(request(s))).toMatchObject({ status: "refused", reason: "work_active" });
 	});
 
+	it("refuses a quiesce built before a delivery was admitted, even once it is gone again", async () => {
+		const s = createSession();
+		await s.prompt("materialize the transcript");
+		// Held, so the delivery neither starts a turn nor leaves anything counted once cancelled.
+		s.setPlanModeState({ enabled: true, planFilePath: "local://PLAN.md" });
+		const req = request(s);
+		const held = s.deliverExternalMessage(deliveryCard("brief"), { mode: "aside" });
+		expect(held.cancel()).toBe(true);
+		expect(s.getWorkCounts().queuedInput).toBe(0);
+		expect(s.quiesceForExit(req)).toMatchObject({ status: "refused", reason: "epoch_mismatch" });
+	});
+
 	it("never accepts an external delivery after a pass: the handle is already discarded", async () => {
 		const s = createSession();
 		await s.prompt("materialize the transcript");
