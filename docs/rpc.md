@@ -46,16 +46,11 @@ The initial ready frame uses protocol v1 and advertises the opt-in lossless tran
   "supportedProtocolVersions": [1, 2],
   "maxFrameBytes": 1048576,
   "maxReassembledFrameBytes": 67108864,
-  "capabilities": ["external-delivery/1"]
+  "capabilities": ["literal-input/1", "tool-approval-binding/1", "reply-attribution/1", "external-delivery/1", "rich-ask/1"]
 }
 ```
 
-`capabilities` lists engine capabilities a host may negotiate on before issuing
-an effectful command (currently `external-delivery/1`, see
-[External delivery](#external-delivery)). Older engines omit the field; treat a
-missing entry as the capability being absent. The same list is returned by
-`get_state.capabilities`, so a host attached after startup can negotiate
-without a destructive command.
+`capabilities` lists versioned engine features (`name/major`) a host may rely on; older engines omit it, so treat a missing entry as the capability being absent. A capability that changes what the engine sends a host is enabled only after the host opts in, as its entry below describes. `external-delivery/1` is described under [External delivery](#external-delivery). The same list is returned by `get_state.capabilities`, so a host attached after startup can negotiate without a destructive command.
 
 Clients that support protocol v2 SHOULD immediately send:
 
@@ -131,15 +126,17 @@ Important edge behavior from runtime:
 
 ### Prompting
 
-- `{ id?, type: "prompt", message: string, images?: ImageContent[], streamingBehavior?: "steer" | "followUp" }`
-- `{ id?, type: "steer", message: string, images?: ImageContent[] }`
-- `{ id?, type: "follow_up", message: string, images?: ImageContent[] }`
+- `{ id?, type: "prompt", message: string, images?: ImageContent[], streamingBehavior?: "steer" | "followUp", literal?: boolean }`
+- `{ id?, type: "steer", message: string, images?: ImageContent[], literal?: boolean }`
+- `{ id?, type: "follow_up", message: string, images?: ImageContent[], literal?: boolean }`
 - `{ id?, type: "remove_queued_message", message: string, queue: "steering" | "followUp" }`
 - `{ id?, type: "promote_queued_message", message: string }`
 - `{ id?, type: "abort" }`
-- `{ id?, type: "abort_and_prompt", message: string, images?: ImageContent[] }`
+- `{ id?, type: "abort_and_prompt", message: string, images?: ImageContent[], literal?: boolean }`
 - `{ id?, type: "new_session", parentSession?: string }`
 - `{ id?, type: "open_session", sessionDir: string }`
+
+With `literal: true` (capability `literal-input/1`) the message is the user's text exactly: no slash, skill, builtin, extension or custom command runs, no prompt template expands and model mentions are not rewritten. Hosts that let remote users converse, but not administer the session through message text, should always send it. It governs command parsing only: the model's tools behave as usual, and per-turn text features that are not commands still read the message (magic keywords such as `ultrathink`, a `+Nk` turn budget, eager todo/task preludes). A non-boolean `literal` is refused with an error response.
 
 ### Protocol
 
@@ -150,6 +147,7 @@ Important edge behavior from runtime:
 - `{ id?, type: "get_state" }`
 - `{ id?, type: "set_fast_mode", enabled: boolean }`
 - `{ id?, type: "goal", op: "get" | "create" | "resume" | "pause" | "drop", objective?: string, token_budget?: number }`
+- `{ id?, type: "set_ui_capabilities", capabilities: string[] }` — opt in to UI extensions the host can answer (currently `rich-ask/1`); the response lists those enabled
 - `{ id?, type: "get_available_commands" }`
 - `{ id?, type: "get_entries", since?: string }`
 - `{ id?, type: "get_tree" }`
@@ -298,6 +296,7 @@ Data payloads are command-specific and defined in `rpc-types.ts`.
 - `agentInvoked: true`: the prompt was dispatched or queued for agent work; normal completion reports when the agent **yielded** — see [Yield vs settled](#yield-vs-settled). An abort that wins before dispatch can still report `true` with `status: "aborted"`. A prompt dispatched as a fresh turn reports the first run that started after it was accepted, so a late `agent_end` from an earlier run never completes it. A prompt queued into a live run (`streamingBehavior`) reports at the first yield after its message left the queue. An `agent_end` with `yielded: false` (the agent is retrying, compacting, or answering a stop-time reminder) never completes a prompt.
 - `status`: `"completed"`, `"aborted"` (interrupted by `abort`, `abort_and_prompt`, or a session transition, or dropped by an abort before dispatch), or `"error"`.
 - `error` (only with `status: "error"`): `{ message, provider?, model?, httpStatus?, retryable }`. `message` is the provider's error text with OMP-local diagnostics (such as saved request-dump paths) removed. `retryable` marks a transient failure; OMP's own automatic retries have already been exhausted. A prompt that fails before reaching the agent also gets the legacy error response with the same `id` before its `prompt_result`.
+- `run`, `promptEntryId` and `replyEntryIds` (capability `reply-attribution/1`). `run` is the engine-local ordinal of the run whose yield answered the prompt. A run spans retries and continuations up to that yield, and prompts reported with the same `run` were answered together, such as a follow-up folded into a live turn. `promptEntryId` is the session entry of the prompt's own user message. `replyEntryIds` are the assistant entries that followed it, up to the next user message; the last is the reply. A `literal` prompt is found by its exact text, unless another prompt answered by the same yield has the same text. Any other prompt is attributed only when it is the sole prompt answered and its run delivered a single user message. Every persisted user message counts: a host `steer`, an extension `sendUserMessage` or a subagent steer ends the preceding reply early and makes parsed prompts unattributable; skill prompts are never attributed. An external delivery or goal-mode context that arrives during the run also ends the preceding reply, without affecting which prompt is identified. A command that schedules agent work (for example an extension command calling `sendUserMessage`) is attributed to the run that work starts, not to a delivery wake that ran while its handler was working; if it schedules work from idle more than once, the last such run is reported. Work it queues into a live run joins that run and is reported at that run's yield, even if an earlier run already yielded while its handler worked. An incoming subagent message also ends the preceding reply. Entries are read at the yield. `replyEntryIds` is empty, and `promptEntryId` absent, rather than guessed when the prompt cannot be identified or the session or branch changed during the run. All three are absent for local-only commands.
 - `sessionSettled`: whether the session is already done when the result is written — see [Yield vs settled](#yield-vs-settled). `false` means background work can still wake the agent; a `session_settled` frame follows once it has.
 
 A failed provider turn is not a failed command: the prompt response is still `success: true`, and the turn ends with a normal terminal `agent_end` whose last assistant message has `stopReason: "error"`. Use `prompt_result.status` rather than parsing that message.
@@ -360,7 +359,7 @@ The command moves the existing queued message, including its attachments and con
 
 `data.promoted: false` means no matching user follow-up is pending at dispatch time (for example, it was already delivered). Non-string `message` values produce an error response. Existing steering, follow-up, and interrupt modes still apply; promotion does not abort the model stream or guarantee cancellation of running tools. While the agent is idle, a promoted message starts a turn right away, including after a user `abort` — promoting is an explicit request to steer now. The move is reported as one `queue_update` in which the message has already left `followUp` and joined `steering`.
 
-Since `prompt` acknowledges only once the message is admitted (see above), a `promote_queued_message` sent immediately after a queued `prompt`'s acknowledgement reliably observes it. Older runtimes reject this command; clients must not fall back to `steer`, which would enqueue a duplicate. The TypeScript client exposes `promoteQueuedMessage(message): Promise<{ promoted: boolean }>`, and its `prompt(message, images?, streamingBehavior?)` accepts `"steer"` or `"followUp"` to queue a prompt sent while the agent is busy.
+Since `prompt` acknowledges only once the message is admitted (see above), a `promote_queued_message` sent immediately after a queued `prompt`'s acknowledgement reliably observes it. Older runtimes reject this command; clients must not fall back to `steer`, which would enqueue a duplicate. The TypeScript client exposes `promoteQueuedMessage(message): Promise<{ promoted: boolean }>`, and its `prompt(message, images?, options?)` accepts `"steer"` or `"followUp"`, or `{ streamingBehavior, literal }`, to queue a prompt sent while the agent is busy. Literal prompts follow the same admission rule.
 
 The official Python client exposes `promote_queued_message(message) -> PromoteQueuedMessageResult`; inspect its `.promoted` boolean rather than the result object's truthiness.
 
@@ -1015,11 +1014,43 @@ Use `--mode rpc --no-ui` for a host without a tool UI surface; use `--mode rpc-u
 
 `RpcExtensionUIRequest` (`type: "extension_ui_request"`) methods:
 
-- `select`, `confirm`, `input`, `editor`, `cancel`
+- `select`, `confirm`, `input`, `editor`, `cancel`, `ask`
+  - `ask` (capability `rich-ask/1`, advertised only by `--mode rpc-ui`; opt-in:
+    sent only after the host sends `{ type: "set_ui_capabilities", capabilities:
+    ["rich-ask/1"] }`, otherwise askers keep their `select`/`editor` fallback)
+    carries every question of one ask dialog, from the ask tool, an extension's
+    `ui.askDialog`, or a prelude: `questions: [{ id, question, header?, options: [{ label,
+    description?, preview? }], multi, recommended? }]`, plus `acceptImages` and
+    `timeout`. Reply with `{ type: "extension_ui_response", id, ask: { kind:
+    "submit", results: [{ id, selectedOptions, customInput?, customInputImages?,
+    note?, noteImages? }] } }` in question order, `ask: { kind: "chat"
+    }` to discuss instead, or `cancelled: true`. Selected labels must be offered
+    options (at most one unless `multi`), and images are accepted only when
+    `acceptImages` is true. A single-choice answer has either one selected
+    option or `customInput`, not both. Images must be base64 raster images (no
+    SVG). Any other reply is logged and treated as cancellation. The engine
+    owns `timeout`: when it expires, each question gets its recommended (or
+    first) option, marked timed out, as in the terminal dialog. As with any
+    dialog that has a `timeout`, the engine then sends `cancel` for the request.
   - `select` keeps labels in `options: string[]` and, when any option has a
     description, emits a positionally aligned
     `optionDetails: Array<{ description?: string }>` array. Hosts that do not
     render descriptions can continue using `options` alone.
+  - A tool-approval `select` (`options: ["Approve", "Deny"]`) also carries
+    `approval: { toolCallId, toolName, arguments, reason? }` (capability
+    `tool-approval-binding/1`): the native call id and the arguments the
+    approval policy evaluated. Those are the tool's arguments, except for
+    provider computer-use calls, where they are the provider's `{ actions }`.
+    Eval prelude approvals carry the same binding with the enclosing eval
+    call's `toolCallId`, so several approvals can share one id; `(toolCallId,
+    toolName)` identifies the decision. Hosts should bind their answer to that
+    call, not to the title. An interrupt sends `cancel` for the pending dialog.
+    An answer that arrives after the call was aborted never runs it.
+  - Under protocol v1, a frame over 1 MiB is shrunk: long strings end in
+    `…[N chars elided for RPC frame]`, so large `arguments` are not exact.
+    Hosts that need exact arguments for review should negotiate protocol v2.
+    Otherwise, treat a binding that contains an elision marker as not
+    reviewable.
 - `notify`, `setStatus`, `setWidget`, `setTitle`, `set_editor_text`
 - `open_url` (emitted by RPC login flows): includes `url`, optional `launchUrl`, and optional `instructions`. When present, `launchUrl` is a short loopback redirect and is the recommended copy target so terminal truncation cannot corrupt OAuth query parameters.
 
@@ -1050,6 +1081,7 @@ Example:
 - `{ type: "extension_ui_response", id: string, value: string }`
 - `{ type: "extension_ui_response", id: string, confirmed: boolean }`
 - `{ type: "extension_ui_response", id: string, cancelled: true, timedOut?: boolean }`
+- `{ type: "extension_ui_response", id: string, ask: RpcAskReply }` (reply to `ask`)
 
 `select` and `input` resolve to `undefined`, and `confirm` to `false`, on
 cancellation, timeout, or signal abort. Signal abort emits a `cancel` request
