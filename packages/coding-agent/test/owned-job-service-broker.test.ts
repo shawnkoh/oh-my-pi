@@ -432,6 +432,20 @@ describe.skipIf(process.platform === "win32")("owned-job registry: broker-hosted
 		});
 	}, 30_000);
 
+	it("runs a restart and a stop sent together in order: the service ends stopped, with no process left", async () => {
+		await withPtyService(async ({ client, meta, marker }) => {
+			const restart = client.request({ op: "restart", name: "svc" });
+			const stop = client.request({ op: "stop", name: "svc", timeoutMs: 2_000 });
+			const restarted = await restart;
+			const stopped = await stop;
+			if (stopped.op !== "stop" || restarted.op !== "restart") throw new Error("unexpected results");
+			expect(["exited", "failed"]).toContain(stopped.daemon.state);
+			await eventually(() => liveSleeps(marker).length === 0, "every service process to exit");
+			expect(["exited", "failed"]).toContain(publishedState(meta).state);
+			expect(registry.liveProcessCount()).toBe(0);
+		});
+	}, 30_000);
+
 	it("leaves no orphan when two restarts arrive together, and a stop then ends every process", async () => {
 		await withPtyService(async ({ client, meta, marker }) => {
 			const results = await Promise.all([
