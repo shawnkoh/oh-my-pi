@@ -156,6 +156,18 @@ describe.skipIf(process.platform === "win32")("owned-job registry: broker-hosted
 			expect(ownedProcessState(firstPid, null)).toBe("gone");
 			expect(registry.liveProcessCount()).toBe(1);
 			expect(serviceJobs()).toEqual([firstJob]);
+			// Another session object binding the file (as a resume does) takes it over too.
+			const resumed = new OwnedJobRegistry({
+				getSessionFile: () => sessionFile,
+				getSessionId: () => "session",
+				pollIntervalMs: 0,
+			});
+			try {
+				resumed.ensureHeader();
+				expect(resumed.openJobs()).toContainEqual(expect.objectContaining({ kind: "service", pid: firstPid }));
+			} finally {
+				resumed.close();
+			}
 
 			// Relaunched (as `omp ps restart` does): the new process carries the work.
 			const restarted = await client.request({ op: "restart", name: "svc" });
