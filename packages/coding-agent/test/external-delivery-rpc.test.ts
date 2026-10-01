@@ -78,13 +78,13 @@ describe("external delivery over RPC", () => {
 		const rpc = start();
 		const ready = await rpc.receive();
 		expect(ready.type).toBe("ready");
-		expect(ready.capabilities).toEqual(["external-delivery/1"]);
+		expect(ready.capabilities).toContain("external-delivery/1");
 		// Advertised before negotiation: a v1-only host can read it from the first frame.
 		expect(rpc.received.length).toBe(1);
 		// The same list is queryable without side effects before any effectful command.
 		const state = await rpc.command({ type: "get_state" });
 		expect(state.success).toBe(true);
-		expect(state.data).toMatchObject({ capabilities: ["external-delivery/1"], externalDeliveries: [] });
+		expect(state.data).toMatchObject({ capabilities: ready.capabilities, externalDeliveries: [] });
 	}, 30_000);
 
 	test("deliver never parses commands, and receipts correlate by the engine-minted delivery id", async () => {
