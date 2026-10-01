@@ -351,6 +351,8 @@ describe.skipIf(process.platform === "win32")("owned-job registry: broker-hosted
 			marker: string;
 			projectDir: string;
 			started: DaemonSnapshot;
+			/** Settles once the broker has shut down. */
+			brokerFinished: Promise<void>;
 		}) => Promise<void>,
 		options: { slowStop?: boolean } = {},
 	): Promise<void> {
@@ -360,6 +362,10 @@ describe.skipIf(process.platform === "win32")("owned-job registry: broker-hosted
 		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
 		const previousTitle = process.title;
 		const broker = await startEmbeddedBroker(projectDir, runtimeDir, 1_000);
+		let brokerDone = false;
+		void broker.finished.then(() => {
+			brokerDone = true;
+		});
 		const meta = daemonMetadataPath(runtimeDir, "svc");
 		const marker = markerSleep();
 		try {
@@ -386,10 +392,11 @@ describe.skipIf(process.platform === "win32")("owned-job registry: broker-hosted
 				broker: { pid: process.pid },
 				daemon: { id: started.daemon.id, meta },
 			});
-			await body({ client, meta, marker, projectDir, started: started.daemon });
+			await body({ client, meta, marker, projectDir, started: started.daemon, brokerFinished: broker.finished });
 		} finally {
 			spawned.push(...liveSleeps(marker));
-			await client.request({ op: "shutdown" }).catch(() => undefined);
+			// A broker the test already shut down is not asked again: the client would spawn a new one.
+			if (!brokerDone) await client.request({ op: "shutdown" }).catch(() => undefined);
 			client.close();
 			await broker.finished;
 			process.title = previousTitle;
@@ -596,16 +603,49 @@ describe.skipIf(process.platform === "win32")("owned-job registry: broker-hosted
 		});
 	}, 30_000);
 
-	it("refuses a restart whose turn comes once the broker is shutting down", async () => {
+	it("runs a restart that arrives during a start's first launch only after that launch", async () => {
+		await withPtyService(async ({ client, projectDir }) => {
+			const marker = markerSleep();
+			const meta = daemonMetadataPath(path.join(tempDir.path(), "runtime"), "web");
+			try {
+				const start = client.request({ op: "start", spec: { ...sleepSpec(marker, projectDir), name: "web" } });
+				const startDone = settledFlag(start);
+				let restart: Promise<DaemonRpcResult> | undefined;
+				while (!startDone.done) {
+					const published = publishedState(meta);
+					// The new record is installed and its process is not spawned yet.
+					if (!restart && published.state === "running" && published.pid === undefined) {
+						restart = client.request({ op: "restart", name: "web" });
+					}
+					await nextTurn();
+				}
+				if (!restart) throw new Error("the first launch was never observed under way");
+				const restarted = await restart;
+				if (restarted.op !== "restart" || restarted.daemon.pid === undefined) throw new Error("no relaunch");
+				const pid = restarted.daemon.pid;
+				await eventually(() => publishedState(meta).pid === pid, "the relaunch to be published");
+				expect(await liveSleepsOnce(marker, pid)).toEqual([pid]);
+			} finally {
+				spawned.push(...liveSleeps(marker));
+			}
+		});
+	}, 30_000);
+
+	it("never relaunches a service for a restart whose turn comes once the broker is shutting down", async () => {
 		await withPtyService(
-			async ({ client }) => {
+			async ({ client, meta, started, brokerFinished }) => {
 				const [, restarted] = await Promise.allSettled([
 					client.request({ op: "stop", name: "svc", timeoutMs: 1_000 }),
 					client.request({ op: "restart", name: "svc" }),
 					client.request({ op: "shutdown" }),
 				]);
+				// Refused ("shutting down"), or cut off when the broker closed the connection.
 				expect(restarted.status).toBe("rejected");
-				expect(restarted.status === "rejected" ? String(restarted.reason) : "").toContain("shutting down");
+				await brokerFinished;
+				// No relaunch: the published generation is still the one the test started.
+				const published = JSON.parse(fs.readFileSync(meta, "utf8")).daemon;
+				expect(published.startedAt).toBe(started.startedAt);
+				expect(["exited", "failed"]).toContain(published.state);
 			},
 			{ slowStop: true },
 		);
