@@ -304,6 +304,8 @@ class FakeAgentSession {
 		return true;
 	}
 
+	beginDispose(): void {}
+
 	async dispose(): Promise<void> {
 		this.disposed = true;
 		await this.sessionManager.close();

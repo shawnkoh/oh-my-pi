@@ -778,6 +778,13 @@ export class SessionAdvisors {
 		await Promise.allSettled(this.#pendingAdvisorCardEvents);
 	}
 
+	/** Advisor work that can still change the session: card events persisting, reviews queued or running. */
+	pendingWork(): number {
+		let pending = this.#pendingAdvisorCardEvents.size;
+		for (const advisor of this.#advisors) pending += advisor.runtime.pendingWork;
+		return pending;
+	}
+
 	// Advisor runtime lifecycle
 	// -------------------------------------------------------------------------
 	#advisorImmuneTurnLimit(): number {
