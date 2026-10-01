@@ -805,6 +805,14 @@ class DaemonBroker {
 			pendingCompletions: replace ? (existing?.pendingCompletions ?? []) : [],
 		};
 		syncReadyPending(record);
+		// Shutdown may have begun during the awaits above. Its pass over the records never
+		// visits a record installed under a key it already passed (or after it finished), so
+		// nothing would ever stop this one: refuse instead. No await between this check and
+		// the install.
+		if (this.#shuttingDown) {
+			await record.log?.close();
+			throw new Error("Daemon broker is shutting down");
+		}
 		this.#records.set(spec.name, record);
 		return { record, launchGate };
 	}
