@@ -293,6 +293,55 @@ describe.skipIf(process.platform === "win32")("owned-job registry: broker-hosted
 		}
 	}, 30_000);
 
+	it("ends the record when a restart request's relaunch fails", async () => {
+		const projectDir = path.join(tempDir.path(), "project");
+		const runtimeDir = path.join(tempDir.path(), "runtime");
+		const serviceDir = path.join(tempDir.path(), "service-cwd");
+		fs.mkdirSync(projectDir);
+		fs.mkdirSync(serviceDir);
+		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+		const previousTitle = process.title;
+		const broker = await startEmbeddedBroker(projectDir, runtimeDir, 1_000);
+		const meta = daemonMetadataPath(runtimeDir, "svc");
+		try {
+			const started = await client.request({
+				op: "start",
+				spec: {
+					name: "svc",
+					application: "/bin/sleep",
+					args: [uniqueSleep()],
+					env: {},
+					cwd: serviceDir,
+					pty: false,
+					restart: "no",
+					persist: false,
+					detached: false,
+				},
+			});
+			if (started.op !== "start" || started.daemon.pid === undefined) throw new Error("service did not start");
+			spawned.push(started.daemon.pid);
+			registry.registerProcess({
+				kind: "service",
+				jobId: `service:${started.daemon.id}:${started.daemon.startedAt}`,
+				pid: started.daemon.pid,
+				command: "sleep",
+				broker: { pid: process.pid },
+				daemon: { id: started.daemon.id, meta },
+			});
+			// Its working directory is gone, so the relaunch cannot start.
+			fs.rmSync(serviceDir, { recursive: true });
+			await client.request({ op: "restart", name: "svc" });
+			await eventually(() => publishedState(meta).state === "failed", "the failed relaunch to be published");
+			expect(registry.liveProcessCount()).toBe(0);
+			expect(registry.openJobs().filter(job => job.kind === "service")).toEqual([]);
+		} finally {
+			await client.request({ op: "shutdown" }).catch(() => undefined);
+			client.close();
+			await broker.finished;
+			process.title = previousTitle;
+		}
+	}, 30_000);
+
 	it("keeps counting a gone service while its broker's metadata cannot be read", () => {
 		stubIdentities(new Map([[FAKE_SERVICE_PID, { state: "gone" }]]));
 		registry.registerProcess({
