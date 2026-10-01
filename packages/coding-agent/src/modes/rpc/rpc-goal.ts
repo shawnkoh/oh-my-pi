@@ -394,18 +394,19 @@ export class RpcGoalController {
 		);
 	}
 
-	/**
-	 * Decide at a yield to continue the goal; admit the continuation once the yielding
-	 * run has fully unwound. While waiting, {@link continuationPending} is true, so no
-	 * settle report calls the session settled. At admission every gate is re-read:
-	 * an abort, disposal, pause, plan mode, or another turn starting meanwhile drops it.
-	 */
+	/** Drop the scheduled continuation and release its quiesce reservation. */
 	#dropScheduled(): void {
 		this.#continuationScheduled = false;
 		this.#reservation?.release();
 		this.#reservation = undefined;
 	}
 
+	/**
+	 * Decide at a yield to continue the goal; admit the continuation once the yielding
+	 * run has fully unwound. While waiting, {@link continuationPending} is true, so no
+	 * settle report calls the session settled. At admission every gate is re-read:
+	 * an abort, disposal, pause, plan mode, or another turn starting meanwhile drops it.
+	 */
 	#scheduleContinuation(): void {
 		if (this.#sessionChanges > 0) {
 			// Held until the change ends; a same-session change resumes it.
