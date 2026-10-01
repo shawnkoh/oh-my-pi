@@ -725,7 +725,11 @@ pidfd where `pidfd_open` works, otherwise from `/proc/<pid>/stat` (older kernels
 sandboxes such as OpenShell whose seccomp filter fails `pidfd_open` with `ENOSYS`), so
 a run whose processes are all visible reports itself complete either way. Its group
 enumeration reads only `/proc/<pid>/stat`, so processes whose environment cannot be
-read, unrelated or not, never make it incomplete. On macOS the kernel withholds the
+read, unrelated or not, never make it incomplete. Whether a group the run created still
+has members is asked with `kill(-pgid, 0)`; where that is denied (OpenShell's seccomp
+filter fails every process-group signal with `EPERM`), the process table decides, and
+a group counts as gone only when a complete listing shows no member of it, zombies
+included. On macOS the kernel withholds the
 environment of Apple platform binaries (`sh`, `zsh`, `sleep`, …), so the scan is almost
 never `sound` there and consumers get `unknown` rather than a false clear. Windows has
 no scan.

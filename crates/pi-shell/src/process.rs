@@ -3057,8 +3057,10 @@ fn prune_exited(spawned: &mut Vec<OwnedSpawn>) {
 
 /// True when process group `pgid` still has at least one member. `kill(2)`
 /// with signal 0 performs permission/existence checks without delivering a
-/// signal; `EPERM` means the group exists but is not ours to signal, which
-/// still counts as alive.
+/// signal. `EPERM` usually means the group exists but is not ours to signal;
+/// a sandbox that denies every process-group signal (OpenShell's seccomp
+/// filter) answers it for empty groups too, so then the process table
+/// decides.
 #[must_use]
 #[allow(
 	clippy::missing_const_for_fn,
@@ -3077,7 +3079,22 @@ fn platform_process_group_alive(pgid: i32) -> bool {
 	// caller-owned memory. A negative pid targets the process group; signal 0
 	// only runs the existence/permission checks.
 	let ret = unsafe { libc::kill(-pgid, 0) };
-	ret == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+	if ret == 0 {
+		return true;
+	}
+	std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+		&& listed_or_unprovable_group(pgid)
+}
+
+/// Whether the process table shows a member of `pgid`, zombies included, or
+/// cannot prove it has none: only a complete listing without a member makes
+/// the group gone.
+#[cfg(unix)]
+fn listed_or_unprovable_group(pgid: i32) -> bool {
+	// The listing leaves out this process, which may be the group's only member.
+	is_self_process_group(pgid)
+		|| platform::list_group_members(&HashSet::from([pgid]))
+			.is_none_or(|listing| listing.partial || listing.seen.contains(&pgid))
 }
 
 #[cfg(not(unix))]
@@ -3308,6 +3325,121 @@ mod tests {
 		let zombie_pinned = platform::Process::from_pid_without_pidfd(zombie).is_some();
 		let _ = exits.wait();
 		assert!(!zombie_pinned, "a zombie must not be pinned");
+	}
+
+	/// Installs, on the calling thread only, the signal rules of OpenShell's
+	/// workload seccomp filter that change what this module observes:
+	/// `pidfd_open` fails with `ENOSYS`, and `kill` with a pid of zero or below
+	/// (a process group, or every process) fails with `EPERM`.
+	#[cfg(target_os = "linux")]
+	fn emulate_openshell_signal_filter() {
+		const fn stmt(code: u32, k: u32) -> libc::sock_filter {
+			libc::sock_filter { code: code as u16, jt: 0, jf: 0, k }
+		}
+		const fn jump(code: u32, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
+			libc::sock_filter { code: code as u16, jt, jf, k }
+		}
+		let syscall = |nr: libc::c_long| u32::try_from(nr).expect("syscall number fits u32");
+		let load = libc::BPF_LD | libc::BPF_W | libc::BPF_ABS;
+		let equal = libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K;
+		let returns = libc::BPF_RET | libc::BPF_K;
+		// `seccomp_data`: `nr` at offset 0, the low word of `args[0]` at 16.
+		let mut program = [
+			stmt(load, 0),
+			jump(equal, syscall(libc::SYS_pidfd_open), 0, 1),
+			stmt(returns, libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32),
+			jump(equal, syscall(libc::SYS_kill), 0, 4),
+			stmt(load, 16),
+			jump(libc::BPF_JMP | libc::BPF_JSET | libc::BPF_K, 1 << 31, 1, 0),
+			jump(equal, 0, 0, 1),
+			stmt(returns, libc::SECCOMP_RET_ERRNO | libc::EPERM as u32),
+			stmt(returns, libc::SECCOMP_RET_ALLOW),
+		];
+		let filter = libc::sock_fprog {
+			len:    u16::try_from(program.len()).expect("program length fits u16"),
+			filter: program.as_mut_ptr(),
+		};
+		// SAFETY: both calls take scalars and, for the filter, a pointer to a
+		// program that stays alive for the call; without
+		// `SECCOMP_FILTER_FLAG_TSYNC` only this thread is filtered.
+		unsafe {
+			assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0, "no_new_privs");
+			assert_eq!(
+				libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &raw const filter),
+				0,
+				"install seccomp filter"
+			);
+		}
+	}
+
+	/// OpenShell's workload filter fails every process-group signal with
+	/// `EPERM`, which `kill(2)` otherwise answers only for a group whose
+	/// members are not ours to signal. A command that ran in its own group and
+	/// exited must leave the survivor list empty and complete, and a member
+	/// still alive in a group whose leader exited must still be reported.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn survivors_stay_exact_where_group_signals_are_denied() {
+		use std::{os::unix::process::CommandExt as _, process::Command};
+
+		let (exited, left_behind, member_pid, leader_pid, member_identity) =
+			std::thread::spawn(|| {
+				emulate_openshell_signal_filter();
+				// SAFETY: `getpgrp` and `kill` take and return scalars only.
+				let probe = unsafe { libc::kill(-libc::getpgrp(), 0) };
+				assert_eq!(
+					(probe, std::io::Error::last_os_error().raw_os_error()),
+					(-1, Some(libc::EPERM)),
+					"the filter must deny a probe of our own live group"
+				);
+
+				let mut exits = Command::new("true")
+					.process_group(0)
+					.spawn()
+					.expect("spawn true");
+				let pid = i32::try_from(exits.id()).expect("child pid fits in i32");
+				let registry = SpawnRegistry::new();
+				registry.record(pid, Some(pid), Process::from_pid(pid));
+				let _ = exits.wait();
+				let exited = registry.survivors();
+
+				let mut leader = Command::new("sleep")
+					.arg("7531")
+					.process_group(0)
+					.spawn()
+					.expect("spawn leader");
+				let leader_pid = i32::try_from(leader.id()).expect("leader pid fits in i32");
+				let mut member = Command::new("sleep")
+					.arg("7532")
+					.process_group(leader_pid)
+					.spawn()
+					.expect("spawn member");
+				let member_pid = i32::try_from(member.id()).expect("member pid fits in i32");
+				let registry = SpawnRegistry::new();
+				registry.record(leader_pid, Some(leader_pid), Process::from_pid(leader_pid));
+				let _ = leader.kill();
+				let _ = leader.wait();
+				let left_behind = registry.survivors();
+				let member_identity = process_identity(member_pid);
+				let _ = member.kill();
+				let _ = member.wait();
+				(exited, left_behind, member_pid, leader_pid, member_identity)
+			})
+			.join()
+			.expect("filtered thread");
+
+		assert_eq!(exited, Survivors { processes: Vec::new(), complete: true });
+		assert_eq!(left_behind, Survivors {
+			processes: vec![SpawnedProcess {
+				pid:          member_pid,
+				pgid:         Some(leader_pid),
+				start_time:   member_identity.start_time,
+				start_id:     member_identity.start_id,
+				reparented:   false,
+				group_member: true,
+			}],
+			complete:  true,
+		});
 	}
 
 	/// The harness pid must be the only protected pid. Including its recorded
