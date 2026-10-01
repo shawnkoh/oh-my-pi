@@ -491,7 +491,9 @@ read-only snapshot, then asks the process to exit only if nothing changed:
    includes commands this process has read but not yet answered, notifications
    received but not yet queued (MCP resource changes inside their debounce window),
    and every [external delivery](#external-delivery) the session still holds (`queued`,
-   or `accepted` and not yet settled).
+   or `accepted` and not yet settled). `goalContinuationScheduled` counts goal
+   continuations decided but not yet submitted, including the RPC goal controller's
+   (`goal.continuationModes` with `"rpc"`); once input admission closes, none is scheduled.
    `scheduledTurns` includes turns scheduled to start, retry and TTSR resumes, event
    and extension handlers still running after the agent went idle, message
    persistence in flight, advisor reviews, and an in-flight cache-warming request;

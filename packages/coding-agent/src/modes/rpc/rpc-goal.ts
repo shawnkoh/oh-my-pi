@@ -13,6 +13,7 @@ import { logger } from "@oh-my-pi/pi-utils";
 import { cfgGoalContinuationModes, cfgGoalEnabled } from "../../goals/settings";
 import { type GoalModeState, goalContinuationActivity, goalFromModeData } from "../../goals/state";
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
+import type { GoalContinuationReservation } from "../../session/quiescence";
 import { nextActionableTask } from "../../tools/todo";
 
 /** `goal.continuationModes` value that enables automatic continuation for RPC hosts. */
@@ -50,6 +51,7 @@ export type RpcGoalSession = Pick<
 	| "isSessionTransitioning"
 	| "hasAdmittedSubmission"
 	| "queuedMessageCount"
+	| "reserveGoalContinuation"
 >;
 
 export class RpcGoalController {
@@ -63,6 +65,8 @@ export class RpcGoalController {
 	#suppressContinuation = false;
 	/** A continuation has been decided and is waiting for the session to go idle. */
 	#continuationScheduled = false;
+	/** Holds the scheduled continuation as session work (quiescence) until it is submitted or dropped. */
+	#reservation: GoalContinuationReservation | undefined;
 	/** Bumped by a host abort or session change; a waiting continuation from before is void. */
 	#continuationGeneration = 0;
 	/** Tool-set restoration triggered by session events; commands and reads wait for it. */
@@ -111,7 +115,7 @@ export class RpcGoalController {
 	 */
 	stopForHostAbort(): void {
 		this.#suppressContinuation = true;
-		this.#continuationScheduled = false;
+		this.#dropScheduled();
 		this.#continuationGeneration++;
 	}
 
@@ -147,7 +151,7 @@ export class RpcGoalController {
 			this.#heldDuringChange = this.#continuationScheduled || this.#continuationWanted();
 		}
 		if (this.#reconcilesPending > 0) this.#changeOverlappedReconcile = true;
-		this.#continuationScheduled = false;
+		this.#dropScheduled();
 		this.#continuationGeneration++;
 		await this.#exitTask;
 	}
@@ -311,7 +315,7 @@ export class RpcGoalController {
 	async #reconcileOnce(): Promise<void> {
 		// Goal state and the goal tool belong to the session that set them; the
 		// session itself keeps both across a switch, so clear them here first.
-		this.#continuationScheduled = false;
+		this.#dropScheduled();
 		this.#continuationGeneration++;
 		await this.#exitTask;
 		await this.#exit();
@@ -403,6 +407,11 @@ export class RpcGoalController {
 			return;
 		}
 		if (this.#continuationScheduled || !this.#continuationWanted()) return;
+		// The decided continuation is session work until it is submitted or dropped; refused
+		// once the session is exiting (a passed quiesce or a hang-up), so nothing is scheduled.
+		const reservation = this.#session.reserveGoalContinuation();
+		if (!reservation) return;
+		this.#reservation = reservation;
 		this.#continuationScheduled = true;
 		const generation = this.#continuationGeneration;
 		void (async () => {
@@ -423,6 +432,7 @@ export class RpcGoalController {
 				!session.isSessionTransitioning;
 			const prompt = idle && this.#continuationWanted() ? session.goalRuntime.buildContinuationPrompt() : undefined;
 			if (!prompt) {
+				this.#releaseReservation();
 				this.#onContinuationDropped?.();
 				return;
 			}
@@ -435,6 +445,8 @@ export class RpcGoalController {
 			// promptCustomMessage counts the submission as admitted synchronously, so every
 			// settle report sees it from here on. A continuation that is refused or bails
 			// before its run starts must neither stay counted nor withhold settlement.
+			// The reservation hands over to that admission in the same synchronous step.
+			this.#releaseReservation();
 			session.promptCustomMessage({ customType: "goal-continuation", content: prompt, display: false }).then(
 				dispatched => {
 					if (!dispatched) unclaim();
@@ -445,10 +457,21 @@ export class RpcGoalController {
 				},
 			);
 		})().catch(error => {
-			this.#continuationScheduled = false;
+			this.#dropScheduled();
 			this.#onContinuationDropped?.();
 			reportControllerError(error);
 		});
+	}
+
+	/** A decided continuation will not run: clear it and release its reservation. */
+	#dropScheduled(): void {
+		this.#continuationScheduled = false;
+		this.#releaseReservation();
+	}
+
+	#releaseReservation(): void {
+		this.#reservation?.release();
+		this.#reservation = undefined;
 	}
 }
 
