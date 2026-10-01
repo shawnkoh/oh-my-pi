@@ -10,6 +10,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{error, openfiles::OpenFile, sys};
 
+/// How often a child wait retries reaping when no SIGCHLD woke it.
+const REAP_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 struct CompletionMarker {
 	output:            OpenFile,
 	end_marker_prefix: String,
@@ -106,6 +109,13 @@ impl ChildProcess {
 			}
 		};
 		tokio::pin!(cancelled);
+		// Where `pidfd_open` is unavailable (old kernels, OpenShell's seccomp filter), tokio
+		// reaps a child only when a SIGCHLD wakes its reaper. Inside a host that handles its own
+		// children (Bun spawning a subprocess) that wakeup can be lost for good, leaving the
+		// child an unreaped zombie and this wait pending forever. Re-polling the wait on a timer
+		// retries tokio's non-blocking reap, so a lost signal only delays completion.
+		let mut reap_retry = tokio::time::interval(REAP_RETRY_INTERVAL);
+		reap_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
 		#[allow(clippy::ignored_unit_patterns)]
 		loop {
@@ -135,6 +145,8 @@ impl ChildProcess {
 					// have received it as well, and either handled it or ended up getting
 					// terminated (in which case we'll see the child exit).
 				},
+				// Loops back to poll the wait (and with it tokio's reap) again.
+				_ = reap_retry.tick() => {},
 			}
 		}
 	}
