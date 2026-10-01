@@ -94,6 +94,13 @@ interface ManagedDaemon {
 	outputOffset: number;
 	readyPattern?: RegExp;
 	restartTimer?: NodeJS.Timeout;
+	/**
+	 * True while a `restart` request (or a switch to detached) stops this daemon to launch it
+	 * again. Its metadata then publishes `restarting` rather than the stop's terminal state:
+	 * out-of-process readers (the owned-job registry) must not see the service as ended
+	 * while the broker is about to relaunch it.
+	 */
+	relaunching?: boolean;
 	consecutiveFailures: number;
 	completionCapable: boolean;
 	pendingCompletions: DaemonCompletionNotification[];
@@ -1255,16 +1262,23 @@ class DaemonBroker {
 
 	async #restart(name: string): Promise<DaemonRpcResult> {
 		const record = this.#record(name);
-		await this.#stopRecord(record, 2_000);
-		await record.log?.close();
-		record.log = await DaemonLog.open(record.dir);
-		record.stopRequested = false;
-		// Settled history does not need subscription writes, but a new generation
-		// must persist the owner's current capability for crash recovery.
-		const owner = record.snapshot.owner;
-		record.completionCapable = owner !== undefined && this.#completionSubscriptions.has(owner);
-		record.completionSubscriptionId = owner === undefined ? undefined : this.#completionSubscriptions.get(owner);
-		await this.#launch(record);
+		record.relaunching = true;
+		try {
+			await this.#stopRecord(record, 2_000);
+			await record.log?.close();
+			record.log = await DaemonLog.open(record.dir);
+			record.stopRequested = false;
+			// Settled history does not need subscription writes, but a new generation
+			// must persist the owner's current capability for crash recovery.
+			const owner = record.snapshot.owner;
+			record.completionCapable = owner !== undefined && this.#completionSubscriptions.has(owner);
+			record.completionSubscriptionId = owner === undefined ? undefined : this.#completionSubscriptions.get(owner);
+			await this.#launch(record);
+		} finally {
+			record.relaunching = false;
+			// A relaunch that failed (or a stop that ended the broker's run of it) is ended now.
+			if (terminalState(record.snapshot.state)) this.#persist(record);
+		}
 		await record.persistQueue;
 		return { op: "restart", daemon: record.snapshot };
 	}
@@ -1312,8 +1326,10 @@ class DaemonBroker {
 	}
 
 	#serializeMetadata(record: ManagedDaemon): string {
+		// A daemon stopped by a restart request is published as `restarting`, never as ended.
+		const relaunching = record.relaunching === true && terminalState(record.snapshot.state);
 		return JSON.stringify({
-			daemon: { ...record.snapshot },
+			daemon: relaunching ? { ...record.snapshot, state: "restarting" } : { ...record.snapshot },
 			spec: record.spec,
 			completionEvents: record.completionCapable,
 			completionSubscriptionId: record.completionSubscriptionId,
