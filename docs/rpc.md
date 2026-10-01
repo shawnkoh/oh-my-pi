@@ -571,10 +571,13 @@ process (or another invocation) that exits between the scan and the count may ha
 handed the marker to a child the scan did not see, so the scan and count are repeated
 while that happens; after 3 rounds that never settle, `sound` is false. `ownerScan` is
 `{ supported, sound, scanned, discovered, opaque }` (`discovered` summed over the
-rounds): `opaque` lists candidate processes started since the invocation began whose
-environment could not be examined (including setuid descendants), which could hide the
-marker; `sound` is false if any exist, if the OS hides processes from the scan (Linux
-`/proc` mounted with `hidepid`), or if the rounds never settled.
+rounds): `opaque` lists candidate processes (this user's) started since the earliest
+invocation scanned for whose environment could not be examined — setuid or
+non-dumpable descendants, or a process in another Landlock domain such as a separate
+`openshell exec` session — which could hide the marker; a process that started before
+every invocation scanned for is never the agent's and is ignored whatever it carries.
+`sound` is false if any opaque process exists, if the OS hides processes from the scan
+(Linux `/proc` mounted with `hidepid`), or if the rounds never settled.
 
 Limits — the classes that can read as clear on Linux, where the scan is otherwise sound,
 so a consumer must keep its own host process census as a required cross-check:
@@ -603,12 +606,29 @@ so a consumer must keep its own host process census as a required cross-check:
 
 Paths that mark the registry incomplete instead: every PTY shell run (on every
 platform), eval runs (their long-lived kernels are not marked), a shell run whose spawn
-report is incomplete (a process that could not be identity-pinned, an unreported
-`nohup … &` reparent, a failed run), a background job still running when its run was
-cancelled, a service start or mode change that ended without reporting its process,
-and any debug (DAP) session. On macOS the kernel withholds the environment of Apple
-platform binaries (`sh`, `zsh`, `sleep`, …), so the scan is almost never `sound` there
-and consumers get `unknown` rather than a false clear. Windows has no scan.
+report is incomplete (a live process it could not identify, a process left in a group
+the run created whose `/proc/<pid>/stat` cannot be read, an unreported `nohup … &`
+reparent, a failed run), a background job still running when its run was cancelled, a
+service start or mode change that ended without reporting its process, and any debug
+(DAP) session. A shell run identifies its processes by pid and start time: through a
+pidfd where `pidfd_open` works, otherwise from `/proc/<pid>/stat` (older kernels, and
+sandboxes such as OpenShell whose seccomp filter fails `pidfd_open` with `ENOSYS`), so
+a run whose processes are all visible reports itself complete either way. Its group
+enumeration reads only `/proc/<pid>/stat`, so processes whose environment cannot be
+read, unrelated or not, never make it incomplete. On macOS the kernel withholds the
+environment of Apple platform binaries (`sh`, `zsh`, `sleep`, …), so the scan is almost
+never `sound` there and consumers get `unknown` rather than a false clear. Windows has
+no scan.
+
+**Processes outside the agent's tree.** Processes the agent never launched — started by
+an operator or a harness, for example with `openshell exec`, even under the agent's uid
+and in the same sandbox — are not agent work: they are not in the registry, never count
+in `attest`, and the host process census (E4) accounts for them. The scan cannot tell
+one from an escaped descendant of the agent only when it started after the agent and
+its environment cannot be read (an `openshell exec` session is a separate Landlock
+domain, so the agent cannot read it): it is then `opaque`, `sound` is false, and the
+answer stays `unknown` until it exits. One that started before the agent, or runs as
+another uid, has no effect.
 
 **Consumer rule after the agent exited** (`verifyOwnedJobRegistry(path, {
 expectedInvocation })` in `@oh-my-pi/pi-coding-agent/session/owned-job-registry`

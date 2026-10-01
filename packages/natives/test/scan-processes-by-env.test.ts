@@ -1,4 +1,7 @@
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { processIdentity, scanProcessesByEnv } from "../native/index.js";
 
 function isAlive(pid: number): boolean {
@@ -102,4 +105,51 @@ describe.skipIf(process.platform === "win32")("scanProcessesByEnv", () => {
 	it("rejects an opaqueSince that is not a start id", () => {
 		expect(() => scanProcessesByEnv("OMP_OWNER", ["x"], "1.5")).toThrow(/opaqueSince/);
 	});
+
+	it.skipIf(process.platform !== "linux" || process.getuid?.() === 0)(
+		"counts a process whose environment it cannot read as opaque only if it started since opaqueSince",
+		async () => {
+			const dir = fs.mkdtempSync(path.join(os.tmpdir(), "natives-opaque-"));
+			const script = path.join(dir, "hidden.ts");
+			fs.writeFileSync(
+				script,
+				[
+					`import { dlopen, FFIType } from "bun:ffi";`,
+					`const libc = dlopen("libc.so.6", { prctl: { args: [FFIType.i32, FFIType.u64, FFIType.u64, FFIType.u64, FFIType.u64], returns: FFIType.i32 } });`,
+					// PR_SET_DUMPABLE 0: its /proc files become root's, so its environment is unreadable.
+					"if (libc.symbols.prctl(4, 0, 0, 0, 0) !== 0) process.exit(3);",
+					"console.log(process.pid);",
+					"setInterval(() => {}, 1 << 30);",
+				].join("\n"),
+			);
+			const hidden = Bun.spawn([process.execPath, script], {
+				env: { ...process.env, OMP_OWNER: "omp1:hidden:1" },
+				stdio: ["ignore", "pipe", "inherit"],
+			});
+			try {
+				const reader = hidden.stdout.getReader();
+				let text = "";
+				while (!text.includes("\n")) {
+					const { done, value } = await reader.read();
+					if (done) break;
+					text += new TextDecoder().decode(value);
+				}
+				reader.releaseLock();
+				const pid = Number(text.trim());
+				expect(pid).toBe(hidden.pid);
+				expect(() => fs.readFileSync(`/proc/${pid}/environ`)).toThrow();
+				const startId = processIdentity(pid).startId!;
+				const opaquePids = (since: string) =>
+					scanProcessesByEnv("OMP_OWNER", ["omp1:hidden:1"], since).opaque.map(entry => entry.pid);
+				// Started at or after the earliest invocation scanned for: it could be ours.
+				expect(opaquePids(startId)).toContain(pid);
+				// Older than every invocation scanned for: not ours, whatever it carries.
+				expect(opaquePids((BigInt(startId) + 1n).toString())).not.toContain(pid);
+			} finally {
+				hidden.kill("SIGKILL");
+				await hidden.exited;
+				fs.rmSync(dir, { recursive: true, force: true });
+			}
+		},
+	);
 });
