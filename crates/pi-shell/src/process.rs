@@ -3513,17 +3513,39 @@ mod tests {
 		}
 	}
 
-	/// On an ordinary, unfiltered thread group signals are not blocked: the real
-	/// probe of our own group succeeds, so `EPERM` keeps meaning a member
-	/// exists.
+	/// The real probe reports a block exactly when a group signal to a group we
+	/// wholly own (a child we put in its own group) is refused. On an ordinary,
+	/// unfiltered host that signal is delivered, so the probe must answer "not
+	/// blocked" and `EPERM` keeps meaning a member exists. Under a filter on the
+	/// whole process (OpenShell, guestbox) no thread is unfiltered, and both
+	/// answers are "refused".
 	#[cfg(unix)]
 	#[test]
-	fn group_signals_are_not_blocked_on_an_unfiltered_thread() {
+	fn group_signal_probe_answers_not_blocked_where_owned_groups_can_be_signalled() {
+		use std::{os::unix::process::CommandExt as _, process::Command};
+
+		let mut child = Command::new("sleep")
+			.arg("19876543")
+			.process_group(0)
+			.spawn()
+			.expect("spawn sleep");
+		let pgid = i32::try_from(child.id()).expect("child pid fits in i32");
 		// A fresh thread: its cached answer comes from its own probe.
-		let blocked = std::thread::spawn(group_signals_blocked)
-			.join()
-			.expect("probe thread");
-		assert!(!blocked, "an unfiltered thread must not see group signals blocked");
+		let (blocked, owned_group_refused) = std::thread::spawn(move || {
+			// SAFETY: `kill` takes integers only; signal 0 only runs the checks.
+			let refused = unsafe { libc::kill(-pgid, 0) } != 0
+				&& std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+			(group_signals_blocked(), refused)
+		})
+		.join()
+		.expect("probe thread");
+		let _ = child.kill();
+		let _ = child.wait();
+
+		assert_eq!(
+			blocked, owned_group_refused,
+			"the probe must say blocked exactly when a group we own cannot be signalled"
+		);
 	}
 
 	/// OpenShell's workload filter fails every process-group signal with
