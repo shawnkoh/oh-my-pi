@@ -12,6 +12,7 @@ import {
 	type BeforeToolCallContext,
 	type BeforeToolCallResult,
 	createToolScopedAbortReason,
+	markEngineInjected,
 } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Judge, ToolCall } from "@oh-my-pi/pi-ai";
 import { logger, prompt, relativePathWithinRoot, withTimeout } from "@oh-my-pi/pi-utils";
@@ -476,15 +477,17 @@ export class TtsrCoordinator {
 		const ruleNames = injection.rules.map(rule => rule.name);
 		const deliveryId = this.#reserveDeferredInjection(injection.rules);
 		try {
-			this.#host.agent.followUp({
-				role: "custom",
-				customType: "ttsr-injection",
-				content: injection.content,
-				display: false,
-				details: { rules: ruleNames, deliveryId },
-				attribution: "agent",
-				timestamp: Date.now(),
-			});
+			this.#host.agent.followUp(
+				markEngineInjected({
+					role: "custom",
+					customType: "ttsr-injection",
+					content: injection.content,
+					display: false,
+					details: { rules: ruleNames, deliveryId },
+					attribution: "agent",
+					timestamp: Date.now(),
+				}),
+			);
 		} catch (error) {
 			this.#releaseDeferredReservation(deliveryId, ruleNames);
 			throw error;
