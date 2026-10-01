@@ -2,11 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- Interactive launches can use `--goal <objective>` to activate goal mode and begin working immediately without typing `/goal` ([#13879](https://github.com/can1357/oh-my-pi/pull/13879) by [@shawnkoh](https://github.com/shawnkoh))
+
 ## [18.4.6] - 2026-10-01
 
 ### Added
 
-- Interactive launches can use `--goal <objective>` to activate goal mode and begin working immediately without typing `/goal` ([#13879](https://github.com/can1357/oh-my-pi/pull/13879) by [@shawnkoh](https://github.com/shawnkoh))
 - Added a live Background Jobs view that lets you monitor running background jobs without interrupting the transcript.
 - Added agent lineage navigation, making it easy to move between subagents and the main session from the composer header.
 - Added queued-message controls to the RPC clients and session API, including promotion of queued follow-ups to steering messages without duplicating text or losing attachments, plus explicit steering or follow-up behavior for prompts sent while the agent is busy.
