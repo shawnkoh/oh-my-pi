@@ -4,24 +4,6 @@
 
 ### Added
 
-- Interactive launches can use `--goal <objective>` to activate goal mode and begin working immediately without typing `/goal` ([#13879](https://github.com/can1357/oh-my-pi/pull/13879) by [@shawnkoh](https://github.com/shawnkoh))
-- Set `goal.toolDefault: true` to let agents start goal mode themselves in ordinary sessions; `--tools=...,goal` also exposes the tool explicitly while the default stays hidden ([#13877](https://github.com/can1357/oh-my-pi/pull/13877) by [@shawnkoh](https://github.com/shawnkoh))
-
-### Fixed
-
-- In OpenShell sandboxes, an external shell command that has exited no longer marks the owned-job registry incomplete, so `quiesce_and_exit` can attest `registryComplete: true` there
-- A named service whose process is gone while its daemon broker can still relaunch it (restart backoff, `omp ps restart`) now keeps `quiesce_and_exit` refused and `verifyOwnedJobRegistry` blocked until the broker publishes it stopped or exits; `service` registry records carry the hosting `broker` identity, a relaunched service is recorded under its new pid, and a `restart` request publishes the service as `restarting` (not `exited`) until its new process runs
-- Overlapping `stop`, `restart`, mode-change and replacing `start` requests for one supervised process (`omp ps`, `proc://`) now run one at a time in arrival order: two restarts sent together no longer leave an orphaned process that `stop` cannot end, a stop sent with a restart is no longer lost, a second restart can no longer briefly publish the service as exited, and a restart queued behind a replacing start or a broker shutdown is refused instead of relaunching a process the broker no longer tracks
-
-## [18.4.6] - 2026-10-01
-
-### Added
-
-- Added a live Background Jobs view that lets you monitor running background jobs without interrupting the transcript.
-- Added agent lineage navigation, making it easy to move between subagents and the main session from the composer header.
-- Added queued-message controls to the RPC clients and session API, including promotion of queued follow-ups to steering messages without duplicating text or losing attachments, plus explicit steering or follow-up behavior for prompts sent while the agent is busy.
-- Added support for keeping Claude prompt caches warm on Amazon Bedrock and Bedrock Mantle according to configured model cache lifetimes and retention settings.
-- In Tern terminals, the effort indicator now visualizes the selected thinking level and becomes a fireball at the maximum level.
 - Added JobsSheet overlay for viewing live background jobs without transcript interruption
 - Added agent lineage tracking, enabling navigation between subagents and the main session via a native composer header
 - Added `promote_queued_message` to RPC, with `promoteQueuedMessage()` on the session and TypeScript RPC client and `promote_queued_message()` on the Python RPC client, so a queued follow-up can become a steering message without duplicating its text or losing attachments ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
@@ -40,6 +22,9 @@
 
 ### Fixed
 
+- In OpenShell sandboxes, an external shell command that has exited no longer marks the owned-job registry incomplete, so `quiesce_and_exit` can attest `registryComplete: true` there
+- A named service whose process is gone while its daemon broker can still relaunch it (restart backoff, `omp ps restart`) now keeps `quiesce_and_exit` refused and `verifyOwnedJobRegistry` blocked until the broker publishes it stopped or exits; `service` registry records carry the hosting `broker` identity, a relaunched service is recorded under its new pid, and a `restart` request publishes the service as `restarting` (not `exited`) until its new process runs
+- Overlapping `stop`, `restart`, mode-change and replacing `start` requests for one supervised process (`omp ps`, `proc://`) now run one at a time in arrival order: two restarts sent together no longer leave an orphaned process that `stop` cannot end, a stop sent with a restart is no longer lost, a second restart can no longer briefly publish the service as exited, and a restart queued behind a replacing start or a broker shutdown is refused instead of relaunching a process the broker no longer tracks
 - Literal RPC prompts (`literal: true`) are acknowledged only once admitted, like other prompts, so an immediate `promote_queued_message` observes a queued literal prompt
 - An `abort` that lands while a prompt's images are still being prepared now drops that prompt instead of starting or queueing it afterward ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
 - A path-pasted image or video sent as an aside while the agent is busy now reaches the model with its source path ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
