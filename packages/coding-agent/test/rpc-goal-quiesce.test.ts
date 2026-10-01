@@ -43,9 +43,9 @@ describe("RPC goal continuation and quiesce", () => {
 		const cwd = tempDir.path();
 		const authStorage = await AuthStorage.create(path.join(cwd, "auth.db"));
 		authStorage.keys.setRuntime("anthropic", "test-key");
-		const settings = await Settings.init({ inMemory: true, cwd });
-		cfgAsyncEnabled.set(settings, false);
-		cfgGoalContinuationModes.set(settings, ["rpc"]);
+		// Isolated, never the process-global instance: Settings.init returns an existing global
+		// (possibly persisting) instance, so writing through it could reach the real config.yml.
+		const settings = Settings.isolated({ [cfgAsyncEnabled.id]: false, [cfgGoalContinuationModes.id]: ["rpc"] });
 		({ session } = await createAgentSession({
 			cwd,
 			agentDir: cwd,
