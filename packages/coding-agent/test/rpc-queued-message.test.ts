@@ -193,4 +193,27 @@ describe("RPC queued-message editing", () => {
 			unsubscribe();
 		}
 	}, 30_000);
+
+	test("acknowledges a queued literal prompt only once it is admitted, so an immediate promote succeeds", async () => {
+		// Same 1x1 PNG as above: its normalization is the gap between acceptance and admission.
+		const image = {
+			type: "image" as const,
+			mimeType: "image/png",
+			data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+		};
+
+		await client.start();
+		const agentStarted = Promise.withResolvers<void>();
+		const unsubscribe = client.onEvent(event => {
+			if (event.type === "agent_start") agentStarted.resolve();
+		});
+		try {
+			await client.prompt("start a long turn", undefined, { literal: true });
+			await withTimeout(agentStarted.promise, 10_000, "First turn never started streaming");
+			await client.prompt("queued literal with image", [image], { literal: true, streamingBehavior: "followUp" });
+			expect(await client.promoteQueuedMessage("queued literal with image")).toEqual({ promoted: true });
+		} finally {
+			unsubscribe();
+		}
+	}, 30_000);
 });
