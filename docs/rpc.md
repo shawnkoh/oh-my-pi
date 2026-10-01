@@ -46,7 +46,7 @@ The initial ready frame uses protocol v1 and advertises the opt-in lossless tran
   "supportedProtocolVersions": [1, 2],
   "maxFrameBytes": 1048576,
   "maxReassembledFrameBytes": 67108864,
-  "capabilities": ["literal-input/1", "tool-approval-binding/1", "reply-attribution/1", "external-delivery/1", "rich-ask/1"]
+  "capabilities": ["literal-input/1", "tool-approval-binding/1", "reply-attribution/1", "external-delivery/1", "quiesce-exit/1", "owned-jobs/1", "rich-ask/1"]
 }
 ```
 
@@ -430,7 +430,7 @@ is re-armed.
     "contextWindow": 200000,
     "percent": 0.55
   },
-  "capabilities": ["quiesce-exit/1", "owned-jobs/1"]
+  "capabilities": ["literal-input/1", "tool-approval-binding/1", "reply-attribution/1", "external-delivery/1", "quiesce-exit/1", "owned-jobs/1", "rich-ask/1"]
 }
 ```
 
@@ -492,11 +492,11 @@ turn, sent as a hidden `goal-continuation` message.
 When the agent completes the goal, the goal tool is removed again and
 `get_state.goal` becomes `null`.
 
-`capabilities` lists protocol features this process implements. A client must
-check for `quiesce-exit/1` before sending `attest` or `quiesce_and_exit`, and for
-`owned-jobs/1` before relying on the owned-job registry file.
-
 ### Quiesce and exit
+
+A client must check `capabilities` for `quiesce-exit/1` before sending `attest` or
+`quiesce_and_exit`, and for `owned-jobs/1` before relying on the owned-job registry
+file. Test membership: the list carries every engine capability (see the ready frame).
 
 A supervisor that wants the agent to exit without interrupting work first takes a
 read-only snapshot, then asks the process to exit only if nothing changed:

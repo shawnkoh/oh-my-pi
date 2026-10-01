@@ -443,6 +443,7 @@ describe("RpcGoalController continuation gate", () => {
 			},
 			promptCustomMessage: (message: { customType: string }) => admit(message.customType),
 			waitForIdle: () => idle.promise,
+			reserveGoalContinuation: () => ({ release: () => {} }),
 		};
 		let dropped = 0;
 		const controller = new RpcGoalController(session as unknown as RpcGoalSession, () => dropped++);
