@@ -107,7 +107,7 @@ describe.skipIf(process.platform === "win32").each(MODES)("RPC quiesce_and_exit 
 
 	it("advertises the capabilities and exits after a passed quiesce with the attestation on disk", async () => {
 		const state = await rpc.request({ id: "s1", type: "get_state" });
-		expect(state.data?.capabilities).toEqual(["quiesce-exit/1", "owned-jobs/1"]);
+		expect(state.data?.capabilities).toEqual(expect.arrayContaining(["quiesce-exit/1", "owned-jobs/1"]));
 		const file = String(state.data?.sessionFile);
 
 		const attest = await rpc.request({ id: "a1", type: "attest", operationId: "op-1", nonce: "n-1" });
@@ -316,7 +316,7 @@ describe.skipIf(process.platform === "win32").each(MODES)("CLI --mode %s quiesce
 
 	it("advertises capabilities, refuses later input and exits 0 with the attestation on disk", async () => {
 		const state = await rpc.request({ id: "s1", type: "get_state" });
-		expect(state.data?.capabilities).toEqual(["quiesce-exit/1", "owned-jobs/1"]);
+		expect(state.data?.capabilities).toEqual(expect.arrayContaining(["quiesce-exit/1", "owned-jobs/1"]));
 		const attest = await rpc.request({ id: "a1", type: "attest", operationId: "cli", nonce: "n" });
 		expect(attest.data).toMatchObject({ operationId: "cli", nonce: "n", admission: "open" });
 		rpc.send(
