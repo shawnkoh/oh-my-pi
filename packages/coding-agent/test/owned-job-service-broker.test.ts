@@ -441,7 +441,7 @@ describe.skipIf(process.platform === "win32")("owned-job registry: broker-hosted
 			if (stopped.op !== "stop" || restarted.op !== "restart") throw new Error("unexpected results");
 			expect(["exited", "failed"]).toContain(stopped.daemon.state);
 			await eventually(() => liveSleeps(marker).length === 0, "every service process to exit");
-			expect(["exited", "failed"]).toContain(publishedState(meta).state);
+			expect(["exited", "failed"]).toContain(publishedState(meta).state ?? "unpublished");
 			expect(registry.liveProcessCount()).toBe(0);
 		});
 	}, 30_000);
