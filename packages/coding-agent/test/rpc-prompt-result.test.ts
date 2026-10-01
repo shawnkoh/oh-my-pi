@@ -292,6 +292,48 @@ describe("RpcPromptResults reply attribution", () => {
 		]);
 	});
 
+	test("a command's send into a later live run drops the outcome of a run that already yielded", async () => {
+		const { frames, session, results } = createHarness();
+		const command = results.begin("req_cmd");
+		// A wake run W starts and yields while the command's handler still works.
+		results.observe(agentStart);
+		session.branch.push(user("w", "wake"), reply("wa"));
+		results.observe(agentEnd([assistant({ stopReason: "stop" })]));
+		// A different run L is live when the command sends: its work is queued into L.
+		results.observe(agentStart);
+		session.isStreaming = true;
+		results.rebase(command);
+		session.branch.push(user("l", "slow L"), reply("la"), user("c", "from-command"), reply("ca"));
+		results.settle(command);
+		await flushFrames();
+		expect(frames).toEqual([]);
+		session.isStreaming = false;
+		results.observe(agentEnd([assistant({ stopReason: "error" })]));
+		await flushFrames();
+		// Reported at L's yield with L's outcome, not W's earlier "completed".
+		expect(frames).toMatchObject([{ id: "req_cmd", run: 2, status: "error" }]);
+	});
+
+	test("a command's send into a live run after a session change is not reported as the detached run's abort", async () => {
+		const { frames, session, results } = createHarness();
+		const command = results.begin("req_cmd");
+		// Another run starts, then a session change detaches it (pre-marking the command aborted).
+		results.observe(agentStart);
+		session.isStreaming = true;
+		results.abortOpen();
+		// A new run L is live when the command sends into it.
+		results.observe(agentStart);
+		results.rebase(command);
+		session.branch.push(user("c", "from-command"), reply("ca"));
+		results.settle(command);
+		await flushFrames();
+		expect(frames).toEqual([]);
+		session.isStreaming = false;
+		results.observe(agentEnd([assistant({ stopReason: "stop" })]));
+		await flushFrames();
+		expect(frames).toMatchObject([{ id: "req_cmd", status: "completed" }]);
+	});
+
 	test("work a command queues into a live run leaves ownership unchanged", async () => {
 		const { frames, session, results } = createHarness();
 		const command = results.begin("req_live");

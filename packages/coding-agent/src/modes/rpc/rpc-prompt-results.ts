@@ -97,15 +97,24 @@ export class RpcPromptResults {
 	 * command's `sendUserMessage`). When nothing is streaming, that work starts
 	 * a fresh run, and the prompt owns that run, not an earlier one (such as a
 	 * delivery wake while the command's handler ran). Work queued into a live
-	 * run leaves ownership unchanged. When a command schedules work from idle
-	 * more than once, the run started by the last such work is reported.
-	 * Known limit: a send that lands while a wake run is unwinding (still
-	 * streaming, past its last queue poll) is queued, so that wake still
-	 * answers the prompt.
+	 * run joins that run: an outcome from an earlier run that already yielded
+	 * is dropped, and the prompt reports at the live run's yield. When a
+	 * command schedules work from idle more than once, the run started by the
+	 * last such work is reported. Known limit: a send that lands while a wake
+	 * run is unwinding (still streaming, past its last queue poll) is queued,
+	 * so that wake still answers the prompt.
 	 */
 	rebase(ticket: RpcPromptTicket): void {
 		const open = this.#open.get(ticket);
-		if (!open || open.waiting || this.#session.isStreaming) return;
+		if (!open || open.waiting) return;
+		if (this.#session.isStreaming) {
+			if (open.ownOutcome) {
+				open.ownOutcome = undefined;
+				// The live run started before this send; it is the one the work joins.
+				open.startsAtBegin = this.#betweenRuns ? this.#agentStarts : this.#agentStarts - 1;
+			}
+			return;
+		}
 		open.ownOutcome = undefined;
 		open.startsAtBegin = this.#agentStarts;
 	}
