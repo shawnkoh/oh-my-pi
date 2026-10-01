@@ -2181,6 +2181,72 @@ export declare function macOSSpellCheckerAvailable(): boolean
  */
 export declare function macOSSpellingGuesses(text: string, start: number, length: number): Promise<Array<string>>
 
+/** A live process whose environment carries a marker token. */
+export interface MarkedProcess {
+  pid: number
+  ppid: number
+  /** Process group id when readable. */
+  pgid?: number
+  /**
+   * OS start time, Unix epoch seconds (floor) — the same value as
+   * `processIdentity(pid).startTime`. Display only.
+   */
+  startTime?: number
+  /**
+   * Opaque start identity — the same value as
+   * `processIdentity(pid).startId`.
+   */
+  startId?: string
+  /** Executable name (best effort, may be truncated). */
+  command: string
+  /**
+   * The first of the requested tokens (in request order) the process
+   * carries. Absent for `opaque` entries.
+   */
+  token?: string
+}
+
+/** Result of `scanProcessesByEnv`. */
+export interface MarkedProcessScan {
+  /**
+   * False on platforms without an implementation (Windows), or when the
+   * process table could not be listed: callers must treat the result as
+   * unknown.
+   */
+  supported: boolean
+  /**
+   * True when the platform may hide processes of this user from the scan
+   * altogether (Linux `/proc` mounted with `hidepid` other than 0/off, or
+   * whose mount options cannot be read): the result is not a complete
+   * census, whatever `opaque` says. False on macOS.
+   */
+  hidden: boolean
+  processes: Array<MarkedProcess>
+  /**
+   * Candidate processes examined: those whose real, effective or saved uid
+   * is the caller's, or whose uids cannot be read.
+   */
+  scanned: number
+  /**
+   * Candidates that were alive but whose environment (or start time) could
+   * not be read (not counting ones that exited mid-scan).
+   */
+  unreadable: number
+  /**
+   * Candidates whose environment came back empty. macOS withholds the
+   * environment of Apple platform binaries (`/bin/sh`, `zsh`,
+   * `/bin/sleep`, …), so a marker on such a process is not visible and it
+   * is counted here instead.
+   */
+  redacted: number
+  /**
+   * The unreadable and redacted processes whose start id is at or after
+   * `opaqueSince`, or unknown (empty when `opaqueSince` was not given): the
+   * only ones that could hide a marker set no earlier than that instant.
+   */
+  opaque: Array<MarkedProcess>
+}
+
 /** A single match in the content. */
 export interface Match {
   /** 1-indexed line number. */
@@ -2482,6 +2548,33 @@ export interface PredictedWord {
   confidence: number
 }
 
+/** Current identity of `pid`; see `ProcessIdentity`. */
+export declare function processIdentity(pid: number): ProcessIdentity
+
+/** Clock-independent identity of a process at a moment. */
+export interface ProcessIdentity {
+  /**
+   * running: exists and is not a zombie. gone: no such process
+   * (ESRCH/ENOENT) or a zombie/dead entry. unreadable: exists (or cannot be
+   * proven gone) but its identity cannot be read (EPERM, hidepid,
+   * setuid/non-dumpable).
+   */
+  state: 'running' | 'gone' | 'unreadable'
+  /**
+   * Opaque start identity, decimal string, comparable only for equality
+   * (and numerically within one host+boot): Linux raw `/proc/<pid>/stat`
+   * field 22 (start ticks since boot), macOS
+   * `pbi_start_tvsec*1_000_000+pbi_start_tvusec`, Windows raw creation
+   * `FILETIME`. Present only when state === "running".
+   */
+  startId?: string
+  /**
+   * Display only: Unix epoch seconds (floor). Present only when
+   * state === "running".
+   */
+  startTime?: number
+}
+
 /** Current state of a process reference. */
 export declare enum ProcessStatus {
   /** The referenced process is still running. */
@@ -2619,6 +2712,23 @@ export declare function renderMermaidAscii(text: string, options?: MermaidRender
  * JS-side re-encode.
  */
 export declare function renderSnapcompactPng(text: string, options: SnapcompactRenderOptions): Promise<string>
+
+/**
+ * Live processes of the calling user whose environment carries a marker.
+ *
+ * Every live process of the calling user (excluding the caller itself) whose
+ * environment variable `name` is set and whose value, split on ',', contains
+ * any of `tokens` exactly; no tokens match nothing. A process is the user's
+ * when its real, effective or saved uid is the caller's (so setuid launches
+ * count); one whose uids cannot be read is examined too. `opaqueSince` is a
+ * `startId` of this host and boot (compared numerically): processes with an
+ * unexaminable environment whose start id is at or after it, or unknown, are
+ * listed in `opaque`.
+ *
+ * # Errors
+ * Throws when `opaqueSince` is not a decimal start id.
+ */
+export declare function scanProcessesByEnv(name: string, tokens: Array<string>, opaqueSince?: string | undefined | null): MarkedProcessScan
 
 /**
  * Search content for a pattern (one-shot, compiles pattern each time).
@@ -3041,7 +3151,12 @@ export interface ShellRunOptions {
   filesystem?: ShellFilesystem
 }
 
-/** Result of running a shell command. */
+/**
+ * Result of running a shell command.
+ *
+ * A run that rejects (throws) carries no `spawnedProcesses`: what it left
+ * running is unknown.
+ */
 export interface ShellRunResult {
   /** Exit code when the command completes normally. */
   exitCode?: number
@@ -3058,6 +3173,21 @@ export interface ShellRunResult {
   minimized?: MinimizerResult
   /** Shell working directory after command completion. */
   workingDir?: string
+  /**
+   * Processes this run launched that were still alive when it resolved,
+   * identity-pinned (pid + start id), including the real process of
+   * reparented launches such as `nohup cmd &` and leftover members of
+   * process groups the run's spawns created. Set on every result.
+   */
+  spawnedProcesses?: Array<SpawnedProcess>
+  /**
+   * False when the run may have left a process the list does not contain:
+   * an owned spawn could not be identity-pinned, a reparented launch fired
+   * no report (report pipe missing/clobbered, or neither hook fired e.g.
+   * `nohup cmd </dev/tty &`), or process-group enumeration failed. Set on
+   * every result.
+   */
+  spawnedComplete?: boolean
 }
 
 /**
@@ -3132,6 +3262,40 @@ export interface SnapcompactRenderOptions {
  * considered renderable because they are interpreted outside font lookup.
  */
 export declare function snapcompactSupportedChars(font: string, chars: string): string
+
+/** A process a shell run launched that was still alive when the run resolved. */
+export interface SpawnedProcess {
+  /** OS process id. */
+  pid: number
+  /**
+   * Process group id when known (reparented launches: the detached
+   * session/group id).
+   */
+  pgid?: number
+  /**
+   * OS process start time, Unix epoch SECONDS (floor) — the same instant
+   * `ps -o lstart` prints. Display only; omitted when the process could not
+   * be identity-pinned.
+   */
+  startTime?: number
+  /**
+   * Opaque start identity pinned when the process was recorded — the same
+   * value as `processIdentity(pid).startId`. Omitted when the process could
+   * not be identity-pinned (then `spawnedComplete` is false).
+   */
+  startId?: string
+  /**
+   * True for a reparented launch (e.g. `nohup cmd &`): the real
+   * double-forked descendant, not the dead intermediate.
+   */
+  reparented: boolean
+  /**
+   * True for a live same-user member of a process group an owned spawn
+   * created, found by enumerating the group (e.g. `sh -c '/bin/sleep 3202
+   * &'` leaves the sleep in the dead sh's group).
+   */
+  groupMember?: boolean
+}
 
 /** A misspelled span measured in JavaScript/UTF-16 code units. */
 export interface SpellingRange {
