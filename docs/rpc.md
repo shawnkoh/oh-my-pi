@@ -683,8 +683,12 @@ records that process as a new `service` record (`jobId` `service:<id>:<startedAt
 same `command`, `cwd`, `sleepable`, `broker` and `daemon`); metadata it cannot read
 keeps the service counted. A `restart` request (and a switch to `detached`) publishes
 the service as `restarting` from the stop until the relaunched process runs, so no
-read in between ends the record. A service whose broker could not be identified, or
-was gone when the service was recorded, marks the registry incomplete. The agent
+read in between ends the record. The broker runs `stop`, `restart` and `mode` requests
+on one service one at a time, in arrival order, so overlapping requests neither end the
+record early nor leave an untracked process: a `stop` followed by a `restart` stops
+the service (ending its record) and then relaunches it. A service whose broker could
+not be identified, or was gone when the service was recorded, marks the registry
+incomplete. The agent
 services start with no restart policy, so the broker relaunches one only on request.
 A relaunch the record cannot follow comes back only through the owner-marker scan (the
 service's environment carries `OMP_OWNER`), as an anonymous `discovered` process

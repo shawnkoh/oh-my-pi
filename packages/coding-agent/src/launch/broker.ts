@@ -98,9 +98,17 @@ interface ManagedDaemon {
 	 * True while a `restart` request (or a switch to detached) stops this daemon to launch it
 	 * again. Its metadata then publishes `restarting` rather than the stop's terminal state:
 	 * out-of-process readers (the owned-job registry) must not see the service as ended
-	 * while the broker is about to relaunch it.
+	 * while the broker is about to relaunch it. Lifecycle requests on one daemon never
+	 * overlap (see `lifecycle`), so one relaunch at a time sets and clears it.
 	 */
 	relaunching?: boolean;
+	/**
+	 * The tail of this daemon's lifecycle requests (`stop`, `restart`, `mode`): each runs
+	 * after the previous one settled, in arrival order. Overlapping requests otherwise stop a
+	 * process another request just launched (losing its `restarting` overlay), lose a stop,
+	 * or launch twice and orphan the first child.
+	 */
+	lifecycle: Promise<void>;
 	consecutiveFailures: number;
 	completionCapable: boolean;
 	pendingCompletions: DaemonCompletionNotification[];
@@ -653,13 +661,17 @@ class DaemonBroker {
 				return this.#send(operation);
 			case "stop": {
 				const record = this.#record(operation.name);
-				await this.#stopRecord(record, operation.timeoutMs);
+				await this.#serialized(record, () => this.#stopRecord(record, operation.timeoutMs));
 				return { op: "stop", daemon: record.snapshot };
 			}
-			case "restart":
-				return this.#restart(operation.name);
-			case "mode":
-				return this.#mode(operation);
+			case "restart": {
+				const record = this.#record(operation.name);
+				return this.#serialized(record, () => this.#restart(record));
+			}
+			case "mode": {
+				const record = this.#record(operation.name);
+				return this.#serialized(record, () => this.#mode(record, operation));
+			}
 			case "describe": {
 				const record = this.#record(operation.name);
 				await this.#refreshDetached(record);
@@ -738,6 +750,7 @@ class DaemonBroker {
 				readyPattern: spec.ready?.log ? new RegExp(spec.ready.log, "u") : undefined,
 				consecutiveFailures: 0,
 				persistQueue: Promise.resolve(),
+				lifecycle: Promise.resolve(),
 				completionCapable: owner !== undefined && this.#completionSubscriptions.has(owner),
 				completionSubscriptionId: owner === undefined ? undefined : this.#completionSubscriptions.get(owner),
 				pendingCompletions: replace ? (existing?.pendingCompletions ?? []) : [],
@@ -1260,8 +1273,27 @@ class DaemonBroker {
 		if (!settled && record.pty) record.pty.kill();
 	}
 
-	async #restart(name: string): Promise<DaemonRpcResult> {
-		const record = this.#record(name);
+	/**
+	 * Run one lifecycle request on `record` once every earlier one has settled. A request
+	 * queued behind a `start` that replaced the daemon fails rather than act on the retired
+	 * record, whose process would no longer be tracked.
+	 */
+	#serialized<T>(record: ManagedDaemon, run: () => Promise<T>): Promise<T> {
+		const result = record.lifecycle.then(() => {
+			if (this.#records.get(record.snapshot.name) !== record) {
+				throw new Error(`Daemon ${record.snapshot.name} was replaced`);
+			}
+			return run();
+		});
+		record.lifecycle = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		return result;
+	}
+
+	/** Stop and relaunch `record`. Callers serialize it ({@link #serialized}). */
+	async #restart(record: ManagedDaemon): Promise<DaemonRpcResult> {
 		record.relaunching = true;
 		try {
 			await this.#stopRecord(record, 2_000);
@@ -1283,8 +1315,8 @@ class DaemonBroker {
 		return { op: "restart", daemon: record.snapshot };
 	}
 
-	async #mode(operation: Extract<DaemonOperation, { op: "mode" }>): Promise<DaemonRpcResult> {
-		const record = this.#record(operation.name);
+	/** Change `record`'s mode. Callers serialize it ({@link #serialized}). */
+	async #mode(record: ManagedDaemon, operation: Extract<DaemonOperation, { op: "mode" }>): Promise<DaemonRpcResult> {
 		await this.#refreshDetached(record);
 		if (terminalState(record.snapshot.state) || record.snapshot.state === "stopping") {
 			throw new Error(`Daemon ${operation.name} is ${record.snapshot.state}`);
@@ -1292,7 +1324,7 @@ class DaemonBroker {
 		if (operation.mode === "detached") {
 			if (!record.spec.detached) {
 				record.spec = { ...record.spec, detached: true, pty: false, persist: true };
-				await this.#restart(operation.name);
+				await this.#restart(record);
 			}
 		} else {
 			if (record.spec.detached && operation.mode === "session") {
@@ -1430,6 +1462,7 @@ class DaemonBroker {
 					readyPattern: spec.ready?.log ? new RegExp(spec.ready.log, "u") : undefined,
 					consecutiveFailures: 0,
 					persistQueue: Promise.resolve(),
+					lifecycle: Promise.resolve(),
 					completionCapable: "completionEvents" in decoded && decoded.completionEvents === true,
 					completionSubscriptionId:
 						"completionSubscriptionId" in decoded && typeof decoded.completionSubscriptionId === "string"
