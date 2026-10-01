@@ -11,7 +11,12 @@ import { createDaemonBrokerClient, type DaemonBrokerClient } from "../src/launch
 import { daemonMetadataPath } from "../src/launch/paths";
 import * as presence from "../src/launch/presence";
 import { registerDaemonProjectPresence } from "../src/launch/presence";
-import { DAEMON_IDLE_GRACE_ENV, DAEMON_PROJECT_DIR_ENV, DAEMON_RUNTIME_DIR_ENV } from "../src/launch/protocol";
+import {
+	DAEMON_IDLE_GRACE_ENV,
+	DAEMON_PROJECT_DIR_ENV,
+	DAEMON_RUNTIME_DIR_ENV,
+	type DaemonRpcResult,
+} from "../src/launch/protocol";
 import { startService } from "../src/launch/services";
 import type { ToolSession } from "../src/tools";
 import {
@@ -104,6 +109,37 @@ function readRecords(file: string): OwnedJobRecord[] {
 /** Seconds for a probe sleep, unique per run so it is never confused with another process. */
 function uniqueSleep(): string {
 	return String(7600 + Math.floor(Math.random() * 300));
+}
+
+/** A sleep duration no other process uses, so its processes can be found by their argv. */
+function markerSleep(): string {
+	return String(10_000_000 + Math.floor(Math.random() * 9_000_000));
+}
+
+/** Live (not zombie) processes running `sleep <marker>`. */
+function liveSleeps(marker: string): number[] {
+	const listing = Bun.spawnSync(["ps", "-A", "-o", "pid=,stat=,args="]).stdout.toString();
+	const pids: number[] = [];
+	for (const line of listing.split("\n")) {
+		const match = /^\s*(\d+)\s+(\S+)\s+(.*)$/.exec(line);
+		if (!match || match[2]!.startsWith("Z")) continue;
+		if (/(^|\/)sleep /.test(match[3]!) && match[3]!.endsWith(` ${marker}`)) pids.push(Number(match[1]));
+	}
+	return pids;
+}
+
+/** Settles (never rejects) once `request` does. */
+function settledFlag(request: Promise<unknown>): { readonly done: boolean } {
+	const flag = { done: false };
+	request.then(
+		() => {
+			flag.done = true;
+		},
+		() => {
+			flag.done = true;
+		},
+	);
+	return flag;
 }
 
 describe.skipIf(process.platform === "win32")("owned-job registry: broker-hosted services", () => {
@@ -292,6 +328,144 @@ describe.skipIf(process.platform === "win32")("owned-job registry: broker-hosted
 			process.title = previousTitle;
 		}
 	}, 30_000);
+
+	/**
+	 * Run `body` against a PTY service (as `startService` starts them: no restart policy) in an
+	 * embedded broker, with its `service` record registered. Every process running the
+	 * service's marker sleep is killed afterwards, orphans included.
+	 */
+	async function withPtyService(
+		body: (service: {
+			client: DaemonBrokerClient;
+			meta: string;
+			marker: string;
+			started: DaemonSnapshot;
+		}) => Promise<void>,
+	): Promise<void> {
+		const projectDir = path.join(tempDir.path(), "project");
+		const runtimeDir = path.join(tempDir.path(), "runtime");
+		fs.mkdirSync(projectDir);
+		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+		const previousTitle = process.title;
+		const broker = await startEmbeddedBroker(projectDir, runtimeDir, 1_000);
+		const meta = daemonMetadataPath(runtimeDir, "svc");
+		const marker = markerSleep();
+		try {
+			const started = await client.request({
+				op: "start",
+				spec: {
+					name: "svc",
+					application: "/bin/sleep",
+					args: [marker],
+					env: {},
+					cwd: projectDir,
+					pty: true,
+					restart: "no",
+					persist: false,
+					detached: false,
+				},
+			});
+			if (started.op !== "start" || started.daemon.pid === undefined) throw new Error("service did not start");
+			registry.registerProcess({
+				kind: "service",
+				jobId: `service:${started.daemon.id}:${started.daemon.startedAt}`,
+				pid: started.daemon.pid,
+				command: "sleep",
+				broker: { pid: process.pid },
+				daemon: { id: started.daemon.id, meta },
+			});
+			await body({ client, meta, marker, started: started.daemon });
+		} finally {
+			spawned.push(...liveSleeps(marker));
+			await client.request({ op: "shutdown" }).catch(() => undefined);
+			client.close();
+			await broker.finished;
+			process.title = previousTitle;
+		}
+	}
+
+	it("never lets the count reach zero when a second restart arrives while the first relaunches a PTY service", async () => {
+		await withPtyService(async ({ client, meta, marker }) => {
+			const first = client.request({ op: "restart", name: "svc" });
+			const firstDone = settledFlag(first);
+			let second: Promise<DaemonRpcResult> | undefined;
+			let secondDone = { done: false };
+			const counts: number[] = [];
+			while (!firstDone.done || !secondDone.done) {
+				counts.push(registry.liveProcessCount());
+				// The first relaunch is under way: its new process is not spawned yet.
+				const published = publishedState(meta);
+				if (!second && !firstDone.done && published.state === "running" && published.pid === undefined) {
+					second = client.request({ op: "restart", name: "svc" });
+					secondDone = settledFlag(second);
+				}
+				if (!second && firstDone.done) throw new Error("the first relaunch was never observed under way");
+				await nextTurn();
+			}
+			const last = await second;
+			if (last?.op !== "restart") throw new Error("second restart failed");
+			const finalPid = last.daemon.pid;
+			if (finalPid === undefined) throw new Error("second restart left no process");
+			await eventually(() => publishedState(meta).pid === finalPid, "the last relaunch to be published");
+			counts.push(registry.liveProcessCount());
+
+			expect(counts.filter(count => count === 0)).toEqual([]);
+			expect(registry.openJobs().filter(job => job.kind === "service")).toEqual([
+				expect.objectContaining({ pid: finalPid }),
+			]);
+			expect(liveSleeps(marker)).toEqual([finalPid]);
+		});
+	}, 30_000);
+
+	it("runs a stop and a restart sent together in order, losing neither", async () => {
+		await withPtyService(async ({ client, meta, marker }) => {
+			const stop = client.request({ op: "stop", name: "svc", timeoutMs: 2_000 });
+			const restart = client.request({ op: "restart", name: "svc" });
+			const stopped = await stop;
+			const restarted = await restart;
+			if (stopped.op !== "stop" || restarted.op !== "restart") throw new Error("unexpected results");
+			expect(["exited", "failed"]).toContain(stopped.daemon.state);
+			const pid = restarted.daemon.pid;
+			if (pid === undefined) throw new Error("the restart left no process");
+			await eventually(() => publishedState(meta).pid === pid, "the relaunch to be published");
+			expect(liveSleeps(marker)).toEqual([pid]);
+		});
+	}, 30_000);
+
+	it("leaves no orphan when two restarts arrive together, and a stop then ends every process", async () => {
+		await withPtyService(async ({ client, meta, marker }) => {
+			const results = await Promise.all([
+				client.request({ op: "restart", name: "svc" }),
+				client.request({ op: "restart", name: "svc" }),
+			]);
+			const last = results[1];
+			if (last.op !== "restart" || last.daemon.pid === undefined) throw new Error("the restart left no process");
+			const pid = last.daemon.pid;
+			await eventually(() => publishedState(meta).pid === pid, "the relaunch to be published");
+			expect(liveSleeps(marker)).toEqual([pid]);
+
+			await client.request({ op: "stop", name: "svc", timeoutMs: 2_000 });
+			await eventually(() => liveSleeps(marker).length === 0, "every service process to exit");
+		});
+	}, 30_000);
+
+	it("ends a service record once its broker hosts another service of that name", () => {
+		stubIdentities(new Map([[FAKE_SERVICE_PID, { state: "gone" }]]));
+		const meta = path.join(tempDir.path(), "meta.json");
+		// Still running, but a different service: a `start` with `replace` took the name.
+		fs.writeFileSync(meta, JSON.stringify({ daemon: { id: "replacement", state: "running" } }));
+		registry.registerProcess({
+			kind: "service",
+			jobId: "service:original:1",
+			pid: FAKE_SERVICE_PID,
+			startId: "5",
+			command: "svc",
+			broker: { pid: process.pid },
+			daemon: { id: "original", meta },
+		});
+		expect(registry.liveProcessCount()).toBe(0);
+		expect(registry.openJobs().filter(job => job.kind === "service")).toEqual([]);
+	});
 
 	it("ends the record when a restart request's relaunch fails", async () => {
 		const projectDir = path.join(tempDir.path(), "project");
