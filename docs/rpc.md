@@ -678,13 +678,22 @@ broker publishes it. A service is work while its own process is alive **or** its
 broker is alive: the record is not ended merely because its pid is gone. The agent
 itself reads `meta` (the consumer rule below does not): it ends the record once the
 broker publishes the service `exited` or `failed`, or replaced by another service of
-that name, and records a published relaunch as a new `service` record (`jobId`
-`service:<id>:<startedAt>`, same `command`, `cwd`, `sleepable`, `broker` and `daemon`);
-metadata it cannot read keeps the service counted. A service whose broker could not be
-identified marks the registry incomplete. The agent services start with no restart
-policy, so the broker relaunches one only on request; a relaunch the agent never saw
-is still found by the owner-marker scan, since the service's environment carries
-`OMP_OWNER`. The agent never stops a broker or a service to clear an answer.
+that name, and when it reads `meta` after the broker published a relaunched process,
+records that process as a new `service` record (`jobId` `service:<id>:<startedAt>`,
+same `command`, `cwd`, `sleepable`, `broker` and `daemon`); metadata it cannot read
+keeps the service counted. A `restart` request (and a switch to `detached`) publishes
+the service as `restarting` from the stop until the relaunched process runs, so no
+read in between ends the record. A service whose broker could not be identified, or
+was gone when the service was recorded, marks the registry incomplete. The agent
+services start with no restart policy, so the broker relaunches one only on request.
+A relaunch the record cannot follow comes back only through the owner-marker scan (the
+service's environment carries `OMP_OWNER`), as an anonymous `discovered` process
+(Linux) or as unexaminable (macOS, `unknown`): a `restart` of a service already
+published `exited` or `failed` (its record ended with it), and a relaunch by a later
+broker of the scope after the recorded one exited — records keep the broker that
+recorded them, so a detached service that a successor broker recovers is followed by
+its pid while that process lives, and by the scan after that. The agent never stops a
+broker or a service to clear an answer.
 
 **Owner marker.** Every process the agent starts for work — embedded shell runs,
 PTY shells, named services, apps the browser tool launches (`app.path`, also recorded as
@@ -791,7 +800,9 @@ implements it):
    ended. Consumers do not read `daemon`. Until the broker exits (a few seconds after
    the last agent process of its scope disconnects, unless it hosts a persistent
    service), this also blocks on a service that already exited after its agent crashed:
-   only the agent, which reads the broker's metadata, can tell that apart.
+   only the agent, which reads the broker's metadata, can tell that apart. Any other
+   agent process, presence or persistent service in the same broker scope keeps that
+   broker alive, so in a shared project scope this can last as long as they do.
 5. One scan for every token in any header's `ownerMarker` and
    `inheritedOwnerMarkers`: any live match → `blocked`; an unexaminable process started
    since the earliest of those invocations, a scan that reports hidden processes, or no

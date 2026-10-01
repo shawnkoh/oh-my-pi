@@ -1,12 +1,19 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as natives from "@oh-my-pi/pi-natives";
+import type { DaemonSnapshot } from "@oh-my-pi/pi-tui/tools/daemon";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { Settings } from "../src/config/settings";
 import { startDaemonBrokerFromEnvironment } from "../src/launch/broker";
+import * as brokerClients from "../src/launch/client";
 import { createDaemonBrokerClient, type DaemonBrokerClient } from "../src/launch/client";
 import { daemonMetadataPath } from "../src/launch/paths";
+import * as presence from "../src/launch/presence";
 import { registerDaemonProjectPresence } from "../src/launch/presence";
 import { DAEMON_IDLE_GRACE_ENV, DAEMON_PROJECT_DIR_ENV, DAEMON_RUNTIME_DIR_ENV } from "../src/launch/protocol";
+import { startService } from "../src/launch/services";
+import type { ToolSession } from "../src/tools";
 import {
 	type OwnedJobRecord,
 	OwnedJobRegistry,
@@ -60,6 +67,24 @@ async function eventually(condition: () => boolean, what: string, timeoutMs = 10
 	}
 }
 
+/** Let other tasks (the embedded broker included) run before continuing. */
+function nextTurn(): Promise<void> {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	setImmediate(resolve);
+	return promise;
+}
+
+/** Pids no process has; their identity is stubbed per test. */
+const FAKE_SERVICE_PID = 0x7ffffff0;
+const FAKE_BROKER_PID = 0x7ffffff1;
+const FAKE_AGENT_PID = 0x7ffffff2;
+
+/** Answer `processIdentity` from `stubs` for the fake pids, and truthfully otherwise. */
+function stubIdentities(stubs: Map<number, natives.ProcessIdentity>): void {
+	const realIdentity = natives.processIdentity;
+	vi.spyOn(natives, "processIdentity").mockImplementation(pid => stubs.get(pid) ?? realIdentity(pid));
+}
+
 function publishedState(meta: string): { state?: string; pid?: number } {
 	try {
 		return JSON.parse(fs.readFileSync(meta, "utf8")).daemon ?? {};
@@ -104,6 +129,7 @@ describe.skipIf(process.platform === "win32")("owned-job registry: broker-hosted
 				process.kill(pid, "SIGKILL");
 			} catch {}
 		}
+		vi.restoreAllMocks();
 		registry.close();
 		OwnedJobRegistry.setInstance(undefined);
 		tempDir.removeSync();
@@ -196,6 +222,216 @@ describe.skipIf(process.platform === "win32")("owned-job registry: broker-hosted
 			process.title = previousTitle;
 		}
 	}, 30_000);
+
+	it("never lets the in-process count reach zero while a restart request relaunches a live service", async () => {
+		const projectDir = path.join(tempDir.path(), "project");
+		const runtimeDir = path.join(tempDir.path(), "runtime");
+		fs.mkdirSync(projectDir);
+		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+		const previousTitle = process.title;
+		const broker = await startEmbeddedBroker(projectDir, runtimeDir, 1_000);
+		const meta = daemonMetadataPath(runtimeDir, "svc");
+		try {
+			// As the agent starts services: no restart policy of its own.
+			const started = await client.request({
+				op: "start",
+				spec: {
+					name: "svc",
+					application: "/bin/sleep",
+					args: [uniqueSleep()],
+					env: {},
+					cwd: projectDir,
+					pty: false,
+					restart: "no",
+					persist: false,
+					detached: false,
+				},
+			});
+			if (started.op !== "start" || started.daemon.pid === undefined) throw new Error("service did not start");
+			spawned.push(started.daemon.pid);
+			registry.registerProcess({
+				kind: "service",
+				jobId: `service:${started.daemon.id}:${started.daemon.startedAt}`,
+				pid: started.daemon.pid,
+				command: "sleep",
+				broker: { pid: process.pid },
+				daemon: { id: started.daemon.id, meta },
+			});
+
+			// `omp ps restart svc`: count as quiesce does (`detachedJobs`) for the whole request.
+			let settled = false;
+			const restart = client.request({ op: "restart", name: "svc" }).finally(() => {
+				settled = true;
+			});
+			const counts: number[] = [];
+			while (!settled) {
+				counts.push(registry.liveProcessCount());
+				await nextTurn();
+			}
+			const restarted = await restart;
+			if (restarted.op !== "restart" || restarted.daemon.pid === undefined)
+				throw new Error("service did not relaunch");
+			const secondPid = restarted.daemon.pid;
+			spawned.push(secondPid);
+			await eventually(() => publishedState(meta).pid === secondPid, "the relaunch to be published");
+			counts.push(registry.liveProcessCount());
+
+			expect(counts.length).toBeGreaterThan(1);
+			expect(counts.filter(count => count === 0)).toEqual([]);
+			expect(registry.openJobs().filter(job => job.kind === "service")).toEqual([
+				expect.objectContaining({
+					pid: secondPid,
+					jobId: `service:${started.daemon.id}:${restarted.daemon.startedAt}`,
+					broker: expect.objectContaining({ pid: process.pid }),
+				}),
+			]);
+		} finally {
+			await client.request({ op: "shutdown" }).catch(() => undefined);
+			client.close();
+			await broker.finished;
+			process.title = previousTitle;
+		}
+	}, 30_000);
+
+	it("keeps counting a gone service while its broker's metadata cannot be read", () => {
+		stubIdentities(new Map([[FAKE_SERVICE_PID, { state: "gone" }]]));
+		registry.registerProcess({
+			kind: "service",
+			jobId: "service:d:1",
+			pid: FAKE_SERVICE_PID,
+			startId: "5",
+			command: "svc",
+			broker: { pid: process.pid },
+			// A directory: reading it as the broker's metadata fails.
+			daemon: { id: "d", meta: tempDir.path() },
+		});
+		expect(registry.liveProcessCount()).toBe(1);
+		expect(registry.openJobs().map(job => job.jobId)).toEqual(["service:d:1"]);
+	});
+
+	it("never ends a service record whose own process cannot be examined, whatever its broker", () => {
+		stubIdentities(
+			new Map([
+				[FAKE_SERVICE_PID, { state: "unreadable" }],
+				[FAKE_BROKER_PID, { state: "gone" }],
+			]),
+		);
+		registry.registerProcess({
+			kind: "service",
+			jobId: "service:d:1",
+			pid: FAKE_SERVICE_PID,
+			startId: "5",
+			command: "svc",
+			broker: { pid: FAKE_BROKER_PID, startId: "7" },
+			daemon: { id: "d", meta: tempDir.path() },
+		});
+		expect(registry.liveProcessCount()).toBe(1);
+		expect(registry.openJobs().map(job => job.jobId)).toEqual(["service:d:1"]);
+	});
+
+	it("verifies a gone service as unexaminable, never ended, when its own process or its broker cannot be read", () => {
+		const unreadableService = FAKE_SERVICE_PID;
+		const goneService = 0x7ffffff3;
+		const unreadableBroker = 0x7ffffff4;
+		stubIdentities(
+			new Map<number, natives.ProcessIdentity>([
+				[FAKE_AGENT_PID, { state: "gone" }],
+				[unreadableService, { state: "unreadable" }],
+				[FAKE_BROKER_PID, { state: "gone" }],
+				[goneService, { state: "gone" }],
+				[unreadableBroker, { state: "unreadable" }],
+			]),
+		);
+		const file = path.join(tempDir.path(), "crashed.jobs.jsonl");
+		const service = (jobId: string, pid: number, broker: number) => ({
+			type: "start",
+			jobId,
+			kind: "service",
+			pid,
+			pgid: null,
+			startTime: null,
+			startId: "5",
+			command: "svc",
+			cwd: null,
+			sleepable: false,
+			inProcess: false,
+			broker: { pid: broker, startId: "7" },
+			invocationPid: FAKE_AGENT_PID,
+			registeredAt: "2026-01-01T00:00:00.000Z",
+		});
+		const lines = [
+			{
+				type: "invocation",
+				version: 1,
+				invocation: { pid: FAKE_AGENT_PID, startId: "1" },
+				sessionId: "crashed",
+				complete: true,
+			},
+			service("service:a:1", unreadableService, FAKE_BROKER_PID),
+			service("service:b:1", goneService, unreadableBroker),
+		];
+		fs.writeFileSync(file, `${lines.map(line => JSON.stringify(line)).join("\n")}\n`);
+		const verdict = verifyOwnedJobRegistry(file);
+		expect(verdict.status).toBe("unknown");
+		expect(verdict.live).toEqual([]);
+		expect(verdict.reasons).toContain(`service service:a:1 (pid ${unreadableService}) cannot be examined`);
+		expect(verdict.reasons).toContain(`service service:b:1 (pid ${goneService}) cannot be examined`);
+	});
+
+	it("stops vouching for a service whose broker cannot be identified or is already gone", async () => {
+		stubIdentities(new Map([[FAKE_BROKER_PID, { state: "gone" }]]));
+		registry.registerProcess({
+			kind: "service",
+			jobId: "service:d:1",
+			pid: process.pid,
+			command: "svc",
+			broker: { pid: FAKE_BROKER_PID },
+			daemon: { id: "d", meta: tempDir.path() },
+		});
+		expect(registry.incompleteReasons).toContain("a service's daemon broker was gone when the service was recorded");
+
+		const projectDir = path.join(tempDir.path(), "project");
+		fs.mkdirSync(projectDir);
+		const client = await brokerClients.createDaemonBrokerClient(projectDir, {
+			runtimeDir: path.join(tempDir.path(), "runtime"),
+			idleGraceMs: 100,
+		});
+		const daemon: DaemonSnapshot = {
+			name: "web",
+			id: "w",
+			state: "running",
+			pid: process.pid,
+			createdAt: 0,
+			startedAt: 1,
+			restartCount: 0,
+			outputBytes: 0,
+			persist: false,
+			detached: false,
+		};
+		vi.spyOn(client, "request").mockImplementation(async operation =>
+			operation.op === "start"
+				? { op: "start", daemon, readyTimedOut: false }
+				: { op: "logs", name: "web", text: "", cursor: 0, timedOut: false, state: "running" },
+		);
+		vi.spyOn(brokerClients, "daemonClientForProject").mockResolvedValue(client);
+		// No live broker named in the scope's lease.
+		vi.spyOn(presence, "readLiveDaemonBrokerPid").mockResolvedValue(undefined);
+		const session: ToolSession = {
+			cwd: projectDir,
+			hasUI: false,
+			settings: Settings.isolated(),
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			getSessionId: () => "session",
+		};
+		try {
+			await startService(session, { name: "web", command: "npm run dev" });
+			expect(registry.incompleteReasons).toContain("a service's daemon broker could not be identified");
+			expect(registry.openJobs().find(job => job.jobId === "service:w:1")?.broker).toBeUndefined();
+		} finally {
+			client.close();
+		}
+	});
 
 	it("verifies a crashed agent's service as blocked while its broker lives, and releases it once the broker is gone", async () => {
 		const projectDir = path.join(tempDir.path(), "project");
