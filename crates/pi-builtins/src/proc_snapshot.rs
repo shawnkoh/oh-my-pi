@@ -485,7 +485,15 @@ mod proc_snapshot {
 			std::thread::sleep(Duration::from_millis(50));
 			let survived = child.try_wait().expect("child status").is_none();
 			let current = ProcInfo::from_pid(pid).expect("snapshot of a live child");
-			let delivered = current.signal_through(unavailable(), libc::SIGKILL, None);
+			let delivered = current.signal_through(unavailable(), libc::SIGTERM, None);
+			// Bounded: if nothing was delivered the sleep is killed here instead.
+			let deadline = std::time::Instant::now() + Duration::from_secs(5);
+			while child.try_wait().expect("child status").is_none()
+				&& std::time::Instant::now() < deadline
+			{
+				std::thread::sleep(Duration::from_millis(5));
+			}
+			let _ = child.kill();
 			let status = child.wait().expect("reap child");
 
 			let mut exits = Command::new("sleep")
@@ -505,7 +513,7 @@ mod proc_snapshot {
 
 			assert!(!delivered_to_recycled && survived, "a pid with another start time was signalled");
 			assert!(delivered, "the process the snapshot saw must be signalled");
-			assert_eq!(status.signal(), Some(libc::SIGKILL));
+			assert_eq!(status.signal(), Some(libc::SIGTERM));
 			assert!(!delivered_to_zombie, "a zombie must never be signalled by pid");
 		}
 	}
