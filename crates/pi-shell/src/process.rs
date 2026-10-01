@@ -29,11 +29,15 @@ mod platform {
 
 	use super::ProcessStatus;
 
-	/// Stable Linux process reference backed by a pidfd.
+	/// Stable Linux process reference. Backed by a pidfd where the kernel and
+	/// sandbox allow `pidfd_open`; otherwise (kernels before 5.3, or a seccomp
+	/// sandbox that fails the call, as OpenShell's does with `ENOSYS`) identity
+	/// is pinned by the `/proc/<pid>/stat` start time, as on macOS, and every
+	/// use re-checks it so a recycled pid never impersonates the original.
 	#[derive(Clone)]
 	pub struct Process {
 		pid:        i32,
-		pidfd:      Arc<OwnedFd>,
+		pidfd:      Option<Arc<OwnedFd>>,
 		start_time: u64,
 	}
 
@@ -42,9 +46,31 @@ mod platform {
 			if pid <= 0 {
 				return None;
 			}
-			let pidfd = open_pidfd(pid)?;
+			let pidfd = match open_pidfd(pid) {
+				Ok(pidfd) => Some(pidfd),
+				Err(PidfdError::Unavailable) => None,
+				Err(PidfdError::NoProcess) => return None,
+			};
+			Self::pinned(pid, pidfd)
+		}
+
+		/// Pin `pid` to its current start time. Without a pidfd only a live,
+		/// non-zombie process is pinned: a zombie's pid may be recycled once
+		/// reaped, and nothing would tell the two apart afterwards.
+		fn pinned(pid: i32, pidfd: Option<Arc<OwnedFd>>) -> Option<Self> {
 			let start_time = read_start_time(pid)?;
-			Some(Self { pid, pidfd, start_time })
+			let process = Self { pid, pidfd, start_time };
+			if process.pidfd.is_none() && process.status() != ProcessStatus::Running {
+				return None;
+			}
+			Some(process)
+		}
+
+		/// A reference pinned by start time only, as when `pidfd_open` is
+		/// unavailable.
+		#[cfg(test)]
+		pub(super) fn from_pid_without_pidfd(pid: i32) -> Option<Self> {
+			Self::pinned(pid, None)
 		}
 
 		pub const fn pid(&self) -> i32 {
@@ -157,7 +183,18 @@ mod platform {
 		}
 
 		pub fn kill(&self, signal: i32) -> bool {
-			// SAFETY: `self.pidfd` is an owned file descriptor returned by a
+			let Some(pidfd) = &self.pidfd else {
+				// No pidfd: re-validate the pinned start time right before
+				// signalling, as on macOS. A tiny window remains between the check
+				// and `kill(2)`, but a recycled pid needs a different start time to
+				// pass it.
+				if !self.live_identity() {
+					return false;
+				}
+				// SAFETY: `kill` takes integers by value and touches no caller memory.
+				return unsafe { libc::kill(self.pid, signal) } == 0;
+			};
+			// SAFETY: `pidfd` is an owned file descriptor returned by a
 			// successful `pidfd_open` call and remains open for the duration of
 			// this syscall. A null `siginfo_t` pointer is explicitly accepted
 			// by `pidfd_send_signal` and makes the kernel synthesize the same
@@ -166,7 +203,7 @@ mod platform {
 			let ret = unsafe {
 				libc::syscall(
 					libc::SYS_pidfd_send_signal,
-					self.pidfd.as_raw_fd(),
+					pidfd.as_raw_fd(),
 					signal,
 					ptr::null::<libc::siginfo_t>(),
 					0,
@@ -180,17 +217,32 @@ mod platform {
 				return None;
 			}
 
-			// SAFETY: `self.pid` names the process currently referenced by
-			// `self.pidfd` unless it exits concurrently. If it exits, `getpgid`
+			// SAFETY: `self.pid` names the process this reference pinned (the
+			// status check above) unless it exits concurrently. If it exits, `getpgid`
 			// reports failure rather than dereferencing caller-owned memory.
 			let pgid = unsafe { libc::getpgid(self.pid) };
 			if pgid > 0 { Some(pgid) } else { None }
 		}
 
 		pub fn status(&self) -> ProcessStatus {
+			let Some(pidfd) = &self.pidfd else {
+				// Exited once the pid is gone, a zombie, or names a process with
+				// another start time. A process whose identity cannot be read is
+				// never reported exited without proof.
+				let identity = process_identity(self.pid);
+				return match identity.state {
+					super::IdentityState::Gone => ProcessStatus::Exited,
+					super::IdentityState::Running if identity.start_id != Some(self.start_time) => {
+						ProcessStatus::Exited
+					},
+					super::IdentityState::Running | super::IdentityState::Unreadable => {
+						ProcessStatus::Running
+					},
+				};
+			};
 			loop {
 				let mut pollfd =
-					libc::pollfd { fd: self.pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+					libc::pollfd { fd: pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
 				// SAFETY: `pollfd` points to one initialized `pollfd` element, and
 				// the pidfd remains open for the duration of the call. Timeout
 				// zero makes this a non-blocking readiness probe.
@@ -612,20 +664,35 @@ mod platform {
 		}
 	}
 
-	fn open_pidfd(pid: i32) -> Option<Arc<OwnedFd>> {
+	/// Why `pidfd_open` gave no descriptor.
+	enum PidfdError {
+		/// No such process (`ESRCH`), or the pid names a thread rather than a
+		/// process (`EINVAL`).
+		NoProcess,
+		/// The call is unavailable or refused (`ENOSYS` on old kernels and under
+		/// sandboxes such as OpenShell's seccomp filter, `EPERM` from a seccomp
+		/// or LSM policy) or out of descriptors: the process may exist, and is
+		/// pinned by start time instead.
+		Unavailable,
+	}
+
+	fn open_pidfd(pid: i32) -> Result<Arc<OwnedFd>, PidfdError> {
 		// SAFETY: `pidfd_open` takes the PID by value and does not read
 		// caller-owned memory. Flags are zero, which is valid. On success the
 		// returned descriptor is newly owned by this process and is immediately
 		// wrapped in `OwnedFd` below.
 		let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
 		if fd < 0 {
-			return None;
+			return Err(match std::io::Error::last_os_error().raw_os_error() {
+				Some(libc::ESRCH | libc::EINVAL) => PidfdError::NoProcess,
+				_ => PidfdError::Unavailable,
+			});
 		}
 
 		// SAFETY: `fd` is non-negative and was just returned by `pidfd_open`, so
 		// it is an open descriptor owned by this process. `OwnedFd` takes sole
 		// ownership and will close it exactly once.
-		Some(Arc::new(unsafe { OwnedFd::from_raw_fd(fd as RawFd) }))
+		Ok(Arc::new(unsafe { OwnedFd::from_raw_fd(fd as RawFd) }))
 	}
 
 	/// Send `signal` to the process group `pgid`.
@@ -2661,11 +2728,12 @@ impl TerminationTargets {
 /// `process` is captured *at spawn time* so its OS-level identity is pinned
 /// before the pid can be recycled. On Windows an open process handle keeps
 /// the pid reserved for the lifetime of the reference; on Linux the pidfd
-/// pins identity; on macOS the recorded `(pid, start_time)` triple detects
-/// impersonation. Storing only the raw pid and re-opening at cancellation
-/// time — as previous versions did — leaked kills onto unrelated processes
-/// that happened to acquire the recycled pid between the child exiting and
-/// the run being cancelled (issue #4605).
+/// pins identity (or, where `pidfd_open` is unavailable, the recorded start
+/// time does, as on macOS); on macOS the recorded `(pid, start_time)` triple
+/// detects impersonation. Storing only the raw pid and re-opening at
+/// cancellation time — as previous versions did — leaked kills onto unrelated
+/// processes that happened to acquire the recycled pid between the child
+/// exiting and the run being cancelled (issue #4605).
 #[derive(Clone)]
 struct OwnedSpawn {
 	process: Option<Process>,
@@ -3164,6 +3232,82 @@ mod tests {
 			after_exit.processes.is_empty() && after_exit.complete,
 			"an exited launch must not be reported: {after_exit:?}"
 		);
+	}
+
+	/// Where `pidfd_open` is unavailable (OpenShell's seccomp filter fails it
+	/// with `ENOSYS`), a start-time-pinned reference still reports a live owned
+	/// process with its identity, and the survivor list stays complete: the work
+	/// is fully visible. Once the process exits it drops out, still complete.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn survivors_stay_complete_without_pidfds() {
+		use std::{os::unix::process::CommandExt as _, process::Command};
+
+		let mut child = Command::new("sleep")
+			.arg("7461")
+			.process_group(0)
+			.spawn()
+			.expect("spawn sleep");
+		let pid = i32::try_from(child.id()).expect("child pid fits in i32");
+		let registry = SpawnRegistry::new();
+		registry.record(
+			pid,
+			Some(pid),
+			platform::Process::from_pid_without_pidfd(pid).map(Process::from_inner),
+		);
+		let live = registry.survivors();
+		let identity = process_identity(pid);
+		let _ = child.kill();
+		let _ = child.wait();
+		let after_exit = registry.survivors();
+
+		assert_eq!(live, Survivors {
+			processes: vec![SpawnedProcess {
+				pid,
+				pgid: Some(pid),
+				start_time: identity.start_time,
+				start_id: identity.start_id,
+				reparented: false,
+				group_member: false,
+			}],
+			complete:  true,
+		});
+		assert_eq!(after_exit, Survivors { processes: Vec::new(), complete: true });
+	}
+
+	/// A start-time-pinned reference signals only the process it pinned: once
+	/// that process is gone (or its pid names a process with another start
+	/// time) the reference reports it exited and `kill` refuses. A zombie is
+	/// never pinned: after it is reaped nothing could tell its pid apart.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_reference_without_pidfd_follows_its_pinned_process_only() {
+		use std::process::Command;
+
+		let mut child = Command::new("sleep")
+			.arg("7462")
+			.spawn()
+			.expect("spawn sleep");
+		let pid = i32::try_from(child.id()).expect("child pid fits in i32");
+		let pinned = platform::Process::from_pid_without_pidfd(pid).expect("a live child is pinned");
+		assert_eq!(pinned.status(), ProcessStatus::Running);
+		assert_eq!(Some(pinned.start_id()), process_identity(pid).start_id);
+		assert!(pinned.kill(libc::SIGKILL), "a live pinned process is signalled");
+		let _ = child.wait();
+		assert_eq!(pinned.status(), ProcessStatus::Exited);
+		assert!(!pinned.kill(libc::SIGKILL), "a reaped process is never signalled");
+
+		let mut exits = Command::new("true").spawn().expect("spawn true");
+		let zombie = i32::try_from(exits.id()).expect("child pid fits in i32");
+		let deadline = std::time::Instant::now() + Duration::from_secs(5);
+		while process_identity(zombie).state != IdentityState::Gone {
+			assert!(std::time::Instant::now() < deadline, "true never exited");
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		// Exited but not yet reaped: still a zombie in the process table.
+		let zombie_pinned = platform::Process::from_pid_without_pidfd(zombie).is_some();
+		let _ = exits.wait();
+		assert!(!zombie_pinned, "a zombie must not be pinned");
 	}
 
 	/// The harness pid must be the only protected pid. Including its recorded
