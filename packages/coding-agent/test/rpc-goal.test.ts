@@ -376,6 +376,8 @@ describe("RpcGoalController continuation gate", () => {
 		resumed.resolve();
 		let threadResumes = 0;
 		const transcript = { id: "t1" };
+		/** Goal-continuation reservations held on the session (quiesce work), and whether it refuses them. */
+		const reservations = { held: 0, refuse: false };
 		const session = {
 			settings: Settings.isolated({ "goal.continuationModes": ["rpc"] }),
 			// Provider-facing id pinned by the host: must not be used to detect a session change.
@@ -443,7 +445,18 @@ describe("RpcGoalController continuation gate", () => {
 			},
 			promptCustomMessage: (message: { customType: string }) => admit(message.customType),
 			waitForIdle: () => idle.promise,
-			reserveGoalContinuation: () => ({ release: () => {} }),
+			reserveGoalContinuation: () => {
+				if (reservations.refuse) return undefined;
+				reservations.held++;
+				let released = false;
+				return {
+					release: () => {
+						if (released) return;
+						released = true;
+						reservations.held--;
+					},
+				};
+			},
 		};
 		let dropped = 0;
 		const controller = new RpcGoalController(session as unknown as RpcGoalSession, () => dropped++);
@@ -463,6 +476,7 @@ describe("RpcGoalController continuation gate", () => {
 			},
 			releaseResume: () => resumed.resolve(),
 			dropped: () => dropped,
+			reservations,
 			/** Hold waitForIdle until {@link release}. */
 			hold: () => {
 				idle = Promise.withResolvers<void>();
@@ -498,6 +512,46 @@ describe("RpcGoalController continuation gate", () => {
 		controller.observe(agentEnd);
 		await nextMacrotask();
 		expect(admitted).toEqual(["goal-continuation"]);
+	});
+
+	test("holds a quiesce reservation from the decision until the prompt is admitted or dropped", async () => {
+		const heldAtAdmission: number[] = [];
+		const fake = fakeSession(async () => {
+			heldAtAdmission.push(fake.reservations.held);
+			return true;
+		});
+		const { session, controller, reservations } = fake;
+
+		// Decided: counted from that moment, released in the same step that admits the prompt.
+		controller.observe(agentEnd);
+		expect(reservations.held).toBe(1);
+		await nextMacrotask();
+		expect(heldAtAdmission).toEqual([0]);
+		expect(reservations.held).toBe(0);
+
+		// Every drop path releases it: a gate closed while waiting, and a host abort.
+		controller.observe(hostInput);
+		session.hasAdmittedSubmission = true;
+		controller.observe(agentEnd);
+		expect(reservations.held).toBe(1);
+		await nextMacrotask();
+		expect(reservations.held).toBe(0);
+		session.hasAdmittedSubmission = false;
+		controller.observe(hostInput);
+		controller.observe(agentEnd);
+		expect(reservations.held).toBe(1);
+		controller.stopForHostAbort();
+		expect(reservations.held).toBe(0);
+		await nextMacrotask();
+		expect(heldAtAdmission).toEqual([0]);
+
+		// A session that refuses the reservation (it is exiting) gets no continuation at all.
+		reservations.refuse = true;
+		controller.observe(hostInput);
+		controller.observe(agentEnd);
+		expect(controller.continuationPending).toBe(false);
+		await nextMacrotask();
+		expect(heldAtAdmission).toEqual([0]);
 	});
 
 	test("a rejected continuation does not claim the next run as its own", async () => {
