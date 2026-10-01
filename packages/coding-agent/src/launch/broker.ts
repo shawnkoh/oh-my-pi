@@ -485,6 +485,9 @@ class DaemonBroker {
 		clearTimeout(this.#idleTimer);
 		this.#idleTimer = undefined;
 		for (const record of this.#records.values()) {
+			// Let a lifecycle request already running on the record finish first (queued ones
+			// are refused now): stopping the record under it races its own stop.
+			await record.lifecycle;
 			const detached = record.spec.detached && !record.stopRequested && record.snapshot.pid !== undefined;
 			if (!detached && !terminalState(record.snapshot.state)) await this.#stopRecord(record, 2_000);
 			// The detached daemon outlives this broker and the next one recovers it from
