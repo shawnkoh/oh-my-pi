@@ -83,7 +83,10 @@ describe("RPC literal input", () => {
 		await client.followUp("/fast on", undefined, { literal: true });
 		expect((await client.getState()).fastModeEnabled).toBe(false);
 
-		await promptAndSettle("go", true);
+		// The idle steer may already be running; a literal prompt is acknowledged once admitted,
+		// so it joins as a follow-up rather than racing the live run.
+		await client.prompt("go", undefined, { literal: true, streamingBehavior: "followUp" });
+		await client.waitForSettled(10_000);
 		const texts = await userTexts();
 		expect(texts).toContain("/fast on");
 		expect(texts).toContain("/greet queued");

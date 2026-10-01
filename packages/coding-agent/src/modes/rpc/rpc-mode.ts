@@ -1335,14 +1335,16 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				try {
 					if (command.literal === true) {
 						// Literal input never reaches skill, builtin, extension, custom or
-						// template dispatch: the exact text is the user's message.
-						watchAndReportPromptResult({
+						// template dispatch: the exact text is the user's message. Like any
+						// prompt, it is acknowledged only once admitted.
+						await watchAndReportPromptResult({
 							ticket,
-							startPrompt: () =>
+							startPrompt: onPromptAdmitted =>
 								session.prompt(command.message, {
 									images: command.images,
 									streamingBehavior: command.streamingBehavior,
 									literal: true,
+									onPromptAdmitted,
 								}),
 							results: promptResults,
 							onError: onPromptError(id, "prompt"),
