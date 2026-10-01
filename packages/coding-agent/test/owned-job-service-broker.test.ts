@@ -703,7 +703,15 @@ describe.skipIf(process.platform === "win32")("owned-job registry: broker-hosted
 				const shutdown = client.request({ op: "shutdown" });
 				await Promise.allSettled([settled, shutdown]);
 				await brokerFinished;
-				// Shutdown waited for the relaunch and stopped it: nothing of the service is left.
+				// The restart finished its relaunch before shutdown stopped the service, and the
+				// broker's last word is that the service ended, not that it is restarting.
+				const [restarted] = await settled;
+				if (restarted?.status !== "fulfilled" || restarted.value.op !== "restart") {
+					throw new Error("the running restart was cut off by shutdown");
+				}
+				expect(restarted.value.daemon.pid).toBeDefined();
+				expect(["exited", "failed"]).toContain(publishedState(meta).state ?? "unpublished");
+				// Shutdown stopped the relaunch: nothing of the service is left.
 				await eventually(() => liveSleeps(marker).length === 0, "every service process to exit", 3_000);
 			},
 			{ slowStop: true },
