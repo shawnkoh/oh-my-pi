@@ -573,10 +573,14 @@ records that process as a new `service` record (`jobId` `service:<id>:<startedAt
 same `command`, `cwd`, `sleepable`, `broker` and `daemon`); metadata it cannot read
 keeps the service counted. A `restart` request (and a switch to `detached`) publishes
 the service as `restarting` from the stop until the relaunched process runs, so no
-read in between ends the record. The broker runs `stop`, `restart` and `mode` requests
-on one service one at a time, in arrival order, so overlapping requests neither end the
-record early nor leave an untracked process: a `stop` followed by a `restart` stops
-the service (ending its record) and then relaunches it. A service whose broker could
+read in between ends the record. The broker runs `stop`, `restart`, `mode` requests
+and a `start` that takes an existing service's name one at a time per service, in
+arrival order. A request whose turn comes after a `start` replaced the service, or
+once the broker is shutting down, is refused rather than acting on a process the broker
+no longer tracks, so overlapping requests never leave a process the broker does not
+track. They can still end the record before a relaunch: a `stop` followed by a
+`restart` stops the service (ending its record) and then relaunches it, and that
+relaunch is the scan-covered class below. A service whose broker could
 not be identified, or was gone when the service was recorded, marks the registry
 incomplete. The agent
 services start with no restart policy, so the broker relaunches one only on request.
