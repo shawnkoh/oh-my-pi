@@ -5,6 +5,7 @@
 ### Added
 
 - Interactive launches can use `--goal <objective>` to activate goal mode and begin working immediately without typing `/goal` ([#13879](https://github.com/can1357/oh-my-pi/pull/13879) by [@shawnkoh](https://github.com/shawnkoh))
+- Set `goal.toolDefault: true` to let agents start goal mode themselves in ordinary sessions; `--tools=...,goal` also exposes the tool explicitly while the default stays hidden ([#13877](https://github.com/can1357/oh-my-pi/pull/13877) by [@shawnkoh](https://github.com/shawnkoh))
 
 ## [18.4.6] - 2026-10-01
 
