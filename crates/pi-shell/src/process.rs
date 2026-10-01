@@ -29,11 +29,16 @@ mod platform {
 
 	use super::ProcessStatus;
 
-	/// Stable Linux process reference backed by a pidfd.
+	/// Stable Linux process reference. Backed by a pidfd where the kernel and
+	/// sandbox allow `pidfd_open`; otherwise (kernels before 5.3, or a seccomp
+	/// sandbox that fails the call, as `OpenShell`'s does with `ENOSYS`)
+	/// identity is pinned by the `/proc/<pid>/stat` start time, as on macOS,
+	/// and every use re-checks it so a recycled pid never impersonates the
+	/// original.
 	#[derive(Clone)]
 	pub struct Process {
 		pid:        i32,
-		pidfd:      Arc<OwnedFd>,
+		pidfd:      Option<Arc<OwnedFd>>,
 		start_time: u64,
 	}
 
@@ -42,9 +47,31 @@ mod platform {
 			if pid <= 0 {
 				return None;
 			}
-			let pidfd = open_pidfd(pid)?;
+			let pidfd = match open_pidfd(pid) {
+				Ok(pidfd) => Some(pidfd),
+				Err(PidfdError::Unavailable) => None,
+				Err(PidfdError::NoProcess) => return None,
+			};
+			Self::pinned(pid, pidfd)
+		}
+
+		/// Pin `pid` to its current start time. Without a pidfd only a live,
+		/// non-zombie process is pinned: a zombie's pid may be recycled once
+		/// reaped, and nothing would tell the two apart afterwards.
+		fn pinned(pid: i32, pidfd: Option<Arc<OwnedFd>>) -> Option<Self> {
 			let start_time = read_start_time(pid)?;
-			Some(Self { pid, pidfd, start_time })
+			let process = Self { pid, pidfd, start_time };
+			if process.pidfd.is_none() && process.status() != ProcessStatus::Running {
+				return None;
+			}
+			Some(process)
+		}
+
+		/// A reference pinned by start time only, as when `pidfd_open` is
+		/// unavailable.
+		#[cfg(test)]
+		pub(super) fn from_pid_without_pidfd(pid: i32) -> Option<Self> {
+			Self::pinned(pid, None)
 		}
 
 		pub const fn pid(&self) -> i32 {
@@ -157,7 +184,18 @@ mod platform {
 		}
 
 		pub fn kill(&self, signal: i32) -> bool {
-			// SAFETY: `self.pidfd` is an owned file descriptor returned by a
+			let Some(pidfd) = &self.pidfd else {
+				// No pidfd: re-validate the pinned start time right before
+				// signalling, as on macOS. A tiny window remains between the check
+				// and `kill(2)`, but a recycled pid needs a different start time to
+				// pass it.
+				if !self.live_identity() {
+					return false;
+				}
+				// SAFETY: `kill` takes integers by value and touches no caller memory.
+				return unsafe { libc::kill(self.pid, signal) } == 0;
+			};
+			// SAFETY: `pidfd` is an owned file descriptor returned by a
 			// successful `pidfd_open` call and remains open for the duration of
 			// this syscall. A null `siginfo_t` pointer is explicitly accepted
 			// by `pidfd_send_signal` and makes the kernel synthesize the same
@@ -166,7 +204,7 @@ mod platform {
 			let ret = unsafe {
 				libc::syscall(
 					libc::SYS_pidfd_send_signal,
-					self.pidfd.as_raw_fd(),
+					pidfd.as_raw_fd(),
 					signal,
 					ptr::null::<libc::siginfo_t>(),
 					0,
@@ -180,17 +218,32 @@ mod platform {
 				return None;
 			}
 
-			// SAFETY: `self.pid` names the process currently referenced by
-			// `self.pidfd` unless it exits concurrently. If it exits, `getpgid`
+			// SAFETY: `self.pid` names the process this reference pinned (the
+			// status check above) unless it exits concurrently. If it exits, `getpgid`
 			// reports failure rather than dereferencing caller-owned memory.
 			let pgid = unsafe { libc::getpgid(self.pid) };
 			if pgid > 0 { Some(pgid) } else { None }
 		}
 
 		pub fn status(&self) -> ProcessStatus {
+			let Some(pidfd) = &self.pidfd else {
+				// Exited once the pid is gone, a zombie, or names a process with
+				// another start time. A process whose identity cannot be read is
+				// never reported exited without proof.
+				let identity = process_identity(self.pid);
+				return match identity.state {
+					super::IdentityState::Gone => ProcessStatus::Exited,
+					super::IdentityState::Running if identity.start_id != Some(self.start_time) => {
+						ProcessStatus::Exited
+					},
+					super::IdentityState::Running | super::IdentityState::Unreadable => {
+						ProcessStatus::Running
+					},
+				};
+			};
 			loop {
 				let mut pollfd =
-					libc::pollfd { fd: self.pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+					libc::pollfd { fd: pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
 				// SAFETY: `pollfd` points to one initialized `pollfd` element, and
 				// the pidfd remains open for the duration of the call. Timeout
 				// zero makes this a non-blocking readiness probe.
@@ -438,10 +491,10 @@ mod platform {
 			match stat_content.as_deref().and_then(parse_stat) {
 				Some(stat) => {
 					let exited = matches!(stat.state, 'Z' | 'X')
-						&& !status
+						&& status
 							.as_deref()
 							.and_then(status_threads)
-							.is_some_and(|threads| threads > 1);
+							.is_none_or(|threads| threads <= 1);
 					if !exited && !stat.is_kernel_thread() {
 						visit(pid, Candidate::Stat(&stat));
 					}
@@ -612,20 +665,35 @@ mod platform {
 		}
 	}
 
-	fn open_pidfd(pid: i32) -> Option<Arc<OwnedFd>> {
+	/// Why `pidfd_open` gave no descriptor.
+	enum PidfdError {
+		/// No such process (`ESRCH`), or the pid names a thread rather than a
+		/// process (`EINVAL`).
+		NoProcess,
+		/// The call is unavailable or refused (`ENOSYS` on old kernels and under
+		/// sandboxes such as `OpenShell`'s seccomp filter, `EPERM` from a seccomp
+		/// or LSM policy) or out of descriptors: the process may exist, and is
+		/// pinned by start time instead.
+		Unavailable,
+	}
+
+	fn open_pidfd(pid: i32) -> Result<Arc<OwnedFd>, PidfdError> {
 		// SAFETY: `pidfd_open` takes the PID by value and does not read
 		// caller-owned memory. Flags are zero, which is valid. On success the
 		// returned descriptor is newly owned by this process and is immediately
 		// wrapped in `OwnedFd` below.
 		let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
 		if fd < 0 {
-			return None;
+			return Err(match std::io::Error::last_os_error().raw_os_error() {
+				Some(libc::ESRCH | libc::EINVAL) => PidfdError::NoProcess,
+				_ => PidfdError::Unavailable,
+			});
 		}
 
 		// SAFETY: `fd` is non-negative and was just returned by `pidfd_open`, so
 		// it is an open descriptor owned by this process. `OwnedFd` takes sole
 		// ownership and will close it exactly once.
-		Some(Arc::new(unsafe { OwnedFd::from_raw_fd(fd as RawFd) }))
+		Ok(Arc::new(unsafe { OwnedFd::from_raw_fd(fd as RawFd) }))
 	}
 
 	/// Send `signal` to the process group `pgid`.
@@ -2661,11 +2729,12 @@ impl TerminationTargets {
 /// `process` is captured *at spawn time* so its OS-level identity is pinned
 /// before the pid can be recycled. On Windows an open process handle keeps
 /// the pid reserved for the lifetime of the reference; on Linux the pidfd
-/// pins identity; on macOS the recorded `(pid, start_time)` triple detects
-/// impersonation. Storing only the raw pid and re-opening at cancellation
-/// time — as previous versions did — leaked kills onto unrelated processes
-/// that happened to acquire the recycled pid between the child exiting and
-/// the run being cancelled (issue #4605).
+/// pins identity (or, where `pidfd_open` is unavailable, the recorded start
+/// time does, as on macOS); on macOS the recorded `(pid, start_time)` triple
+/// detects impersonation. Storing only the raw pid and re-opening at
+/// cancellation time — as previous versions did — leaked kills onto unrelated
+/// processes that happened to acquire the recycled pid between the child
+/// exiting and the run being cancelled (issue #4605).
 #[derive(Clone)]
 struct OwnedSpawn {
 	process: Option<Process>,
@@ -2989,8 +3058,9 @@ fn prune_exited(spawned: &mut Vec<OwnedSpawn>) {
 
 /// True when process group `pgid` still has at least one member. `kill(2)`
 /// with signal 0 performs permission/existence checks without delivering a
-/// signal; `EPERM` means the group exists but is not ours to signal, which
-/// still counts as alive.
+/// signal. `EPERM` means the group has a member that is not ours to signal,
+/// except where every process-group signal is refused outright (`OpenShell`'s
+/// seccomp filter): there the process table decides (see [`group_alive_from`]).
 #[must_use]
 #[allow(
 	clippy::missing_const_for_fn,
@@ -3003,13 +3073,103 @@ fn process_group_alive(pgid: i32) -> bool {
 	platform_process_group_alive(pgid)
 }
 
+/// What `kill(-pgid, 0)` answered.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GroupSignalAnswer {
+	/// A member could be signalled.
+	Delivered,
+	/// `EPERM`.
+	NotPermitted,
+	/// `ESRCH`: no process is in the group.
+	NoGroup,
+	/// Any other failure. It says nothing about the group's members, so the
+	/// group is never taken for gone on it.
+	Unexplained,
+}
+
+/// Classify the result of `kill(-pgid, 0)`: its return value and, when it
+/// failed, the `errno` it left.
+#[cfg(unix)]
+const fn group_signal_answer(ret: i32, errno: Option<i32>) -> GroupSignalAnswer {
+	if ret == 0 {
+		return GroupSignalAnswer::Delivered;
+	}
+	match errno {
+		Some(libc::EPERM) => GroupSignalAnswer::NotPermitted,
+		Some(libc::ESRCH) => GroupSignalAnswer::NoGroup,
+		_ => GroupSignalAnswer::Unexplained,
+	}
+}
+
 #[cfg(unix)]
 fn platform_process_group_alive(pgid: i32) -> bool {
 	// SAFETY: `kill` takes integer identifiers by value and does not access
 	// caller-owned memory. A negative pid targets the process group; signal 0
 	// only runs the existence/permission checks.
 	let ret = unsafe { libc::kill(-pgid, 0) };
-	ret == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+	let errno = if ret == 0 {
+		None
+	} else {
+		std::io::Error::last_os_error().raw_os_error()
+	};
+	group_alive_from(group_signal_answer(ret, errno), group_signals_blocked, || {
+		listed_or_unprovable_group(pgid)
+	})
+}
+
+/// Group liveness from `kill(-pgid, 0)`'s answer. Only `ESRCH` makes a group
+/// gone. `EPERM` is the kernel's exact "a member exists that is not ours to
+/// signal" unless `signals_blocked` says every group signal is refused here;
+/// then only the process table can tell, through `listed`. One listing can miss
+/// a member that forks a child and is reaped mid-pass, so the group counts as
+/// gone only when two listings in a row find no member. Any other failure keeps
+/// the group alive (unprovable).
+#[cfg(unix)]
+fn group_alive_from(
+	answer: GroupSignalAnswer,
+	signals_blocked: impl FnOnce() -> bool,
+	mut listed: impl FnMut() -> bool,
+) -> bool {
+	match answer {
+		GroupSignalAnswer::Delivered | GroupSignalAnswer::Unexplained => true,
+		GroupSignalAnswer::NoGroup => false,
+		GroupSignalAnswer::NotPermitted => !signals_blocked() || listed() || listed(),
+	}
+}
+
+/// Whether this thread's process-group signals are refused outright, whatever
+/// the group: a sandbox filter that fails `kill` with a pid of zero or below
+/// (`OpenShell`'s seccomp filter). Our own group always has a member we may
+/// signal (this process), so only such a filter answers `EPERM` to it. Seccomp
+/// filters are per-thread state and the group probes run on the calling thread,
+/// so the answer is probed once per thread and cached; in a sandbox that
+/// filters the whole process every thread gets the same answer.
+#[cfg(unix)]
+fn group_signals_blocked() -> bool {
+	thread_local! {
+		static BLOCKED: std::cell::OnceCell<bool> = const { std::cell::OnceCell::new() };
+	}
+	BLOCKED.with(|blocked| *blocked.get_or_init(probe_group_signals_blocked))
+}
+
+#[cfg(unix)]
+fn probe_group_signals_blocked() -> bool {
+	// SAFETY: `getpgrp` and `kill` take and return scalars only; signal 0 only
+	// runs the existence/permission checks.
+	let ret = unsafe { libc::kill(-libc::getpgrp(), 0) };
+	ret != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Whether the process table shows a member of `pgid`, zombies included, or
+/// cannot prove it has none: only a complete listing without a member makes
+/// the group gone.
+#[cfg(unix)]
+fn listed_or_unprovable_group(pgid: i32) -> bool {
+	// The listing leaves out this process, which may be the group's only member.
+	is_self_process_group(pgid)
+		|| platform::list_group_members(&HashSet::from([pgid]))
+			.is_none_or(|listing| listing.partial || listing.seen.contains(&pgid))
 }
 
 #[cfg(not(unix))]
@@ -3164,6 +3324,300 @@ mod tests {
 			after_exit.processes.is_empty() && after_exit.complete,
 			"an exited launch must not be reported: {after_exit:?}"
 		);
+	}
+
+	/// Where `pidfd_open` is unavailable (OpenShell's seccomp filter fails it
+	/// with `ENOSYS`), a start-time-pinned reference still reports a live owned
+	/// process with its identity, and the survivor list stays complete: the work
+	/// is fully visible. Once the process exits it drops out, still complete.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn survivors_stay_complete_without_pidfds() {
+		use std::{os::unix::process::CommandExt as _, process::Command};
+
+		let mut child = Command::new("sleep")
+			.arg("7461")
+			.process_group(0)
+			.spawn()
+			.expect("spawn sleep");
+		let pid = i32::try_from(child.id()).expect("child pid fits in i32");
+		let registry = SpawnRegistry::new();
+		registry.record(
+			pid,
+			Some(pid),
+			platform::Process::from_pid_without_pidfd(pid).map(Process::from_inner),
+		);
+		let live = registry.survivors();
+		let identity = process_identity(pid);
+		let _ = child.kill();
+		let _ = child.wait();
+		let after_exit = registry.survivors();
+
+		assert_eq!(live, Survivors {
+			processes: vec![SpawnedProcess {
+				pid,
+				pgid: Some(pid),
+				start_time: identity.start_time,
+				start_id: identity.start_id,
+				reparented: false,
+				group_member: false,
+			}],
+			complete:  true,
+		});
+		assert_eq!(after_exit, Survivors { processes: Vec::new(), complete: true });
+	}
+
+	/// A start-time-pinned reference signals only the process it pinned: once
+	/// that process is gone (or its pid names a process with another start
+	/// time) the reference reports it exited and `kill` refuses. A zombie is
+	/// never pinned: after it is reaped nothing could tell its pid apart.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn a_reference_without_pidfd_follows_its_pinned_process_only() {
+		use std::process::Command;
+
+		let mut child = Command::new("sleep")
+			.arg("7462")
+			.spawn()
+			.expect("spawn sleep");
+		let pid = i32::try_from(child.id()).expect("child pid fits in i32");
+		let pinned = platform::Process::from_pid_without_pidfd(pid).expect("a live child is pinned");
+		assert_eq!(pinned.status(), ProcessStatus::Running);
+		assert_eq!(Some(pinned.start_id()), process_identity(pid).start_id);
+		assert!(pinned.kill(libc::SIGKILL), "a live pinned process is signalled");
+		let _ = child.wait();
+		assert_eq!(pinned.status(), ProcessStatus::Exited);
+		assert!(!pinned.kill(libc::SIGKILL), "a reaped process is never signalled");
+
+		let mut exits = Command::new("true").spawn().expect("spawn true");
+		let zombie = i32::try_from(exits.id()).expect("child pid fits in i32");
+		let deadline = std::time::Instant::now() + Duration::from_secs(5);
+		while process_identity(zombie).state != IdentityState::Gone {
+			assert!(std::time::Instant::now() < deadline, "true never exited");
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		// Exited but not yet reaped: still a zombie in the process table.
+		let zombie_pinned = platform::Process::from_pid_without_pidfd(zombie).is_some();
+		let _ = exits.wait();
+		assert!(!zombie_pinned, "a zombie must not be pinned");
+	}
+
+	/// Installs, on the calling thread only, the signal rules of OpenShell's
+	/// workload seccomp filter that change what this module observes:
+	/// `pidfd_open` fails with `ENOSYS`, and `kill` with a pid of zero or below
+	/// (a process group, or every process) fails with `EPERM`.
+	#[cfg(target_os = "linux")]
+	fn emulate_openshell_signal_filter() {
+		const fn stmt(code: u32, k: u32) -> libc::sock_filter {
+			libc::sock_filter { code: code as u16, jt: 0, jf: 0, k }
+		}
+		const fn jump(code: u32, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
+			libc::sock_filter { code: code as u16, jt, jf, k }
+		}
+		let syscall = |nr: libc::c_long| u32::try_from(nr).expect("syscall number fits u32");
+		let load = libc::BPF_LD | libc::BPF_W | libc::BPF_ABS;
+		let equal = libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K;
+		let returns = libc::BPF_RET | libc::BPF_K;
+		// `seccomp_data`: `nr` at offset 0, the low word of `args[0]` at 16.
+		let mut program = [
+			stmt(load, 0),
+			jump(equal, syscall(libc::SYS_pidfd_open), 0, 1),
+			stmt(returns, libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32),
+			jump(equal, syscall(libc::SYS_kill), 0, 4),
+			stmt(load, 16),
+			jump(libc::BPF_JMP | libc::BPF_JSET | libc::BPF_K, 1 << 31, 1, 0),
+			jump(equal, 0, 0, 1),
+			stmt(returns, libc::SECCOMP_RET_ERRNO | libc::EPERM as u32),
+			stmt(returns, libc::SECCOMP_RET_ALLOW),
+		];
+		let filter = libc::sock_fprog {
+			len:    u16::try_from(program.len()).expect("program length fits u16"),
+			filter: program.as_mut_ptr(),
+		};
+		// SAFETY: both calls take scalars and, for the filter, a pointer to a
+		// program that stays alive for the call; without
+		// `SECCOMP_FILTER_FLAG_TSYNC` only this thread is filtered.
+		unsafe {
+			assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0, "no_new_privs");
+			assert_eq!(
+				libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &raw const filter),
+				0,
+				"install seccomp filter"
+			);
+		}
+	}
+
+	/// On an ordinary host `EPERM` from `kill(-pgid, 0)` is the kernel's exact
+	/// answer that the group has a member we may not signal (a setuid program,
+	/// another user's process): it stays alive even when a listing would see no
+	/// member, and no listing is taken.
+	#[cfg(unix)]
+	#[test]
+	fn group_eperm_stays_alive_where_group_signals_are_not_blocked() {
+		let mut listings = 0;
+		let alive = group_alive_from(
+			GroupSignalAnswer::NotPermitted,
+			|| false,
+			|| {
+				listings += 1;
+				false
+			},
+		);
+		assert!(alive, "EPERM must keep the group alive when group signals are not blocked");
+		assert_eq!(listings, 0, "the kernel's answer needs no listing");
+	}
+
+	/// Where every group signal is refused, the process table decides: a group
+	/// is gone only when two listings in a row find no member, so one listing
+	/// that misses a member (forked and reaped mid-pass) cannot end it.
+	#[cfg(unix)]
+	#[test]
+	fn blocked_group_signals_need_two_empty_listings_to_end_a_group() {
+		let decide = |listed: [bool; 2]| {
+			let mut calls = 0;
+			let alive = group_alive_from(
+				GroupSignalAnswer::NotPermitted,
+				|| true,
+				|| {
+					calls += 1;
+					listed[calls - 1]
+				},
+			);
+			(alive, calls)
+		};
+		assert_eq!(decide([true, false]), (true, 1));
+		assert_eq!(decide([false, true]), (true, 2), "a second listing must confirm the first");
+		assert_eq!(decide([false, false]), (false, 2));
+		// The kernel's own answers need neither a probe nor a listing.
+		let never = || -> bool { panic!("must not be consulted") };
+		assert!(group_alive_from(GroupSignalAnswer::Delivered, never, never));
+		assert!(!group_alive_from(GroupSignalAnswer::NoGroup, never, never));
+		assert!(group_alive_from(GroupSignalAnswer::Unexplained, never, never));
+	}
+
+	/// Only `ESRCH` says a group has no member. `EPERM` is its own answer, and
+	/// any other failure (a sandbox refusing with `EACCES` or `ENOSYS`, no
+	/// errno at all) is unexplained, which keeps the group alive.
+	#[cfg(unix)]
+	#[test]
+	fn only_esrch_from_a_group_signal_means_the_group_is_gone() {
+		assert_eq!(group_signal_answer(0, None), GroupSignalAnswer::Delivered);
+		assert_eq!(group_signal_answer(-1, Some(libc::EPERM)), GroupSignalAnswer::NotPermitted);
+		assert_eq!(group_signal_answer(-1, Some(libc::ESRCH)), GroupSignalAnswer::NoGroup);
+		for errno in [Some(libc::EACCES), Some(libc::ENOSYS), Some(libc::EINVAL), None] {
+			assert_eq!(
+				group_signal_answer(-1, errno),
+				GroupSignalAnswer::Unexplained,
+				"errno {errno:?}"
+			);
+		}
+	}
+
+	/// The real probe reports a block exactly when a group signal to a group we
+	/// wholly own (a child we put in its own group) is refused. On an ordinary,
+	/// unfiltered host that signal is delivered, so the probe must answer "not
+	/// blocked" and `EPERM` keeps meaning a member exists. Under a filter on the
+	/// whole process (OpenShell, guestbox) no thread is unfiltered, and both
+	/// answers are "refused".
+	#[cfg(unix)]
+	#[test]
+	fn group_signal_probe_answers_not_blocked_where_owned_groups_can_be_signalled() {
+		use std::{os::unix::process::CommandExt as _, process::Command};
+
+		let mut child = Command::new("sleep")
+			.arg("19876543")
+			.process_group(0)
+			.spawn()
+			.expect("spawn sleep");
+		let pgid = i32::try_from(child.id()).expect("child pid fits in i32");
+		// A fresh thread: its cached answer comes from its own probe.
+		let (blocked, owned_group_refused) = std::thread::spawn(move || {
+			// SAFETY: `kill` takes integers only; signal 0 only runs the checks.
+			let refused = unsafe { libc::kill(-pgid, 0) } != 0
+				&& std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+			(group_signals_blocked(), refused)
+		})
+		.join()
+		.expect("probe thread");
+		let _ = child.kill();
+		let _ = child.wait();
+
+		assert_eq!(
+			blocked, owned_group_refused,
+			"the probe must say blocked exactly when a group we own cannot be signalled"
+		);
+	}
+
+	/// OpenShell's workload filter fails every process-group signal with
+	/// `EPERM`, which `kill(2)` otherwise answers only for a group whose
+	/// members are not ours to signal. A command that ran in its own group and
+	/// exited must leave the survivor list empty and complete, and a member
+	/// still alive in a group whose leader exited must still be reported.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn survivors_stay_exact_where_group_signals_are_denied() {
+		use std::{os::unix::process::CommandExt as _, process::Command};
+
+		let (exited, left_behind, member_pid, leader_pid, member_identity) =
+			std::thread::spawn(|| {
+				emulate_openshell_signal_filter();
+				// SAFETY: `getpgrp` and `kill` take and return scalars only.
+				let probe = unsafe { libc::kill(-libc::getpgrp(), 0) };
+				assert_eq!(
+					(probe, std::io::Error::last_os_error().raw_os_error()),
+					(-1, Some(libc::EPERM)),
+					"the filter must deny a probe of our own live group"
+				);
+				// The liveness checks below run on this thread and so use the scan.
+				assert!(group_signals_blocked(), "this thread's probe must see group signals blocked");
+
+				let mut exits = Command::new("true")
+					.process_group(0)
+					.spawn()
+					.expect("spawn true");
+				let pid = i32::try_from(exits.id()).expect("child pid fits in i32");
+				let registry = SpawnRegistry::new();
+				registry.record(pid, Some(pid), Process::from_pid(pid));
+				let _ = exits.wait();
+				let exited = registry.survivors();
+
+				let mut leader = Command::new("sleep")
+					.arg("7531")
+					.process_group(0)
+					.spawn()
+					.expect("spawn leader");
+				let leader_pid = i32::try_from(leader.id()).expect("leader pid fits in i32");
+				let mut member = Command::new("sleep")
+					.arg("7532")
+					.process_group(leader_pid)
+					.spawn()
+					.expect("spawn member");
+				let member_pid = i32::try_from(member.id()).expect("member pid fits in i32");
+				let registry = SpawnRegistry::new();
+				registry.record(leader_pid, Some(leader_pid), Process::from_pid(leader_pid));
+				let _ = leader.kill();
+				let _ = leader.wait();
+				let left_behind = registry.survivors();
+				let member_identity = process_identity(member_pid);
+				let _ = member.kill();
+				let _ = member.wait();
+				(exited, left_behind, member_pid, leader_pid, member_identity)
+			})
+			.join()
+			.expect("filtered thread");
+
+		assert_eq!(exited, Survivors { processes: Vec::new(), complete: true });
+		assert_eq!(left_behind, Survivors {
+			processes: vec![SpawnedProcess {
+				pid:          member_pid,
+				pgid:         Some(leader_pid),
+				start_time:   member_identity.start_time,
+				start_id:     member_identity.start_id,
+				reparented:   false,
+				group_member: true,
+			}],
+			complete:  true,
+		});
 	}
 
 	/// The harness pid must be the only protected pid. Including its recorded

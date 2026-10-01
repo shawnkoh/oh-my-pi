@@ -376,6 +376,8 @@ describe("RpcGoalController continuation gate", () => {
 		resumed.resolve();
 		let threadResumes = 0;
 		const transcript = { id: "t1" };
+		/** Goal-continuation reservations the session currently holds (quiesce work). */
+		const reservations = { held: 0 };
 		const session = {
 			settings: Settings.isolated({ "goal.continuationModes": ["rpc"] }),
 			// Provider-facing id pinned by the host: must not be used to detect a session change.
@@ -443,6 +445,17 @@ describe("RpcGoalController continuation gate", () => {
 			},
 			promptCustomMessage: (message: { customType: string }) => admit(message.customType),
 			waitForIdle: () => idle.promise,
+			reserveGoalContinuation: () => {
+				reservations.held++;
+				let released = false;
+				return {
+					release: () => {
+						if (released) return;
+						released = true;
+						reservations.held--;
+					},
+				};
+			},
 		};
 		let dropped = 0;
 		const controller = new RpcGoalController(session as unknown as RpcGoalSession, () => dropped++);
@@ -462,6 +475,7 @@ describe("RpcGoalController continuation gate", () => {
 			},
 			releaseResume: () => resumed.resolve(),
 			dropped: () => dropped,
+			reservations,
 			/** Hold waitForIdle until {@link release}. */
 			hold: () => {
 				idle = Promise.withResolvers<void>();
@@ -469,6 +483,38 @@ describe("RpcGoalController continuation gate", () => {
 			release: () => idle.resolve(),
 		};
 	}
+
+	test("a stale continuation task never releases the reservation of a newer one", async () => {
+		const heldAtAdmission: number[] = [];
+		const fake = fakeSession(async () => {
+			heldAtAdmission.push(fake.reservations.held);
+			return true;
+		});
+		const { controller, reservations } = fake;
+
+		// Continuation 1 is decided and its task waits for the session to go idle.
+		fake.hold();
+		controller.observe(agentEnd);
+		await nextMacrotask();
+		expect(reservations.held).toBe(1);
+		// The host aborts (releasing 1), then re-arms; continuation 2 is decided.
+		controller.stopForHostAbort();
+		expect(reservations.held).toBe(0);
+		controller.observe(hostInput);
+		controller.observe(agentEnd);
+		expect(reservations.held).toBe(1);
+		// Task 1 wakes while continuation 2 still waits on a later idle.
+		fake.release();
+		fake.hold();
+		await nextMacrotask();
+		expect(controller.continuationPending).toBe(true);
+		expect(reservations.held).toBe(1);
+		// Continuation 2 is admitted, its reservation handed over in the same step.
+		fake.release();
+		await nextMacrotask();
+		expect(heldAtAdmission).toEqual([0]);
+		expect(reservations.held).toBe(0);
+	});
 
 	test("a continuation decided before the session closes is never admitted after it", async () => {
 		const admitted: string[] = [];
