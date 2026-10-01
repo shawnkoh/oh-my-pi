@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `spawnedComplete` being `false` for every shell run that started an external command in OpenShell sandboxes, whose seccomp filter denies every process-group signal: whether such a command's process group is gone is now read from the process table
+
 ## [18.4.5] - 2026-09-30
 ### Added
 
