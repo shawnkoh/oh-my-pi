@@ -128,6 +128,15 @@ function liveSleeps(marker: string): number[] {
 	return pids;
 }
 
+/**
+ * The processes running `sleep <marker>` once `pid` itself does: the broker publishes a pid
+ * as soon as it forks, before the child has exec'd its program.
+ */
+async function liveSleepsOnce(marker: string, pid: number): Promise<number[]> {
+	await eventually(() => liveSleeps(marker).includes(pid), `pid ${pid} to run its program`);
+	return liveSleeps(marker);
+}
+
 /** Settles (never rejects) once `request` does. */
 function settledFlag(request: Promise<unknown>): { readonly done: boolean } {
 	const flag = { done: false };
@@ -413,7 +422,7 @@ describe.skipIf(process.platform === "win32")("owned-job registry: broker-hosted
 			expect(registry.openJobs().filter(job => job.kind === "service")).toEqual([
 				expect.objectContaining({ pid: finalPid }),
 			]);
-			expect(liveSleeps(marker)).toEqual([finalPid]);
+			expect(await liveSleepsOnce(marker, finalPid)).toEqual([finalPid]);
 		});
 	}, 30_000);
 
@@ -428,7 +437,7 @@ describe.skipIf(process.platform === "win32")("owned-job registry: broker-hosted
 			const pid = restarted.daemon.pid;
 			if (pid === undefined) throw new Error("the restart left no process");
 			await eventually(() => publishedState(meta).pid === pid, "the relaunch to be published");
-			expect(liveSleeps(marker)).toEqual([pid]);
+			expect(await liveSleepsOnce(marker, pid)).toEqual([pid]);
 		});
 	}, 30_000);
 
@@ -456,7 +465,7 @@ describe.skipIf(process.platform === "win32")("owned-job registry: broker-hosted
 			if (last.op !== "restart" || last.daemon.pid === undefined) throw new Error("the restart left no process");
 			const pid = last.daemon.pid;
 			await eventually(() => publishedState(meta).pid === pid, "the relaunch to be published");
-			expect(liveSleeps(marker)).toEqual([pid]);
+			expect(await liveSleepsOnce(marker, pid)).toEqual([pid]);
 
 			await client.request({ op: "stop", name: "svc", timeoutMs: 2_000 });
 			await eventually(() => liveSleeps(marker).length === 0, "every service process to exit");
