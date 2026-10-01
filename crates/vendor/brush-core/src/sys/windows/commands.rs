@@ -116,8 +116,19 @@ pub trait CommandSessionExt {
 	fn detach_session(&mut self);
 	/// Like [`CommandSessionExt::detach_session`]. On Windows there is no session
 	/// or `fork`-based reparenting, so this is a no-op: the operand stays a child
-	/// of the shell.
-	fn detach_session_reparent(&mut self);
+	/// of the shell and there is never a reparented pid to report.
+	fn detach_session_reparent(&mut self) -> Option<ReparentedPidReceiver>;
+}
+
+/// Receiver for a reparented launch's real pid. Uninhabited: Windows has no
+/// `fork`-based reparenting.
+pub enum ReparentedPidReceiver {}
+
+impl ReparentedPidReceiver {
+	/// Returns the real reparented process' `(pid, pgid)`.
+	pub fn receive(self) -> Option<(i32, i32)> {
+		match self {}
+	}
 }
 
 impl CommandSessionExt for std::process::Command {
@@ -125,7 +136,8 @@ impl CommandSessionExt for std::process::Command {
 		// NOTE: Windows has no setsid; intentionally a no-op.
 	}
 
-	fn detach_session_reparent(&mut self) {
+	fn detach_session_reparent(&mut self) -> Option<ReparentedPidReceiver> {
 		// NOTE: no reparenting primitive on Windows; intentionally a no-op.
+		None
 	}
 }
