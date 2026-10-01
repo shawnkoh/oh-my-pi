@@ -3058,10 +3058,9 @@ fn prune_exited(spawned: &mut Vec<OwnedSpawn>) {
 
 /// True when process group `pgid` still has at least one member. `kill(2)`
 /// with signal 0 performs permission/existence checks without delivering a
-/// signal. `EPERM` usually means the group exists but is not ours to signal;
-/// a sandbox that denies every process-group signal (`OpenShell`'s seccomp
-/// filter) answers it for empty groups too, so then the process table
-/// decides.
+/// signal. `EPERM` means the group has a member that is not ours to signal,
+/// except where every process-group signal is refused outright (`OpenShell`'s
+/// seccomp filter): there the process table decides (see [`group_alive_from`]).
 #[must_use]
 #[allow(
 	clippy::missing_const_for_fn,
@@ -3074,17 +3073,73 @@ fn process_group_alive(pgid: i32) -> bool {
 	platform_process_group_alive(pgid)
 }
 
+/// What `kill(-pgid, 0)` answered.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GroupSignalAnswer {
+	/// A member could be signalled.
+	Delivered,
+	/// `EPERM`.
+	NotPermitted,
+	/// Any other failure (`ESRCH`: no such group).
+	NoGroup,
+}
+
 #[cfg(unix)]
 fn platform_process_group_alive(pgid: i32) -> bool {
 	// SAFETY: `kill` takes integer identifiers by value and does not access
 	// caller-owned memory. A negative pid targets the process group; signal 0
 	// only runs the existence/permission checks.
-	let ret = unsafe { libc::kill(-pgid, 0) };
-	if ret == 0 {
-		return true;
+	let answer = if unsafe { libc::kill(-pgid, 0) } == 0 {
+		GroupSignalAnswer::Delivered
+	} else if std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) {
+		GroupSignalAnswer::NotPermitted
+	} else {
+		GroupSignalAnswer::NoGroup
+	};
+	group_alive_from(answer, group_signals_blocked, || listed_or_unprovable_group(pgid))
+}
+
+/// Group liveness from `kill(-pgid, 0)`'s answer. `EPERM` is the kernel's exact
+/// "a member exists that is not ours to signal" unless `signals_blocked` says
+/// every group signal is refused here; then only the process table can tell,
+/// through `listed`. One listing can miss a member that forks a child and is
+/// reaped mid-pass, so the group counts as gone only when two listings in a
+/// row find no member.
+#[cfg(unix)]
+fn group_alive_from(
+	answer: GroupSignalAnswer,
+	signals_blocked: impl FnOnce() -> bool,
+	mut listed: impl FnMut() -> bool,
+) -> bool {
+	match answer {
+		GroupSignalAnswer::Delivered => true,
+		GroupSignalAnswer::NoGroup => false,
+		GroupSignalAnswer::NotPermitted => !signals_blocked() || listed() || listed(),
 	}
-	std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-		&& listed_or_unprovable_group(pgid)
+}
+
+/// Whether this thread's process-group signals are refused outright, whatever
+/// the group: a sandbox filter that fails `kill` with a pid of zero or below
+/// (`OpenShell`'s seccomp filter). Our own group always has a member we may
+/// signal (this process), so only such a filter answers `EPERM` to it. Seccomp
+/// filters are per-thread state and the group probes run on the calling thread,
+/// so the answer is probed once per thread and cached; in a sandbox that
+/// filters the whole process every thread gets the same answer.
+#[cfg(unix)]
+fn group_signals_blocked() -> bool {
+	thread_local! {
+		static BLOCKED: std::cell::OnceCell<bool> = const { std::cell::OnceCell::new() };
+	}
+	BLOCKED.with(|blocked| *blocked.get_or_init(probe_group_signals_blocked))
+}
+
+#[cfg(unix)]
+fn probe_group_signals_blocked() -> bool {
+	// SAFETY: `getpgrp` and `kill` take and return scalars only; signal 0 only
+	// runs the existence/permission checks.
+	let ret = unsafe { libc::kill(-libc::getpgrp(), 0) };
+	ret != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Whether the process table shows a member of `pgid`, zombies included, or
@@ -3373,6 +3428,53 @@ mod tests {
 		}
 	}
 
+	/// On an ordinary host `EPERM` from `kill(-pgid, 0)` is the kernel's exact
+	/// answer that the group has a member we may not signal (a setuid program,
+	/// another user's process): it stays alive even when a listing would see no
+	/// member, and no listing is taken.
+	#[cfg(unix)]
+	#[test]
+	fn group_eperm_stays_alive_where_group_signals_are_not_blocked() {
+		let mut listings = 0;
+		let alive = group_alive_from(
+			GroupSignalAnswer::NotPermitted,
+			|| false,
+			|| {
+				listings += 1;
+				false
+			},
+		);
+		assert!(alive, "EPERM must keep the group alive when group signals are not blocked");
+		assert_eq!(listings, 0, "the kernel's answer needs no listing");
+	}
+
+	/// Where every group signal is refused, the process table decides: a group
+	/// is gone only when two listings in a row find no member, so one listing
+	/// that misses a member (forked and reaped mid-pass) cannot end it.
+	#[cfg(unix)]
+	#[test]
+	fn blocked_group_signals_need_two_empty_listings_to_end_a_group() {
+		let decide = |listed: [bool; 2]| {
+			let mut calls = 0;
+			let alive = group_alive_from(
+				GroupSignalAnswer::NotPermitted,
+				|| true,
+				|| {
+					calls += 1;
+					listed[calls - 1]
+				},
+			);
+			(alive, calls)
+		};
+		assert_eq!(decide([true, false]), (true, 1));
+		assert_eq!(decide([false, true]), (true, 2), "a second listing must confirm the first");
+		assert_eq!(decide([false, false]), (false, 2));
+		// The kernel's own answers need neither a probe nor a listing.
+		let never = || -> bool { panic!("must not be consulted") };
+		assert!(group_alive_from(GroupSignalAnswer::Delivered, never, never));
+		assert!(!group_alive_from(GroupSignalAnswer::NoGroup, never, never));
+	}
+
 	/// OpenShell's workload filter fails every process-group signal with
 	/// `EPERM`, which `kill(2)` otherwise answers only for a group whose
 	/// members are not ours to signal. A command that ran in its own group and
@@ -3393,6 +3495,8 @@ mod tests {
 					(-1, Some(libc::EPERM)),
 					"the filter must deny a probe of our own live group"
 				);
+				// The liveness checks below run on this thread and so use the scan.
+				assert!(group_signals_blocked(), "this thread's probe must see group signals blocked");
 
 				let mut exits = Command::new("true")
 					.process_group(0)

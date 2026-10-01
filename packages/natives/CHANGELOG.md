@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Fixed `spawnedComplete` being `false` for every shell run that started an external command in OpenShell sandboxes, whose seccomp filter denies every process-group signal: whether such a command's process group is gone is now read from the process table
+- Fixed `spawnedComplete` being `false` for every shell run that started an external command in OpenShell sandboxes, whose seccomp filter denies every process-group signal: where group signals are refused outright, whether such a command's process group is gone is now read from the process table (two empty listings in a row); elsewhere a refused group signal still means the group has a member
 - Fixed `pkill` reporting "signalling pid N failed" for every process where `pidfd_open` is unavailable (OpenShell sandboxes); it now signals by pid after re-checking that the pid still names the selected process
 
 ## [18.4.5] - 2026-09-30
