@@ -11,6 +11,7 @@
 
 - In OpenShell sandboxes, an external shell command that has exited no longer marks the owned-job registry incomplete, so `quiesce_and_exit` can attest `registryComplete: true` there
 - A named service whose process is gone while its daemon broker can still relaunch it (restart backoff, `omp ps restart`) now keeps `quiesce_and_exit` refused and `verifyOwnedJobRegistry` blocked until the broker publishes it stopped or exits; `service` registry records carry the hosting `broker` identity, a relaunched service is recorded under its new pid, and a `restart` request publishes the service as `restarting` (not `exited`) until its new process runs
+- Overlapping `stop`, `restart` and mode-change requests for one supervised process (`omp ps`, `proc://`) now run one at a time in arrival order: two restarts sent together no longer leave an orphaned process that `stop` cannot end, a stop sent with a restart is no longer lost, and a second restart can no longer briefly publish the service as exited
 
 ## [18.4.6] - 2026-10-01
 
