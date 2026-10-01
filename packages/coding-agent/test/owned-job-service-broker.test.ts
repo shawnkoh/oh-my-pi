@@ -340,16 +340,19 @@ describe.skipIf(process.platform === "win32")("owned-job registry: broker-hosted
 
 	/**
 	 * Run `body` against a PTY service (as `startService` starts them: no restart policy) in an
-	 * embedded broker, with its `service` record registered. Every process running the
-	 * service's marker sleep is killed afterwards, orphans included.
+	 * embedded broker, with its `service` record registered. With `slowStop` the service
+	 * ignores SIGTERM, so a stop takes its whole grace period before SIGKILL. Every process
+	 * running the service's marker sleep is killed afterwards, orphans included.
 	 */
 	async function withPtyService(
 		body: (service: {
 			client: DaemonBrokerClient;
 			meta: string;
 			marker: string;
+			projectDir: string;
 			started: DaemonSnapshot;
 		}) => Promise<void>,
+		options: { slowStop?: boolean } = {},
 	): Promise<void> {
 		const projectDir = path.join(tempDir.path(), "project");
 		const runtimeDir = path.join(tempDir.path(), "runtime");
@@ -364,8 +367,8 @@ describe.skipIf(process.platform === "win32")("owned-job registry: broker-hosted
 				op: "start",
 				spec: {
 					name: "svc",
-					application: "/bin/sleep",
-					args: [marker],
+					application: options.slowStop ? "/bin/sh" : "/bin/sleep",
+					args: options.slowStop ? ["-c", `trap '' TERM; exec /bin/sleep ${marker}`] : [marker],
 					env: {},
 					cwd: projectDir,
 					pty: true,
@@ -383,7 +386,7 @@ describe.skipIf(process.platform === "win32")("owned-job registry: broker-hosted
 				broker: { pid: process.pid },
 				daemon: { id: started.daemon.id, meta },
 			});
-			await body({ client, meta, marker, started: started.daemon });
+			await body({ client, meta, marker, projectDir, started: started.daemon });
 		} finally {
 			spawned.push(...liveSleeps(marker));
 			await client.request({ op: "shutdown" }).catch(() => undefined);
@@ -470,6 +473,142 @@ describe.skipIf(process.platform === "win32")("owned-job registry: broker-hosted
 			await client.request({ op: "stop", name: "svc", timeoutMs: 2_000 });
 			await eventually(() => liveSleeps(marker).length === 0, "every service process to exit");
 		});
+	}, 30_000);
+
+	/** A PTY spec for service `svc` running `sleep <marker>`, as a `start` request carries it. */
+	function sleepSpec(marker: string, cwd: string) {
+		return {
+			name: "svc",
+			application: "/bin/sleep",
+			args: [marker],
+			env: {},
+			cwd,
+			pty: true,
+			restart: "no" as const,
+			persist: false,
+			detached: false,
+		};
+	}
+
+	it("runs a stop, a restart and a replacing start sent together in order, leaving only the replacement", async () => {
+		await withPtyService(
+			async ({ client, meta, marker, projectDir }) => {
+				const replacement = markerSleep();
+				try {
+					const [stopped, restarted, started] = await Promise.allSettled([
+						client.request({ op: "stop", name: "svc", timeoutMs: 1_000 }),
+						client.request({ op: "restart", name: "svc" }),
+						client.request({ op: "start", spec: sleepSpec(replacement, projectDir), replace: true }),
+					]);
+					// In arrival order: the restart relaunches the service before the start replaces it.
+					expect(stopped.status).toBe("fulfilled");
+					expect(restarted.status).toBe("fulfilled");
+					if (started.status !== "fulfilled" || started.value.op !== "start") throw new Error("start failed");
+					const pid = started.value.daemon.pid;
+					if (pid === undefined) throw new Error("the replacement has no process");
+					await eventually(() => liveSleeps(marker).length === 0, "the replaced service's processes to exit");
+					expect(publishedState(meta)).toMatchObject({ id: started.value.daemon.id, pid });
+					expect(await liveSleepsOnce(replacement, pid)).toEqual([pid]);
+				} finally {
+					spawned.push(...liveSleeps(replacement));
+				}
+			},
+			{ slowStop: true },
+		);
+	}, 30_000);
+
+	it("refuses a restart queued behind a replacing start instead of relaunching the replaced service", async () => {
+		await withPtyService(
+			async ({ client, meta, marker, projectDir }) => {
+				const replacement = markerSleep();
+				try {
+					const [started, restarted] = await Promise.allSettled([
+						client.request({ op: "start", spec: sleepSpec(replacement, projectDir), replace: true }),
+						client.request({ op: "restart", name: "svc" }),
+					]);
+					if (started.status !== "fulfilled" || started.value.op !== "start") throw new Error("start failed");
+					expect(restarted.status).toBe("rejected");
+					expect(restarted.status === "rejected" ? String(restarted.reason) : "").toContain("svc was replaced");
+					const pid = started.value.daemon.pid;
+					if (pid === undefined) throw new Error("the replacement has no process");
+					await eventually(() => liveSleeps(marker).length === 0, "the replaced service's processes to exit");
+					expect(publishedState(meta)).toMatchObject({ id: started.value.daemon.id, pid });
+					expect(await liveSleepsOnce(replacement, pid)).toEqual([pid]);
+				} finally {
+					spawned.push(...liveSleeps(replacement));
+				}
+			},
+			{ slowStop: true },
+		);
+	}, 30_000);
+
+	it("switches a PTY service to detached through the broker without losing count of it", async () => {
+		await withPtyService(async ({ client, meta, marker }) => {
+			const mode = client.request({ op: "mode", name: "svc", mode: "detached" });
+			const done = settledFlag(mode);
+			const counts: number[] = [];
+			while (!done.done) {
+				counts.push(registry.liveProcessCount());
+				await nextTurn();
+			}
+			const switched = await mode;
+			if (switched.op !== "mode" || switched.daemon.pid === undefined)
+				throw new Error("mode switch left no process");
+			const pid = switched.daemon.pid;
+			await eventually(() => publishedState(meta).pid === pid, "the detached process to be published");
+			counts.push(registry.liveProcessCount());
+			expect(switched.daemon.detached).toBe(true);
+			expect(counts.filter(count => count === 0)).toEqual([]);
+			expect(registry.openJobs().filter(job => job.kind === "service")).toEqual([expect.objectContaining({ pid })]);
+			expect(await liveSleepsOnce(marker, pid)).toEqual([pid]);
+		});
+	}, 30_000);
+
+	it("leaves one process when a switch to detached and a restart arrive together", async () => {
+		await withPtyService(async ({ client, meta, marker }) => {
+			const [switched, restarted] = await Promise.all([
+				client.request({ op: "mode", name: "svc", mode: "detached" }),
+				client.request({ op: "restart", name: "svc" }),
+			]);
+			if (switched.op !== "mode" || restarted.op !== "restart") throw new Error("unexpected results");
+			const pid = restarted.daemon.pid;
+			if (pid === undefined) throw new Error("the restart left no process");
+			await eventually(() => publishedState(meta).pid === pid, "the last relaunch to be published");
+			expect(await liveSleepsOnce(marker, pid)).toEqual([pid]);
+		});
+	}, 30_000);
+
+	it("still runs a lifecycle request queued behind one that failed", async () => {
+		await withPtyService(async ({ client, meta, marker }) => {
+			await client.request({ op: "stop", name: "svc", timeoutMs: 2_000 });
+			const [mode, restart] = await Promise.allSettled([
+				// A mode change of a stopped service fails.
+				client.request({ op: "mode", name: "svc", mode: "persist" }),
+				client.request({ op: "restart", name: "svc" }),
+			]);
+			expect(mode.status).toBe("rejected");
+			if (restart.status !== "fulfilled" || restart.value.op !== "restart")
+				throw new Error("the restart did not run");
+			const pid = restart.value.daemon.pid;
+			if (pid === undefined) throw new Error("the restart left no process");
+			await eventually(() => publishedState(meta).pid === pid, "the relaunch to be published");
+			expect(await liveSleepsOnce(marker, pid)).toEqual([pid]);
+		});
+	}, 30_000);
+
+	it("refuses a restart whose turn comes once the broker is shutting down", async () => {
+		await withPtyService(
+			async ({ client }) => {
+				const [, restarted] = await Promise.allSettled([
+					client.request({ op: "stop", name: "svc", timeoutMs: 1_000 }),
+					client.request({ op: "restart", name: "svc" }),
+					client.request({ op: "shutdown" }),
+				]);
+				expect(restarted.status).toBe("rejected");
+				expect(restarted.status === "rejected" ? String(restarted.reason) : "").toContain("shutting down");
+			},
+			{ slowStop: true },
+		);
 	}, 30_000);
 
 	it("ends a service record once its broker hosts another service of that name", () => {
