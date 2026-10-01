@@ -30,6 +30,7 @@
 | `async` | `boolean` | No | Background execution request. Present only when `async.enabled` is true for the session. Returns immediately with a job id instead of waiting; it does not change the effective deadline, including a disabled deadline from `timeout: 0`. |
 | `name` | `string` | No | Project-unique supervised service name: 1–48 letters, numbers, dots, underscores, or hyphens, starting with a letter or number. Present only when `launch.enabled` and Bash is active. Blank names select finite-command mode. A live name restarts using the new spec. Incompatible with `async: true` or any supplied `timeout`. |
 | `ready` | `{ log?: string; port?: number; host?: string; timeout?: number }` | No | Service readiness requires a nonblank log regex and/or integer TCP port `1..65535`; all supplied conditions must pass. Host defaults to `127.0.0.1`, timeout to 30 seconds (clamped to `0.05..3600`). Without `name`, a nonempty spec is ignored with a notice. |
+| `sleepable` | `boolean` | No | Only with `name`; without it the flag is ignored and the result says so. Marks the service as allowed to keep running while the session is suspended. Recorded once, at start, in the owned-job registry (`<session>.jobs.jsonl`); never changed later. It is independent of the service mode (`persist`/`session`/`detached`, changeable later through `proc://<name>/mode`), which decides when the broker stops the service; `sleepable` only tells a supervisor whether a live service may outlast a suspended session. Quiescence counts every live service as outstanding work regardless. Default `false`. |
 
 There is no `env` input. Named services inherit the configured shell environment; put command-specific assignments in `command`.
 
@@ -211,6 +212,7 @@ Choose the setting by the desired outcome:
 - Background work / cancellation
   - Async and auto-background jobs continue after the initial tool return, until completion, cancellation, or their deadline (unless `timeout: 0` disabled it).
   - Cancellation aborts the native run; PTY overlay dismissal also kills the PTY.
+  - A shell `&` job still running when its command returns — an external child, or an in-process subshell/brace group such as `{ sleep 1; cmd; } &` — keeps its shell alive until the job ends (it is reaped every 5 seconds). The shell counts as outstanding work (`retainedJobs`) and holds an open `retained-shell` record in the owned-job registry for that time. A cancelled or timed-out run tears its shell down instead.
 
 ## Limits & Caps
 - Default timeout: `300s` (`TOOL_TIMEOUTS.bash.default` in `packages/coding-agent/src/tools/tool-timeouts.ts`).
