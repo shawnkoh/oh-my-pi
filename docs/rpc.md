@@ -657,10 +657,12 @@ sandboxes such as OpenShell whose seccomp filter fails `pidfd_open` with `ENOSYS
 a run whose processes are all visible reports itself complete either way. Its group
 enumeration reads only `/proc/<pid>/stat`, so processes whose environment cannot be
 read, unrelated or not, never make it incomplete. Whether a group the run created still
-has members is asked with `kill(-pgid, 0)`; where that is denied (OpenShell's seccomp
-filter fails every process-group signal with `EPERM`), the process table decides, and
-a group counts as gone only when a complete listing shows no member of it, zombies
-included. On macOS the kernel withholds the
+has members is asked with `kill(-pgid, 0)`, and `EPERM` (a member exists that is not
+ours to signal, such as a setuid program) means it has. Only where every process-group
+signal is refused (OpenShell's seccomp filter fails them all with `EPERM`; detected by
+probing the agent's own group, once per thread) does the process table decide instead:
+a group counts as gone only when two complete listings in a row show no member of it,
+zombies included. On macOS the kernel withholds the
 environment of Apple platform binaries (`sh`, `zsh`, `sleep`, …), so the scan is almost
 never `sound` there and consumers get `unknown` rather than a false clear. Windows has
 no scan.
