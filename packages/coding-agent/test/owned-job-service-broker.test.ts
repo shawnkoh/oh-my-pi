@@ -384,6 +384,9 @@ describe.skipIf(process.platform === "win32")("owned-job registry: broker-hosted
 				},
 			});
 			if (started.op !== "start" || started.daemon.pid === undefined) throw new Error("service did not start");
+			// A slow-stop service ignores SIGTERM only once its shell has installed the trap and
+			// exec'd the marker sleep.
+			if (options.slowStop) await liveSleepsOnce(marker, started.daemon.pid);
 			registry.registerProcess({
 				kind: "service",
 				jobId: `service:${started.daemon.id}:${started.daemon.startedAt}`,
@@ -629,6 +632,82 @@ describe.skipIf(process.platform === "win32")("owned-job registry: broker-hosted
 				spawned.push(...liveSleeps(marker));
 			}
 		});
+	}, 30_000);
+
+	/** Sample `liveSleeps(marker)` on every turn until `done` settles; returns every pid seen. */
+	async function sampleSleepsUntil(marker: string, done: Promise<unknown>): Promise<number[]> {
+		const flag = settledFlag(done);
+		const seen = new Set<number>();
+		while (!flag.done) {
+			for (const pid of liveSleeps(marker)) seen.add(pid);
+			await nextTurn();
+		}
+		for (const pid of liveSleeps(marker)) seen.add(pid);
+		return [...seen];
+	}
+
+	it("never launches a replacing start that is still stopping the old service when shutdown begins", async () => {
+		await withPtyService(
+			async ({ client, projectDir, brokerFinished }) => {
+				const replacement = markerSleep();
+				try {
+					// The replace stop takes the old service's whole grace period, so shutdown begins
+					// while the start is inside it, past the start's up-front check.
+					const settled = Promise.allSettled([
+						client.request({ op: "start", spec: sleepSpec(replacement, projectDir), replace: true }),
+						client.request({ op: "shutdown" }),
+					]);
+					const seen = await sampleSleepsUntil(replacement, brokerFinished);
+					const [started] = await settled;
+					expect(started.status).toBe("rejected");
+					expect(seen).toEqual([]);
+					expect(liveSleeps(replacement)).toEqual([]);
+				} finally {
+					spawned.push(...liveSleeps(replacement));
+				}
+			},
+			{ slowStop: true },
+		);
+	}, 30_000);
+
+	it("refuses a new-name start once shutdown has begun", async () => {
+		await withPtyService(
+			async ({ client, meta, projectDir, brokerFinished }) => {
+				const other = markerSleep();
+				try {
+					const shutdown = client.request({ op: "shutdown" });
+					// Shutdown is stopping the slow service: it has begun.
+					await eventually(() => publishedState(meta).state === "stopping", "shutdown to stop the service");
+					const started = await Promise.allSettled([
+						client.request({ op: "start", spec: { ...sleepSpec(other, projectDir), name: "web" } }),
+					]);
+					expect(started[0]?.status).toBe("rejected");
+					const seen = await sampleSleepsUntil(other, brokerFinished);
+					await shutdown.catch(() => undefined);
+					expect(seen).toEqual([]);
+				} finally {
+					spawned.push(...liveSleeps(other));
+				}
+			},
+			{ slowStop: true },
+		);
+	}, 30_000);
+
+	it("lets a restart already running finish before shutdown stops its service, leaving no process", async () => {
+		await withPtyService(
+			async ({ client, meta, marker, brokerFinished }) => {
+				const restart = client.request({ op: "restart", name: "svc" });
+				// The restart's own stop is under way (the slow service ignores SIGTERM).
+				const settled = Promise.allSettled([restart]);
+				await eventually(() => publishedState(meta).state === "stopping", "the restart's stop to begin");
+				const shutdown = client.request({ op: "shutdown" });
+				await Promise.allSettled([settled, shutdown]);
+				await brokerFinished;
+				// Shutdown waited for the relaunch and stopped it: nothing of the service is left.
+				await eventually(() => liveSleeps(marker).length === 0, "every service process to exit", 3_000);
+			},
+			{ slowStop: true },
+		);
 	}, 30_000);
 
 	it("never relaunches a service for a restart whose turn comes once the broker is shutting down", async () => {

@@ -577,9 +577,13 @@ read in between ends the record. The broker runs `stop`, `restart`, `mode` reque
 and a `start` that takes an existing service's name one at a time per service, in
 arrival order. A request whose turn comes after a `start` replaced the service, or
 once the broker is shutting down, is refused rather than acting on a process the broker
-no longer tracks, so overlapping requests never leave a process the broker does not
-track. They can still end the record before a relaunch: a `stop` followed by a
-`restart` stops the service (ending its record) and then relaunches it, and that
+no longer tracks; a `start` that is still stopping the service it replaces, or still
+setting up, when shutdown begins is refused before it launches anything. So
+overlapping requests never leave a process the broker does not track. A refused
+request is not re-sent to the replacement: a `stop` refused because a `start` replaced
+the service leaves the replacement running, and a caller that wants it stopped sends
+`stop` again. Requests can still end the record before a relaunch: a `stop` followed by
+a `restart` stops the service (ending its record) and then relaunches it, and that
 relaunch is the scan-covered class below. A service whose broker could
 not be identified, or was gone when the service was recorded, marks the registry
 incomplete. The agent
