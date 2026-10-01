@@ -13,7 +13,7 @@ import {
 	truncateTailBytes,
 } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { workerEnvFromParent } from "../subprocess/worker-client";
-import { daemonBrokerEndpoint, writeDaemonScopeMeta } from "./paths";
+import { DAEMON_META_FILE, daemonBrokerEndpoint, daemonRecordDir, writeDaemonScopeMeta } from "./paths";
 import type { DaemonReadySpec, DaemonSnapshot, DaemonSpec } from "@oh-my-pi/pi-tui/tools/daemon";
 import { hasLiveDaemonProjectPresence, pruneDeadDaemonRuntimeDirs } from "./presence";
 import {
@@ -57,7 +57,6 @@ const PID_FILE = "broker.pid";
 const LEASE_HANDOFF_GRACE_MS = 500;
 /** Connect budget for the endpoint probe that answers "is a broker serving this scope?". */
 const LEASE_PROBE_TIMEOUT_MS = 250;
-const META_FILE = "meta.json";
 const LOG_FILE = "output.log";
 const PREVIOUS_LOG_FILE = "output.previous.log";
 const DAEMON_SPAWN_OPTIONS = resolveDaemonSpawnOptions({
@@ -705,7 +704,7 @@ class DaemonBroker {
 			}
 			const stat = await fs.stat(spec.cwd);
 			if (!stat.isDirectory()) throw new Error(`Daemon cwd is not a directory: ${spec.cwd}`);
-			const dir = path.join(this.#runtimeDir, "daemons", spec.name);
+			const dir = daemonRecordDir(this.#runtimeDir, spec.name);
 			const now = Date.now();
 			record = {
 				spec,
@@ -1328,7 +1327,7 @@ class DaemonBroker {
 	}
 
 	#persist(record: ManagedDaemon): void {
-		const metaPath = path.join(record.dir, META_FILE);
+		const metaPath = path.join(record.dir, DAEMON_META_FILE);
 		const tempPath = `${metaPath}.${process.pid}.tmp`;
 		const metadata = this.#serializeMetadata(record);
 		record.persistQueue = record.persistQueue
@@ -1379,7 +1378,7 @@ class DaemonBroker {
 			if (!entry.isDirectory()) continue;
 			const dir = path.join(root, entry.name);
 			try {
-				const decoded: unknown = await Bun.file(path.join(dir, META_FILE)).json();
+				const decoded: unknown = await Bun.file(path.join(dir, DAEMON_META_FILE)).json();
 				if (typeof decoded !== "object" || decoded === null || !("daemon" in decoded) || !("spec" in decoded)) {
 					continue;
 				}

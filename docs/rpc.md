@@ -602,7 +602,8 @@ false` when some process may be untracked; `writer`, a random id of the registry
 `inheritedOwnerMarkers` when it took over other invocations, below), `start` records
 (`jobId`, `kind`, `pid`, `pgid`, `startId`, `startTime` in Unix seconds for display,
 `command` (at most 4096 characters), `cwd`, `sleepable`, `inProcess`, `reparented?`,
-`groupMember?`, `discovered?`, `carriedFrom?`, `adoptedFrom?`), `end` records, and
+`groupMember?`, `discovered?`, `carriedFrom?`, `adoptedFrom?`; `service` records also
+`broker?` and `daemon?`, below), `end` records, and
 `incomplete` records; `start`, `end` and `incomplete` records carry `invocationPid` and
 the `writer` of their header (records written before `writer` existed have none). A
 record belongs to the latest preceding header whose invocation has its `invocationPid`
@@ -665,6 +666,25 @@ broker hosts, including persistent or detached ones that outlive it, have their 
 `service` records; a mode change that restarts a service records the new process with
 the `sleepable` value given at start. A helper started by a different agent process
 has no record here; consumers identify it by that worker selector in its argv.
+
+**Services and their broker.** A `service` record's `pid` is the service's current
+process, but the broker hosting it can relaunch it under a new pid — after an
+out-of-band kill while a restart policy holds (`restarting`, its backoff), on a
+`restart` request (`omp ps restart`), or on a switch to `detached`. So each `service`
+record carries `broker: { pid, startId }`, the identity of the broker serving the
+service's scope when it was recorded (read from the scope's `broker.pid` lease), and
+`daemon: { id, meta }`, the broker's id for the service and the `meta.json` where the
+broker publishes it. A service is work while its own process is alive **or** its
+broker is alive: the record is not ended merely because its pid is gone. The agent
+itself reads `meta` (the consumer rule below does not): it ends the record once the
+broker publishes the service `exited` or `failed`, or replaced by another service of
+that name, and records a published relaunch as a new `service` record (`jobId`
+`service:<id>:<startedAt>`, same `command`, `cwd`, `sleepable`, `broker` and `daemon`);
+metadata it cannot read keeps the service counted. A service whose broker could not be
+identified marks the registry incomplete. The agent services start with no restart
+policy, so the broker relaunches one only on request; a relaunch the agent never saw
+is still found by the owner-marker scan, since the service's environment carries
+`OMP_OWNER`. The agent never stops a broker or a service to clear an answer.
 
 **Owner marker.** Every process the agent starts for work — embedded shell runs,
 PTY shells, named services, apps the browser tool launches (`app.path`, also recorded as
@@ -755,14 +775,23 @@ implements it):
    string, `ownerMarker` and every `inheritedOwnerMarkers` entry with string
    `token`/`env` and a decimal-string or null `startId`); a start record without a string
    `jobId` and `kind`, an integer `pid`, a boolean `inProcess` and a decimal-string or
-   null `startId`; a record with a non-string `writer`; a record with no such header.
+   null `startId`, or with a `broker` that is not `{ pid: integer, startId:
+   decimal-string | null }` or a `daemon` that is not `{ id: string, meta: string }`; a
+   record with a non-string `writer`; a record with no such header.
    With `expectedInvocation`, no header for it → at best `unknown`.
 2. Any invocation still alive (pid + `startId`) → `live`: use `attest` instead; one
    whose identity cannot be read → at best `unknown`.
 3. A header counts as complete only when `complete` is exactly `true` and it lists no
    `incompleteReasons`; any other header, or any `incomplete` record → at best `unknown`.
 4. Open records, ignoring `internal`: `inProcess` → `unknown`; otherwise alive by pid +
-   `startId` → `blocked`; identity unreadable → at best `unknown`.
+   `startId` → `blocked`; identity unreadable → at best `unknown`. A record with a
+   `broker` (only `service` records have one) whose own process is gone is still work
+   while its broker is alive by pid + `startId` → `blocked` (the verdict's `live` entry
+   names it in `broker`); broker identity unreadable → at best `unknown`; broker gone →
+   ended. Consumers do not read `daemon`. Until the broker exits (a few seconds after
+   the last agent process of its scope disconnects, unless it hosts a persistent
+   service), this also blocks on a service that already exited after its agent crashed:
+   only the agent, which reads the broker's metadata, can tell that apart.
 5. One scan for every token in any header's `ownerMarker` and
    `inheritedOwnerMarkers`: any live match → `blocked`; an unexaminable process started
    since the earliest of those invocations, a scan that reports hidden processes, or no
