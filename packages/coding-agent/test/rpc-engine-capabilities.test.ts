@@ -24,9 +24,11 @@ describe("RPC engine capabilities", () => {
 		await removeWithRetries(directory);
 	});
 
-	test("the ready frame advertises exactly the engine capability list", async () => {
+	test("the ready frame and get_state advertise one list: protocol features plus external delivery", async () => {
 		expect(client.capabilities).toEqual([]);
 		await client.start();
-		expect(client.capabilities).toEqual([...RPC_ENGINE_CAPABILITIES]);
+		expect(client.capabilities).toEqual([...RPC_ENGINE_CAPABILITIES, "external-delivery/1"]);
+		const state = await client.getState();
+		expect(state.capabilities).toEqual([...client.capabilities]);
 	}, 30_000);
 });
