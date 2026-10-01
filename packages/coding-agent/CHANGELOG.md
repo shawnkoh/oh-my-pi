@@ -30,6 +30,11 @@
 
 ### Added
 
+- The RPC ready frame carries `capabilities: string[]`, a versioned list of engine features hosts can rely on without probing; the TypeScript `RpcClient` exposes it as `capabilities`
+- RPC hosts can send `literal: true` on `prompt`, `steer`, `follow_up` and `abort_and_prompt` to deliver the text exactly as the user's message, with no slash, skill, builtin, extension or custom command dispatch, prompt-template expansion or model-mention rewriting; the ready frame advertises `capabilities: ["literal-input/1"]` and the TypeScript `RpcClient` exposes both
+- Tool-approval dialogs sent to RPC hosts carry `approval: { toolCallId, toolName, arguments, reason? }`, binding the answer to the exact call that will run; the ready frame advertises `capabilities: ["tool-approval-binding/1"]`
+- In `--mode rpc-ui`, hosts that opt in with `set_ui_capabilities` `["rich-ask/1"]` receive the ask tool as one `ask` request with every question, including multi-select, option previews and the recommended choice, and accepts submitted answers with custom text, notes and pasted images, or a request to chat instead; the ready frame advertises `capabilities: ["rich-ask/1"]`
+- RPC `prompt_result` frames carry `run` (shared by prompts answered by the same run, including retries), `promptEntryId` (the prompt's persisted user message) and `replyEntryIds` (the assistant entries answering that message), so hosts settle replies by entry identity; the ready frame advertises `capabilities: ["reply-attribution/1"]`
 - Added Factory Droid login and model selection with base credit badges and account-matched regional discovery ([#8577](https://github.com/can1357/oh-my-pi/pull/8577) by [@will-bogusz](https://github.com/will-bogusz), continued in [#13276](https://github.com/can1357/oh-my-pi/pull/13276) by [@DusKing1](https://github.com/DusKing1)).
 - RPC hosts (`--mode rpc` and `rpc-ui`) can create, read, pause, resume and drop goals with a `goal` command, see the goal in `get_state`, and opt into automatic goal continuation with `goal.continuationModes: ["rpc"]`.
 - Added `HELMCODE_API_KEY` to the environment variables listed in `omp --help` ([#13630](https://github.com/can1357/oh-my-pi/pull/13630) by [@alexcerezo](https://github.com/alexcerezo)).
@@ -58,6 +63,7 @@
 
 - In a native terminal (Tern), the welcome card's omp mark survives restarting Tern: Tern draws it itself instead of receiving it as an image
 - In a native terminal (Tern), the "N agents running" pill stays put while subagents work instead of popping back in several times a second: each progress update now updates the pill instead of replacing it
+- Interrupting a turn while a tool approval is pending now closes the dialog (RPC hosts receive `cancel`), and an approval answered after the call was aborted no longer runs the tool
 - Fixed the subagent live preview blanking or mislabelling a running call when a sibling call finishes: concurrent calls are tracked by call id and keep their own intent, and the row keeps the last completed call with its success or error mark until the next one starts ([#11210](https://github.com/can1357/oh-my-pi/pull/11210) by [@DarkPhilosophy](https://github.com/DarkPhilosophy)).
 - Fixed subagent tool previews rewriting a search pattern that names a home directory: path arguments are now shortened by argument key, so the pattern still shows what was searched ([#11210](https://github.com/can1357/oh-my-pi/pull/11210) by [@DarkPhilosophy](https://github.com/DarkPhilosophy)).
 - Fixed background task job progress dropping the current tool's arguments and start time ([#11210](https://github.com/can1357/oh-my-pi/pull/11210) by [@DarkPhilosophy](https://github.com/DarkPhilosophy)).
