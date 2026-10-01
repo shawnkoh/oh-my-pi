@@ -4,6 +4,73 @@
 
 ### Added
 
+- Interactive launches can use `--goal <objective>` to activate goal mode and begin working immediately without typing `/goal` ([#13879](https://github.com/can1357/oh-my-pi/pull/13879) by [@shawnkoh](https://github.com/shawnkoh))
+- Set `goal.toolDefault: true` to let agents start goal mode themselves in ordinary sessions; `--tools=...,goal` also exposes the tool explicitly while the default stays hidden ([#13877](https://github.com/can1357/oh-my-pi/pull/13877) by [@shawnkoh](https://github.com/shawnkoh))
+
+### Fixed
+
+- In OpenShell sandboxes, an external shell command that has exited no longer marks the owned-job registry incomplete, so `quiesce_and_exit` can attest `registryComplete: true` there
+
+## [18.4.6] - 2026-10-01
+
+### Added
+
+- Added a live Background Jobs view that lets you monitor running background jobs without interrupting the transcript.
+- Added agent lineage navigation, making it easy to move between subagents and the main session from the composer header.
+- Added queued-message controls to the RPC clients and session API, including promotion of queued follow-ups to steering messages without duplicating text or losing attachments, plus explicit steering or follow-up behavior for prompts sent while the agent is busy.
+- Added support for keeping Claude prompt caches warm on Amazon Bedrock and Bedrock Mantle according to configured model cache lifetimes and retention settings.
+- In Tern terminals, the effort indicator now visualizes the selected thinking level and becomes a fireball at the maximum level.
+- Added JobsSheet overlay for viewing live background jobs without transcript interruption
+- Added agent lineage tracking, enabling navigation between subagents and the main session via a native composer header
+- Added `promote_queued_message` to RPC, with `promoteQueuedMessage()` on the session and TypeScript RPC client and `promote_queued_message()` on the Python RPC client, so a queued follow-up can become a steering message without duplicating its text or losing attachments ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
+- The TypeScript RPC client's `prompt()` accepts a `streamingBehavior` (`"steer"` or `"followUp"`) for prompts sent while the agent is busy ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
+- Claude prompt caches can now stay warm on Amazon Bedrock and Bedrock Mantle, respecting configured per-model cache lifetimes as well as cache retention ([#13871](https://github.com/can1357/oh-my-pi/pull/13871) by [@anatoli-tsinovoy](https://github.com/anatoli-tsinovoy)).
+
+### Changed
+
+- RPC prompt requests now acknowledge only after the message has been accepted for processing, queued, or routed to an extension command, so subsequent queue-management operations can act on the admitted message reliably.
+- Idle recaps now appear as structured notices in the transcript rather than status-line messages.
+- Attached-image descriptions for text-only models now time out after 20 seconds and stop when aborted, while preserving the image and informing the model when a description is unavailable.
+- The status line now separates the session's own cost from total subagent spend, including nested, background, and resumed subagents, and matches the Agent Hub total.
+- Tool-use reminders are now delivered as separate developer messages, keeping them distinct from tool output.
+- Reworked Tern transcript navigation and presentation: Esc-Esc rewind now uses the transcript with turn-by-turn and branch navigation, attached images open in Tern's image viewer, idle recaps remain unobtrusively in the transcript, and the background-jobs pill opens the live jobs view.
+- Tern now reports agent activity through terminal progress consistently, and its progress and agent indicators update smoothly during subagent work.
+
+### Fixed
+
+- Fixed Tern commands issued while the agent is working so they appear immediately in the transcript instead of being clipped above the prompt.
+- Added a dismiss action for Tern's prompt-area error notifications.
+- Fixed dollar signs in prompts being mistaken for Python mode until a following space confirms the mode.
+- Fixed turns getting stuck in a working state when post-turn maintenance, such as saving the session, fails; the session now becomes idle and reports a warning.
+- Fixed failed tool-output pruning from leaving live context out of sync with saved history.
+- Fixed oversized or undersized attached images being distorted when resized to fit display limits.
+- Fixed interrupted tool calls disappearing from the model's context after resuming a stopped session.
+- Fixed aborted prompts with images still being prepared from starting or entering the queue afterward.
+- Fixed aside messages containing pasted image or video paths so the source path is preserved when sent to the model.
+- Fixed extension-registered prompt-cache settings, including explicit opt-outs, not taking precedence over matching models.yml definitions.
+- Fixed prompt-cache warming to honor cache-retention settings, including disabling replay for no-retention caches and using the lifetime written by long-retention requests.
+- Literal RPC prompts (`literal: true`) are acknowledged only once admitted, like other prompts, so an immediate `promote_queued_message` observes a queued literal prompt
+- An `abort` that lands while a prompt's images are still being prepared now drops that prompt instead of starting or queueing it afterward ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
+- A path-pasted image or video sent as an aside while the agent is busy now reaches the model with its source path ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
+- Extension-registered model prompt-cache settings, including `{}` opt-outs, now take precedence over matching `models.yml` definitions ([#13871](https://github.com/can1357/oh-my-pi/pull/13871) by [@anatoli-tsinovoy](https://github.com/anatoli-tsinovoy)).
+- Cache warming now follows `providers.cacheRetention`: `none` no longer replays uncached requests, and `long` warms on the 1-hour lifetime the request actually wrote ([#13871](https://github.com/can1357/oh-my-pi/pull/13871) by [@anatoli-tsinovoy](https://github.com/anatoli-tsinovoy)).
+- External deliveries are inside the quiesce boundary: a held delivery keeps `quiesce_and_exit` refused (`queuedInput`) and marks a hang-up `interrupted`, and `deliverMessage` after a passed quiesce or a hang-up returns a handle already discarded with `admission_closed` instead of one that can never be accepted
+
+## [18.4.5] - 2026-09-30
+
+### Added
+
+- The RPC ready frame carries `capabilities: string[]`, a versioned list of engine features hosts can rely on without probing; the TypeScript `RpcClient` exposes it as `capabilities`
+- RPC hosts can send `literal: true` on `prompt`, `steer`, `follow_up` and `abort_and_prompt` to deliver the text exactly as the user's message, with no slash, skill, builtin, extension or custom command dispatch, prompt-template expansion or model-mention rewriting; the ready frame advertises `capabilities: ["literal-input/1"]` and the TypeScript `RpcClient` exposes both
+- Tool-approval dialogs sent to RPC hosts carry `approval: { toolCallId, toolName, arguments, reason? }`, binding the answer to the exact call that will run; the ready frame advertises `capabilities: ["tool-approval-binding/1"]`
+- In `--mode rpc-ui`, hosts that opt in with `set_ui_capabilities` `["rich-ask/1"]` receive the ask tool as one `ask` request with every question, including multi-select, option previews and the recommended choice, and accepts submitted answers with custom text, notes and pasted images, or a request to chat instead; the ready frame advertises `capabilities: ["rich-ask/1"]`
+- RPC `prompt_result` frames carry `run` (shared by prompts answered by the same run, including retries), `promptEntryId` (the prompt's persisted user message) and `replyEntryIds` (the assistant entries answering that message), so hosts settle replies by entry identity; the ready frame advertises `capabilities: ["reply-attribution/1"]`
+- Added Factory Droid login and model selection with base credit badges and account-matched regional discovery ([#8577](https://github.com/can1357/oh-my-pi/pull/8577) by [@will-bogusz](https://github.com/will-bogusz), continued in [#13276](https://github.com/can1357/oh-my-pi/pull/13276) by [@DusKing1](https://github.com/DusKing1)).
+- RPC hosts (`--mode rpc` and `rpc-ui`) can create, read, pause, resume and drop goals with a `goal` command, see the goal in `get_state`, and opt into automatic goal continuation with `goal.continuationModes: ["rpc"]`.
+- Added `HELMCODE_API_KEY` to the environment variables listed in `omp --help` ([#13630](https://github.com/can1357/oh-my-pi/pull/13630) by [@alexcerezo](https://github.com/alexcerezo)).
+- Interactive launches can use `--goal <objective>` to activate goal mode and begin working immediately without typing `/goal` ([#13879](https://github.com/can1357/oh-my-pi/pull/13879) by [@shawnkoh](https://github.com/shawnkoh))
+- Set `goal.toolDefault: true` to let agents start goal mode themselves in ordinary sessions; `--tools=...,goal` also exposes the tool explicitly while the default stays hidden ([#13877](https://github.com/can1357/oh-my-pi/pull/13877) by [@shawnkoh](https://github.com/shawnkoh))
+- External delivery (`external-delivery/1`): RPC hosts can hand the session a record authored by another actor with `deliver` (`mode: "aside" | "steer"`) and withdraw it with `cancel_delivery`; the engine reports `delivery_accepted`, `delivery_settled`, `delivery_discarded` and `delivery_cancelled` receipts, lists held records in `get_state.externalDeliveries`, and advertises the capability in `ready.capabilities` and `get_state.capabilities`. Extensions get the same surface as `ExtensionAPI.deliverMessage` with `ExtensionAPI.capabilities`. Records declare their provider view in `details["omp.llm"]` and are rejected without one; delivery-owned evaluations may complete quietly (see `docs/rpc.md#external-delivery`).
 - Sessions keep a durable owned-job registry next to the session file (`<session>.jobs.jsonl`) recording every background job, subagent, shell run, retained background shell, surviving or `nohup`'d process (with pid, process group and a clock-independent start identity) and named service, so a supervisor can tell after the agent exits whether anything it started is still running; the registry follows session switches, takes over what other runs of the same session file — earlier or still running — left running or could not vouch for, counts another run still using the file as live work, and marks itself incomplete whenever a process may have escaped it (every PTY run, eval, debug sessions); named services accept `sleepable: true`
 - Supervisors can stop an agent only when it is provably idle: RPC `attest` and `quiesce_and_exit` (also `ctx.attest()` / `ctx.quiesceAndExit()` for extensions) close every input path, check that no turn, queued input, job, subagent, shell, compaction, running handler, advisor review, side turn or scheduled continuation remains, write a terminal attestation next to the session file and exit — or refuse and change nothing; requests are bound to the attesting session object and session (`instanceId`, `sessionId`), a repeated attempt replays its answer, only read-only RPC commands run after a pass, a failure after the transcript is final exits with `exit_unattested` instead of hanging, and reopening a session retires the previous invocation's attestation; `get_state` advertises `capabilities: ["quiesce-exit/1", "owned-jobs/1"]`
 - SIGHUP/SIGTERM now record which work was still outstanding before any other exit cleanup runs, in `<session>.terminal.json` (`kind: "hangup"`, `interrupted: true` when anything was running or queued), with the final transcript's size and SHA-256

@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `spawnedComplete` being `false` for every shell run that started an external command in OpenShell sandboxes, whose seccomp filter denies every process-group signal: whether such a command's process group is gone is now read from the process table
+
+## [18.4.5] - 2026-09-30
 ### Added
 
 - Added `spawnedProcesses` and `spawnedComplete` to `Shell.run`/`executeShell` results. `spawnedProcesses` lists each process the command launched that is still alive when it resolves, with pid, process group, OS start time and `startId`. It includes the real process behind `nohup cmd &` (`reparented: true`) and processes of any user left in a process group the command or a `nohup` launch created, such as the sleep that `sh -c 'sleep 60 &'` or `nohup sh -c 'sleep 60 &' &` leaves behind (`groupMember: true`). `nohup cmd </dev/tty &`, which cannot detach, reports `cmd` itself. `spawnedComplete` is `false` when the list may be missing a process: one could not be identified, a `nohup` launch was never reported, or the process groups could not be fully listed. A run that throws has no list. Also added `processIdentity(pid)`, which reports whether a process is `running`, `gone` (including zombies) or `unreadable`, with a `startId` that stays the same if the system clock changes, so callers can tell later whether that exact process is still running, and its `startTime` for display.
