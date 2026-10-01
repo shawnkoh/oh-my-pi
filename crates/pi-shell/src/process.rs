@@ -31,9 +31,10 @@ mod platform {
 
 	/// Stable Linux process reference. Backed by a pidfd where the kernel and
 	/// sandbox allow `pidfd_open`; otherwise (kernels before 5.3, or a seccomp
-	/// sandbox that fails the call, as OpenShell's does with `ENOSYS`) identity
-	/// is pinned by the `/proc/<pid>/stat` start time, as on macOS, and every
-	/// use re-checks it so a recycled pid never impersonates the original.
+	/// sandbox that fails the call, as `OpenShell`'s does with `ENOSYS`)
+	/// identity is pinned by the `/proc/<pid>/stat` start time, as on macOS,
+	/// and every use re-checks it so a recycled pid never impersonates the
+	/// original.
 	#[derive(Clone)]
 	pub struct Process {
 		pid:        i32,
@@ -490,10 +491,10 @@ mod platform {
 			match stat_content.as_deref().and_then(parse_stat) {
 				Some(stat) => {
 					let exited = matches!(stat.state, 'Z' | 'X')
-						&& !status
+						&& status
 							.as_deref()
 							.and_then(status_threads)
-							.is_some_and(|threads| threads > 1);
+							.is_none_or(|threads| threads <= 1);
 					if !exited && !stat.is_kernel_thread() {
 						visit(pid, Candidate::Stat(&stat));
 					}
@@ -670,7 +671,7 @@ mod platform {
 		/// process (`EINVAL`).
 		NoProcess,
 		/// The call is unavailable or refused (`ENOSYS` on old kernels and under
-		/// sandboxes such as OpenShell's seccomp filter, `EPERM` from a seccomp
+		/// sandboxes such as `OpenShell`'s seccomp filter, `EPERM` from a seccomp
 		/// or LSM policy) or out of descriptors: the process may exist, and is
 		/// pinned by start time instead.
 		Unavailable,
@@ -3058,7 +3059,7 @@ fn prune_exited(spawned: &mut Vec<OwnedSpawn>) {
 /// True when process group `pgid` still has at least one member. `kill(2)`
 /// with signal 0 performs permission/existence checks without delivering a
 /// signal. `EPERM` usually means the group exists but is not ours to signal;
-/// a sandbox that denies every process-group signal (OpenShell's seccomp
+/// a sandbox that denies every process-group signal (`OpenShell`'s seccomp
 /// filter) answers it for empty groups too, so then the process table
 /// decides.
 #[must_use]
