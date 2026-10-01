@@ -46,7 +46,7 @@ The initial ready frame uses protocol v1 and advertises the opt-in lossless tran
   "supportedProtocolVersions": [1, 2],
   "maxFrameBytes": 1048576,
   "maxReassembledFrameBytes": 67108864,
-  "capabilities": ["literal-input/1", "tool-approval-binding/1", "reply-attribution/1", "external-delivery/1", "rich-ask/1"]
+  "capabilities": ["literal-input/1", "tool-approval-binding/1", "reply-attribution/1", "external-delivery/1", "quiesce-exit/1", "owned-jobs/1", "rich-ask/1"]
 }
 ```
 
@@ -430,7 +430,7 @@ is re-armed.
     "contextWindow": 200000,
     "percent": 0.55
   },
-  "capabilities": ["quiesce-exit/1", "owned-jobs/1"]
+  "capabilities": ["literal-input/1", "tool-approval-binding/1", "reply-attribution/1", "external-delivery/1", "quiesce-exit/1", "owned-jobs/1", "rich-ask/1"]
 }
 ```
 
@@ -492,11 +492,11 @@ turn, sent as a hidden `goal-continuation` message.
 When the agent completes the goal, the goal tool is removed again and
 `get_state.goal` becomes `null`.
 
-`capabilities` lists protocol features this process implements. A client must
-check for `quiesce-exit/1` before sending `attest` or `quiesce_and_exit`, and for
-`owned-jobs/1` before relying on the owned-job registry file.
-
 ### Quiesce and exit
+
+A client must check `capabilities` for `quiesce-exit/1` before sending `attest` or
+`quiesce_and_exit`, and for `owned-jobs/1` before relying on the owned-job registry
+file. Test membership: the list carries every engine capability (see the ready frame).
 
 A supervisor that wants the agent to exit without interrupting work first takes a
 read-only snapshot, then asks the process to exit only if nothing changed:
@@ -507,8 +507,10 @@ read-only snapshot, then asks the process to exit only if nothing changed:
    `counts` has `streaming`, `queuedInput`, `asyncJobs`, `subagents`, `retainedJobs`,
    `detachedJobs`, `compacting`, `handoff`, `goalContinuationScheduled`,
    `scheduledTurns`; any non-zero value means work is outstanding. `queuedInput`
-   includes commands this process has read but not yet answered and notifications
-   received but not yet queued (MCP resource changes inside their debounce window).
+   includes commands this process has read but not yet answered, notifications
+   received but not yet queued (MCP resource changes inside their debounce window),
+   and every [external delivery](#external-delivery) the session still holds (`queued`,
+   or `accepted` and not yet settled).
    `scheduledTurns` includes turns scheduled to start, retry and TTSR resumes, event
    and extension handlers still running after the agent went idle, message
    persistence in flight, advisor reviews, and an in-flight cache-warming request;
@@ -536,8 +538,12 @@ read-only snapshot, then asks the process to exit only if nothing changed:
      0. From the pass on, only read-only commands run (`attest`, `get_*`,
      `negotiate_protocol`, `set_event_filter`, `set_subagent_subscription`, `goal`
      `get`); every other command — input and state-changing commands alike — fails
-     with `code: "admission_closed"`, and no internal producer (queued notifications,
-     scheduled continuations, IRC wakes, cache warming) starts a provider call.
+     with `code: "admission_closed"`, including `deliver` and `cancel_delivery` (no
+     delivery can be held after a pass, since a held one refuses the quiesce; after a
+     hang-up, held records are discarded with `disposed` during teardown), and no
+     internal producer (queued notifications, scheduled continuations, IRC wakes, cache
+     warming) starts a provider call. An extension's `deliverMessage` after that point
+     is not admitted: it returns a handle already discarded with `admission_closed`.
    - Exit without attestation → `data: { status: "exit_unattested", operationId,
      attempt, reason: "attestation_unavailable", error, snapshot }`. The session was
      idle and its transcript was made final, but the attestation could not be written.
@@ -675,10 +681,13 @@ process (or another invocation) that exits between the scan and the count may ha
 handed the marker to a child the scan did not see, so the scan and count are repeated
 while that happens; after 3 rounds that never settle, `sound` is false. `ownerScan` is
 `{ supported, sound, scanned, discovered, opaque }` (`discovered` summed over the
-rounds): `opaque` lists candidate processes started since the invocation began whose
-environment could not be examined (including setuid descendants), which could hide the
-marker; `sound` is false if any exist, if the OS hides processes from the scan (Linux
-`/proc` mounted with `hidepid`), or if the rounds never settled.
+rounds): `opaque` lists candidate processes (this user's) started since the earliest
+invocation scanned for whose environment could not be examined — setuid or
+non-dumpable descendants, or a process in another Landlock domain such as a separate
+`openshell exec` session — which could hide the marker; a process that started before
+every invocation scanned for is never the agent's and is ignored whatever it carries.
+`sound` is false if any opaque process exists, if the OS hides processes from the scan
+(Linux `/proc` mounted with `hidepid`), or if the rounds never settled.
 
 Limits — the classes that can read as clear on Linux, where the scan is otherwise sound,
 so a consumer must keep its own host process census as a required cross-check:
@@ -699,16 +708,37 @@ so a consumer must keep its own host process census as a required cross-check:
 - a writer in another pid namespace that shares the session directory (a sibling
   container, `unshare -p`) has pids that mean nothing here: its invocation and processes
   read as gone, so the registry and the verifier assume every writer of a session file
-  runs in the consumer's pid namespace.
+  runs in the consumer's pid namespace;
+- a marked process no earlier scan found, which the scan lists but which forks a marked
+  child and exits before its environment is read, is dropped by that scan without a
+  trace: nothing counted vanished, so the answer settles while the child runs. The
+  window is one environment read; the verifier's later scan finds the child.
 
 Paths that mark the registry incomplete instead: every PTY shell run (on every
 platform), eval runs (their long-lived kernels are not marked), a shell run whose spawn
-report is incomplete (a process that could not be identity-pinned, an unreported
-`nohup … &` reparent, a failed run), a background job still running when its run was
-cancelled, a service start or mode change that ended without reporting its process,
-and any debug (DAP) session. On macOS the kernel withholds the environment of Apple
-platform binaries (`sh`, `zsh`, `sleep`, …), so the scan is almost never `sound` there
-and consumers get `unknown` rather than a false clear. Windows has no scan.
+report is incomplete (a live process it could not identify, a process left in a group
+the run created whose `/proc/<pid>/stat` cannot be read, an unreported `nohup … &`
+reparent, a failed run), a background job still running when its run was cancelled, a
+service start or mode change that ended without reporting its process, and any debug
+(DAP) session. A shell run identifies its processes by pid and start time: through a
+pidfd where `pidfd_open` works, otherwise from `/proc/<pid>/stat` (older kernels, and
+sandboxes such as OpenShell whose seccomp filter fails `pidfd_open` with `ENOSYS`), so
+a run whose processes are all visible reports itself complete either way. Its group
+enumeration reads only `/proc/<pid>/stat`, so processes whose environment cannot be
+read, unrelated or not, never make it incomplete. On macOS the kernel withholds the
+environment of Apple platform binaries (`sh`, `zsh`, `sleep`, …), so the scan is almost
+never `sound` there and consumers get `unknown` rather than a false clear. Windows has
+no scan.
+
+**Processes outside the agent's tree.** Processes the agent never launched — started by
+an operator or a harness, for example with `openshell exec`, even under the agent's uid
+and in the same sandbox — are not agent work: they are not in the registry, never count
+in `attest`, and the host process census (E4) accounts for them. The scan cannot tell
+one from an escaped descendant of the agent only when it started after the agent and
+its environment cannot be read (an `openshell exec` session is a separate Landlock
+domain, so the agent cannot read it): it is then `opaque`, `sound` is false, and the
+answer stays `unknown` until it exits. One that started before the agent, or runs as
+another uid, has no effect.
 
 **Consumer rule after the agent exited** (`verifyOwnedJobRegistry(path, {
 expectedInvocation })` in `@oh-my-pi/pi-coding-agent/session/owned-job-registry`
@@ -1118,6 +1148,9 @@ Receipts, one event each, all carrying `deliveryId`:
   without the usual empty-response retry.
 - `delivery_discarded` `{ reason }` when the session lets go of a queued
   record without admitting it: `new-session`, `session-switched`, `disposed`.
+  An extension `deliverMessage` made after the session closed input admission
+  (a passed quiesce or a hang-up) returns a handle already discarded with
+  `admission_closed`; RPC `deliver` then fails with `code: "admission_closed"`.
 - `delivery_cancelled` when `cancel_delivery` succeeded (only while `queued`).
 
 `delivery_settled` is emitted after the run's `agent_end`. A wake whose only
