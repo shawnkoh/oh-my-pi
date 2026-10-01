@@ -21,7 +21,7 @@ import type {
 	ExtensionAskDialogResult,
 	ExtensionAskDialogResultItem,
 } from "@oh-my-pi/pi-tui/overlays/ask-dialog";
-import { $env, isRecord, logger, Snowflake } from "@oh-my-pi/pi-utils";
+import { $env, isRecord, logger, postmortem, Snowflake } from "@oh-my-pi/pi-utils";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
 	type ExtensionUIContext,
@@ -66,6 +66,12 @@ import {
 } from "./rpc-prompt-results";
 import { RpcSessionEventForwarder } from "./rpc-session-events";
 import { isRpcSessionSettled, RpcSessionSettleWatcher, watchedScheduledTurnProbe } from "./rpc-session-settle";
+import {
+	QUIESCE_EXIT_DEADLINE_MS,
+	quiesceEndsProcess,
+	quiesceExitCode,
+	SESSION_CAPABILITIES,
+} from "../../session/quiescence";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
 import { RICH_ASK_CAPABILITY, RPC_ENGINE_CAPABILITIES } from "./rpc-types";
 import type {
@@ -259,6 +265,48 @@ export interface RpcInputFrameDeps {
 	onHostToolResult: (frame: RpcHostToolResult) => void;
 	onHostToolUpdate: (frame: RpcHostToolUpdate) => void;
 	onHostUriResult: (frame: RpcHostUriResult) => void;
+	/**
+	 * Handles commands that must run on receipt rather than wait behind queued commands
+	 * (`attest`, `quiesce_and_exit`). Writes its own response frame.
+	 */
+	handleImmediateCommand?: (command: RpcCommand) => void;
+}
+
+/** Commands answered on receipt, ahead of the serialized command queue. */
+const IMMEDIATE_RPC_COMMANDS: ReadonlySet<string> = new Set(["attest", "quiesce_and_exit"]);
+
+/**
+ * Commands still answered normally once admission is closed for exit (a passed quiesce or a
+ * hang-up): they read state or change only this connection's view, never the session or its
+ * transcript. Every other command is refused with `admission_closed`, so nothing mutates the
+ * session after its terminal attestation. `goal` is allowed only for its read op.
+ */
+const RPC_COMMANDS_ALLOWED_WHILE_EXITING: ReadonlySet<string> = new Set([
+	"attest",
+	"quiesce_and_exit",
+	"negotiate_protocol",
+	"set_event_filter",
+	"set_subagent_subscription",
+	"get_available_commands",
+	"get_available_models",
+	"get_available_thinking_levels",
+	"get_branch_messages",
+	"get_entries",
+	"get_last_assistant_text",
+	"get_login_providers",
+	"get_messages",
+	"get_messages_page",
+	"get_session_stats",
+	"get_state",
+	"get_subagent_messages",
+	"get_subagents",
+	"get_tree",
+]);
+const RPC_GOAL_OPS_ALLOWED_WHILE_EXITING: ReadonlySet<string> = new Set(["get"]);
+
+export function isRpcCommandAllowedWhileExiting(command: { type: string; op?: unknown }): boolean {
+	if (command.type === "goal") return RPC_GOAL_OPS_ALLOWED_WHILE_EXITING.has(String(command.op));
+	return RPC_COMMANDS_ALLOWED_WHILE_EXITING.has(command.type);
 }
 
 /**
@@ -292,6 +340,11 @@ export function dispatchRpcControlFrame(parsed: unknown, deps: RpcInputFrameDeps
 
 	if (isRpcHostUriResult(parsed)) {
 		deps.onHostUriResult(parsed);
+		return true;
+	}
+
+	if (deps.handleImmediateCommand && isRecord(parsed) && IMMEDIATE_RPC_COMMANDS.has(String(parsed.type))) {
+		deps.handleImmediateCommand(parsed as RpcCommand);
 		return true;
 	}
 
@@ -399,6 +452,11 @@ export class RpcInputDispatcher {
 		}
 	}
 
+	/** Accepted serial commands that have not finished (running or waiting their turn). */
+	get pendingCount(): number {
+		return this.#tasks.size;
+	}
+
 	async #dispatchSerialCommand(command: RpcCommand): Promise<void> {
 		try {
 			const awaited = dispatchRpcInputFrame(command, this.#deps);
@@ -433,6 +491,11 @@ export class RpcShutdownCoordinator {
 	constructor(options: { isShutdownRequested: () => boolean; performShutdown: () => Promise<void> }) {
 		this.#isShutdownRequested = options.isShutdownRequested;
 		this.#performShutdown = options.performShutdown;
+	}
+
+	/** Background-dispatched commands (`bash`) that still owe a response. */
+	get pendingCount(): number {
+		return this.#tasks.size;
 	}
 
 	/**
@@ -955,6 +1018,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	const engineCapabilities: readonly string[] = [
 		...RPC_ENGINE_CAPABILITIES,
 		EXTERNAL_DELIVERY_CAPABILITY,
+		// quiesce-exit/1 and owned-jobs/1: this host wires quiesce_and_exit and the registry.
+		...SESSION_CAPABILITIES,
 		...(setToolUIContext ? [RICH_ASK_CAPABILITY] : []),
 	];
 	// Signal to RPC clients that the server is ready to accept commands
@@ -1021,6 +1086,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 
 	// Shutdown request flag (wrapped in object to allow mutation with const)
 	const shutdownState = { requested: false };
+	/** Set once a quiesce result ended the process: its exit code and hard-deadline timer. */
+	let quiesceExit: { code: number; deadline: NodeJS.Timeout } | undefined;
 
 	/**
 	 * Extension UI context that uses the RPC protocol.
@@ -1265,6 +1332,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		onShutdown: () => {
 			shutdownState.requested = true;
 		},
+		onQuiesced: code => exitAfterQuiesce(code),
 		trackAgentInvokingMessage: task => {
 			extensionUserMessageTracker.trackAgentMessageTask(task);
 		},
@@ -1334,7 +1402,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		// A failure that already reported and then recovered still leaves its notice
 		// queued here, so the success path drains the same queue before it exits.
 		await outputWriter.close();
-		process.exit(0);
+		process.exit(quiesceExit?.code ?? 0);
 	};
 
 	const getAvailableCommands = async () => buildAvailableSlashCommands(session);
@@ -1356,11 +1424,21 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
 		const id = command.id;
+		// Admission closes only on the way out (passed quiesce or hang-up). From then on only
+		// read-only commands run; the rest get a machine-readable refusal, so no command can
+		// mutate the session (or append to the attested transcript) after the decision.
+		if (session.isAdmissionClosed() && !isRpcCommandAllowedWhileExiting(command)) {
+			return error(id, command.type, "Session is exiting; input is no longer admitted", "admission_closed");
+		}
 		// A malformed security flag fails closed instead of falling back to parsing.
 		if ("literal" in command && command.literal !== undefined && typeof command.literal !== "boolean")
 			return error(id, command.type, "literal must be a boolean");
 
 		switch (command.type) {
+			case "attest":
+			case "quiesce_and_exit":
+				return answerQuiescence(command);
+
 			case "negotiate_protocol": {
 				if (command.protocolVersion !== 2)
 					return error(id, "negotiate_protocol", `Unsupported RPC protocol version: ${command.protocolVersion}`);
@@ -2113,6 +2191,55 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		}
 	};
 
+	/**
+	 * Answer `attest` / `quiesce_and_exit` synchronously. Both run on receipt (see
+	 * {@link IMMEDIATE_RPC_COMMANDS}); the response carries the command `id` and the
+	 * caller's `operationId` (and `attempt`) so a shared stdout reader can correlate it.
+	 */
+	const answerQuiescence = (command: Extract<RpcCommand, { type: "attest" | "quiesce_and_exit" }>): RpcResponse => {
+		if (command.type === "attest") {
+			if (typeof command.operationId !== "string" || typeof command.nonce !== "string") {
+				return error(command.id, "attest", "attest requires string operationId and nonce", "invalid_request");
+			}
+			return success(command.id, "attest", session.attest(command.operationId, command.nonce));
+		}
+		const result = session.quiesceForExit({
+			operationId: command.operationId,
+			attempt: command.attempt,
+			epoch: command.epoch,
+			instanceId: command.instanceId,
+			sessionId: command.sessionId,
+			deadline: command.deadline,
+		});
+		if (quiesceEndsProcess(result)) exitAfterQuiesce(quiesceExitCode(result));
+		return success(command.id, "quiesce_and_exit", result);
+	};
+
+	/**
+	 * Exit after a quiesce that ends the process. The response is queued first; every command
+	 * already read (the input reader yields between lines, so wait one macrotask for the rest
+	 * of the current read) is still answered — mutators with `admission_closed` — before
+	 * dispose drains the writer. A hard deadline ends the process even if teardown or a
+	 * stream of read-only commands never lets it finish.
+	 */
+	const exitAfterQuiesce = (code: number): void => {
+		if (quiesceExit) return;
+		const deadline = setTimeout(() => {
+			logger.error("Exit after quiesce exceeded its deadline; exiting now", { code });
+			postmortem.exitProcess(code);
+		}, QUIESCE_EXIT_DEADLINE_MS);
+		quiesceExit = { code, deadline };
+		// Not `shutdownState.requested` yet: that would let the next serial command's completion
+		// exit before the commands queued behind it were answered.
+		setImmediate(
+			() =>
+				void inputDispatcher.drain().then(() => {
+					shutdownState.requested = true;
+					return shutdownCoordinator.checkShutdownRequested();
+				}),
+		);
+	};
+
 	// Deferred shutdown (pi.shutdown() from an extension) must not kill the
 	// process while a background-dispatched bash still owes the client its
 	// response frame. The coordinator drains tracked tasks before exiting and
@@ -2138,11 +2265,19 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		onHostToolResult: frame => hostToolBridge.handleResult(frame),
 		onHostToolUpdate: frame => hostToolBridge.handleUpdate(frame),
 		onHostUriResult: frame => hostUriBridge.handleResult(frame),
+		handleImmediateCommand: command => {
+			if (command.type === "attest" || command.type === "quiesce_and_exit") output(answerQuiescence(command));
+		},
 	};
 
 	const inputDispatcher = new RpcInputDispatcher({
 		deps: dispatchFrameDeps,
 		afterSerialCommand: () => shutdownCoordinator.checkShutdownRequested(),
+	});
+	// Commands read but not yet answered are admitted input the session cannot see.
+	session.registerWorkSource({
+		kind: "queuedInput",
+		count: () => inputDispatcher.pendingCount + shutdownCoordinator.pendingCount,
 	});
 
 	// Keep the stdin reader moving: side-channel frames dispatch immediately,
