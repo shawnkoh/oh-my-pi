@@ -31,6 +31,7 @@ import type {
 	InputEventResult,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
+import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { getProjectAgentDir, logger, TempDir } from "@oh-my-pi/pi-utils";
@@ -2628,11 +2629,108 @@ describe("ExtensionRunner", () => {
 				{ type: "ui_select" },
 				{ type: "tool_approval_resolved", approved: true },
 			]);
-			expect(select).toHaveBeenCalledWith(expect.stringContaining("Allow tool: dangerous_tool"), [
-				"Approve",
-				"Deny",
-			]);
+			expect(select).toHaveBeenCalledWith(
+				expect.stringContaining("Allow tool: dangerous_tool"),
+				["Approve", "Deny"],
+				expect.objectContaining({
+					approval: { toolCallId: "call-approval", toolName: "dangerous_tool", arguments: {} },
+				}),
+			);
 			delete globalState.__approvalEvents;
+		});
+		const abortContext = () => ({
+			sessionManager,
+			modelRegistry,
+			model: undefined,
+			isIdle: () => true,
+			hasQueuedMessages: () => false,
+			abort: () => {},
+			settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
+		});
+
+		it("never executes, and records no approval, when an answer ignoring the signal arrives after abort", async () => {
+			const resolved: Array<{ approved: boolean; reason?: string }> = [];
+			const globalState = globalThis as typeof globalThis & { __lateApproval?: typeof resolved };
+			globalState.__lateApproval = resolved;
+			fs.writeFileSync(
+				path.join(extensionsDir, "late-approval.ts"),
+				`export default function(pi) {
+					pi.on("tool_approval_resolved", async (event) => {
+						globalThis.__lateApproval.push({ approved: event.approved, reason: event.reason });
+					});
+				}`,
+			);
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const controller = new AbortController();
+			// A UI that ignores the signal and answers after the abort.
+			initializeRunner(runner, async () => {
+				controller.abort();
+				return "Approve";
+			});
+			const execute = vi.fn(approvalTool.execute);
+			const wrapper = new ExtensionToolWrapper({ ...approvalTool, execute }, runner);
+			try {
+				await expect(
+					(wrapper as ExtensionToolWrapper<any>).execute(
+						"call-late",
+						{},
+						controller.signal,
+						undefined,
+						abortContext(),
+					),
+				).rejects.toBeInstanceOf(ToolAbortError);
+				expect(execute).not.toHaveBeenCalled();
+				expect(resolved).toEqual([{ approved: false, reason: "aborted" }]);
+			} finally {
+				delete globalState.__lateApproval;
+			}
+		});
+
+		it("never executes when an abort lands while approval handlers run", async () => {
+			const controller = new AbortController();
+			const globalState = globalThis as typeof globalThis & { __abortApproval?: AbortController };
+			globalState.__abortApproval = controller;
+			fs.writeFileSync(
+				path.join(extensionsDir, "abort-on-resolved.ts"),
+				`export default function(pi) {
+					pi.on("tool_approval_resolved", async () => {
+						await Promise.resolve();
+						globalThis.__abortApproval.abort();
+					});
+				}`,
+			);
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			initializeRunner(runner, async () => "Approve");
+			const execute = vi.fn(approvalTool.execute);
+			const wrapper = new ExtensionToolWrapper({ ...approvalTool, execute }, runner);
+			try {
+				await expect(
+					(wrapper as ExtensionToolWrapper<any>).execute(
+						"call-handler-abort",
+						{},
+						controller.signal,
+						undefined,
+						abortContext(),
+					),
+				).rejects.toBeInstanceOf(ToolAbortError);
+				expect(execute).not.toHaveBeenCalled();
+			} finally {
+				delete globalState.__abortApproval;
+			}
 		});
 		it("runs bridged preflight before approval and cancels denied state", async () => {
 			const runner = new ExtensionRunner([], new ExtensionRuntime(), tempDir.path(), sessionManager, modelRegistry);
