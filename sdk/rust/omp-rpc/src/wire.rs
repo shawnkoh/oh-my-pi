@@ -2580,6 +2580,19 @@ pub struct ModelInfo {
 	pub compat: Option<Map<String, Value>>,
 }
 
+/// Exact call and evaluated arguments decided by a tool-approval select.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolApprovalBinding {
+	#[serde(rename = "toolCallId")]
+	pub tool_call_id: String,
+	#[serde(rename = "toolName")]
+	pub tool_name: String,
+	#[serde(deserialize_with = "Deserialize::deserialize")]
+	pub arguments: Value,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum QueueMode {
 	#[serde(rename = "all")]
@@ -4027,6 +4040,12 @@ pub struct PromptResultEvent {
 	pub id: Option<String>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub error: Option<PromptError>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub run: Option<i64>,
+	#[serde(rename = "promptEntryId", default, skip_serializing_if = "Option::is_none")]
+	pub prompt_entry_id: Option<String>,
+	#[serde(rename = "replyEntryIds", default, skip_serializing_if = "Option::is_none")]
+	pub reply_entry_ids: Option<Vec<String>>,
 }
 
 /// The session went quiet: the last run yielded and no background work can wake it.
@@ -4329,6 +4348,8 @@ pub struct SelectUiRequest {
 	#[serde(rename = "optionDetails", default, skip_serializing_if = "Option::is_none")]
 	pub option_details: Option<Vec<SelectOptionDetail>>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub approval: Option<ToolApprovalBinding>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub timeout: Option<i64>,
 }
 
@@ -4368,6 +4389,8 @@ pub struct AskUiRequest {
 	pub questions: Vec<AskQuestion>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub timeout: Option<i64>,
+	#[serde(rename = "acceptImages", default, skip_serializing_if = "Option::is_none")]
+	pub accept_images: Option<bool>,
 }
 
 /// Close the dialog opened by request `targetId`; a later answer to it is ignored.
@@ -4505,6 +4528,12 @@ pub struct AskAnswer {
 	pub selected_options: Vec<String>,
 	#[serde(rename = "customInput", default, skip_serializing_if = "Option::is_none")]
 	pub custom_input: Option<String>,
+	#[serde(rename = "customInputImages", default, skip_serializing_if = "Option::is_none")]
+	pub custom_input_images: Option<Vec<ImageContent>>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub note: Option<String>,
+	#[serde(rename = "noteImages", default, skip_serializing_if = "Option::is_none")]
+	pub note_images: Option<Vec<ImageContent>>,
 }
 
 /// Answers a `select`, `input`, or `editor` request.
@@ -4537,6 +4566,13 @@ pub struct AnswersUiResponse {
 	pub answers: Vec<AskAnswer>,
 }
 
+/// Redirects a negotiated rich ask dialog to chat.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatUiResponse {
+	pub id: String,
+	pub chat: LitTrue,
+}
+
 /// Host reply to an extension UI request; variants share `type` and differ by their payload key.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExtensionUiResponse {
@@ -4548,6 +4584,8 @@ pub enum ExtensionUiResponse {
 	CancelUiResponse(CancelUiResponse),
 	/// Answers an `ask` request: one `AskAnswer` per question, in question order.
 	AnswersUiResponse(AnswersUiResponse),
+	/// Redirects a negotiated rich ask dialog to chat.
+	ChatUiResponse(ChatUiResponse),
 }
 
 impl ExtensionUiResponse {
@@ -4565,6 +4603,9 @@ impl ExtensionUiResponse {
 		if let Ok(member) = AnswersUiResponse::deserialize(&value) {
 			return Ok(Self::AnswersUiResponse(member));
 		}
+		if let Ok(member) = ChatUiResponse::deserialize(&value) {
+			return Ok(Self::ChatUiResponse(member));
+		}
 		Err(serde_json::Error::custom("no ExtensionUiResponse variant matches"))
 	}
 }
@@ -4576,6 +4617,7 @@ impl Serialize for ExtensionUiResponse {
 			Self::ConfirmUiResponse(member) => serialize_tagged(member, &[("type", "extension_ui_response")], serializer),
 			Self::CancelUiResponse(member) => serialize_tagged(member, &[("type", "extension_ui_response")], serializer),
 			Self::AnswersUiResponse(member) => serialize_tagged(member, &[("type", "extension_ui_response")], serializer),
+			Self::ChatUiResponse(member) => serialize_tagged(member, &[("type", "extension_ui_response")], serializer),
 		}
 	}
 }
@@ -5021,6 +5063,8 @@ pub struct PromptParams {
 	pub images: Option<Vec<ImageContent>>,
 	#[serde(rename = "streamingBehavior", default, skip_serializing_if = "Option::is_none")]
 	pub streaming_behavior: Option<StreamingBehavior>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub literal: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5029,6 +5073,8 @@ pub struct SteerParams {
 	/// Images attached to the message.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub images: Option<Vec<ImageContent>>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub literal: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5037,6 +5083,8 @@ pub struct FollowUpParams {
 	/// Images attached to the message.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub images: Option<Vec<ImageContent>>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub literal: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5079,6 +5127,8 @@ pub struct AbortAndPromptParams {
 	/// Images attached to the message.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub images: Option<Vec<ImageContent>>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub literal: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5110,11 +5160,15 @@ pub struct GoalParams {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SetAskDialogParams {
 	pub enabled: bool,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub rich: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SetAskDialogResult {
 	pub enabled: bool,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub rich: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5870,6 +5924,8 @@ pub struct PromptCommand {
 	pub images: Option<Vec<ImageContent>>,
 	#[serde(rename = "streamingBehavior", default, skip_serializing_if = "Option::is_none")]
 	pub streaming_behavior: Option<StreamingBehavior>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub literal: Option<bool>,
 }
 
 impl Command for PromptCommand {
@@ -5889,6 +5945,8 @@ pub struct SteerCommand {
 	/// Images attached to the message.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub images: Option<Vec<ImageContent>>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub literal: Option<bool>,
 }
 
 impl Command for SteerCommand {
@@ -5909,6 +5967,8 @@ pub struct FollowUpCommand {
 	/// Images attached to the message.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub images: Option<Vec<ImageContent>>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub literal: Option<bool>,
 }
 
 impl Command for FollowUpCommand {
@@ -6014,6 +6074,8 @@ pub struct AbortAndPromptCommand {
 	/// Images attached to the message.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub images: Option<Vec<ImageContent>>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub literal: Option<bool>,
 }
 
 impl Command for AbortAndPromptCommand {
@@ -6115,15 +6177,17 @@ impl Command for GoalCommand {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SetAskDialogCommand {
 	pub enabled: bool,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub rich: Option<bool>,
 }
 
 impl Command for SetAskDialogCommand {
 	const NAME: &'static str = "set_ask_dialog";
 	const TIMEOUT_MS: Option<u64> = None;
-	type Output = bool;
+	type Output = SetAskDialogResult;
 
 	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
-		serde_json::from_value::<SetAskDialogResult>(data.unwrap_or_else(|| Value::Object(Map::new()))).map(|result| result.enabled)
+		serde_json::from_value::<SetAskDialogResult>(data.unwrap_or_else(|| Value::Object(Map::new())))
 	}
 }
 

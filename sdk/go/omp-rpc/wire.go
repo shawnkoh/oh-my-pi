@@ -1848,6 +1848,32 @@ func (v *ModelInfo) decodeFrom(raw map[string]json.RawMessage) error {
 	return nil
 }
 
+// Exact call and evaluated arguments decided by a tool-approval select.
+type ToolApprovalBinding struct {
+	ToolCallID string          `json:"toolCallId"`
+	ToolName   string          `json:"toolName"`
+	Arguments  json.RawMessage `json:"arguments"`
+	Reason     *string         `json:"reason,omitempty"`
+}
+
+func (v *ToolApprovalBinding) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "ToolApprovalBinding", v.decodeFrom)
+}
+
+func (v *ToolApprovalBinding) decodeFrom(raw map[string]json.RawMessage) error {
+	var out ToolApprovalBinding
+	d := fieldDecoder{raw: raw, owner: "ToolApprovalBinding"}
+	d.required("toolCallId", &out.ToolCallID)
+	d.required("toolName", &out.ToolName)
+	d.required("arguments", &out.Arguments)
+	d.optional("reason", &out.Reason)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
 type QueueMode string
 
 const (
@@ -4653,6 +4679,9 @@ type PromptResultEvent struct {
 	SessionSettled bool         `json:"sessionSettled"`
 	ID             *string      `json:"id,omitempty"`
 	Error          *PromptError `json:"error,omitempty"`
+	Run            *int64       `json:"run,omitempty"`
+	PromptEntryID  *string      `json:"promptEntryId,omitempty"`
+	ReplyEntryIds  []string     `json:"replyEntryIds,omitempty"`
 }
 
 func (v *PromptResultEvent) UnmarshalJSON(data []byte) error {
@@ -4668,6 +4697,9 @@ func (v *PromptResultEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("sessionSettled", &out.SessionSettled)
 	d.optional("id", &out.ID)
 	d.optional("error", &out.Error)
+	d.optional("run", &out.Run)
+	d.optional("promptEntryId", &out.PromptEntryID)
+	d.optional("replyEntryIds", &out.ReplyEntryIds)
 	if d.err != nil {
 		return d.err
 	}
@@ -5324,6 +5356,7 @@ type SelectUiRequest struct {
 	Title         string               `json:"title"`
 	Options       []string             `json:"options"`
 	OptionDetails []SelectOptionDetail `json:"optionDetails,omitempty"`
+	Approval      *ToolApprovalBinding `json:"approval,omitempty"`
 	Timeout       *int64               `json:"timeout,omitempty"`
 }
 
@@ -5340,6 +5373,7 @@ func (v *SelectUiRequest) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("title", &out.Title)
 	d.required("options", &out.Options)
 	d.optional("optionDetails", &out.OptionDetails)
+	d.optional("approval", &out.Approval)
 	d.optional("timeout", &out.Timeout)
 	if d.err != nil {
 		return d.err
@@ -5451,9 +5485,10 @@ func (v EditorUiRequest) MarshalJSON() ([]byte, error) {
 
 // Every question of one `ask` tool call; sent only after `set_ask_dialog` enables it.
 type AskUiRequest struct {
-	ID        string        `json:"id"`
-	Questions []AskQuestion `json:"questions"`
-	Timeout   *int64        `json:"timeout,omitempty"`
+	ID           string        `json:"id"`
+	Questions    []AskQuestion `json:"questions"`
+	Timeout      *int64        `json:"timeout,omitempty"`
+	AcceptImages *bool         `json:"acceptImages,omitempty"`
 }
 
 func (v *AskUiRequest) UnmarshalJSON(data []byte) error {
@@ -5468,6 +5503,7 @@ func (v *AskUiRequest) decodeFrom(raw map[string]json.RawMessage) error {
 	d.constant("method", "ask")
 	d.required("questions", &out.Questions)
 	d.optional("timeout", &out.Timeout)
+	d.optional("acceptImages", &out.AcceptImages)
 	if d.err != nil {
 		return d.err
 	}
@@ -5765,9 +5801,12 @@ func (v *ExtensionUiRequest) decodeFrom(raw map[string]json.RawMessage) error {
 
 // Answer to one `ask` question: exact option labels, plus optional free text.
 type AskAnswer struct {
-	ID              string   `json:"id"`
-	SelectedOptions []string `json:"selectedOptions"`
-	CustomInput     *string  `json:"customInput,omitempty"`
+	ID                string         `json:"id"`
+	SelectedOptions   []string       `json:"selectedOptions"`
+	CustomInput       *string        `json:"customInput,omitempty"`
+	CustomInputImages []ImageContent `json:"customInputImages,omitempty"`
+	Note              *string        `json:"note,omitempty"`
+	NoteImages        []ImageContent `json:"noteImages,omitempty"`
 }
 
 func (v *AskAnswer) UnmarshalJSON(data []byte) error {
@@ -5780,6 +5819,9 @@ func (v *AskAnswer) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("id", &out.ID)
 	d.required("selectedOptions", &out.SelectedOptions)
 	d.optional("customInput", &out.CustomInput)
+	d.optional("customInputImages", &out.CustomInputImages)
+	d.optional("note", &out.Note)
+	d.optional("noteImages", &out.NoteImages)
 	if d.err != nil {
 		return d.err
 	}
@@ -5900,6 +5942,33 @@ func (v AnswersUiResponse) MarshalJSON() ([]byte, error) {
 	return encodeObject(plain(v), `"type":"extension_ui_response"`, nil)
 }
 
+// Redirects a negotiated rich ask dialog to chat.
+type ChatUiResponse struct {
+	ID string `json:"id"`
+}
+
+func (v *ChatUiResponse) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "ChatUiResponse", v.decodeFrom)
+}
+
+func (v *ChatUiResponse) decodeFrom(raw map[string]json.RawMessage) error {
+	var out ChatUiResponse
+	d := fieldDecoder{raw: raw, owner: "ChatUiResponse"}
+	d.constant("type", "extension_ui_response")
+	d.required("id", &out.ID)
+	d.constant("chat", true)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v ChatUiResponse) MarshalJSON() ([]byte, error) {
+	type plain ChatUiResponse
+	return encodeObject(plain(v), `"type":"extension_ui_response","chat":true`, nil)
+}
+
 // Host reply to an extension UI request; variants share `type` and differ by their payload key.
 type ExtensionUiResponse struct {
 	// Value holds one variant. Encode-only: no discriminator tells the variants apart.
@@ -5915,6 +5984,7 @@ func (ValueUiResponse) isExtensionUiResponse()   {}
 func (ConfirmUiResponse) isExtensionUiResponse() {}
 func (CancelUiResponse) isExtensionUiResponse()  {}
 func (AnswersUiResponse) isExtensionUiResponse() {}
+func (ChatUiResponse) isExtensionUiResponse()    {}
 
 func (v ExtensionUiResponse) MarshalJSON() ([]byte, error) {
 	return encodeVariant("ExtensionUiResponse", v.Value)
@@ -6267,6 +6337,7 @@ func (ValueUiResponse) isRpcInbound()   {}
 func (ConfirmUiResponse) isRpcInbound() {}
 func (CancelUiResponse) isRpcInbound()  {}
 func (AnswersUiResponse) isRpcInbound() {}
+func (ChatUiResponse) isRpcInbound()    {}
 func (HostToolUpdate) isRpcInbound()    {}
 func (HostToolResult) isRpcInbound()    {}
 func (HostUriResult) isRpcInbound()     {}
@@ -6852,7 +6923,8 @@ func (v *CancelDeliveryResult) decodeFrom(raw map[string]json.RawMessage) error 
 }
 
 type SetAskDialogResult struct {
-	Enabled bool `json:"enabled"`
+	Enabled bool  `json:"enabled"`
+	Rich    *bool `json:"rich,omitempty"`
 }
 
 func (v *SetAskDialogResult) UnmarshalJSON(data []byte) error {
@@ -6863,6 +6935,7 @@ func (v *SetAskDialogResult) decodeFrom(raw map[string]json.RawMessage) error {
 	var out SetAskDialogResult
 	d := fieldDecoder{raw: raw, owner: "SetAskDialogResult"}
 	d.required("enabled", &out.Enabled)
+	d.optional("rich", &out.Rich)
 	if d.err != nil {
 		return d.err
 	}
@@ -7270,6 +7343,7 @@ type PromptCommand struct {
 	// Images attached to the message.
 	Images            []ImageContent     `json:"images,omitempty"`
 	StreamingBehavior *StreamingBehavior `json:"streamingBehavior,omitempty"`
+	Literal           *bool              `json:"literal,omitempty"`
 }
 
 // Prompt sends "prompt": Submit a prompt; acknowledged once admitted, completed by its `prompt_result`.
@@ -7284,7 +7358,8 @@ func (c Commands) Prompt(ctx context.Context, p PromptCommand) (PromptAck, error
 type SteerCommand struct {
 	Message string `json:"message"`
 	// Images attached to the message.
-	Images []ImageContent `json:"images,omitempty"`
+	Images  []ImageContent `json:"images,omitempty"`
+	Literal *bool          `json:"literal,omitempty"`
 }
 
 // Steer sends "steer": Queue a steering message.
@@ -7296,7 +7371,8 @@ func (c Commands) Steer(ctx context.Context, p SteerCommand) error {
 type FollowUpCommand struct {
 	Message string `json:"message"`
 	// Images attached to the message.
-	Images []ImageContent `json:"images,omitempty"`
+	Images  []ImageContent `json:"images,omitempty"`
+	Literal *bool          `json:"literal,omitempty"`
 }
 
 // FollowUp sends "follow_up": Queue a follow-up message.
@@ -7363,7 +7439,8 @@ func (c Commands) Abort(ctx context.Context) error {
 type AbortAndPromptCommand struct {
 	Message string `json:"message"`
 	// Images attached to the message.
-	Images []ImageContent `json:"images,omitempty"`
+	Images  []ImageContent `json:"images,omitempty"`
+	Literal *bool          `json:"literal,omitempty"`
 }
 
 // AbortAndPrompt sends "abort_and_prompt": Abort the current run and submit a prompt; completed by its `prompt_result`.
@@ -7431,14 +7508,15 @@ func (c Commands) Goal(ctx context.Context, p GoalCommand) (GoalResult, error) {
 
 // SetAskDialogCommand holds the parameters of "set_ask_dialog".
 type SetAskDialogCommand struct {
-	Enabled bool `json:"enabled"`
+	Enabled bool  `json:"enabled"`
+	Rich    *bool `json:"rich,omitempty"`
 }
 
 // SetAskDialog sends "set_ask_dialog": Opt in to `ask` UI requests; returns the applied setting.
-func (c Commands) SetAskDialog(ctx context.Context, p SetAskDialogCommand) (bool, error) {
+func (c Commands) SetAskDialog(ctx context.Context, p SetAskDialogCommand) (SetAskDialogResult, error) {
 	var out SetAskDialogResult
 	err := c.call(ctx, "set_ask_dialog", p, 0, &out)
-	return out.Enabled, err
+	return out, err
 }
 
 // GetAvailableCommands sends "get_available_commands": List the slash-command catalog.
