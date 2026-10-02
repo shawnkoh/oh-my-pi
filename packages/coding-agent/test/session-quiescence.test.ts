@@ -13,6 +13,9 @@ import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensi
 import type { ExtensionFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import type { DeliveryHandle } from "@oh-my-pi/pi-coding-agent/session/external-delivery";
+import { IrcBridge } from "@oh-my-pi/pi-coding-agent/session/irc-bridge";
+import type { CustomMessagePayload } from "@oh-my-pi/pi-coding-agent/session/messages";
 import {
 	type OwnedJobRecord,
 	ownedJobRegistryPath,
@@ -31,6 +34,8 @@ import {
 	type TerminalAttestation,
 	terminalAttestationPath,
 } from "@oh-my-pi/pi-coding-agent/session/quiescence";
+import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { postmortem, TempDir } from "@oh-my-pi/pi-utils";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
@@ -198,6 +203,41 @@ describe("AgentSession quiesce-and-exit", () => {
 		};
 		await expect(s.queueLaunchCompletion(completion)).rejects.toBeInstanceOf(AdmissionClosedError);
 		expect(mock.calls.length).toBe(0);
+	});
+
+	it("keeps parked agents parked from the pass until dispose ends, and lifts that even when dispose throws", async () => {
+		AgentRegistry.resetGlobalForTests();
+		AgentLifecycleManager.resetGlobalForTests();
+		try {
+			AgentRegistry.global().register({
+				id: "0-Parked",
+				displayName: "task",
+				kind: "sub",
+				session: null,
+				status: "parked",
+			});
+			AgentLifecycleManager.global().adopt("0-Parked", {
+				idleTtlMs: 0,
+				revive: async () => {
+					throw new Error("reviver ran");
+				},
+			});
+			const s = createSession();
+			expect(s.quiesceForExit(request(s)).status).toBe("quiesced");
+			await expect(AgentLifecycleManager.global().ensureLive("0-Parked")).rejects.toThrow(
+				/cannot be revived: the session is exiting/,
+			);
+
+			vi.spyOn(s.sessionManager, "close").mockRejectedValue(new Error("disk failed"));
+			session = undefined;
+			await expect(s.dispose()).rejects.toThrow("disk failed");
+			// The refusal is process-wide: a failed teardown must not leave every parked agent of a
+			// host that keeps running unrevivable.
+			await expect(AgentLifecycleManager.global().ensureLive("0-Parked")).rejects.toThrow("reviver ran");
+		} finally {
+			AgentLifecycleManager.resetGlobalForTests();
+			AgentRegistry.resetGlobalForTests();
+		}
 	});
 
 	it("refuses with work_active when input admitted before the attestation is still outstanding", async () => {
@@ -526,6 +566,84 @@ describe("AgentSession quiesce-and-exit", () => {
 		},
 	);
 
+	/** An external-delivery record (`external-delivery/1`) with its required provider projection. */
+	function deliveryCard(text: string): CustomMessagePayload {
+		return {
+			customType: "external-card",
+			content: `[card ${text}]`,
+			display: true,
+			details: { "omp.llm": { role: "user", content: [{ type: "text", text }] }, "omp.llm.source": `src-${text}` },
+		};
+	}
+
+	/** Deliver an aside the session holds without waking (plan mode, no `wakeInPlanMode`). */
+	function holdDelivery(s: AgentSession, text: string): DeliveryHandle {
+		s.setPlanModeState({ enabled: true, planFilePath: "local://PLAN.md" });
+		const held = s.deliverExternalMessage(deliveryCard(text), { mode: "aside" });
+		expect(held.state()).toBe("queued");
+		return held;
+	}
+
+	it("refuses while an external delivery is held, and passes once it is cancelled", async () => {
+		const s = createSession();
+		await s.prompt("materialize the transcript");
+		const held = holdDelivery(s, "held");
+		expect(s.getWorkCounts().queuedInput).toBeGreaterThan(0);
+		expect(s.quiesceForExit(request(s))).toMatchObject({ status: "refused", reason: "work_active" });
+		expect(held.cancel()).toBe(true);
+		expect(s.quiesceForExit(request(s, { attempt: 2 }))).toMatchObject({ status: "quiesced" });
+		expect(mock.calls.length).toBe(1);
+	});
+
+	it("counts a held external delivery even while no host queue lists it", async () => {
+		const s = createSession();
+		await s.prompt("materialize the transcript");
+		holdDelivery(s, "held");
+		// Owners can sit outside every counted queue (handed back, parked, snapshotted by a
+		// transition): the delivery itself is what counts.
+		vi.spyOn(IrcBridge.prototype, "pendingCount").mockReturnValue(0);
+		expect(s.quiesceForExit(request(s))).toMatchObject({ status: "refused", reason: "work_active" });
+	});
+
+	it("refuses a quiesce built before a delivery was admitted, even once it is gone again", async () => {
+		const s = createSession();
+		await s.prompt("materialize the transcript");
+		// Held, so the delivery neither starts a turn nor leaves anything counted once cancelled.
+		s.setPlanModeState({ enabled: true, planFilePath: "local://PLAN.md" });
+		const req = request(s);
+		const held = s.deliverExternalMessage(deliveryCard("brief"), { mode: "aside" });
+		expect(held.cancel()).toBe(true);
+		expect(s.getWorkCounts().queuedInput).toBe(0);
+		expect(s.quiesceForExit(req)).toMatchObject({ status: "refused", reason: "epoch_mismatch" });
+	});
+
+	it("never accepts an external delivery after a pass: the handle is already discarded", async () => {
+		const s = createSession();
+		await s.prompt("materialize the transcript");
+		expect(s.quiesceForExit(request(s))).toMatchObject({ status: "quiesced" });
+		const epoch = s.activityEpoch;
+		const late = s.deliverExternalMessage(deliveryCard("late"), { mode: "steer" });
+		expect(late.state()).toBe("discarded");
+		expect(await late.discarded).toEqual({ reason: "admission_closed" });
+		expect(late.cancel()).toBe(false);
+		expect(s.listExternalDeliveries()).toEqual([]);
+		expect(s.activityEpoch).toBe(epoch);
+		await s.waitForIdle();
+		expect(mock.calls.length).toBe(1);
+	});
+
+	it("records a hang-up with a held external delivery as interrupted", async () => {
+		const s = createSession();
+		await s.prompt("materialize the transcript");
+		const held = holdDelivery(s, "held");
+		await s.dispose({ reason: postmortem.Reason.SIGHUP });
+		session = undefined;
+		const onDisk = readAttestation(s);
+		expect(onDisk).toMatchObject({ kind: "hangup", signal: "sighup", interrupted: true });
+		expect(onDisk.counts.queuedInput).toBeGreaterThan(0);
+		expect(await held.discarded).toEqual({ reason: "disposed" });
+	});
+
 	it("starts no scheduled continuation after a pass", async () => {
 		const s = createSession();
 		// A transcript an agent.continue() could resume from.
@@ -838,7 +956,8 @@ describe("AgentSession quiesce with an advisor", () => {
 			entered.resolve();
 			return release.promise.then(() => true);
 		});
-		// The reviewer itself reports nothing queued or running: only the parked boundary is work.
+		// The reviewer itself reports nothing queued or running: only the parked boundary is work,
+		// and it is counted as streaming because the wait runs inside the agent loop's turn end.
 		const pendingWork = Object.getOwnPropertyDescriptor(AdvisorRuntime.prototype, "pendingWork");
 		if (!pendingWork) throw new Error("expected AdvisorRuntime.pendingWork");
 		Object.defineProperty(AdvisorRuntime.prototype, "pendingWork", { configurable: true, get: () => 0 });
@@ -846,12 +965,12 @@ describe("AgentSession quiesce with an advisor", () => {
 			const s = createAdvisedSession({ "advisor.syncBacklog": "strict" });
 			const run = s.prompt("hello");
 			await entered.promise;
-			expect(s.getWorkCounts().scheduledTurns).toBeGreaterThan(0);
+			expect(s.getWorkCounts().streaming).toBe(1);
 			expect(s.quiesceForExit(request(s))).toMatchObject({ status: "refused", reason: "work_active" });
 			release.resolve();
 			await run;
 			await s.waitForIdle();
-			expect(s.getWorkCounts().scheduledTurns).toBe(0);
+			expect(s.getWorkCounts()).toMatchObject({ streaming: 0, scheduledTurns: 0 });
 		} finally {
 			release.resolve();
 			Object.defineProperty(AdvisorRuntime.prototype, "pendingWork", pendingWork);

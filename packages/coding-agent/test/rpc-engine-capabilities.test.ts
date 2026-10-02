@@ -3,7 +3,6 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
-import { RPC_ENGINE_CAPABILITIES } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
 describe("RPC engine capabilities", () => {
@@ -24,9 +23,19 @@ describe("RPC engine capabilities", () => {
 		await removeWithRetries(directory);
 	});
 
-	test("the ready frame advertises exactly the engine capability list", async () => {
+	test("the ready frame and get_state advertise one list: protocol features, external delivery and quiesce", async () => {
 		expect(client.capabilities).toEqual([]);
 		await client.start();
-		expect(client.capabilities).toEqual([...RPC_ENGINE_CAPABILITIES]);
+		// Plain `--mode rpc` has no tool UI context, so no `rich-ask/2`.
+		expect(client.capabilities).toEqual([
+			"literal-input/1",
+			"tool-approval-binding/1",
+			"reply-attribution/1",
+			"external-delivery/1",
+			"quiesce-exit/1",
+			"owned-jobs/1",
+		]);
+		const state = await client.getState();
+		expect(state.capabilities).toEqual([...client.capabilities]);
 	}, 30_000);
 });

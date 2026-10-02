@@ -779,7 +779,6 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 				},
 			),
 		);
-		options?.onStart?.(() => executionShell.pids());
 		// Register processes the run left alive and any retained background jobs, then
 		// close the run record, so no moment exists without an open record. A rejected run
 		// reports no survivors, and an incomplete report may have missed some.
@@ -803,6 +802,8 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 				registry?.markIncomplete("shell run survivors could not be recorded");
 				logger.warn("Recording shell run survivors failed", { error: String(error) });
 			});
+		// After the run is tracked: a throwing probe must not leave the run record open.
+		options?.onStart?.(() => executionShell.pids());
 
 		const ey = new ExponentialYield();
 		const winner = await ey.race<
