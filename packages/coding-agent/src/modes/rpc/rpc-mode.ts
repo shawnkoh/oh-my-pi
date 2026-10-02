@@ -43,7 +43,7 @@ import {
 	type WordCompletionQuery,
 	wordCompletionQuery,
 } from "@oh-my-pi/pi-tui/prompt/word-completion";
-import { requestTextPrediction, textPredictionBackend } from "../../predict/client";
+import { hasTextPredictionConnection, requestTextPrediction, textPredictionBackend } from "../../predict/client";
 import type { AgentSession } from "../../session/agent-session";
 import { CACHE_WARMING_MODES } from "../../session/cache-warmer";
 import { findMostRecentNonEmptySession } from "../../session/session-listing";
@@ -141,10 +141,15 @@ export class RpcWordPredictor {
 	#busy = false;
 	#queued: QueuedWordPrediction | undefined;
 	readonly #request: typeof requestTextPrediction;
+	readonly #connectedOnly: () => boolean;
 
-	/** `request` is a test seam. */
-	constructor(request: typeof requestTextPrediction = requestTextPrediction) {
+	/**
+	 * `request` is a test seam. While `connectedOnly()` holds (read as each engine request
+	 * starts), predictions use only an already-open daemon connection and start nothing.
+	 */
+	constructor(request: typeof requestTextPrediction = requestTextPrediction, connectedOnly = () => false) {
 		this.#request = request;
+		this.#connectedOnly = connectedOnly;
 	}
 
 	/**
@@ -166,7 +171,9 @@ export class RpcWordPredictor {
 	async #run(engine: WordCompletionEngine, query: WordCompletionQuery): Promise<string | null> {
 		this.#busy = true;
 		try {
-			const { suggestion } = await this.#request(engine, query.before, query.prefix);
+			const { suggestion } = await this.#request(engine, query.before, query.prefix, {
+				connectedOnly: this.#connectedOnly(),
+			});
 			return suggestion?.suffix || null;
 		} finally {
 			this.#busy = false;
@@ -1394,7 +1401,9 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	};
 
 	const extensionUserMessageTracker = new RpcExtensionUserMessageTracker();
-	const wordPredictor = new RpcWordPredictor();
+	// Once admission closes the session is exiting: predictions must not start the shared daemon
+	// (or its broker, or a weights download) after the exit decision.
+	const wordPredictor = new RpcWordPredictor(requestTextPrediction, () => session.isAdmissionClosed());
 	// A continuation abandoned while waiting leaves nothing to end the activity stretch: re-check settlement.
 	const goalController = new RpcGoalController(session, () => void settleWatcher.check());
 	// A scheduled or held goal turn will start a turn: every settle report treats it as busy,
@@ -2584,7 +2593,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					return error(id, "predict_word_feedback", "suggestion must be a string and accepted a boolean");
 				}
 				const method = cfgSpellingAutocomplete.get(session.settings);
-				if (method !== "off") {
+				// Like `predict_word`: an exiting session sends feedback only over an open connection.
+				if (method !== "off" && (!session.isAdmissionClosed() || hasTextPredictionConnection())) {
 					const query = wordQueryAt(command.text, command.cursor);
 					if (query) {
 						textPredictionBackend(method).feedback(

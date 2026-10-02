@@ -137,6 +137,22 @@ describe.skipIf(process.platform === "win32")("owned-job registry", () => {
 		}
 	});
 
+	it("closes the shell-run record even when the start probe throws", async () => {
+		const run = executeBash("/bin/sleep 0.1", {
+			cwd: tempDir.path(),
+			onStart: () => {
+				throw new Error("probe failed");
+			},
+		});
+		await expect(run).rejects.toThrow("probe failed");
+		// The run itself keeps going; once it settles its record closes like any other run's.
+		await eventually(
+			() => !registry.openJobs().some(record => record.kind === "shell-run"),
+			"the shell-run record to close",
+		);
+		expect(retainedShellWorkCount()).toBe(retainedBefore);
+	});
+
 	it("keeps a retained-shell record open while a background job can still start processes", async () => {
 		// The job forks its long-lived child only after the run returned: no survivor report sees it.
 		const result = await executeBash("{ /bin/sleep 0.3; /bin/sleep 4; } >/dev/null 2>&1 & echo started", {

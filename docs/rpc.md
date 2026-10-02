@@ -610,6 +610,10 @@ read-only snapshot, then asks the process to exit only if nothing changed:
      continuations, IRC wakes, cache warming) starts a provider call, and no parked
      subagent is revived. An extension's `deliverMessage` after that point is not
      admitted: it returns a handle already discarded with `admission_closed`.
+     `predict_word` and `predict_word_feedback` use only a prediction-daemon
+     connection the process already holds: without one, `predict_word` answers
+     `suffix: null` and feedback is dropped, so neither starts the daemon, its broker
+     or a model download after the pass.
    - Exit without attestation → `data: { status: "exit_unattested", operationId,
      attempt, reason: "attestation_unavailable", error, snapshot }`. The session was
      idle and its transcript was made final, but the attestation could not be written.

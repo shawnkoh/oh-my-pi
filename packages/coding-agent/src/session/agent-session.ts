@@ -6301,6 +6301,17 @@ export class AgentSession implements SettingsScope {
 	}
 
 	async #doDispose(options: AgentSessionDisposeOptions = {}): Promise<void> {
+		try {
+			await this.#disposeResources(options);
+		} finally {
+			// Disposal is over, finished or failed: this session no longer holds parked agents
+			// back. The refusal is process-wide, so a throwing teardown must not leave it set.
+			this.#releaseRevivalRefusal?.();
+			this.#releaseRevivalRefusal = undefined;
+		}
+	}
+
+	async #disposeResources(options: AgentSessionDisposeOptions): Promise<void> {
 		this.beginDispose(options.reason);
 		// Stop cache warming before the drain windows below: an armed tick firing
 		// mid-dispose would issue a paid warm request and persist usage into the
@@ -6440,9 +6451,6 @@ export class AgentSession implements SettingsScope {
 		// graph shed its heavy payloads even while the lifecycle adoption record's
 		// reviver closure still references the session object. Fixes #8003.
 		this.#releaseRetainedSessionMemory();
-		// Disposal is complete: this session no longer holds parked agents back.
-		this.#releaseRevivalRefusal?.();
-		this.#releaseRevivalRefusal = undefined;
 
 		// The deadline does not cancel the drain: a handler parked in a slow
 		// extension hook resumes afterwards and would repopulate exactly the

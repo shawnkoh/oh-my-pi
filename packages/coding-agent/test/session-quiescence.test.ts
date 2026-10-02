@@ -34,6 +34,8 @@ import {
 	type TerminalAttestation,
 	terminalAttestationPath,
 } from "@oh-my-pi/pi-coding-agent/session/quiescence";
+import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { postmortem, TempDir } from "@oh-my-pi/pi-utils";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
@@ -201,6 +203,41 @@ describe("AgentSession quiesce-and-exit", () => {
 		};
 		await expect(s.queueLaunchCompletion(completion)).rejects.toBeInstanceOf(AdmissionClosedError);
 		expect(mock.calls.length).toBe(0);
+	});
+
+	it("keeps parked agents parked from the pass until dispose ends, and lifts that even when dispose throws", async () => {
+		AgentRegistry.resetGlobalForTests();
+		AgentLifecycleManager.resetGlobalForTests();
+		try {
+			AgentRegistry.global().register({
+				id: "0-Parked",
+				displayName: "task",
+				kind: "sub",
+				session: null,
+				status: "parked",
+			});
+			AgentLifecycleManager.global().adopt("0-Parked", {
+				idleTtlMs: 0,
+				revive: async () => {
+					throw new Error("reviver ran");
+				},
+			});
+			const s = createSession();
+			expect(s.quiesceForExit(request(s)).status).toBe("quiesced");
+			await expect(AgentLifecycleManager.global().ensureLive("0-Parked")).rejects.toThrow(
+				/cannot be revived: the session is exiting/,
+			);
+
+			vi.spyOn(s.sessionManager, "close").mockRejectedValue(new Error("disk failed"));
+			session = undefined;
+			await expect(s.dispose()).rejects.toThrow("disk failed");
+			// The refusal is process-wide: a failed teardown must not leave every parked agent of a
+			// host that keeps running unrevivable.
+			await expect(AgentLifecycleManager.global().ensureLive("0-Parked")).rejects.toThrow("reviver ran");
+		} finally {
+			AgentLifecycleManager.resetGlobalForTests();
+			AgentRegistry.resetGlobalForTests();
+		}
 	});
 
 	it("refuses with work_active when input admitted before the attestation is still outstanding", async () => {
@@ -919,7 +956,8 @@ describe("AgentSession quiesce with an advisor", () => {
 			entered.resolve();
 			return release.promise.then(() => true);
 		});
-		// The reviewer itself reports nothing queued or running: only the parked boundary is work.
+		// The reviewer itself reports nothing queued or running: only the parked boundary is work,
+		// and it is counted as streaming because the wait runs inside the agent loop's turn end.
 		const pendingWork = Object.getOwnPropertyDescriptor(AdvisorRuntime.prototype, "pendingWork");
 		if (!pendingWork) throw new Error("expected AdvisorRuntime.pendingWork");
 		Object.defineProperty(AdvisorRuntime.prototype, "pendingWork", { configurable: true, get: () => 0 });
@@ -927,12 +965,12 @@ describe("AgentSession quiesce with an advisor", () => {
 			const s = createAdvisedSession({ "advisor.syncBacklog": "strict" });
 			const run = s.prompt("hello");
 			await entered.promise;
-			expect(s.getWorkCounts().scheduledTurns).toBeGreaterThan(0);
+			expect(s.getWorkCounts().streaming).toBe(1);
 			expect(s.quiesceForExit(request(s))).toMatchObject({ status: "refused", reason: "work_active" });
 			release.resolve();
 			await run;
 			await s.waitForIdle();
-			expect(s.getWorkCounts().scheduledTurns).toBe(0);
+			expect(s.getWorkCounts()).toMatchObject({ streaming: 0, scheduledTurns: 0 });
 		} finally {
 			release.resolve();
 			Object.defineProperty(AdvisorRuntime.prototype, "pendingWork", pendingWork);
