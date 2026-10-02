@@ -147,6 +147,8 @@ export class AgentLifecycleManager {
 	#persistedReviveTtlMs: () => number = () => 0;
 	/** Set once {@link dispose} runs; blocks late revivals from adopting into a torn-down manager. */
 	#disposed = false;
+	/** Active {@link refuseRevivals} refusals, each with its reason; any one refuses a revival. */
+	readonly #revivalRefusals = new Set<{ reason: string }>();
 
 	constructor(registry: AgentRegistry = AgentRegistry.global()) {
 		this.#registry = registry;
@@ -163,6 +165,21 @@ export class AgentLifecycleManager {
 	setPersistedSubagentReviverFactory(factory: PersistedSubagentReviverFactory, idleTtlMs: () => number): void {
 		this.#persistedReviverFactory = factory;
 		this.#persistedReviveTtlMs = idleTtlMs;
+	}
+
+	/**
+	 * Refuse every revival of a parked agent while the returned release has not been called,
+	 * because the session is on its way out of the process (a passed quiesce or a hang-up
+	 * closed input admission). A parked agent is not live work, so it must stay parked:
+	 * reviving it would start work after the exit decision. Agents with a live session are
+	 * unaffected.
+	 */
+	refuseRevivals(reason: string): () => void {
+		const refusal = { reason };
+		this.#revivalRefusals.add(refusal);
+		return () => {
+			this.#revivalRefusals.delete(refusal);
+		};
 	}
 
 	/**
@@ -367,6 +384,11 @@ export class AgentLifecycleManager {
 			);
 		}
 		if (ref.session) return ref.session;
+		for (const refusal of this.#revivalRefusals) {
+			throw new Error(
+				`Agent "${id}" cannot be revived: ${refusal.reason}. Its transcript remains readable at history://${id}.`,
+			);
+		}
 		const inflight = this.#revivals.get(id);
 		if (inflight?.ref === ref) return inflight.promise;
 		const revival = this.#resolveAndRevive(id, ref);
