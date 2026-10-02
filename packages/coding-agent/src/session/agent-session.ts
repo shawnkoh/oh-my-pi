@@ -1162,6 +1162,12 @@ export class AgentSession implements SettingsScope {
 	}
 
 	#endInFlight(onSettled?: () => void | Promise<void>): void {
+		// A turn's tail (the deferred agent_end, settle callbacks, the stranded drain) runs
+		// outside host input's hook scope like the run itself, however the turn was started.
+		if (this.#hostInputHookScope.getStore() !== undefined) {
+			this.#hostInputHookScope.exit(() => this.#endInFlight(onSettled));
+			return;
+		}
 		if (onSettled) this.#inFlightSettledCallbacks.push(onSettled);
 		this.#promptInFlightCount = Math.max(0, this.#promptInFlightCount - 1);
 		if (this.#promptInFlightCount !== 0) return;
@@ -1413,6 +1419,12 @@ export class AgentSession implements SettingsScope {
 	 *  because #canAutoContinueForFollowUp suppresses follow-up auto-resume while a user interrupt is
 	 *  in effect, even though the wake left a provider-valid tail. */
 	#wakeForIrc(records: AgentMessage[]): void {
+		// The wake and its whole tail run outside host input's hook scope (runHostInputHooks),
+		// even when a hook's own delivery woke it: deliveries made there are ordinary.
+		if (this.#hostInputHookScope.getStore() !== undefined) {
+			this.#hostInputHookScope.exit(() => this.#wakeForIrc(records));
+			return;
+		}
 		if (this.#turnStartBlocked("irc wake")) {
 			// Kept with the bridge: disposal persists undelivered records.
 			this.#irc.queueAside(records);
@@ -3101,20 +3113,26 @@ export class AgentSession implements SettingsScope {
 	}
 
 	/**
-	 * Run host input's own hooks (e.g. RPC input hooks). A delivery the hooks make themselves
-	 * (inside them or in anything they await), whether or not a turn is running, ignores every
-	 * {@link holdTurnDispatch} hold while they run: those holds are this input's and input
-	 * ordered behind it, which cannot proceed until the hooks return, so parking a delivery
-	 * the hooks wait on would hang them. For the same reason, while they run it is covered by
-	 * that input as host action: a host interrupt or plan mode does not gate its wake (as if
-	 * it set `wakeAfterInterrupt`/`wakeInPlanMode`), and the interrupt latch is untouched.
+	 * Run host input's own hooks (e.g. RPC input hooks). A delivery made in the hooks' async
+	 * context (code they call, and promises, timers and callbacks they create), whether or not
+	 * a turn is running, ignores every {@link holdTurnDispatch} hold while they run: those holds
+	 * are this input's and input ordered behind it, which cannot proceed until the hooks
+	 * return. For the same reason, while they run it is covered by that input as host action:
+	 * a host interrupt or plan mode does not gate its wake (as if it set
+	 * `wakeAfterInterrupt`/`wakeInPlanMode`), and the interrupt latch is untouched.
 	 * Such a delivery wakes an idle session at once, and the held input then meets a running
 	 * turn (a prompt without `streamingBehavior` is refused as busy). Prompts' own dispatch
 	 * windows still apply; the delivery records its coverage (`ExternalDeliveryOwner.hostInputHooks`)
 	 * so it keeps every exemption when it resumes after such a window closes, or after the turn
 	 * it was made during ends, while `hooks` still runs. Every exemption ends when `hooks`
 	 * settles, even for work it left running. A turn the hooks start (a woken delivery, a
-	 * prompt, a continuation) runs outside their scope, so a delivery made inside it is ordinary.
+	 * prompt, a continuation) and its tail (deferred `agent_end`, settle drain) run outside
+	 * their scope, so a delivery made there is ordinary.
+	 *
+	 * Nothing here ends `hooks`, and input ordered behind it waits: a hook that awaits its own
+	 * delivery must race `accepted` with `discarded` (a committed session change or shutdown
+	 * discards it), must not cancel it (a cancelled record resolves neither), and must make it
+	 * in its own async context (a delivery from a context it did not create is not exempt).
 	 */
 	async runHostInputHooks<T>(hooks: () => Promise<T>): Promise<T> {
 		const scope = { open: true };
@@ -9414,7 +9432,7 @@ export class AgentSession implements SettingsScope {
 		const record = owner.record;
 		// A delivery made by held host input's own hooks, while they run, is exempt from host
 		// holds, plan mode and the interrupt (runHostInputHooks), during a turn or not; a turn
-		// the hooks start runs outside their scope, so nothing made inside it is.
+		// the hooks start, and its tail, run outside their scope, so nothing made there is.
 		const hookScope = this.#hostInputHookScope.getStore();
 		if (hookScope?.open) owner.hostInputHooks = hookScope;
 		if (this.isStreaming) {

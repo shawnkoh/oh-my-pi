@@ -256,6 +256,34 @@ describe("external delivery over RPC", () => {
 		expect(rpc.received.filter(frame => frame.type === "response" && frame.success === false)).toEqual([]);
 	}, 30_000);
 
+	test("a new_session while an input hook awaits its delivery discards it, and the hook and later input go on", async () => {
+		// The model delay keeps p1's turn running, so p2's hook delivery is still queued when
+		// new_session discards it; the hook races `accepted` with `discarded` and returns.
+		const rpc = start({ DELIVERY_FIXTURE_HOOK_DELIVERS: "1", DELIVERY_FIXTURE_MODEL_DELAY_MS: "600" });
+		await rpc.until(frame => frame.type === "ready");
+		await rpc.pipeline([{ id: "p1", type: "prompt", message: "hello" }]);
+		await rpc.until(frame => frame.type === "agent_start");
+		await rpc.pipeline([{ id: "p2", type: "prompt", message: "deliver:mid", streamingBehavior: "followUp" }]);
+		// Wait until the hook's delivery is queued in p1's running turn, then switch sessions.
+		for (;;) {
+			const state = await rpc.command({ type: "get_state" });
+			const deliveries = isRecord(state.data) ? state.data.externalDeliveries : undefined;
+			if (Array.isArray(deliveries) && deliveries.length > 0) break;
+		}
+		await rpc.pipeline([{ id: "n1", type: "new_session" }]);
+		expect(await rpc.until(frame => frame.type === "response" && frame.id === "n1")).toMatchObject({
+			success: true,
+		});
+		// A hook awaiting only `accepted` never returns here and every later input wedges
+		// behind it (the test times out).
+		await rpc.until(frame => frame.type === "prompt_result" && frame.id === "p2");
+		await rpc.pipeline([{ id: "p3", type: "prompt", message: "later" }]);
+		expect(await rpc.until(frame => frame.type === "prompt_result" && frame.id === "p3")).toMatchObject({
+			status: "completed",
+		});
+		expect(replies(rpc.received).at(-1)).toContain('seen:[\\"later\\"]');
+	}, 30_000);
+
 	test("deliver never parses commands, and receipts correlate by the engine-minted delivery id", async () => {
 		const rpc = start();
 		await rpc.until(frame => frame.type === "ready");

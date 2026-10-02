@@ -18,7 +18,8 @@ import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 // slash interpretation (or its absence) is observable.
 // DELIVERY_FIXTURE_INPUT_HOOK_MS: an RPC input hook that takes that long (async).
 // DELIVERY_FIXTURE_HOOK_DELIVERS=1: for input "deliver:<text>", the input hook delivers
-// <text> as an aside (source "hook") and waits for it to be accepted before returning.
+// <text> as an aside (source "hook") and waits until it is accepted or discarded (a session
+// change discards it) before returning.
 // DELIVERY_FIXTURE_MODEL_DELAY_MS: each model reply takes that long.
 // DELIVERY_FIXTURE_PLAN_MODE=1: the session starts in plan mode.
 const hookMs = Number(process.env.DELIVERY_FIXTURE_INPUT_HOOK_MS ?? 0);
@@ -49,7 +50,7 @@ if (hookMs > 0 || hookDelivers) {
 						},
 						{ mode: "aside" },
 					);
-					await handle.accepted;
+					await Promise.race([handle.accepted, handle.discarded]);
 				}
 				return undefined;
 			});
