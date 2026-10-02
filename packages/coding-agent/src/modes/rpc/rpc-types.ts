@@ -27,6 +27,12 @@ import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 import type { RpcMessagesPage } from "./rpc-messages";
 import type { GoalModeState } from "../../goals/state";
 import type { RpcGoalOp, RpcGoalResult } from "./rpc-goal";
+import {
+	OWNED_JOBS_CAPABILITY,
+	QUIESCE_EXIT_CAPABILITY,
+	type QuiesceResult,
+	type WorkAttestation,
+} from "../../session/quiescence";
 
 // ============================================================================
 // RPC Commands (stdin)
@@ -144,6 +150,19 @@ export type RpcCommand =
 			cursor: number;
 			suggestion: string;
 			accepted: boolean;
+	  }
+
+	// Quiescence (dispatched on receipt, ahead of queued commands)
+	| { id?: string; type: "attest"; operationId: string; nonce: string }
+	| {
+			id?: string;
+			type: "quiesce_and_exit";
+			operationId: string;
+			attempt: number;
+			epoch: number;
+			instanceId: string;
+			sessionId: string;
+			deadline: number;
 	  };
 
 // ============================================================================
@@ -308,6 +327,8 @@ export const RPC_ENGINE_CAPABILITIES: readonly string[] = [
 	TOOL_APPROVAL_BINDING_CAPABILITY,
 	REPLY_ATTRIBUTION_CAPABILITY,
 	EXTERNAL_DELIVERY_CAPABILITY,
+	QUIESCE_EXIT_CAPABILITY,
+	OWNED_JOBS_CAPABILITY,
 ];
 
 export interface RpcChunkFrame {
@@ -394,6 +415,8 @@ export type RpcResponse =
 
 	// State
 	| { id?: string; type: "response"; command: "get_state"; success: true; data: RpcSessionState }
+	| { id?: string; type: "response"; command: "attest"; success: true; data: WorkAttestation }
+	| { id?: string; type: "response"; command: "quiesce_and_exit"; success: true; data: QuiesceResult }
 	| {
 			id?: string;
 			type: "response";

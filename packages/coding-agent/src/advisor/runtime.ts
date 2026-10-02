@@ -355,6 +355,11 @@ export class AdvisorRuntime {
 	get backlog(): number {
 		return this.#backlog;
 	}
+	/** Reviews queued or running that can still add advisor output (0 once stopped). */
+	get pendingWork(): number {
+		if (this.disposed || this.#halted) return 0;
+		return this.#pending.length + (this.#busy ? 1 : 0);
+	}
 	get quotaExhausted(): boolean {
 		return this.#quotaExhausted;
 	}

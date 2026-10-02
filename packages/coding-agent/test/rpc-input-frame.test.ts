@@ -11,6 +11,7 @@ import {
 	RpcInputDispatcher,
 	type RpcInputFrameDeps,
 	RpcPendingExtensionRequests,
+	isRpcCommandAllowedWhileExiting,
 	RpcShutdownCoordinator,
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import type {
@@ -843,5 +844,62 @@ describe("RpcShutdownCoordinator", () => {
 		gateB.resolve();
 		await drain;
 		expect(drained).toBe(true);
+	});
+});
+
+describe("RPC commands once the session is exiting", () => {
+	test("lets host config and word prediction through, and refuses subagent control", () => {
+		for (const type of ["set_ask_dialog", "predict_word", "predict_word_feedback"]) {
+			expect(isRpcCommandAllowedWhileExiting({ type })).toBe(true);
+		}
+		for (const type of ["cancel_subagent", "steer_subagent", "promote_queued_message", "remove_queued_message"]) {
+			expect(isRpcCommandAllowedWhileExiting({ type })).toBe(false);
+		}
+	});
+
+	test("counts only queued commands that can change the session as pending input", async () => {
+		const gate = Promise.withResolvers<void>();
+		const { deps } = makeDeps(async command => {
+			await gate.promise;
+			return { id: command.id, type: "response", command: command.type, success: true } as RpcResponse;
+		});
+		const dispatcher = new RpcInputDispatcher({ deps });
+
+		// Serial read-only commands queue behind each other but are not work.
+		dispatcher.dispatch({ id: "g1", type: "get_state" });
+		dispatcher.dispatch({
+			id: "f1",
+			type: "predict_word_feedback",
+			text: "hel",
+			cursor: 3,
+			suggestion: "lo",
+			accepted: true,
+		});
+		expect(dispatcher.pendingCount).toBe(0);
+
+		dispatcher.dispatch({ id: "n1", type: "set_session_name", name: "renamed" });
+		expect(dispatcher.pendingCount).toBe(1);
+
+		gate.resolve();
+		await dispatcher.drain();
+		expect(dispatcher.pendingCount).toBe(0);
+	});
+
+	test("tracks a background read-only command for shutdown without counting it as work", async () => {
+		const gate = Promise.withResolvers<void>();
+		const coordinator = new RpcShutdownCoordinator({
+			isShutdownRequested: () => false,
+			performShutdown: async () => {},
+		});
+		coordinator.track(gate.promise, false);
+		expect(coordinator.pendingCount).toBe(0);
+		let drained = false;
+		const drain = coordinator.drain().then(() => {
+			drained = true;
+		});
+		await flushMicrotasks();
+		expect(drained).toBe(false);
+		gate.resolve();
+		await drain;
 	});
 });
