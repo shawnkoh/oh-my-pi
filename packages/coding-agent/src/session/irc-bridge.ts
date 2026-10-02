@@ -1,4 +1,4 @@
-import type { Agent, AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { type Agent, type AgentMessage, isOwnedAsideMessage } from "@oh-my-pi/pi-agent-core";
 import { prompt } from "@oh-my-pi/pi-utils";
 import { type IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import parentIrcSteerTemplate from "../prompts/steering/parent-irc.md" with { type: "text" };
@@ -58,12 +58,33 @@ export class IrcBridge {
 		void pending.finally(() => this.#pendingReplies.delete(pending));
 	}
 
-	/** Takes every queued IRC record in interrupt-before-aside order. */
-	drainPending(): AgentMessage[] {
-		const records = [...this.#interrupts, ...this.#asides];
-		this.#interrupts = [];
-		this.#asides = [];
+	/** Takes every queued IRC record in interrupt-before-aside order. Records matching
+	 *  `keep` stay queued in place (used to hold owned external records back). */
+	drainPending(keep?: (record: AgentMessage) => boolean): AgentMessage[] {
+		if (!keep) {
+			const records = [...this.#interrupts, ...this.#asides];
+			this.#interrupts = [];
+			this.#asides = [];
+			return records;
+		}
+		const records: AgentMessage[] = [];
+		const split = (queue: AgentMessage[]): AgentMessage[] => {
+			const kept: AgentMessage[] = [];
+			for (const record of queue) (keep(record) ? kept : records).push(record);
+			return kept;
+		};
+		this.#interrupts = split(this.#interrupts);
+		this.#asides = split(this.#asides);
 		return records;
+	}
+
+	/** Removes one record from every queue (a retired owned record must not be drained again). */
+	removeRecord(record: AgentMessage): boolean {
+		const before = this.#interrupts.length + this.#asides.length + this.#deferredWakes.length;
+		this.#interrupts = this.#interrupts.filter(queued => queued !== record);
+		this.#asides = this.#asides.filter(queued => queued !== record);
+		this.#deferredWakes = this.#deferredWakes.filter(queued => queued !== record);
+		return this.#interrupts.length + this.#asides.length + this.#deferredWakes.length !== before;
 	}
 
 	/** Snapshots and discards every queued IRC record — used when a session-boundary transition
@@ -237,9 +258,10 @@ export class IrcBridge {
 		void this.#host.emitSessionEvent({ type: "irc_message", message: record });
 	}
 
-	/** Persists queued IRC records that missed their step-boundary injection. */
+	/** Persists queued IRC records that missed their step-boundary injection. Owned external
+	 *  records are never flushed: they only enter context through their own admission. */
 	flushPending(): void {
-		for (const record of this.drainPending()) {
+		for (const record of this.drainPending(isOwnedAsideMessage)) {
 			this.#host.agent.emitExternalEvent({ type: "message_start", message: record });
 			this.#host.agent.emitExternalEvent({ type: "message_end", message: record });
 		}
