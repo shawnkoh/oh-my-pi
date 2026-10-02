@@ -1505,6 +1505,37 @@ describe("external delivery (session)", () => {
 			expect(mock.calls).toHaveLength(1);
 		});
 
+		// M1 (I13h): an abort the hook itself calls flushes the turn's deferred agent_end outside the
+		// hook scope too, so an agent_end subscriber's aside stays an ordinary, interrupted delivery.
+		it("an agent_end subscriber's aside stays queued when the hook aborts the turn it prompted", async () => {
+			const slow = slowTool();
+			const { mock, session: s } = makeSession({ tools: [slow.tool] });
+			let fromEnd: DeliveryHandle | undefined;
+			s.subscribe(event => {
+				if (event.type === "agent_end" && !fromEnd) {
+					fromEnd = s.deliverExternalMessage(card("from-end"), { mode: "aside" });
+				}
+			});
+			const releaseHold = s.holdTurnDispatch();
+			mock.push(toolCall("slow"));
+			await s.runHostInputHooks(async () => {
+				const run = s.prompt("go");
+				await slow.started;
+				const aborting = s.abort({ reason: USER_INTERRUPT_LABEL });
+				slow.release();
+				await aborting;
+				await run.catch(() => {});
+				// Keep the hook open while the abort's tail drains.
+				for (let i = 0; i < 10; i++) await setImmediate();
+			});
+			releaseHold();
+			await s.waitForIdle();
+			for (let i = 0; i < 5; i++) await setImmediate();
+			expect(fromEnd?.state()).toBe("queued");
+			const texts = mock.calls.flatMap((_, index) => userTexts(mock, index));
+			expect(texts).not.toContain("from-end");
+		});
+
 		// P1: a slash-prefixed prompt issued during a manual-compaction wait, with a
 		// delivery arriving during that wait, must never be lost to the wake the
 		// parked delivery starts (the window is released only for a matched

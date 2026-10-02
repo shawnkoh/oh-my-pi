@@ -1573,6 +1573,12 @@ export class AgentSession implements SettingsScope {
 	}
 
 	#resetInFlight(): void {
+		// An abort's tail (the deferred agent_end, settle callbacks, the stranded drain) also runs
+		// outside host input's hook scope, even when a hook itself called abort().
+		if (this.#hostInputHookScope.getStore() !== undefined) {
+			this.#hostInputHookScope.exit(() => this.#resetInFlight());
+			return;
+		}
 		this.#promptInFlightCount = 0;
 		this.#externalDeliveries.settleEvaluation({ aborted: true });
 		this.yieldQueue.requestIdleFlush();
