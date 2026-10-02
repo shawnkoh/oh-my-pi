@@ -21,7 +21,6 @@ import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../
 import {
 	type ExtensionAskDialogQuestion,
 	type ExtensionAskDialogResult,
-	type ExtensionAskDialogSubmitResult,
 	type ExtensionUIContext,
 	type ExtensionUIDialogOptions,
 	type ExtensionUISelectItem,
@@ -46,7 +45,6 @@ import {
 } from "@oh-my-pi/pi-tui/prompt/word-completion";
 import { requestTextPrediction, textPredictionBackend } from "../../predict/client";
 import type { AgentSession } from "../../session/agent-session";
-import { EXTERNAL_DELIVERY_CAPABILITY } from "../../session/external-delivery";
 import { CACHE_WARMING_MODES } from "../../session/cache-warmer";
 import { findMostRecentNonEmptySession } from "../../session/session-listing";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
@@ -79,6 +77,7 @@ import {
 import { RpcSessionEventForwarder } from "./rpc-session-events";
 import { isRpcSessionSettled, RpcSessionSettleWatcher, watchedScheduledTurnProbe } from "./rpc-session-settle";
 import { RpcSubagentRegistry, readRpcSubagentTranscript, resolveOwnedLiveSubagent } from "./rpc-subagents";
+import { RICH_ASK_CAPABILITY, RPC_ENGINE_CAPABILITIES } from "./rpc-types";
 import type {
 	RpcCommand,
 	RpcDeliveryEventFrame,
@@ -916,10 +915,32 @@ export function requestRpcSelect(
 			title,
 			options: labels,
 			...(optionDetails ? { optionDetails } : {}),
+			...(dialogOptions?.approval ? { approval: dialogOptions.approval } : {}),
 			timeout: dialogOptions?.timeout,
 		},
 		response => parseValueDialogResponse(response, dialogOptions),
 	);
+}
+
+const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
+
+function rpcAskImages(value: unknown, acceptImages: boolean): ImageContent[] | undefined {
+	if (value === undefined) return undefined;
+	if (!acceptImages || !Array.isArray(value)) throw new Error("Ask dialog images were not accepted");
+	for (const image of value) {
+		if (
+			!isRecord(image) ||
+			image.type !== "image" ||
+			typeof image.data !== "string" ||
+			typeof image.mimeType !== "string" ||
+			!image.mimeType.startsWith("image/") ||
+			image.mimeType.startsWith("image/svg") ||
+			image.data.length % 4 !== 0 ||
+			!BASE64.test(image.data)
+		)
+			throw new Error("Ask dialog image must be base64 non-SVG image content");
+	}
+	return value as ImageContent[];
 }
 
 /** Validates `ask` answers against the questions; any mismatch throws instead of guessing. */
@@ -927,10 +948,20 @@ function parseAskDialogResponse(
 	response: RpcExtensionUIResponse,
 	questions: ExtensionAskDialogQuestion[],
 	dialogOptions: ExtensionUIDialogOptions,
-): ExtensionAskDialogSubmitResult | undefined {
+	rich = false,
+): ExtensionAskDialogResult | undefined {
 	if ("cancelled" in response && response.cancelled) {
 		if (response.timedOut) dialogOptions.onTimeout?.();
 		return undefined;
+	}
+	if ("chat" in response) {
+		if (
+			rich &&
+			response.chat === true &&
+			Object.keys(response).every(key => key === "type" || key === "id" || key === "chat")
+		)
+			return { kind: "chat" };
+		throw new Error("Ask dialog chat redirect is malformed or was not negotiated");
 	}
 	const answers: unknown = "answers" in response ? response.answers : undefined;
 	if (!Array.isArray(answers) || answers.length !== questions.length) {
@@ -972,6 +1003,15 @@ function parseAskDialogResponse(
 					`Ask dialog answer ${JSON.stringify(question.id)} is single-select but carries more than one answer`,
 				);
 			}
+			if (
+				!rich &&
+				(answer.customInputImages !== undefined || answer.note !== undefined || answer.noteImages !== undefined)
+			)
+				throw new Error(`Ask dialog answer ${JSON.stringify(question.id)} contains unnegotiated rich fields`);
+			if (answer.note !== undefined && typeof answer.note !== "string")
+				throw new Error(`Ask dialog answer ${JSON.stringify(question.id)} note must be a string`);
+			const customInputImages = rpcAskImages(answer.customInputImages, rich && dialogOptions.acceptImages === true);
+			const noteImages = rpcAskImages(answer.noteImages, rich && dialogOptions.acceptImages === true);
 			return {
 				id: question.id,
 				question: question.question,
@@ -979,6 +1019,9 @@ function parseAskDialogResponse(
 				multi,
 				selectedOptions: selected,
 				customInput: custom,
+				...(customInputImages ? { customInputImages } : {}),
+				...(answer.note !== undefined ? { note: answer.note } : {}),
+				...(noteImages ? { noteImages } : {}),
 			};
 		}),
 	};
@@ -990,6 +1033,7 @@ export async function requestRpcAskDialog(
 	output: RpcOutput,
 	questions: ExtensionAskDialogQuestion[],
 	dialogOptions?: ExtensionUIDialogOptions,
+	rich = false,
 ): Promise<ExtensionAskDialogResult | undefined> {
 	let timedOut = false;
 	const opts: ExtensionUIDialogOptions = {
@@ -1004,8 +1048,13 @@ export async function requestRpcAskDialog(
 		output,
 		opts,
 		undefined,
-		{ method: "ask", questions, timeout: dialogOptions?.timeout },
-		response => parseAskDialogResponse(response, questions, opts),
+		{
+			method: "ask",
+			questions,
+			...(rich ? { acceptImages: dialogOptions?.acceptImages === true } : {}),
+			timeout: dialogOptions?.timeout,
+		},
+		response => parseAskDialogResponse(response, questions, opts, rich),
 	);
 	return timedOut ? timedOutAskDialogResult(questions) : result;
 }
@@ -1207,6 +1256,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	// breaks JSON.parse. In RPC mode stdout is the JSON protocol channel — nothing else
 	// may write there.
 	process.env.PI_NOTIFICATIONS = "off";
+	// Rich ask reaches a host only through the tool UI context.
+	const capabilities = [...RPC_ENGINE_CAPABILITIES, ...(setToolUIContext ? [RICH_ASK_CAPABILITY] : [])];
 
 	const frameEncoder = new RpcFrameEncoder();
 	const outputWriter = new RpcOutputWriter(process.stdout, failure => {
@@ -1220,7 +1271,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			supportedProtocolVersions: [1, 2],
 			maxFrameBytes: MAX_RPC_FRAME_BYTES,
 			maxReassembledFrameBytes: MAX_RPC_REASSEMBLED_BYTES,
-			capabilities: [EXTERNAL_DELIVERY_CAPABILITY],
+			capabilities,
 		}),
 	);
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
@@ -1273,6 +1324,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	class RpcExtensionUIContext implements ExtensionUIContext {
 		/** Set by `set_ask_dialog`; hosts that never opt in keep the select/editor ask fallback. */
 		askDialogEnabled = false;
+		richAsk = false;
 
 		constructor(
 			private pendingRequests: Map<string, PendingExtensionRequest>,
@@ -1282,7 +1334,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		get askDialog(): ExtensionUIContext["askDialog"] {
 			if (!this.askDialogEnabled) return undefined;
 			return (questions, dialogOptions) =>
-				requestRpcAskDialog(this.pendingRequests, this.output, questions, dialogOptions);
+				requestRpcAskDialog(this.pendingRequests, this.output, questions, dialogOptions, this.richAsk);
 		}
 
 		select(
@@ -1616,14 +1668,14 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			if (!isCurrent()) return "cancelled";
 			if (!text.trim() && !images?.length) return "local";
 			if (command.type === "steer") {
-				await session.steer(text, images);
+				await session.steer(text, images, { literal: command.literal === true });
 				return "admitted";
 			}
 			if (command.type === "follow_up") {
-				await session.followUp(text, images);
+				await session.followUp(text, images, { literal: command.literal === true });
 				return "admitted";
 			}
-			if (command.type === "prompt") {
+			if (command.type === "prompt" && command.literal !== true) {
 				if (!ticket) return "cancelled";
 				const skillResult = await dispatchRpcSkillPrompt({
 					ticket,
@@ -1674,11 +1726,13 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				}
 			}
 			if (!isCurrent() || !ticket) return "cancelled";
+			if (command.literal === true) ticket.text = text;
 			await watchAndReportPromptResult({
 				ticket,
 				startPrompt: onPromptAdmitted =>
 					session.prompt(text, {
 						images,
+						literal: command.literal === true,
 						...(command.type === "prompt" ? { streamingBehavior: command.streamingBehavior } : {}),
 						onPromptAdmitted,
 					}),
@@ -1692,6 +1746,9 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
 		const id = command.id;
+		// A malformed security flag fails closed instead of falling back to parsing.
+		if ("literal" in command && command.literal !== undefined && typeof command.literal !== "boolean")
+			return error(id, command.type, "literal must be a boolean");
 
 		switch (command.type) {
 			case "negotiate_protocol": {
@@ -1707,7 +1764,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			case "prompt": {
 				// Taken before any dispatch so a builtin that schedules a turn (e.g. `/retry`)
 				// cannot start its run ahead of the prompt's event-stream position.
-				const ticket = promptResults.begin(id);
+				// Literal text is the persisted user message verbatim, so it identifies the reply.
+				const ticket = promptResults.begin(id, command.literal === true ? command.message : undefined);
 				try {
 					// Ack after admission, including hooks and skill image preparation, so a
 					// queue edit sent after this response finds the message.
@@ -1906,7 +1964,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					isSettled: isRpcSessionSettled(session, goalTurnScheduled),
 					queuedMessages: { steering: [...queuedMessages.steering], followUp: [...queuedMessages.followUp] },
 					todoPhases: session.getTodoPhases(),
-					capabilities: [EXTERNAL_DELIVERY_CAPABILITY],
+					capabilities,
 					externalDeliveries: session.listExternalDeliveries(),
 					fastModeEnabled: session.isFastModeEnabled(),
 					tokensPerSecond: calculateTokensPerSecond(session.messages, session.isStreaming),
@@ -1946,7 +2004,15 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 
 			case "set_ask_dialog": {
 				rpcUiContext.askDialogEnabled = command.enabled === true;
-				return success(id, "set_ask_dialog", { enabled: rpcUiContext.askDialogEnabled });
+				rpcUiContext.richAsk =
+					rpcUiContext.askDialogEnabled && setToolUIContext !== undefined && command.rich === true;
+				return success(
+					id,
+					"set_ask_dialog",
+					command.rich === true
+						? { enabled: rpcUiContext.askDialogEnabled, rich: rpcUiContext.richAsk }
+						: { enabled: rpcUiContext.askDialogEnabled },
+				);
 			}
 
 			case "get_available_commands": {

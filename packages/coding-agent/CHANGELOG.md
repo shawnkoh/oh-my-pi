@@ -114,11 +114,21 @@
 - Fixed aside messages containing pasted image or video paths so the source path is preserved when sent to the model.
 - Fixed extension-registered prompt-cache settings, including explicit opt-outs, not taking precedence over matching models.yml definitions.
 - Fixed prompt-cache warming to honor cache-retention settings, including disabling replay for no-retention caches and using the lifetime written by long-retention requests.
+- Literal RPC prompts (`literal: true`) are acknowledged only once admitted, like other prompts, so an immediate `promote_queued_message` observes a queued literal prompt
+- An `abort` that lands while a prompt's images are still being prepared now drops that prompt instead of starting or queueing it afterward ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
+- A path-pasted image or video sent as an aside while the agent is busy now reaches the model with its source path ([#11618](https://github.com/can1357/oh-my-pi/pull/11618) by [@andrebrait](https://github.com/andrebrait)).
+- Extension-registered model prompt-cache settings, including `{}` opt-outs, now take precedence over matching `models.yml` definitions ([#13871](https://github.com/can1357/oh-my-pi/pull/13871) by [@anatoli-tsinovoy](https://github.com/anatoli-tsinovoy)).
+- Cache warming now follows `providers.cacheRetention`: `none` no longer replays uncached requests, and `long` warms on the 1-hour lifetime the request actually wrote ([#13871](https://github.com/can1357/oh-my-pi/pull/13871) by [@anatoli-tsinovoy](https://github.com/anatoli-tsinovoy)).
 
 ## [18.4.5] - 2026-09-30
 
 ### Added
 
+- The RPC ready frame carries `capabilities: string[]`, a versioned list of engine features hosts can rely on without probing; the TypeScript `RpcClient` exposes it as `capabilities`
+- RPC hosts can send `literal: true` on `prompt`, `steer`, `follow_up` and `abort_and_prompt`: upstream RPC input hooks run first, then the resulting text is admitted as a plain user message without slash, skill, builtin, extension/custom command dispatch, prompt-template expansion or model-mention rewriting; ready and `get_state` advertise `literal-input/1` and the TypeScript `RpcClient` exposes the option.
+- Tool-approval dialogs sent to RPC hosts carry `approval: { toolCallId, toolName, arguments, reason? }`, binding the answer to the exact call that will run; the ready frame advertises `capabilities: ["tool-approval-binding/1"]`
+- In `--mode rpc-ui`, hosts may opt in with `set_ask_dialog {enabled:true,rich:true}` (capability `rich-ask/2`) to extend upstream's ask `answers[]` with notes, pasted images when `acceptImages` is true, and `chat:true` redirects; without rich opt-in upstream's ask contract is unchanged.
+- RPC `prompt_result` frames carry `run` (shared by prompts answered by the same run, including retries), `promptEntryId` (the prompt's persisted user message) and `replyEntryIds` (the assistant entries answering that message), so hosts settle replies by entry identity; the ready frame advertises `capabilities: ["reply-attribution/1"]`
 - Added Factory Droid login and model selection with base credit badges and account-matched regional discovery ([#8577](https://github.com/can1357/oh-my-pi/pull/8577) by [@will-bogusz](https://github.com/will-bogusz), continued in [#13276](https://github.com/can1357/oh-my-pi/pull/13276) by [@DusKing1](https://github.com/DusKing1)).
 - Added `HELMCODE_API_KEY` to the environment variables listed in `omp --help` ([#13630](https://github.com/can1357/oh-my-pi/pull/13630) by [@alexcerezo](https://github.com/alexcerezo)).
 - External delivery (`external-delivery/1`): RPC hosts can hand the session a record authored by another actor with `deliver` (`mode: "aside" | "steer"`) and withdraw it with `cancel_delivery`; the engine reports `delivery_accepted`, `delivery_settled`, `delivery_discarded` and `delivery_cancelled` receipts, lists held records in `get_state.externalDeliveries`, and advertises the capability in `ready.capabilities` and `get_state.capabilities`. Extensions get the same surface as `ExtensionAPI.deliverMessage` with `ExtensionAPI.capabilities`. Records declare their provider view in `details["omp.llm"]` and are rejected without one; delivery-owned evaluations may complete quietly (see `docs/rpc.md#external-delivery`).
@@ -137,6 +147,9 @@
 
 ### Fixed
 
+- In a native terminal (Tern), the welcome card's omp mark survives restarting Tern: Tern draws it itself instead of receiving it as an image
+- In a native terminal (Tern), the "N agents running" pill stays put while subagents work instead of popping back in several times a second: each progress update now updates the pill instead of replacing it
+- Interrupting a turn while a tool approval is pending now closes the dialog (RPC hosts receive `cancel`), and an approval answered after the call was aborted no longer runs the tool
 - Fixed the subagent live preview blanking or mislabelling a running call when a sibling call finishes: concurrent calls are tracked by call id and keep their own intent, and the row keeps the last completed call with its success or error mark until the next one starts ([#11210](https://github.com/can1357/oh-my-pi/pull/11210) by [@DarkPhilosophy](https://github.com/DarkPhilosophy)).
 - Fixed subagent tool previews rewriting a search pattern that names a home directory: path arguments are now shortened by argument key, so the pattern still shows what was searched ([#11210](https://github.com/can1357/oh-my-pi/pull/11210) by [@DarkPhilosophy](https://github.com/DarkPhilosophy)).
 - Fixed background task job progress dropping the current tool's arguments and start time ([#11210](https://github.com/can1357/oh-my-pi/pull/11210) by [@DarkPhilosophy](https://github.com/DarkPhilosophy)).
