@@ -275,6 +275,13 @@ export class ExternalDeliveryOwner {
 	/** Times the loop deferred admission and the host re-queued the record. */
 	deferrals = 0;
 	requests = 0;
+	/**
+	 * Scope of the held host input's hooks that made this delivery themselves, not from inside
+	 * a turn (`AgentSession.runHostInputHooks`; turns run outside that scope). While the scope
+	 * is `open` the input covers it as host action: plan mode and a host interrupt never gate
+	 * its wake, and it ignores host-input dispatch holds wherever it is parked.
+	 */
+	hostInputHooks: { readonly open: boolean } | undefined;
 	included = false;
 	producedOutput = false;
 	lastAssistant: AssistantMessage | undefined;
@@ -415,6 +422,22 @@ export class ExternalDeliveries {
 		return owner;
 	}
 
+	/**
+	 * A handle for a record the session did not admit (its input admission is closed): already
+	 * `discarded` with `reason`, never accepted. No owner is registered, so nothing is queued.
+	 */
+	refuse(payload: NormalizedCustomMessagePayload, options: DeliveryOptions, reason: string): DeliveryHandle {
+		const id = `delivery_${++this.#sequence}_${Date.now().toString(36)}`;
+		const owner = new ExternalDeliveryOwner(id, payload, options, {
+			admit: target => target.admit(false),
+			commit: () => {},
+			discard: () => {},
+			cancel: () => {},
+		});
+		owner.discard(reason);
+		return owner.handle;
+	}
+
 	ownerOf(record: AgentMessage): ExternalDeliveryOwner | undefined {
 		return this.#byRecord.get(record);
 	}
@@ -435,6 +458,15 @@ export class ExternalDeliveries {
 	hasQueued(): boolean {
 		for (const owner of this.#owners.values()) if (owner.state === "queued") return true;
 		return false;
+	}
+
+	/** Owners still held (queued, or accepted but unsettled): outstanding work for quiescence. */
+	pendingCount(): number {
+		let pending = 0;
+		for (const owner of this.#owners.values()) {
+			if (owner.state === "queued" || owner.state === "accepted") pending++;
+		}
+		return pending;
 	}
 
 	cancel(id: string): boolean {

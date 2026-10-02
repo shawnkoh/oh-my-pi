@@ -135,10 +135,13 @@ export class IrcBridge {
 		this.#deferredWakes.push(...records);
 	}
 
-	/** Takes parked wake records for a post-clear monitored wake, oldest first. */
-	drainDeferredWakes(): AgentMessage[] {
-		const records = this.#deferredWakes;
-		this.#deferredWakes = [];
+	/** Takes parked wake records for a post-clear monitored wake, oldest first. Records
+	 *  matching `keep` stay parked in place. */
+	drainDeferredWakes(keep?: (record: AgentMessage) => boolean): AgentMessage[] {
+		const records: AgentMessage[] = [];
+		const kept: AgentMessage[] = [];
+		for (const record of this.#deferredWakes) (keep?.(record) ? kept : records).push(record);
+		this.#deferredWakes = kept;
 		return records;
 	}
 
