@@ -545,6 +545,65 @@ describe("RpcGoalController continuation gate", () => {
 		expect(admitted).toEqual(["goal-continuation"]);
 	});
 
+	test("a host abort of a continuation turn that ran a tool admits no further continuation", async () => {
+		const admitted: string[] = [];
+		const { controller } = fakeSession(async customType => {
+			admitted.push(customType);
+			return true;
+		});
+		const toolTurnEnd = {
+			type: "agent_end",
+			isTerminal: true,
+			messages: [
+				{ role: "assistant", content: [{ type: "toolCall", id: "t1", name: "read", arguments: { path: "a" } }] },
+				{ role: "toolResult", toolName: "read", content: [{ type: "text", text: "x" }], isError: false },
+			],
+		} as unknown as AgentSessionEvent;
+
+		// A yield admits continuation #1, so the next run is a continuation turn.
+		controller.observe(agentEnd);
+		await nextMacrotask();
+		expect(admitted).toEqual(["goal-continuation"]);
+
+		// The host aborts that turn after it ran a tool (new activity); its agent_end follows.
+		controller.stopForHostAbort();
+		controller.observe(toolTurnEnd);
+		await nextMacrotask();
+		expect(controller.continuationPending).toBe(false);
+		expect(admitted).toEqual(["goal-continuation"]);
+	});
+
+	test("a turn that was not a continuation re-arms after a no-progress stop, but never after a host abort", async () => {
+		const admitted: string[] = [];
+		const { controller } = fakeSession(async customType => {
+			admitted.push(customType);
+			return true;
+		});
+		// Continuation #1 makes no progress, so continuation stops.
+		controller.observe(agentEnd);
+		await nextMacrotask();
+		controller.observe(agentEnd);
+		await nextMacrotask();
+		expect(admitted).toEqual(["goal-continuation"]);
+		expect(controller.continuationPending).toBe(false);
+
+		// A turn nobody prompted (a delivery or job wake) ends: as in the TUI, the goal continues.
+		controller.observe(agentEnd);
+		await nextMacrotask();
+		expect(admitted).toEqual(["goal-continuation", "goal-continuation"]);
+
+		// After a host abort, such a turn does not re-arm; only host input does.
+		controller.stopForHostAbort();
+		controller.observe(agentEnd);
+		controller.observe(agentEnd);
+		await nextMacrotask();
+		expect(admitted).toEqual(["goal-continuation", "goal-continuation"]);
+		controller.observe(hostInput);
+		controller.observe(agentEnd);
+		await nextMacrotask();
+		expect(admitted).toEqual(["goal-continuation", "goal-continuation", "goal-continuation"]);
+	});
+
 	test("a rejected continuation does not claim the next run as its own", async () => {
 		let calls = 0;
 		const { controller } = fakeSession(async () => {
