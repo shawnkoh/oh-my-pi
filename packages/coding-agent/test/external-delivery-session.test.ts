@@ -1663,6 +1663,43 @@ describe("external delivery (session)", () => {
 			},
 		);
 
+		it("I13l failed new-session header persistence retains identity and replayable provider context", async () => {
+			const dir = path.join(tempDir.path(), "sessions");
+			const manager = SessionManager.create(tempDir.path(), dir);
+			const { mock, agent, session: s } = makeSession({ sessionManager: manager });
+			await s.prompt("OLD-TRANSCRIPT");
+			await manager.ensureOnDisk();
+			await manager.flush();
+			const previousId = manager.getSessionId();
+			const previousFile = manager.getSessionFile()!;
+			const previousMessages = [...agent.state.messages];
+			const failure = new Error("injected new header persistence failure");
+			const ensure = spyOn(manager, "ensureOnDisk").mockRejectedValueOnce(failure);
+			try {
+				await expect(s.newSession()).rejects.toBe(failure);
+			} finally {
+				ensure.mockRestore();
+			}
+			expect(manager.getSessionId()).toBe(previousId);
+			expect(manager.getSessionFile()).toBe(previousFile);
+			expect(manager.buildSessionContext().messages).toEqual(previousMessages);
+			expect(agent.state.messages).toEqual(previousMessages);
+
+			await s.prompt("AFTER-FAILURE");
+			await manager.flush();
+			const reopened = await SessionManager.open(previousFile, dir);
+			expect(reopened.getSessionId()).toBe(previousId);
+			const transcript = (messages: Message[]) =>
+				messages.map(message => ({ role: message.role, content: message.content }));
+			expect(transcript(convertToLlm(reopened.buildSessionContext().messages))).toEqual(
+				transcript(convertToLlm(agent.state.messages)),
+			);
+			expect(userTexts(mock, 1)).toEqual(["OLD-TRANSCRIPT", "AFTER-FAILURE"]);
+			expect(transcript(mock.calls[1].context.messages)).toEqual(
+				transcript(convertToLlm(reopened.buildSessionContext().messages.slice(0, -1))),
+			);
+		});
+
 		it.each(["new", "switch"] as const)(
 			"I13k failed %s flush resumes parked and subsequent hook deliveries",
 			async action => {

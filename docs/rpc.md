@@ -315,8 +315,10 @@ while the hook runs:
 - While the session's agent subscription is disconnected for compaction or a session
   transition, even a hook's own delivery stays queued, not accepted. Reconnection and
   the stranded drain resume it (or the transition discards it). A failed, uncommitted
-  new-session or switch operation reconnects the retained session, including when
-  persistence flushing fails; its parked deliveries resume after the transition ends.
+  new-session or switch operation restores the retained manager identity and transcript
+  before reconnecting, including when flushing or persisting the new session header
+  fails. Its parked deliveries resume after the transition ends; subsequent provider
+  requests retain the same conversation as the persisted transcript.
   Start/await a compaction the hook calls before awaiting its delivery's acceptance;
   an observer must not await acceptance that depends on its own operation completing.
 - Make the delivery in the hook's async context. A delivery handed to code that runs in

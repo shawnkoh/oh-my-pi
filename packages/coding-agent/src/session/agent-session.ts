@@ -10573,6 +10573,7 @@ export class AgentSession implements SettingsScope {
 			this.#closeAllProviderSessions("new session");
 			await this.#bash.flushPending();
 			const bashTransition = this.#bash.beginSessionTransition({ persistDetached: options?.drop !== true });
+			let previousSessionState = this.sessionManager.captureState();
 			let sessionTransitioned = false;
 			try {
 				advisorRecordersDetached = true;
@@ -10586,6 +10587,9 @@ export class AgentSession implements SettingsScope {
 						}
 					} else {
 						await this.sessionManager.flush();
+						// Flush may advance the writer's disk position; rollback must use
+						// the committed snapshot, not the pre-flush size.
+						previousSessionState = this.sessionManager.captureState();
 					}
 					await this.sessionManager.newSession({
 						...options,
@@ -10664,6 +10668,13 @@ export class AgentSession implements SettingsScope {
 				}
 
 				return true;
+			} catch (error) {
+				if (!sessionTransitioned) {
+					// newSession adopts its identity before ensureOnDisk can reject.
+					// Restore the manager before recorder feeds and the agent reconnect.
+					this.sessionManager.restoreState(previousSessionState);
+				}
+				throw error;
 			} finally {
 				if (advisorRecordersDetached) {
 					if (sessionTransitioned) this.#advisors.resetSessionState();
