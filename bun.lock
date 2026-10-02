@@ -296,7 +296,7 @@
     },
     "packages/utils": {
       "name": "@oh-my-pi/pi-utils",
-      "version": "18.4.10",
+      "version": "18.4.10+fork.0af0a52efb",
       "dependencies": {
         "@oh-my-pi/pi-natives": "catalog:",
       },
