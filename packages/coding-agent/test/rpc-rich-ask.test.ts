@@ -274,3 +274,61 @@ describe("RPC rich ask end to end", () => {
 		expect(methods[0], stderr).toBe("select");
 	}, 30_000);
 });
+
+/** Sends `set_ask_dialog` commands to a real RPC process and returns each response's `data`, in order. */
+async function negotiateAskDialog(mode: "rpc" | "rpc-ui", commands: object[]): Promise<unknown[]> {
+	await using temp = await TempDir.create("@rpc-ask-negotiation-");
+	// The quiesce fixture wires the tool UI context exactly as `--mode rpc-ui` does.
+	const child = Bun.spawn([process.execPath, path.join(import.meta.dir, "fixtures", "quiesce-rpc-agent.ts")], {
+		cwd: temp.path(),
+		env: { ...process.env, PI_CODING_AGENT_DIR: temp.path(), PI_NO_TITLE: "1", QUIESCE_FIXTURE_MODE: mode },
+		stdin: "pipe",
+		stdout: "pipe",
+		stderr: "pipe",
+		timeout: 25_000,
+	});
+	const ids = commands.map((_, index) => `ask-${index}`);
+	const data = new Map<string, unknown>();
+	try {
+		for await (const frame of readJsonl<unknown>(child.stdout)) {
+			if (!isRecord(frame)) continue;
+			if (frame.type === "ready") {
+				child.stdin.write(
+					commands
+						.map(
+							(command, index) => `${JSON.stringify({ ...command, id: ids[index], type: "set_ask_dialog" })}\n`,
+						)
+						.join(""),
+				);
+				await child.stdin.flush();
+			}
+			if (frame.type === "response" && typeof frame.id === "string" && ids.includes(frame.id)) {
+				expect(frame.success).toBe(true);
+				data.set(frame.id, frame.data);
+				if (data.size === ids.length) break;
+			}
+		}
+	} finally {
+		child.stdin.end();
+		child.kill();
+		await child.exited;
+	}
+	return ids.map(id => data.get(id));
+}
+
+describe("set_ask_dialog rich negotiation", () => {
+	it("in rpc-ui grants rich only with an enabled dialog, and answers a plain request without a rich key", async () => {
+		const responses = await negotiateAskDialog("rpc-ui", [
+			{ enabled: true, rich: true },
+			{ enabled: false, rich: true },
+			{ enabled: true },
+		]);
+		expect(responses).toEqual([{ enabled: true, rich: true }, { enabled: false, rich: false }, { enabled: true }]);
+	}, 30_000);
+
+	it("in plain rpc, without a tool UI context, refuses rich", async () => {
+		expect(await negotiateAskDialog("rpc", [{ enabled: true, rich: true }])).toEqual([
+			{ enabled: true, rich: false },
+		]);
+	}, 30_000);
+});

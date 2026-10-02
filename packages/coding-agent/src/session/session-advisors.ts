@@ -593,8 +593,6 @@ export class SessionAdvisors {
 	#advisorBoundaryGuidanceLastTurn: number | undefined;
 	#advisorInterruptImmuneTurnStart: number | undefined;
 	#pendingAdvisorCardEvents = new Set<Promise<void>>();
-	/** Primary boundaries currently parked in {@link onPrimaryTurnEnd}'s sync catch-up wait. */
-	#boundarySyncWaits = 0;
 	#advisorYieldQueueUnsubscribe: (() => void) | undefined;
 
 	constructor(host: SessionAdvisorsHost, options: SessionAdvisorsOptions) {
@@ -633,7 +631,6 @@ export class SessionAdvisors {
 		// final, so non-blocker notes must preserve instead of steering a fresh
 		// turn against completed work.
 		this.#advisorTerminalBoundaryOpen = !this.#advisorPrimaryWillContinue;
-		let syncWaiting = false;
 		try {
 			this.#retuneAutoThinkingAdvisors();
 			if (!this.#advisorPrimaryWillContinue) {
@@ -695,13 +692,6 @@ export class SessionAdvisors {
 				const threshold = strict ? 1 : Number.parseInt(syncBacklog, 10);
 				waits.push(scheduled.runtime.waitForCatchup(strict ? undefined : 30_000, threshold, signal));
 			}
-			// A sync wait parks the primary at this boundary and may still deliver advice
-			// when it releases, so it is outstanding work (see pendingWork) until the
-			// boundary closes, even once the reviewer itself has gone idle.
-			if (waits.length > 0) {
-				syncWaiting = true;
-				this.#boundarySyncWaits++;
-			}
 			await Promise.all(waits);
 		} finally {
 			this.#advisorTerminalBoundaryOpen = false;
@@ -715,7 +705,6 @@ export class SessionAdvisors {
 			// keeps them from steering finished work — only a blocker or an
 			// agent-end reviewer's concern may still request a continuation.
 			if (!terminalBoundary) this.#terminalUnwindActive = false;
-			if (syncWaiting) this.#boundarySyncWaits--;
 		}
 	}
 
@@ -953,13 +942,15 @@ export class SessionAdvisors {
 	}
 
 	/**
-	 * Advisor work that can still change the session: card events persisting, reviews queued
-	 * or running, and primary boundaries parked on a sync catch-up wait (`advisor.syncBacklog`
-	 * strict or numeric). Deltas held back by review cadence are not work: nothing reviews
-	 * them until a later boundary schedules a review.
+	 * Advisor work that can still change the session: card events persisting and reviews
+	 * queued or running. A primary boundary parked on a sync catch-up wait
+	 * (`advisor.syncBacklog` strict or numeric) needs no count here: the wait runs inside the
+	 * agent loop's turn-end callback, so the session still reports it as streaming. Deltas
+	 * held back by review cadence are not work: nothing reviews them until a later boundary
+	 * schedules a review.
 	 */
 	pendingWork(): number {
-		let pending = this.#pendingAdvisorCardEvents.size + this.#boundarySyncWaits;
+		let pending = this.#pendingAdvisorCardEvents.size;
 		for (const advisor of this.#advisors) pending += advisor.runtime.pendingWork;
 		return pending;
 	}
