@@ -46,7 +46,7 @@ describe("AgentSession mid-run todo reconciliation nudge", () => {
 	let session: AgentSession;
 	let sessionManager: SessionManager;
 	let reminderEvents: Array<Extract<AgentSessionEvent, { type: "todo_reminder" }>>;
-	let asideProvider: (() => AsideMessage[] | Promise<AsideMessage[]>) | undefined;
+	let asideProvider: ((boundary: { atStopBoundary: boolean }) => AsideMessage[] | Promise<AsideMessage[]>) | undefined;
 
 	const THRESHOLD = 12; // mirrors MID_RUN_TODO_NUDGE_MUTATION_THRESHOLD
 	const MAX_PER_CYCLE = 2; // mirrors MID_RUN_TODO_NUDGE_MAX_PER_CYCLE
@@ -119,7 +119,7 @@ describe("AgentSession mid-run todo reconciliation nudge", () => {
 
 	async function drainNudges(): Promise<CustomMessage[]> {
 		if (!asideProvider) throw new Error("aside provider was never captured");
-		const thunks = await asideProvider();
+		const thunks = await asideProvider({ atStopBoundary: false });
 		const out: CustomMessage[] = [];
 		for (const entry of thunks) {
 			const message = typeof entry === "function" ? entry() : entry;
@@ -278,7 +278,7 @@ describe("AgentSession mid-run todo reconciliation nudge", () => {
 		for (let i = 0; i < THRESHOLD; i++) emitToolResult("edit");
 
 		if (!asideProvider) throw new Error("aside provider was never captured");
-		const result = asideProvider();
+		const result = asideProvider({ atStopBoundary: false });
 		if (result instanceof Promise) throw new Error("aside provider unexpectedly returned a Promise");
 		const nudges = result
 			.map(entry => (typeof entry === "function" ? entry() : entry))
