@@ -32,11 +32,12 @@ describe("--goal launch option", () => {
 		expect(parseArgs(["--goal", "Inspect\nthen fix"]).goal).toBe("Inspect\nthen fix");
 	});
 
-	it("does not consume a following option as the objective", () => {
+	it("rejects a flag-looking objective without letting that flag act", () => {
 		const args = parseArgs(["--goal", "-p", "hello"]);
 		expect(args.invalidFlagValues).toContain("--goal requires an objective.");
-		expect(args.print).toBe(true);
-		expect(args.messages).toEqual(["hello"]);
+		// Like every string flag, `--goal` takes the next token as its value (here rejected):
+		// `-p` never switches to print mode behind the error.
+		expect(args.print).toBeFalsy();
 	});
 
 	it("rejects print mode with a usage exit before a model request", async () => {

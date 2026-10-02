@@ -258,6 +258,9 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 					(equalsValueIndex === -1 && args[i + 1].startsWith("-")))
 			) {
 				result.invalidFlagValues.push("--goal requires an objective.");
+				// Like every string flag, a flag-looking token after `--goal` is its (rejected)
+				// value, never a flag of its own: `--goal --profile work` must not activate a profile.
+				if (i + 1 < args.length && args[i + 1] !== PROFILE_BOOTSTRAP_BOUNDARY_ARG) i++;
 				continue;
 			}
 			if (i + 1 < args.length && args[i + 1] !== PROFILE_BOOTSTRAP_BOUNDARY_ARG) {
