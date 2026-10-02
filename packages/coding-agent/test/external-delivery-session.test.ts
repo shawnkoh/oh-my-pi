@@ -1536,6 +1536,47 @@ describe("external delivery (session)", () => {
 			expect(texts).not.toContain("from-end");
 		});
 
+		// I13i: abort's finally drains stranded asides; folding one emits message_end, and a
+		// subscriber's delivery there must not inherit the hook exemption either.
+		it("a delivery made while a hook-called abort folds a stranded aside stays queued", async () => {
+			const slow = slowTool();
+			const { mock, session: s } = makeSession({ tools: [slow.tool] });
+			let fromEnd: DeliveryHandle | undefined;
+			s.subscribe(event => {
+				if (
+					event.type === "message_end" &&
+					event.message.role === "custom" &&
+					event.message.customType === "ext-aside" &&
+					!fromEnd
+				) {
+					fromEnd = s.deliverExternalMessage(card("from-end"), { mode: "aside" });
+				}
+			});
+			const releaseHold = s.holdTurnDispatch();
+			mock.push(toolCall("slow"));
+			await s.runHostInputHooks(async () => {
+				const run = s.prompt("go");
+				await slow.started;
+				await s.sendCustomMessage(
+					{ customType: "ext-aside", content: "STRANDED", display: false, attribution: "agent" },
+					{ deliverAs: "aside" },
+				);
+				releaseHold();
+				const aborting = s.abort({ reason: USER_INTERRUPT_LABEL });
+				slow.release();
+				await aborting;
+				await run.catch(() => {});
+				// Keep the hook open while the stranded drain runs.
+				for (let i = 0; i < 10; i++) await setImmediate();
+			});
+			await s.waitForIdle();
+			for (let i = 0; i < 5; i++) await setImmediate();
+			expect(fromEnd).toBeDefined();
+			expect(fromEnd?.state()).toBe("queued");
+			const texts = mock.calls.flatMap((_, index) => userTexts(mock, index));
+			expect(texts).not.toContain("from-end");
+		});
+
 		// P1: a slash-prefixed prompt issued during a manual-compaction wait, with a
 		// delivery arriving during that wait, must never be lost to the wake the
 		// parked delivery starts (the window is released only for a matched

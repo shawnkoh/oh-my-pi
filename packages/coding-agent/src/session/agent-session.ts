@@ -1222,6 +1222,13 @@ export class AgentSession implements SettingsScope {
 	 *  Runs whenever the session settles; the guard makes it a no-op when the
 	 *  queue was consumed normally or a new turn already started. */
 	#drainStrandedQueuedMessages(): void {
+		// The drain folds stranded asides and may wake a turn; its event emissions and
+		// everything they start run outside host input's hook scope (an abort's finally or a
+		// dispatch-window close can call it from inside a hook).
+		if (this.#hostInputHookScope.getStore() !== undefined) {
+			this.#hostInputHookScope.exit(() => this.#drainStrandedQueuedMessages());
+			return;
+		}
 		if (this.#abortInProgress) return;
 		// Session transitions (newSession/`/new`, compact, model-switch, session-switch,
 		// dispose) call #disconnectFromAgent() BEFORE `await abort()`, so abort's own
