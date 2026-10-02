@@ -488,6 +488,57 @@ describe("SessionManager cross-process rewrite freshness", () => {
 		await moved.close();
 	});
 
+	it("continues the session through a sibling move, but not through a switch, fork or new session", async () => {
+		using tempDir = TempDir.createSync("@omp-session-continues-");
+		const creator = SessionManager.create(tempDir.path(), tempDir.path(), new FileSessionStorage());
+		await creator.ensureOnDisk();
+		const contested = creator.getSessionFile();
+		if (!contested) throw new Error("Expected session file");
+		creator.appendMessage(userTurn("our turn before the conflict"));
+		await creator.close();
+
+		const storage = new RacedStorage();
+		const ours = await SessionManager.open(contested, tempDir.path(), storage, { suppressBreadcrumb: true });
+		const theirs = await SessionManager.open(contested, tempDir.path(), new FileSessionStorage(), {
+			suppressBreadcrumb: true,
+		});
+		const original = ours.getSessionId();
+		let racingTurns = 0;
+		storage.raced = contested;
+		storage.race = () => theirs.appendMessage(userTurn(`racing turn ${racingTurns++}`));
+		await ours.rewriteEntries();
+		storage.race = undefined;
+
+		const sibling = ours.getSessionId();
+		expect(ours.getSessionFile()).not.toBe(contested);
+		expect(sibling).not.toBe(original);
+		expect(ours.getHeader()?.parentSession).toBe(original);
+		expect(ours.continuesSession(original)).toBe(true);
+		expect(ours.continuesSession(sibling)).toBe(true);
+		expect(ours.continuesSession("unrelated")).toBe(false);
+
+		// Switching to the original file and back to the sibling are session changes, not moves.
+		const siblingFile = ours.getSessionFile();
+		if (!siblingFile) throw new Error("Expected sibling file");
+		await ours.setSessionFile(contested);
+		expect(ours.getSessionId()).toBe(original);
+		expect(ours.continuesSession(sibling)).toBe(false);
+		await ours.setSessionFile(siblingFile);
+		expect(ours.getSessionId()).toBe(sibling);
+		expect(ours.continuesSession(sibling)).toBe(true);
+		expect(ours.continuesSession(original)).toBe(false);
+
+		// A fork also points back through `parentSession`, yet it is another session.
+		await ours.fork();
+		expect(ours.getHeader()?.parentSession).toBe(sibling);
+		expect(ours.continuesSession(sibling)).toBe(false);
+		expect(ours.continuesSession(original)).toBe(false);
+		await ours.newSession();
+		expect(ours.continuesSession(sibling)).toBe(false);
+		await ours.close();
+		await theirs.close();
+	});
+
 	it("recreates a deleted session file in place on the memory backend instead of moving", async () => {
 		const storage = new MemorySessionStorage();
 		const manager = SessionManager.create("/cwd", "/sessions", storage);

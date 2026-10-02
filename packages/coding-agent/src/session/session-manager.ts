@@ -889,6 +889,11 @@ export class SessionManager {
 	/** Every notice raised so far, replayed to each later subscriber. */
 	#persistenceNotices: SessionPersistenceNotice[] = [];
 	/**
+	 * Ids the current session continues through sibling moves ({@link SessionPersistenceNotice}),
+	 * oldest first. Any other id change ({@link #adoptSessionId}) starts a new lineage.
+	 */
+	#siblingLineage: string[] = [];
+	/**
 	 * This process's ownership claim on the file it last wrote (file storage
 	 * only). `release` is unset while another live process holds the file, and
 	 * after {@link close} gave the claim up.
@@ -1140,6 +1145,7 @@ export class SessionManager {
 		const from = this.#sessionFile as string;
 		const previousSessionId = this.#sessionId;
 		const timestamp = nowIso();
+		this.#siblingLineage.push(previousSessionId);
 		this.#sessionId = mintSessionId();
 		const to = path.join(path.dirname(from), `${fileSafeTimestamp(timestamp)}_${this.#sessionId}.jsonl`);
 		this.#header = {
@@ -1830,7 +1836,7 @@ export class SessionManager {
 			this.#sessionDir = path.resolve(options.sessionDir);
 			this.#storage.ensureDirSync(this.#sessionDir);
 		}
-		this.#sessionId = mintSessionId();
+		this.#adoptSessionId(mintSessionId());
 		this.#sessionName = undefined;
 		this.#titleSource = undefined;
 		this.#titleUpdatedAt = "";
@@ -1887,7 +1893,7 @@ export class SessionManager {
 	#applyEntries(header: SessionHeader, entries: SessionEntry[]): void {
 		this.#header = header;
 		this.#entries = entries;
-		this.#sessionId = header.id;
+		this.#adoptSessionId(header.id);
 		this.#sessionName = header.title;
 		this.#titleSource = header.titleSource;
 		this.#titleUpdatedAt = header.timestamp;
@@ -2267,7 +2273,7 @@ export class SessionManager {
 		this.#reconcileSessionDirForFallback();
 
 		const timestamp = nowIso();
-		this.#sessionId = mintSessionId();
+		this.#adoptSessionId(mintSessionId());
 		this.#sessionFile = path.join(this.#sessionDir, `${fileSafeTimestamp(timestamp)}_${this.#sessionId}.jsonl`);
 		this.#expectedDiskSize = null;
 		this.#header = {
@@ -2968,6 +2974,21 @@ export class SessionManager {
 
 	getSessionId(): string {
 		return this.#sessionId;
+	}
+
+	/**
+	 * True when the current session is `sessionId`, or continues it through sibling moves
+	 * only: a move to a fresh file after a write conflict (see {@link SessionPersistenceNotice})
+	 * mints a new id for the same transcript. A fork, branch, new or opened session never does.
+	 */
+	continuesSession(sessionId: string): boolean {
+		return sessionId === this.#sessionId || this.#siblingLineage.includes(sessionId);
+	}
+
+	/** Every id change except a sibling move: a different id ends the sibling lineage. */
+	#adoptSessionId(sessionId: string): void {
+		if (sessionId !== this.#sessionId) this.#siblingLineage = [];
+		this.#sessionId = sessionId;
 	}
 
 	getSessionFile(): string | undefined {
@@ -3720,7 +3741,7 @@ export class SessionManager {
 
 		this.#header = header;
 		this.#entries = [...entriesToKeep, ...labels];
-		this.#sessionId = newSessionId;
+		this.#adoptSessionId(newSessionId);
 		this.#sessionName = header.title;
 		this.#titleSource = header.titleSource;
 		this.#titleUpdatedAt = timestamp;
