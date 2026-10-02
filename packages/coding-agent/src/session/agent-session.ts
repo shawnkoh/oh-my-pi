@@ -1686,7 +1686,12 @@ export class AgentSession implements SettingsScope {
 		const externalDeliveryHost: ExternalDeliveryHost = {
 			isSessionTransitioning: () => this.#sessionTransitionDepth > 0,
 			isDisposed: () => this.#isDisposed,
-			requeue: records => this.#irc.queueAside(records),
+			requeue: records => {
+				// A record handed back (deferred admission, drained but not inserted) is new
+				// pending work for an attestation taken before.
+				this.#activityEpoch++;
+				this.#irc.queueAside(records);
+			},
 			removeQueued: record => {
 				this.#irc.removeRecord(record);
 				const steering = this.agent.peekSteeringQueue();
@@ -3200,7 +3205,10 @@ export class AgentSession implements SettingsScope {
 			this.#irc.pendingCount() +
 			this.yieldQueue.size() +
 			this.#admittedSubmissionCount +
-			this.#queuedInputsInFlight;
+			this.#queuedInputsInFlight +
+			// Every external delivery the session still holds (queued, or accepted but not
+			// settled), including ones outside the queues above.
+			this.#externalDeliveries.pendingCount();
 		const manager = this.#asyncJobManager;
 		if (manager) {
 			// The session that owns the process-wide manager answers for every owner's jobs.
@@ -9278,10 +9286,17 @@ export class AgentSession implements SettingsScope {
 	 * those gates stays queued until a turn drains it. Acceptance fires at the
 	 * loop's commit, never when `agent.prompt()` resolves.
 	 *
-	 * Rejects with a synchronous throw only when the session is disposed.
+	 * Rejects with a synchronous throw only when the session is disposed. Once input admission
+	 * is closed (a passed quiesce or a hang-up), the record is not admitted: the returned handle
+	 * is already `discarded` with reason `admission_closed` and no owner is queued. Every
+	 * admitted record advances the activity epoch and counts as queued input until it settles.
 	 */
 	deliverExternalMessage<T = unknown>(record: CustomMessagePayload<T>, options: DeliveryOptions): DeliveryHandle {
 		if (this.#isDisposed) throw new Error("Cannot deliver to a disposed session");
+		if (this.#admissionClosedBy) {
+			return this.#externalDeliveries.refuse(normalizeCustomMessagePayload<T>(record), options, "admission_closed");
+		}
+		this.#activityEpoch++;
 		if (options.mode !== "aside" && options.mode !== "steer") {
 			throw new Error(`Unknown delivery mode: ${String(options.mode)}`);
 		}

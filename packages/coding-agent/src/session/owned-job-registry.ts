@@ -27,6 +27,7 @@ import {
 	type ShellRunResult,
 	scanProcessesByEnv,
 } from "@oh-my-pi/pi-natives";
+import { TERMINAL_STATES } from "@oh-my-pi/pi-tui/apps/ps-data";
 import { isEnoent, logger } from "@oh-my-pi/pi-utils";
 
 export const OWNED_JOB_REGISTRY_VERSION = 1;
@@ -47,7 +48,8 @@ const REGISTRY_COMMAND_MAX_CHARS = 4_096;
  *   prediction). Shared by every agent process in its scope and not Thread work: it exits on
  *   its own idle timer once no agent process in that scope is connected. Never counted as
  *   outstanding work; services it hosts are recorded separately as `service`.
- * - `service`: a named long-running service started through the launch broker.
+ * - `service`: a named long-running service started through the launch broker. It stays work
+ *   while the broker hosting it lives, even between processes (see `broker`).
  * - `service-start`: a service launch request whose process id is not known yet.
  */
 export type OwnedJobKind =
@@ -98,6 +100,17 @@ export interface OwnedJobStartRecord {
 	 * invocation's work from then on.
 	 */
 	adoptedFrom?: InvocationIdentity;
+	/**
+	 * `service` only: the daemon broker hosting the service. The broker can relaunch the
+	 * service under a new pid (a restart backoff, a `restart` request), so the service is
+	 * work while its broker lives even once `pid` is gone, until a record ends it.
+	 */
+	broker?: ProcessRef;
+	/**
+	 * `service` only: the broker's id for the service and the metadata file where the broker
+	 * publishes its state. Read by the engine only; consumers need not.
+	 */
+	daemon?: { id: string; meta: string };
 	invocationPid: number;
 	/** The `writer` of the header this record belongs to (see {@link RegistryReader}). */
 	writer?: string;
@@ -179,6 +192,12 @@ interface RegistryFileRead {
 
 /** How many of the last consumed bytes a reader re-checks to detect a rewrite in place. */
 const CONSUMED_TAIL_BYTES = 512;
+/** A process identified by pid plus start identity (`null` when it could not be read). */
+export interface ProcessRef {
+	pid: number;
+	startId: string | null;
+}
+
 export interface OwnedProcessInput {
 	kind: "process" | "service" | "internal";
 	pid: number;
@@ -192,6 +211,10 @@ export interface OwnedProcessInput {
 	reparented?: boolean;
 	discovered?: boolean;
 	groupMember?: boolean;
+	/** `service` only: the hosting broker; its identity is read now when not given. */
+	broker?: { pid: number; startId?: string | null };
+	/** `service` only: see {@link OwnedJobStartRecord.daemon}. */
+	daemon?: { id: string; meta: string };
 	/** Stable id; defaults to `<kind>:<pid>:<startId>`. */
 	jobId?: string;
 }
@@ -313,6 +336,45 @@ export function ownedProcessState(pid: number, startId: string | null | undefine
 	return startId == null ? "unreadable" : "alive";
 }
 
+/**
+ * Liveness of the work an open OS-process record stands for: its process, or, for a
+ * `service` record whose process is gone, the broker hosting it — a live broker can still
+ * relaunch the service, so it counts as alive until its broker is gone too.
+ */
+export function recordedWorkState(record: Pick<OwnedJobStartRecord, "pid" | "startId" | "broker">): OwnedProcessState {
+	const own = ownedProcessState(record.pid, record.startId);
+	if (own !== "gone" || !record.broker) return own;
+	return ownedProcessState(record.broker.pid, record.broker.startId);
+}
+
+/** What a daemon broker last published about one service (its `meta.json`). */
+interface ServiceHostState {
+	id: string;
+	state: string;
+	pid?: number;
+	startedAt?: number;
+}
+
+function readServiceHostState(meta: string): ServiceHostState | undefined {
+	try {
+		const decoded: unknown = JSON.parse(fs.readFileSync(meta, "utf8"));
+		const daemon = isRecordObject(decoded) ? decoded.daemon : undefined;
+		if (!isRecordObject(daemon) || typeof daemon.id !== "string" || typeof daemon.state !== "string")
+			return undefined;
+		return {
+			id: daemon.id,
+			state: daemon.state,
+			pid: typeof daemon.pid === "number" && Number.isSafeInteger(daemon.pid) ? daemon.pid : undefined,
+			startedAt:
+				typeof daemon.startedAt === "number" && Number.isSafeInteger(daemon.startedAt)
+					? daemon.startedAt
+					: undefined,
+		};
+	} catch {
+		return undefined;
+	}
+}
+
 function readIdentity(pid: number): ProcessIdentity {
 	try {
 		return processIdentity(pid);
@@ -386,13 +448,21 @@ function isHeader(value: Record<string, unknown>): value is Record<string, unkno
 	);
 }
 
+function isProcessRef(value: unknown): value is ProcessRef {
+	return isRecordObject(value) && Number.isSafeInteger(value.pid) && isStartIdValue(value.startId);
+}
+
 function isStartRecord(value: Record<string, unknown>): value is Record<string, unknown> & OwnedJobStartRecord {
+	const daemon = value.daemon;
 	return (
 		typeof value.jobId === "string" &&
 		typeof value.kind === "string" &&
 		Number.isSafeInteger(value.pid) &&
 		typeof value.inProcess === "boolean" &&
-		isStartIdValue(value.startId)
+		isStartIdValue(value.startId) &&
+		(value.broker === undefined || isProcessRef(value.broker)) &&
+		(daemon === undefined ||
+			(isRecordObject(daemon) && typeof daemon.id === "string" && typeof daemon.meta === "string"))
 	);
 }
 
@@ -667,6 +737,7 @@ export class OwnedJobRegistry {
 		}
 		const jobId = input.jobId ?? `${input.kind}:${input.pid}:${startId ?? "unknown"}`;
 		if (this.#open.has(jobId)) return jobId;
+		const broker = input.broker && this.#pinBroker(input.broker);
 		this.#start({
 			type: "start",
 			jobId,
@@ -682,11 +753,27 @@ export class OwnedJobRegistry {
 			...(input.reparented ? { reparented: true } : {}),
 			...(input.discovered ? { discovered: true } : {}),
 			...(input.groupMember ? { groupMember: true } : {}),
+			...(broker ? { broker } : {}),
+			...(input.daemon ? { daemon: input.daemon } : {}),
 			invocationPid: process.pid,
 			registeredAt: new Date().toISOString(),
 		});
 		this.#ensureMonitor();
 		return jobId;
+	}
+
+	/**
+	 * The identity of a service's broker. A broker that is already gone cannot vouch for the
+	 * service it hosted: the registry stops vouching instead.
+	 */
+	#pinBroker(broker: { pid: number; startId?: string | null }): ProcessRef | undefined {
+		if (broker.startId != null) return { pid: broker.pid, startId: broker.startId };
+		const identity = readIdentity(broker.pid);
+		if (identity.state === "gone") {
+			this.markIncomplete("a service's daemon broker was gone when the service was recorded");
+			return undefined;
+		}
+		return { pid: broker.pid, startId: identity.startId ?? null };
 	}
 
 	/**
@@ -759,14 +846,45 @@ export class OwnedJobRegistry {
 		if (foreignEnded) this.refresh();
 		for (const [jobId, open] of this.#open) {
 			if (open.record.inProcess) continue;
-			if (ownedProcessState(open.record.pid, open.record.startId) === "gone") {
+			if (ownedProcessState(open.record.pid, open.record.startId) !== "gone") {
+				if (open.record.kind !== "internal") alive++;
+			} else if (this.#serviceStillHosted(open.record)) {
+				alive++;
+			} else {
 				if (open.record.kind !== "internal") this.#vanished++;
 				this.end(jobId, "exited");
-			} else if (open.record.kind !== "internal") {
-				alive++;
 			}
 		}
 		return alive;
+	}
+
+	/**
+	 * Whether a `service` record whose own process is gone is still work: its broker is alive
+	 * (or cannot be examined) and has not published the service as terminal. A relaunched
+	 * service whose new process the broker published is recorded as a new `service` record,
+	 * which carries the work from then on. Unreadable broker state counts as still hosted.
+	 */
+	#serviceStillHosted(record: OwnedJobStartRecord): boolean {
+		if (record.kind !== "service" || !record.broker) return false;
+		if (ownedProcessState(record.broker.pid, record.broker.startId) === "gone") return false;
+		if (!record.daemon) return true;
+		const host = readServiceHostState(record.daemon.meta);
+		if (!host) return true;
+		// The broker replaced this service with another of the same name: not this one any more.
+		if (host.id !== record.daemon.id) return false;
+		if (Object.hasOwn(TERMINAL_STATES, host.state)) return false;
+		if (host.pid === undefined || host.startedAt === undefined) return true;
+		const successor = this.registerProcess({
+			kind: "service",
+			jobId: `service:${host.id}:${host.startedAt}`,
+			pid: host.pid,
+			command: record.command,
+			cwd: record.cwd,
+			sleepable: record.sleepable,
+			broker: record.broker,
+			daemon: record.daemon,
+		});
+		return successor === undefined || successor === record.jobId;
 	}
 
 	/**
@@ -1157,7 +1275,7 @@ export class OwnedJobRegistry {
 			}
 			this.#handledForeign.add(recordKey);
 			// The same process (process job ids name pid and start identity) is already tracked.
-			if (this.#open.has(record.jobId) || ownedProcessState(record.pid, record.startId) === "gone") continue;
+			if (this.#open.has(record.jobId) || recordedWorkState(record) === "gone") continue;
 			const { carriedFrom: _carried, writer: _writer, ...rest } = record;
 			adopted.push({
 				...rest,
@@ -1239,12 +1357,14 @@ export interface OwnedJobVerdict {
 	/**
 	 * - `clear`: every invocation ended, every recorded process ended, and a sound owner-marker
 	 *   scan found no live marked process.
-	 * - `blocked`: a recorded or marked process is alive (listed in `live`).
+	 * - `blocked`: a recorded or marked process, or the broker of a recorded service, is alive
+	 *   (listed in `live`).
 	 * - `unknown`: the registry or scan cannot vouch for every process (see `reasons`).
 	 * - `live`: an invocation that wrote the registry is still running; ask it (`attest`).
 	 */
 	status: "clear" | "blocked" | "unknown" | "live";
-	live: Array<{ jobId: string; kind: OwnedJobKind; pid: number; command: string }>;
+	/** `broker`: the live broker that keeps a service whose own process is gone. */
+	live: Array<{ jobId: string; kind: OwnedJobKind; pid: number; command: string; broker?: number }>;
 	reasons: string[];
 }
 
@@ -1274,6 +1394,10 @@ export interface VerifyOwnedJobRegistryOptions {
  * 3. A process is identified by pid plus `startId` (clock-independent; compare for equality
  *    only). It is gone when no process has the pid, it is a zombie, or its `startId` differs;
  *    a process whose identity cannot be read is neither gone nor proven alive (`unknown`).
+ *    A `service` record with a `broker` (pid plus `startId` of the daemon broker hosting it)
+ *    whose own process is gone is still work while that broker is alive (`blocked`; broker
+ *    unreadable → `unknown`): the broker can relaunch it. `broker` or `daemon` present with
+ *    the wrong shape is malformed (rule 1).
  * 4. An invocation still running means the registry is not final (`live`); one that cannot
  *    be examined makes the answer `unknown`.
  * 5. Open in-process records (runs, retained shells, jobs) that never ended mean `unknown`.
@@ -1323,10 +1447,20 @@ export function verifyOwnedJobRegistry(file: string, options: VerifyOwnedJobRegi
 				reasons.push(`${record.kind} ${record.jobId} never ended`);
 				continue;
 			}
-			const state = ownedProcessState(record.pid, record.startId);
+			const state = recordedWorkState(record);
 			if (state === "alive") {
 				if (live.some(entry => entry.pid === record.pid)) continue;
-				live.push({ jobId: record.jobId, kind: record.kind, pid: record.pid, command: record.command });
+				const broker =
+					record.broker && ownedProcessState(record.pid, record.startId) === "gone"
+						? record.broker.pid
+						: undefined;
+				live.push({
+					jobId: record.jobId,
+					kind: record.kind,
+					pid: record.pid,
+					command: record.command,
+					...(broker === undefined ? {} : { broker }),
+				});
 			} else if (state === "unreadable") {
 				reasons.push(`${record.kind} ${record.jobId} (pid ${record.pid}) cannot be examined`);
 			}

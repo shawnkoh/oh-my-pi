@@ -174,6 +174,40 @@ describe.skipIf(process.platform === "win32").each(MODES)("RPC quiesce_and_exit 
 		expect(fs.statSync(file).size).toBe(result.attestation.session.size ?? -1);
 	}, 30_000);
 
+	it("refuses an external delivery sent in the same read as a passing quiesce", async () => {
+		await rpc.request({ id: "p0", type: "prompt", message: "materialize the transcript" });
+		await rpc.waitFor(frame => frame.type === "agent_end", "agent_end");
+		const attest = await rpc.request({ id: "a1", type: "attest", operationId: "op-d", nonce: "n-1" });
+		const record = {
+			customType: "external-card",
+			content: "[card late]",
+			display: true,
+			details: { "omp.llm": { role: "user", content: "late" }, "omp.llm.source": "src-late" },
+		};
+		rpc.send(
+			{
+				id: "q1",
+				type: "quiesce_and_exit",
+				operationId: "op-d",
+				attempt: 1,
+				...boundTo(attest),
+				deadline: Date.now() + 30_000,
+			},
+			{ id: "d1", type: "deliver", record, options: { mode: "steer" } },
+			{ id: "c1", type: "cancel_delivery", deliveryId: "delivery_1" },
+		);
+		const quiesce = await rpc.waitFor(frame => frame.type === "response" && frame.id === "q1", "q1");
+		expect(quiesce.data).toMatchObject({ status: "quiesced", operationId: "op-d" });
+		for (const id of ["d1", "c1"]) {
+			const refused = await rpc.waitFor(frame => frame.type === "response" && frame.id === id, id);
+			expect(refused).toMatchObject({ success: false, code: "admission_closed" });
+		}
+		expect(await withTimeout(rpc.child.exited, 15_000, "RPC process did not exit")).toBe(0);
+		expect(rpc.frames.some(frame => typeof frame.type === "string" && frame.type.startsWith("delivery_"))).toBe(
+			false,
+		);
+	}, 30_000);
+
 	it("refuses when a prompt shares the read with the quiesce, runs the prompt, and exits on a fresh attempt", async () => {
 		const file = await sessionFile();
 		const attest = await rpc.request({ id: "a1", type: "attest", operationId: "op-2", nonce: "n-1" });

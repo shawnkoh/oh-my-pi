@@ -13,6 +13,7 @@ import { logger } from "@oh-my-pi/pi-utils";
 import { cfgGoalContinuationModes, cfgGoalEnabled } from "../../goals/settings";
 import { type GoalModeState, goalContinuationActivity, goalFromModeData } from "../../goals/state";
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
+import type { GoalContinuationReservation } from "../../session/quiescence";
 import { nextActionableTask } from "../../tools/todo";
 
 /** `goal.continuationModes` value that enables automatic continuation for RPC hosts. */
@@ -50,6 +51,7 @@ export type RpcGoalSession = Pick<
 	| "isSessionTransitioning"
 	| "hasAdmittedSubmission"
 	| "queuedMessageCount"
+	| "reserveGoalContinuation"
 >;
 
 export class RpcGoalController {
@@ -69,6 +71,8 @@ export class RpcGoalController {
 	#hostStopped = false;
 	/** A continuation has been decided and is waiting for the session to go idle. */
 	#continuationScheduled = false;
+	/** Holds a scheduled continuation as session work (quiesce) until it is submitted or dropped. */
+	#reservation: GoalContinuationReservation | undefined;
 	/** Bumped by a host abort or session change; a waiting continuation from before is void. */
 	#continuationGeneration = 0;
 	/** Tool-set restoration triggered by session events; commands and reads wait for it. */
@@ -118,7 +122,7 @@ export class RpcGoalController {
 	stopForHostAbort(): void {
 		this.#hostStopped = true;
 		this.#suppressContinuation = true;
-		this.#continuationScheduled = false;
+		this.#dropScheduled();
 		this.#continuationGeneration++;
 	}
 
@@ -154,7 +158,7 @@ export class RpcGoalController {
 			this.#heldDuringChange = this.#continuationScheduled || this.#continuationWanted();
 		}
 		if (this.#reconcilesPending > 0) this.#changeOverlappedReconcile = true;
-		this.#continuationScheduled = false;
+		this.#dropScheduled();
 		this.#continuationGeneration++;
 		await this.#exitTask;
 	}
@@ -319,7 +323,7 @@ export class RpcGoalController {
 	async #reconcileOnce(): Promise<void> {
 		// Goal state and the goal tool belong to the session that set them; the
 		// session itself keeps both across a switch, so clear them here first.
-		this.#continuationScheduled = false;
+		this.#dropScheduled();
 		this.#continuationGeneration++;
 		await this.#exitTask;
 		await this.#exit();
@@ -404,6 +408,13 @@ export class RpcGoalController {
 		);
 	}
 
+	/** Drop the scheduled continuation and release its quiesce reservation. */
+	#dropScheduled(): void {
+		this.#continuationScheduled = false;
+		this.#reservation?.release();
+		this.#reservation = undefined;
+	}
+
 	/**
 	 * Decide at a yield to continue the goal; admit the continuation once the yielding
 	 * run has fully unwound. While waiting, {@link continuationPending} is true, so no
@@ -417,6 +428,11 @@ export class RpcGoalController {
 			return;
 		}
 		if (this.#continuationScheduled || !this.#continuationWanted()) return;
+		// Refused while the session is closed to input (quiesce/exit); otherwise the
+		// continuation counts as pending work until it is submitted or dropped.
+		const reservation = this.#session.reserveGoalContinuation();
+		if (!reservation) return;
+		this.#reservation = reservation;
 		this.#continuationScheduled = true;
 		const generation = this.#continuationGeneration;
 		void (async () => {
@@ -428,7 +444,9 @@ export class RpcGoalController {
 				this.#onContinuationDropped?.();
 				return;
 			}
-			this.#continuationScheduled = false;
+			// Released here, in the same synchronous step as promptCustomMessage admits the
+			// prompt below (or the continuation drops), so a quiesce never sees neither.
+			this.#dropScheduled();
 			const session = this.#session;
 			const idle =
 				!session.isStreaming &&
@@ -459,7 +477,7 @@ export class RpcGoalController {
 				},
 			);
 		})().catch(error => {
-			this.#continuationScheduled = false;
+			this.#dropScheduled();
 			this.#onContinuationDropped?.();
 			reportControllerError(error);
 		});
