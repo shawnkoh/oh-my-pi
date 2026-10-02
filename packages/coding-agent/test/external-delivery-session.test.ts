@@ -1220,6 +1220,115 @@ describe("external delivery (session)", () => {
 			},
 		);
 
+		// J1: the H2 coverage lasts only while the hook runs. Once it returned, a later
+		// interrupt or plan mode holds its parked record, and nothing it woke pulls in
+		// records delivered outside the hook.
+		it.each(["a user abort", "plan mode"] as const)(
+			"a hook's parked record and an outside aside stay queued under %s that comes after the hook returned (J1)",
+			async gate => {
+				const inCommand = Promise.withResolvers<void>();
+				const releaseCommand = Promise.withResolvers<void>();
+				const { mock, session: s } = makeSession({
+					customCommands: [
+						{
+							path: "local.ts",
+							resolvedPath: "/virtual/local.ts",
+							source: "project",
+							command: {
+								name: "local",
+								description: "handled locally after an await",
+								execute: async () => {
+									inCommand.resolve();
+									await releaseCommand.promise;
+									return "";
+								},
+							},
+						},
+					],
+				});
+				const localCommand = s.prompt("/local");
+				await inCommand.promise;
+				const releaseHold = s.holdTurnDispatch();
+				const fromHook = await s.runHostInputHooks(async () =>
+					s.deliverExternalMessage(card("from-hook"), { mode: "aside" }),
+				);
+				releaseHold();
+				const outside = s.deliverExternalMessage(card("outside"), { mode: "aside" });
+				if (gate === "plan mode") s.setPlanModeState({ enabled: true, planFilePath: "local://PLAN.md" });
+				else await s.abort({ reason: USER_INTERRUPT_LABEL });
+				releaseCommand.resolve();
+				await expect(localCommand).resolves.toBe(false);
+				await s.waitForIdle();
+				for (let i = 0; i < 5; i++) await setImmediate();
+				expect(fromHook.state()).toBe("queued");
+				expect(outside.state()).toBe("queued");
+				expect(mock.calls).toHaveLength(0);
+			},
+		);
+
+		it("a tool's delivery inside the turn a hook's delivery woke stays queued after a user abort (J1)", async () => {
+			const holder: { session?: AgentSession; fromTool?: DeliveryHandle } = {};
+			const started = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const deliverer: AgentTool = {
+				name: "deliverer",
+				label: "deliverer",
+				description: "Delivers an aside, then blocks until released",
+				parameters: type({}),
+				execute: async () => {
+					holder.fromTool = holder.session?.deliverExternalMessage(card("from-tool"), { mode: "aside" });
+					started.resolve();
+					await release.promise;
+					return { content: [{ type: "text", text: "deliverer_DONE" }] };
+				},
+			};
+			const { mock, session: s } = makeSession({ tools: [deliverer] });
+			holder.session = s;
+			mock.push(toolCall("deliverer"));
+			const releaseHold = s.holdTurnDispatch();
+			// The hook keeps its scope open across the turn its own delivery wakes.
+			const hook = s.runHostInputHooks(async () => {
+				const handle = s.deliverExternalMessage(card("from-hook"), { mode: "aside" });
+				await handle.settled;
+				return handle;
+			});
+			await started.promise;
+			const aborting = s.abort({ reason: USER_INTERRUPT_LABEL });
+			release.resolve();
+			await aborting;
+			await hook;
+			releaseHold();
+			const callsAtAbort = mock.calls.length;
+			await s.waitForIdle();
+			for (let i = 0; i < 5; i++) await setImmediate();
+			expect(holder.fromTool?.state()).toBe("queued");
+			expect(mock.calls).toHaveLength(callsAtAbort);
+		});
+
+		// J2: a hook's own delivery parked as a pooled deferred wake must wake once the pool
+		// clears while only the hook's host hold remains; that hold lasts until the hook returns.
+		it("a hook's own delivery parked while pooled wakes when the pool clears under its host hold (J2)", async () => {
+			const { mock, session: s } = makeSession();
+			await s.setWorkPoolYieldItems([{ id: "pool#1", index: 1 }]);
+			const releaseHold = s.holdTurnDispatch();
+			mock.push({ content: ["hook delivery handled"] });
+			const hook = s.runHostInputHooks(async () => {
+				const handle = s.deliverExternalMessage(card("from-hook"), { mode: "aside" });
+				await handle.accepted;
+				return handle;
+			});
+			for (let i = 0; i < 5; i++) await setImmediate();
+			expect(mock.calls).toHaveLength(0);
+			await s.setWorkPoolYieldItems([]);
+			// Without the deferred-wake drain the hook never completes (the test times out).
+			const handle = await hook;
+			releaseHold();
+			expect((await handle.settled).included).toBe(true);
+			await s.waitForIdle();
+			expect(mock.calls).toHaveLength(1);
+			expect(userTexts(mock, 0)).toContain("from-hook");
+		});
+
 		// P1: a slash-prefixed prompt issued during a manual-compaction wait, with a
 		// delivery arriving during that wait, must never be lost to the wake the
 		// parked delivery starts (the window is released only for a matched

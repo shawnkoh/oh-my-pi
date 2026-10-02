@@ -278,21 +278,23 @@ hold turn dispatch. Wait for `delivery_accepted` and `delivery_settled` to learn
 actually happened. Cancellation succeeds only before acceptance.
 
 An extension input hook may deliver a record itself (`pi.deliverMessage`) and wait for
-it to be accepted. Such a delivery, made inside the hook or in anything the hook awaits,
-is never held behind these holds: they belong to the hook's own input and to input
-queued behind it, which cannot proceed until the hook returns, so holding it would hang
-every later input. For the same reason it counts as part of that host input: a host
-`abort` still in effect or plan mode does not hold it either, as if it had set
-`wakeAfterInterrupt` and `wakeInPlanMode` (the interrupt itself stays in effect until
-host input clears it). The record wakes the idle session at once, and the input then
-meets that running turn: a `prompt` without `streamingBehavior`, or an
-`abort_and_prompt`, is refused as busy (a same-id error response with the busy message
-and a `prompt_result` with `status: "error"`); a `prompt` with `streamingBehavior`, a
-`steer` or a `follow_up` is queued into the turn. A prompt's own setup window (an
-earlier admitted prompt still setting up its turn) does hold it; when that window
-closes without starting a turn, the record wakes then, still exempt from the host's
-holds while the hook runs and still not held by the interrupt or plan mode. The
-exemption from holds ends when the hook returns.
+it to be accepted. Such a delivery, made inside the hook or in anything the hook awaits
+while no turn is running, is never held behind these holds while the hook runs: they
+belong to the hook's own input and to input queued behind it, which cannot proceed until
+the hook returns, so holding it would hang every later input. For the same reason, while
+the hook runs it counts as part of that host input: a host `abort` still in effect or
+plan mode does not hold it either, as if it had set `wakeAfterInterrupt` and
+`wakeInPlanMode` (the interrupt itself stays in effect until host input clears it). The
+record wakes the idle session at once, and the input then meets that running turn: a
+`prompt` without `streamingBehavior`, or an `abort_and_prompt`, is refused as busy (a
+same-id error response with the busy message and a `prompt_result` with
+`status: "error"`); a `prompt` with `streamingBehavior`, a `steer` or a `follow_up` is
+queued into the turn. A prompt's own setup window (an earlier admitted prompt still
+setting up its turn) does hold it; when that window closes without starting a turn while
+the hook still runs, the record wakes then, still exempt from the host's holds, the
+interrupt and plan mode. Every exemption ends when the hook returns: a record still parked
+then waits like any other delivery, and a delivery made inside the turn the hook's record
+woke (a tool's, for instance) is ordinary delivery.
 
 ### Login
 

@@ -276,9 +276,10 @@ export class ExternalDeliveryOwner {
 	deferrals = 0;
 	requests = 0;
 	/**
-	 * Scope of the held host input's hooks that made this delivery (`AgentSession.runHostInputHooks`).
-	 * The input covers it as host action, so plan mode and a host interrupt never gate its wake;
-	 * while the scope is `open` it also ignores host-input dispatch holds, wherever it is parked.
+	 * Scope of the held host input's hooks that made this delivery while no turn was running
+	 * (`AgentSession.runHostInputHooks`). While the scope is `open` the input covers it as host
+	 * action: plan mode and a host interrupt never gate its wake, and it ignores host-input
+	 * dispatch holds wherever it is parked.
 	 */
 	hostInputHooks: { readonly open: boolean } | undefined;
 	included = false;
