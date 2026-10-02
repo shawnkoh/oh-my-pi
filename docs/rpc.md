@@ -314,11 +314,12 @@ while the hook runs:
   `accepted` nor `discarded`.
 - While the session's agent subscription is disconnected for compaction or a session
   transition, even a hook's own delivery stays queued, not accepted. Reconnection and
-  the stranded drain resume it (or the transition discards it). A failed, uncommitted
-  new-session or switch operation restores the retained manager identity and transcript
-  before reconnecting, including when flushing or persisting the new session header
-  fails. Its parked deliveries resume after the transition ends; subsequent provider
-  requests retain the same conversation as the persisted transcript.
+  the stranded drain resume it (or the transition discards it). Failed transitions
+  reconnect without changing upstream's reset, persistence, or rollback semantics:
+  new-session resets the agent before persistence and does not roll back the manager
+  (a failed new header write leaves the new empty session, including with `drop: true`);
+  switch-session retains upstream's `restoreState` rollback. Retained deliveries resume
+  after the transition ends; this is a connectivity guarantee, not a storage transaction.
   Start/await a compaction the hook calls before awaiting its delivery's acceptance;
   an observer must not await acceptance that depends on its own operation completing.
 - Make the delivery in the hook's async context. A delivery handed to code that runs in

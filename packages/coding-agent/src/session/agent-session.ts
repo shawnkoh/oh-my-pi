@@ -10573,12 +10573,14 @@ export class AgentSession implements SettingsScope {
 			this.#closeAllProviderSessions("new session");
 			await this.#bash.flushPending();
 			const bashTransition = this.#bash.beginSessionTransition({ persistDetached: options?.drop !== true });
-			let previousSessionState = this.sessionManager.captureState();
 			let sessionTransitioned = false;
 			try {
 				advisorRecordersDetached = true;
 				await this.#advisors.drainAndDetachRecorders();
 				try {
+					this.#releaseQueuedTtsrReservations();
+					this.agent.reset();
+					this.tokenRate.reset();
 					if (options?.drop && previousSessionFile) {
 						try {
 							await this.sessionManager.dropSession(previousSessionFile);
@@ -10587,17 +10589,11 @@ export class AgentSession implements SettingsScope {
 						}
 					} else {
 						await this.sessionManager.flush();
-						// Flush may advance the writer's disk position; rollback must use
-						// the committed snapshot, not the pre-flush size.
-						previousSessionState = this.sessionManager.captureState();
 					}
 					await this.sessionManager.newSession({
 						...options,
 						additionalDirectories: cfgWorkspaceAdditionalDirectories.get(this.settings),
 					});
-					this.#releaseQueuedTtsrReservations();
-					this.agent.reset();
-					this.tokenRate.reset();
 					this.#bash.markSessionTransition(bashTransition);
 					// The new session owns the transcript from here, so the previous
 					// conversation's advisor spend is retired with it. Clearing at the commit
@@ -10668,13 +10664,6 @@ export class AgentSession implements SettingsScope {
 				}
 
 				return true;
-			} catch (error) {
-				if (!sessionTransitioned) {
-					// newSession adopts its identity before ensureOnDisk can reject.
-					// Restore the manager before recorder feeds and the agent reconnect.
-					this.sessionManager.restoreState(previousSessionState);
-				}
-				throw error;
 			} finally {
 				if (advisorRecordersDetached) {
 					if (sessionTransitioned) this.#advisors.resetSessionState();
@@ -10682,8 +10671,8 @@ export class AgentSession implements SettingsScope {
 				}
 			}
 		} finally {
-			// Includes abort, bash flushing and persistence failures before the commit.
-			// The transition scope re-offers retained deliveries after reconnecting.
+			// Preserve upstream failure state; only repair the disconnected subscription.
+			// The transition scope re-offers retained deliveries through the stranded drain.
 			if (!this.#isDisposed) this.#reconnectToAgent();
 		}
 	}

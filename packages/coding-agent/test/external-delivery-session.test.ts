@@ -1663,42 +1663,54 @@ describe("external delivery (session)", () => {
 			},
 		);
 
-		it("I13l failed new-session header persistence retains identity and replayable provider context", async () => {
-			const dir = path.join(tempDir.path(), "sessions");
-			const manager = SessionManager.create(tempDir.path(), dir);
-			const { mock, agent, session: s } = makeSession({ sessionManager: manager });
-			await s.prompt("OLD-TRANSCRIPT");
-			await manager.ensureOnDisk();
-			await manager.flush();
-			const previousId = manager.getSessionId();
-			const previousFile = manager.getSessionFile()!;
-			const previousMessages = [...agent.state.messages];
-			const failure = new Error("injected new header persistence failure");
-			const ensure = spyOn(manager, "ensureOnDisk").mockRejectedValueOnce(failure);
-			try {
-				await expect(s.newSession()).rejects.toBe(failure);
-			} finally {
-				ensure.mockRestore();
-			}
-			expect(manager.getSessionId()).toBe(previousId);
-			expect(manager.getSessionFile()).toBe(previousFile);
-			expect(manager.buildSessionContext().messages).toEqual(previousMessages);
-			expect(agent.state.messages).toEqual(previousMessages);
-
-			await s.prompt("AFTER-FAILURE");
-			await manager.flush();
-			const reopened = await SessionManager.open(previousFile, dir);
-			expect(reopened.getSessionId()).toBe(previousId);
-			const transcript = (messages: Message[]) =>
-				messages.map(message => ({ role: message.role, content: message.content }));
-			expect(transcript(convertToLlm(reopened.buildSessionContext().messages))).toEqual(
-				transcript(convertToLlm(agent.state.messages)),
-			);
-			expect(userTexts(mock, 1)).toEqual(["OLD-TRANSCRIPT", "AFTER-FAILURE"]);
-			expect(transcript(mock.calls[1].context.messages)).toEqual(
-				transcript(convertToLlm(reopened.buildSessionContext().messages.slice(0, -1))),
-			);
-		});
+		it.each([false, true])(
+			"I13m failed new-session header persistence (drop: %s) keeps upstream empty state and resumes deliveries",
+			async drop => {
+				const dir = path.join(tempDir.path(), "sessions");
+				const manager = SessionManager.create(tempDir.path(), dir);
+				const { mock, agent, session: s } = makeSession({ sessionManager: manager });
+				await s.prompt("OLD-TRANSCRIPT");
+				await manager.ensureOnDisk();
+				await manager.flush();
+				const previousId = manager.getSessionId();
+				const reached = Promise.withResolvers<void>();
+				const finish = Promise.withResolvers<void>();
+				const failure = new Error("injected new header persistence failure");
+				const ensure = spyOn(manager, "ensureOnDisk").mockImplementationOnce(async () => {
+					reached.resolve();
+					await finish.promise;
+					throw failure;
+				});
+				const releaseHold = s.holdTurnDispatch();
+				let parked: DeliveryHandle;
+				try {
+					const transition = s.newSession({ drop }).catch(error => error);
+					await reached.promise;
+					parked = s.deliverExternalMessage(card("parked"), { mode: "aside" });
+					for (let i = 0; i < 10; i++) await setImmediate();
+					expect(parked.state()).toBe("queued");
+					finish.resolve();
+					expect(await transition).toBe(failure);
+					expect(manager.getSessionId()).not.toBe(previousId);
+					expect(manager.buildSessionContext().messages).toEqual([]);
+					expect(agent.state.messages).toEqual([]);
+				} finally {
+					finish.resolve();
+					ensure.mockRestore();
+					releaseHold();
+				}
+				expect((await parked.settled).included).toBe(true);
+				const next = s.deliverExternalMessage(card("after-failure"), { mode: "aside" });
+				expect((await next.settled).included).toBe(true);
+				expect(userTexts(mock, 1)).toEqual(["parked"]);
+				await manager.flush();
+				const reopened = await SessionManager.open(manager.getSessionFile()!, dir);
+				// Persisted replies prove the agent subscription was reconnected.
+				expect(
+					convertToLlm(reopened.buildSessionContext().messages).map(({ role, content }) => ({ role, content })),
+				).toEqual(convertToLlm(agent.state.messages).map(({ role, content }) => ({ role, content })));
+			},
+		);
 
 		it.each(["new", "switch"] as const)(
 			"I13k failed %s flush resumes parked and subsequent hook deliveries",
@@ -1737,7 +1749,8 @@ describe("external delivery (session)", () => {
 						await Promise.all([parked, next].map(handle => Promise.race([handle.accepted, handle.discarded])));
 						expect((await parked.settled).included).toBe(true);
 						expect((await next.settled).included).toBe(true);
-						expect(userTexts(mock, 1)).toContain("seed");
+						if (action === "switch") expect(userTexts(mock, 1)).toContain("seed");
+						else expect(userTexts(mock, 1)).not.toContain("seed");
 					});
 				} finally {
 					finish.resolve();
