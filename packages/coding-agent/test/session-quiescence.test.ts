@@ -13,6 +13,9 @@ import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensi
 import type { ExtensionFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import type { DeliveryHandle } from "@oh-my-pi/pi-coding-agent/session/external-delivery";
+import { IrcBridge } from "@oh-my-pi/pi-coding-agent/session/irc-bridge";
+import type { CustomMessagePayload } from "@oh-my-pi/pi-coding-agent/session/messages";
 import {
 	type OwnedJobRecord,
 	ownedJobRegistryPath,
@@ -521,6 +524,84 @@ describe("AgentSession quiesce-and-exit", () => {
 			}
 		},
 	);
+
+	/** An external-delivery record (`external-delivery/1`) with its required provider projection. */
+	function deliveryCard(text: string): CustomMessagePayload {
+		return {
+			customType: "external-card",
+			content: `[card ${text}]`,
+			display: true,
+			details: { "omp.llm": { role: "user", content: [{ type: "text", text }] }, "omp.llm.source": `src-${text}` },
+		};
+	}
+
+	/** Deliver an aside the session holds without waking (plan mode, no `wakeInPlanMode`). */
+	function holdDelivery(s: AgentSession, text: string): DeliveryHandle {
+		s.setPlanModeState({ enabled: true, planFilePath: "local://PLAN.md" });
+		const held = s.deliverExternalMessage(deliveryCard(text), { mode: "aside" });
+		expect(held.state()).toBe("queued");
+		return held;
+	}
+
+	it("refuses while an external delivery is held, and passes once it is cancelled", async () => {
+		const s = createSession();
+		await s.prompt("materialize the transcript");
+		const held = holdDelivery(s, "held");
+		expect(s.getWorkCounts().queuedInput).toBeGreaterThan(0);
+		expect(s.quiesceForExit(request(s))).toMatchObject({ status: "refused", reason: "work_active" });
+		expect(held.cancel()).toBe(true);
+		expect(s.quiesceForExit(request(s, { attempt: 2 }))).toMatchObject({ status: "quiesced" });
+		expect(mock.calls.length).toBe(1);
+	});
+
+	it("counts a held external delivery even while no host queue lists it", async () => {
+		const s = createSession();
+		await s.prompt("materialize the transcript");
+		holdDelivery(s, "held");
+		// Owners can sit outside every counted queue (handed back, parked, snapshotted by a
+		// transition): the delivery itself is what counts.
+		vi.spyOn(IrcBridge.prototype, "pendingCount").mockReturnValue(0);
+		expect(s.quiesceForExit(request(s))).toMatchObject({ status: "refused", reason: "work_active" });
+	});
+
+	it("refuses a quiesce built before a delivery was admitted, even once it is gone again", async () => {
+		const s = createSession();
+		await s.prompt("materialize the transcript");
+		// Held, so the delivery neither starts a turn nor leaves anything counted once cancelled.
+		s.setPlanModeState({ enabled: true, planFilePath: "local://PLAN.md" });
+		const req = request(s);
+		const held = s.deliverExternalMessage(deliveryCard("brief"), { mode: "aside" });
+		expect(held.cancel()).toBe(true);
+		expect(s.getWorkCounts().queuedInput).toBe(0);
+		expect(s.quiesceForExit(req)).toMatchObject({ status: "refused", reason: "epoch_mismatch" });
+	});
+
+	it("never accepts an external delivery after a pass: the handle is already discarded", async () => {
+		const s = createSession();
+		await s.prompt("materialize the transcript");
+		expect(s.quiesceForExit(request(s))).toMatchObject({ status: "quiesced" });
+		const epoch = s.activityEpoch;
+		const late = s.deliverExternalMessage(deliveryCard("late"), { mode: "steer" });
+		expect(late.state()).toBe("discarded");
+		expect(await late.discarded).toEqual({ reason: "admission_closed" });
+		expect(late.cancel()).toBe(false);
+		expect(s.listExternalDeliveries()).toEqual([]);
+		expect(s.activityEpoch).toBe(epoch);
+		await s.waitForIdle();
+		expect(mock.calls.length).toBe(1);
+	});
+
+	it("records a hang-up with a held external delivery as interrupted", async () => {
+		const s = createSession();
+		await s.prompt("materialize the transcript");
+		const held = holdDelivery(s, "held");
+		await s.dispose({ reason: postmortem.Reason.SIGHUP });
+		session = undefined;
+		const onDisk = readAttestation(s);
+		expect(onDisk).toMatchObject({ kind: "hangup", signal: "sighup", interrupted: true });
+		expect(onDisk.counts.queuedInput).toBeGreaterThan(0);
+		expect(await held.discarded).toEqual({ reason: "disposed" });
+	});
 
 	it("starts no scheduled continuation after a pass", async () => {
 		const s = createSession();

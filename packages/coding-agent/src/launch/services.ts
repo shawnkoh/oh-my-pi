@@ -6,7 +6,8 @@ import { formatDuration, replaceTabs } from "@oh-my-pi/pi-tui/render/render-util
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { getDaemonRuntimeDir, sanitizeText } from "@oh-my-pi/pi-utils";
 import { type DaemonBrokerClient, daemonClientForProject } from "./client";
-import { canonicalProjectDir } from "./paths";
+import { canonicalProjectDir, daemonMetadataPath } from "./paths";
+import { readLiveDaemonBrokerPid } from "./presence";
 import type { DaemonOperation, DaemonRpcResult } from "./protocol";
 import { renderTerminalOutputIsolated } from "./terminal-output-worker-client";
 import type { ToolSession } from "../tools";
@@ -242,11 +243,12 @@ export async function startService(
 			signal,
 		);
 		if (result.op !== "start") throw new Error("Unexpected daemon start response");
-		recordServiceProcess(registry, result.daemon, {
-			command: params.command,
-			cwd: spec.cwd ?? null,
-			sleepable: params.sleepable === true,
-		});
+		recordServiceProcess(
+			registry,
+			result.daemon,
+			{ command: params.command, cwd: spec.cwd ?? null, sleepable: params.sleepable === true },
+			await serviceHost(session, result.daemon.name),
+		);
 	} catch (error) {
 		// Aborted, timed out, failed in transit or answered unexpectedly: the broker may still
 		// have started the service, and its pid was never reported.
@@ -262,17 +264,37 @@ export async function startService(
 	};
 }
 
+/** Where a service runs: the broker serving its scope, and the file the broker publishes it in. */
+interface ServiceHost {
+	/** Pid in the scope's broker lease; `undefined` when no live broker is recorded there. */
+	brokerPid: number | undefined;
+	meta: string;
+}
+
+async function serviceHost(session: ToolSession, name: string): Promise<ServiceHost> {
+	const client = await daemonClientForProject(session.cwd);
+	return {
+		brokerPid: await readLiveDaemonBrokerPid(client.runtimeDir),
+		meta: daemonMetadataPath(client.runtimeDir, name),
+	};
+}
+
 /**
- * Record the process a service runs as. `sleepable` is the value given when the service was
+ * Record the process a service runs as, with the broker hosting it: the broker can relaunch
+ * the service under a new pid, so the record stays work while that broker lives (see
+ * `OwnedJobStartRecord.broker`). `sleepable` is the value given when the service was
  * started; a restart (e.g. a mode change) keeps it rather than deciding it again.
  */
 function recordServiceProcess(
 	registry: OwnedJobRegistry | undefined,
 	daemon: DaemonSnapshot,
 	spawn: { command: string; cwd: string | null; sleepable: boolean },
+	host: ServiceHost,
 ): void {
 	if (!registry) return;
 	if (daemon.pid !== undefined) {
+		// Without the broker the record would read as ended while the broker relaunches it.
+		if (host.brokerPid === undefined) registry.markIncomplete("a service's daemon broker could not be identified");
 		registry.registerProcess({
 			kind: "service",
 			jobId: `service:${daemon.id}:${daemon.startedAt}`,
@@ -280,6 +302,8 @@ function recordServiceProcess(
 			command: spawn.command,
 			cwd: spawn.cwd,
 			sleepable: spawn.sleepable,
+			broker: host.brokerPid === undefined ? undefined : { pid: host.brokerPid },
+			daemon: { id: daemon.id, meta: host.meta },
 		});
 	} else if (!TERMINAL_STATES[daemon.state]) {
 		registry.markIncomplete("service started without a reported pid");
@@ -326,11 +350,16 @@ export async function modeService(
 	const previous = registry
 		?.openJobs()
 		.find(record => record.kind === "service" && record.jobId.startsWith(`service:${daemon.id}:`));
-	recordServiceProcess(registry, daemon, {
-		command: previous?.command ?? daemon.name,
-		cwd: previous?.cwd ?? null,
-		sleepable: previous?.sleepable ?? false,
-	});
+	recordServiceProcess(
+		registry,
+		daemon,
+		{
+			command: previous?.command ?? daemon.name,
+			cwd: previous?.cwd ?? null,
+			sleepable: previous?.sleepable ?? false,
+		},
+		await serviceHost(session, daemon.name),
+	);
 	return daemon;
 }
 

@@ -376,6 +376,8 @@ describe("RpcGoalController continuation gate", () => {
 		resumed.resolve();
 		let threadResumes = 0;
 		const transcript = { id: "t1" };
+		/** Goal-continuation reservations the session currently holds (quiesce work). */
+		const reservations = { held: 0 };
 		const session = {
 			settings: Settings.isolated({ "goal.continuationModes": ["rpc"] }),
 			// Provider-facing id pinned by the host: must not be used to detect a session change.
@@ -443,6 +445,17 @@ describe("RpcGoalController continuation gate", () => {
 			},
 			promptCustomMessage: (message: { customType: string }) => admit(message.customType),
 			waitForIdle: () => idle.promise,
+			reserveGoalContinuation: () => {
+				reservations.held++;
+				let released = false;
+				return {
+					release: () => {
+						if (released) return;
+						released = true;
+						reservations.held--;
+					},
+				};
+			},
 		};
 		let dropped = 0;
 		const controller = new RpcGoalController(session as unknown as RpcGoalSession, () => dropped++);
@@ -462,6 +475,7 @@ describe("RpcGoalController continuation gate", () => {
 			},
 			releaseResume: () => resumed.resolve(),
 			dropped: () => dropped,
+			reservations,
 			/** Hold waitForIdle until {@link release}. */
 			hold: () => {
 				idle = Promise.withResolvers<void>();
@@ -469,6 +483,38 @@ describe("RpcGoalController continuation gate", () => {
 			release: () => idle.resolve(),
 		};
 	}
+
+	test("a stale continuation task never releases the reservation of a newer one", async () => {
+		const heldAtAdmission: number[] = [];
+		const fake = fakeSession(async () => {
+			heldAtAdmission.push(fake.reservations.held);
+			return true;
+		});
+		const { controller, reservations } = fake;
+
+		// Continuation 1 is decided and its task waits for the session to go idle.
+		fake.hold();
+		controller.observe(agentEnd);
+		await nextMacrotask();
+		expect(reservations.held).toBe(1);
+		// The host aborts (releasing 1), then re-arms; continuation 2 is decided.
+		controller.stopForHostAbort();
+		expect(reservations.held).toBe(0);
+		controller.observe(hostInput);
+		controller.observe(agentEnd);
+		expect(reservations.held).toBe(1);
+		// Task 1 wakes while continuation 2 still waits on a later idle.
+		fake.release();
+		fake.hold();
+		await nextMacrotask();
+		expect(controller.continuationPending).toBe(true);
+		expect(reservations.held).toBe(1);
+		// Continuation 2 is admitted, its reservation handed over in the same step.
+		fake.release();
+		await nextMacrotask();
+		expect(heldAtAdmission).toEqual([0]);
+		expect(reservations.held).toBe(0);
+	});
 
 	test("a continuation decided before the session closes is never admitted after it", async () => {
 		const admitted: string[] = [];
@@ -497,6 +543,65 @@ describe("RpcGoalController continuation gate", () => {
 		controller.observe(agentEnd);
 		await nextMacrotask();
 		expect(admitted).toEqual(["goal-continuation"]);
+	});
+
+	test("a host abort of a continuation turn that ran a tool admits no further continuation", async () => {
+		const admitted: string[] = [];
+		const { controller } = fakeSession(async customType => {
+			admitted.push(customType);
+			return true;
+		});
+		const toolTurnEnd = {
+			type: "agent_end",
+			isTerminal: true,
+			messages: [
+				{ role: "assistant", content: [{ type: "toolCall", id: "t1", name: "read", arguments: { path: "a" } }] },
+				{ role: "toolResult", toolName: "read", content: [{ type: "text", text: "x" }], isError: false },
+			],
+		} as unknown as AgentSessionEvent;
+
+		// A yield admits continuation #1, so the next run is a continuation turn.
+		controller.observe(agentEnd);
+		await nextMacrotask();
+		expect(admitted).toEqual(["goal-continuation"]);
+
+		// The host aborts that turn after it ran a tool (new activity); its agent_end follows.
+		controller.stopForHostAbort();
+		controller.observe(toolTurnEnd);
+		await nextMacrotask();
+		expect(controller.continuationPending).toBe(false);
+		expect(admitted).toEqual(["goal-continuation"]);
+	});
+
+	test("a turn that was not a continuation re-arms after a no-progress stop, but never after a host abort", async () => {
+		const admitted: string[] = [];
+		const { controller } = fakeSession(async customType => {
+			admitted.push(customType);
+			return true;
+		});
+		// Continuation #1 makes no progress, so continuation stops.
+		controller.observe(agentEnd);
+		await nextMacrotask();
+		controller.observe(agentEnd);
+		await nextMacrotask();
+		expect(admitted).toEqual(["goal-continuation"]);
+		expect(controller.continuationPending).toBe(false);
+
+		// A turn nobody prompted (a delivery or job wake) ends: as in the TUI, the goal continues.
+		controller.observe(agentEnd);
+		await nextMacrotask();
+		expect(admitted).toEqual(["goal-continuation", "goal-continuation"]);
+
+		// After a host abort, such a turn does not re-arm; only host input does.
+		controller.stopForHostAbort();
+		controller.observe(agentEnd);
+		controller.observe(agentEnd);
+		await nextMacrotask();
+		expect(admitted).toEqual(["goal-continuation", "goal-continuation"]);
+		controller.observe(hostInput);
+		controller.observe(agentEnd);
+		await nextMacrotask();
+		expect(admitted).toEqual(["goal-continuation", "goal-continuation", "goal-continuation"]);
 	});
 
 	test("a rejected continuation does not claim the next run as its own", async () => {

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as bashExecutor from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
 import { executeBash } from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
 import { execCommand } from "@oh-my-pi/pi-coding-agent/exec/exec";
 import {
@@ -45,8 +46,11 @@ describe.skipIf(process.platform === "win32")("owned-job registry", () => {
 	let sessionFile: string;
 	let registry: OwnedJobRegistry;
 	const spawned: number[] = [];
+	/** Shell work already retained in this process (by other suites) when the test began. */
+	let retainedBefore = 0;
 
 	beforeEach(() => {
+		retainedBefore = bashExecutor.retainedShellWorkCount();
 		tempDir = TempDir.createSync("@omp-owned-jobs-");
 		sessionFile = path.join(tempDir.path(), "2026-01-01_session.jsonl");
 		registry = new OwnedJobRegistry({
@@ -57,12 +61,20 @@ describe.skipIf(process.platform === "win32")("owned-job registry", () => {
 		OwnedJobRegistry.setInstance(registry);
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		for (const pid of spawned.splice(0)) killQuietly(pid);
+		// A shell this test retained for a background job stays in the process-wide set until
+		// its reap interval sees the job gone; a later suite in this process would count it as
+		// outstanding work. The jobs here are bounded, so wait for their shells' release.
+		await eventually(
+			() => bashExecutor.retainedShellWorkCount() <= retainedBefore,
+			"the shells this test retained to be released",
+			15_000,
+		);
 		registry.close();
 		OwnedJobRegistry.setInstance(undefined);
 		tempDir.removeSync();
-	});
+	}, 20_000);
 
 	it("records a nohup'd, double-forked descendant with its real pid before executeBash returns", async () => {
 		const result = await executeBash("nohup /bin/sleep 30 >/dev/null 2>&1 & echo $!", { cwd: tempDir.path() });
@@ -93,8 +105,8 @@ describe.skipIf(process.platform === "win32")("owned-job registry", () => {
 	});
 
 	/** Poll `condition` (bounded); the native shell reports asynchronously. */
-	async function eventually(condition: () => boolean, what: string): Promise<void> {
-		const deadline = Date.now() + 5_000;
+	async function eventually(condition: () => boolean, what: string, timeoutMs = 5_000): Promise<void> {
+		const deadline = Date.now() + timeoutMs;
 		while (!condition()) {
 			if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
 			await Bun.sleep(10);
@@ -1104,6 +1116,79 @@ describe.skipIf(process.platform === "win32")("owned-job registry", () => {
 			registry.scanOwnedProcesses();
 			expect(tokensOnNextBind()).toContain(token);
 			registry.scanOwnedProcesses();
+			expect(tokensOnNextBind()).not.toContain(token);
+		} finally {
+			vi.restoreAllMocks();
+		}
+	});
+
+	it("repeats the scan when another invocation counted as live is gone by the count, and finds what it handed on", () => {
+		// A live process stands in for another invocation of the session file.
+		const other = Bun.spawn(["/bin/sleep", uniqueSleep()], { stdout: "ignore", stderr: "ignore" });
+		const handedOn = Bun.spawn(["/bin/sleep", uniqueSleep()], { stdout: "ignore", stderr: "ignore" });
+		spawned.push(other.pid, handedOn.pid);
+		const otherStartId = processIdentity(other.pid).startId!;
+		const token = `omp1:${other.pid}:${otherStartId}`;
+		fs.writeFileSync(ownedJobRegistryPath(sessionFile), `${JSON.stringify(header(other.pid, otherStartId))}\n`);
+		registry.ensureHeader();
+		expect(registry.liveProcessCount()).toBe(1);
+		const gone = new Set<number>();
+		const realIdentity = natives.processIdentity;
+		vi.spyOn(natives, "processIdentity").mockImplementation(pid =>
+			gone.has(pid) ? { state: "gone" } : realIdentity(pid),
+		);
+		let calls = 0;
+		// The other invocation exits right after the first scan, having handed its marker to a
+		// child that scan did not see yet.
+		const scan = vi.spyOn(natives, "scanProcessesByEnv").mockImplementation(() => {
+			if (++calls === 1) {
+				gone.add(other.pid);
+				return cleanScan();
+			}
+			const child = processIdentity(handedOn.pid);
+			return {
+				...cleanScan(),
+				processes: [{ pid: handedOn.pid, ppid: 1, startId: child.startId, command: "sleep", token }],
+			};
+		});
+		try {
+			const result = registry.scanAndCount();
+			expect(scan).toHaveBeenCalledTimes(2);
+			expect(result).toMatchObject({ live: 1, scan: { sound: true, discovered: 1 } });
+			expect(registry.openJobs()).toContainEqual(expect.objectContaining({ pid: handedOn.pid, discovered: true }));
+		} finally {
+			vi.restoreAllMocks();
+		}
+	});
+
+	it("breaks the run of clean scans a prune needs when a scan-and-count round did not settle", () => {
+		const pid = 0x7ffffff3;
+		const token = `omp1:${pid}:5`;
+		fs.writeFileSync(ownedJobRegistryPath(sessionFile), `${JSON.stringify(header(pid, "5"))}\n`);
+		registry.ensureHeader();
+		const fake = 0x7ffe0000;
+		const realIdentity = natives.processIdentity;
+		vi.spyOn(natives, "processIdentity").mockImplementation(queried =>
+			queried === fake ? { state: "gone" } : realIdentity(queried),
+		);
+		let vanishOnce = false;
+		// A clean scan whose count finds nothing gone, or (once) a marked process gone by the count.
+		const scan = vi.spyOn(natives, "scanProcessesByEnv").mockImplementation(() => {
+			if (!vanishOnce) return cleanScan();
+			vanishOnce = false;
+			return {
+				...cleanScan(),
+				processes: [{ pid: fake, ppid: 1, startId: "7", command: "carrier", token: ownerToken() }],
+			};
+		});
+		try {
+			registry.scanAndCount();
+			// Unsettled first round, then a settled one: that settled scan starts a new run.
+			vanishOnce = true;
+			registry.scanAndCount();
+			expect(scan).toHaveBeenCalledTimes(3);
+			expect(tokensOnNextBind()).toContain(token);
+			registry.scanAndCount();
 			expect(tokensOnNextBind()).not.toContain(token);
 		} finally {
 			vi.restoreAllMocks();

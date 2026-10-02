@@ -46,6 +46,19 @@ export async function readDaemonScopeMeta(runtimeDir: string): Promise<string | 
 	return undefined;
 }
 
+/** File in a daemon's record dir where its broker publishes its snapshot and spec. */
+export const DAEMON_META_FILE = "meta.json";
+
+/** Directory where a broker keeps one daemon's metadata and logs. */
+export function daemonRecordDir(runtimeDir: string, name: string): string {
+	return path.join(runtimeDir, "daemons", name);
+}
+
+/** File where a broker publishes one daemon's snapshot and spec (`{ daemon, spec, … }`). */
+export function daemonMetadataPath(runtimeDir: string, name: string): string {
+	return path.join(daemonRecordDir(runtimeDir, name), DAEMON_META_FILE);
+}
+
 /** Resolve the Unix socket or Windows named pipe used by one daemon broker scope. */
 export function daemonBrokerEndpoint(projectDir: string, runtimeDir: string): string {
 	if (process.platform === "win32") {

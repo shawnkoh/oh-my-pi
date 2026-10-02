@@ -46,7 +46,7 @@ The initial ready frame uses protocol v1 and advertises the opt-in lossless tran
   "supportedProtocolVersions": [1, 2],
   "maxFrameBytes": 1048576,
   "maxReassembledFrameBytes": 67108864,
-  "capabilities": ["literal-input/1", "tool-approval-binding/1", "reply-attribution/1", "external-delivery/1", "rich-ask/1"]
+  "capabilities": ["literal-input/1", "tool-approval-binding/1", "reply-attribution/1", "external-delivery/1", "quiesce-exit/1", "owned-jobs/1", "rich-ask/1"]
 }
 ```
 
@@ -430,7 +430,7 @@ is re-armed.
     "contextWindow": 200000,
     "percent": 0.55
   },
-  "capabilities": ["quiesce-exit/1", "owned-jobs/1"]
+  "capabilities": ["literal-input/1", "tool-approval-binding/1", "reply-attribution/1", "external-delivery/1", "quiesce-exit/1", "owned-jobs/1", "rich-ask/1"]
 }
 ```
 
@@ -492,11 +492,11 @@ turn, sent as a hidden `goal-continuation` message.
 When the agent completes the goal, the goal tool is removed again and
 `get_state.goal` becomes `null`.
 
-`capabilities` lists protocol features this process implements. A client must
-check for `quiesce-exit/1` before sending `attest` or `quiesce_and_exit`, and for
-`owned-jobs/1` before relying on the owned-job registry file.
-
 ### Quiesce and exit
+
+A client must check `capabilities` for `quiesce-exit/1` before sending `attest` or
+`quiesce_and_exit`, and for `owned-jobs/1` before relying on the owned-job registry
+file. Test membership: the list carries every engine capability (see the ready frame).
 
 A supervisor that wants the agent to exit without interrupting work first takes a
 read-only snapshot, then asks the process to exit only if nothing changed:
@@ -507,8 +507,10 @@ read-only snapshot, then asks the process to exit only if nothing changed:
    `counts` has `streaming`, `queuedInput`, `asyncJobs`, `subagents`, `retainedJobs`,
    `detachedJobs`, `compacting`, `handoff`, `goalContinuationScheduled`,
    `scheduledTurns`; any non-zero value means work is outstanding. `queuedInput`
-   includes commands this process has read but not yet answered and notifications
-   received but not yet queued (MCP resource changes inside their debounce window).
+   includes commands this process has read but not yet answered, notifications
+   received but not yet queued (MCP resource changes inside their debounce window),
+   and every [external delivery](#external-delivery) the session still holds (`queued`,
+   or `accepted` and not yet settled).
    `scheduledTurns` includes turns scheduled to start, retry and TTSR resumes, event
    and extension handlers still running after the agent went idle, message
    persistence in flight, advisor reviews, and an in-flight cache-warming request;
@@ -536,8 +538,12 @@ read-only snapshot, then asks the process to exit only if nothing changed:
      0. From the pass on, only read-only commands run (`attest`, `get_*`,
      `negotiate_protocol`, `set_event_filter`, `set_subagent_subscription`, `goal`
      `get`); every other command — input and state-changing commands alike — fails
-     with `code: "admission_closed"`, and no internal producer (queued notifications,
-     scheduled continuations, IRC wakes, cache warming) starts a provider call.
+     with `code: "admission_closed"`, including `deliver` and `cancel_delivery` (no
+     delivery can be held after a pass, since a held one refuses the quiesce; after a
+     hang-up, held records are discarded with `disposed` during teardown), and no
+     internal producer (queued notifications, scheduled continuations, IRC wakes, cache
+     warming) starts a provider call. An extension's `deliverMessage` after that point
+     is not admitted: it returns a handle already discarded with `admission_closed`.
    - Exit without attestation → `data: { status: "exit_unattested", operationId,
      attempt, reason: "attestation_unavailable", error, snapshot }`. The session was
      idle and its transcript was made final, but the attestation could not be written.
@@ -596,7 +602,8 @@ false` when some process may be untracked; `writer`, a random id of the registry
 `inheritedOwnerMarkers` when it took over other invocations, below), `start` records
 (`jobId`, `kind`, `pid`, `pgid`, `startId`, `startTime` in Unix seconds for display,
 `command` (at most 4096 characters), `cwd`, `sleepable`, `inProcess`, `reparented?`,
-`groupMember?`, `discovered?`, `carriedFrom?`, `adoptedFrom?`), `end` records, and
+`groupMember?`, `discovered?`, `carriedFrom?`, `adoptedFrom?`; `service` records also
+`broker?` and `daemon?`, below), `end` records, and
 `incomplete` records; `start`, `end` and `incomplete` records carry `invocationPid` and
 the `writer` of their header (records written before `writer` existed have none). A
 record belongs to the latest preceding header whose invocation has its `invocationPid`
@@ -660,6 +667,46 @@ broker hosts, including persistent or detached ones that outlive it, have their 
 the `sleepable` value given at start. A helper started by a different agent process
 has no record here; consumers identify it by that worker selector in its argv.
 
+**Services and their broker.** A `service` record's `pid` is the service's current
+process, but the broker hosting it can relaunch it under a new pid — after an
+out-of-band kill while a restart policy holds (`restarting`, its backoff), on a
+`restart` request (`omp ps restart`), or on a switch to `detached`. So each `service`
+record carries `broker: { pid, startId }`, the identity of the broker serving the
+service's scope when it was recorded (read from the scope's `broker.pid` lease), and
+`daemon: { id, meta }`, the broker's id for the service and the `meta.json` where the
+broker publishes it. A service is work while its own process is alive **or** its
+broker is alive: the record is not ended merely because its pid is gone. The agent
+itself reads `meta` (the consumer rule below does not): it ends the record once the
+broker publishes the service `exited` or `failed`, or replaced by another service of
+that name, and when it reads `meta` after the broker published a relaunched process,
+records that process as a new `service` record (`jobId` `service:<id>:<startedAt>`,
+same `command`, `cwd`, `sleepable`, `broker` and `daemon`); metadata it cannot read
+keeps the service counted. A `restart` request (and a switch to `detached`) publishes
+the service as `restarting` from the stop until the relaunched process runs, so no
+read in between ends the record. The broker runs `stop`, `restart`, `mode` requests
+and a `start` that takes an existing service's name one at a time per service, in
+arrival order. A request whose turn comes after a `start` replaced the service, or
+once the broker is shutting down, is refused rather than acting on a process the broker
+no longer tracks; a `start` that is still stopping the service it replaces, or still
+setting up, when shutdown begins is refused before it launches anything. So
+overlapping requests never leave a process the broker does not track. A refused
+request is not re-sent to the replacement: a `stop` refused because a `start` replaced
+the service leaves the replacement running, and a caller that wants it stopped sends
+`stop` again. Requests can still end the record before a relaunch: a `stop` followed by
+a `restart` stops the service (ending its record) and then relaunches it, and that
+relaunch is the scan-covered class below. A service whose broker could
+not be identified, or was gone when the service was recorded, marks the registry
+incomplete. The agent
+services start with no restart policy, so the broker relaunches one only on request.
+A relaunch the record cannot follow comes back only through the owner-marker scan (the
+service's environment carries `OMP_OWNER`), as an anonymous `discovered` process
+(Linux) or as unexaminable (macOS, `unknown`): a `restart` of a service already
+published `exited` or `failed` (its record ended with it), and a relaunch by a later
+broker of the scope after the recorded one exited — records keep the broker that
+recorded them, so a detached service that a successor broker recovers is followed by
+its pid while that process lives, and by the scan after that. The agent never stops a
+broker or a service to clear an answer.
+
 **Owner marker.** Every process the agent starts for work — embedded shell runs,
 PTY shells, named services, apps the browser tool launches (`app.path`, also recorded as
 `process`), and commands run by extensions (`pi.exec`), hooks and custom tools — inherits
@@ -675,10 +722,13 @@ process (or another invocation) that exits between the scan and the count may ha
 handed the marker to a child the scan did not see, so the scan and count are repeated
 while that happens; after 3 rounds that never settle, `sound` is false. `ownerScan` is
 `{ supported, sound, scanned, discovered, opaque }` (`discovered` summed over the
-rounds): `opaque` lists candidate processes started since the invocation began whose
-environment could not be examined (including setuid descendants), which could hide the
-marker; `sound` is false if any exist, if the OS hides processes from the scan (Linux
-`/proc` mounted with `hidepid`), or if the rounds never settled.
+rounds): `opaque` lists candidate processes (this user's) started since the earliest
+invocation scanned for whose environment could not be examined — setuid or
+non-dumpable descendants, or a process in another Landlock domain such as a separate
+`openshell exec` session — which could hide the marker; a process that started before
+every invocation scanned for is never the agent's and is ignored whatever it carries.
+`sound` is false if any opaque process exists, if the OS hides processes from the scan
+(Linux `/proc` mounted with `hidepid`), or if the rounds never settled.
 
 Limits — the classes that can read as clear on Linux, where the scan is otherwise sound,
 so a consumer must keep its own host process census as a required cross-check:
@@ -699,16 +749,44 @@ so a consumer must keep its own host process census as a required cross-check:
 - a writer in another pid namespace that shares the session directory (a sibling
   container, `unshare -p`) has pids that mean nothing here: its invocation and processes
   read as gone, so the registry and the verifier assume every writer of a session file
-  runs in the consumer's pid namespace.
+  runs in the consumer's pid namespace;
+- a marked process no earlier scan found, which the scan lists but which forks a marked
+  child and exits before its environment is read, is dropped by that scan without a
+  trace: nothing counted vanished, so the answer settles while the child runs. The
+  window is one environment read; the verifier's later scan finds the child.
 
 Paths that mark the registry incomplete instead: every PTY shell run (on every
 platform), eval runs (their long-lived kernels are not marked), a shell run whose spawn
-report is incomplete (a process that could not be identity-pinned, an unreported
-`nohup … &` reparent, a failed run), a background job still running when its run was
-cancelled, a service start or mode change that ended without reporting its process,
-and any debug (DAP) session. On macOS the kernel withholds the environment of Apple
-platform binaries (`sh`, `zsh`, `sleep`, …), so the scan is almost never `sound` there
-and consumers get `unknown` rather than a false clear. Windows has no scan.
+report is incomplete (a live process it could not identify, a process left in a group
+the run created whose `/proc/<pid>/stat` cannot be read, an unreported `nohup … &`
+reparent, a failed run), a background job still running when its run was cancelled, a
+service start or mode change that ended without reporting its process, and any debug
+(DAP) session. A shell run identifies its processes by pid and start time: through a
+pidfd where `pidfd_open` works, otherwise from `/proc/<pid>/stat` (older kernels, and
+sandboxes such as OpenShell whose seccomp filter fails `pidfd_open` with `ENOSYS`), so
+a run whose processes are all visible reports itself complete either way. Its group
+enumeration reads only `/proc/<pid>/stat`, so processes whose environment cannot be
+read, unrelated or not, never make it incomplete. Whether a group the run created still
+has members is asked with `kill(-pgid, 0)`: only `ESRCH` means it has none, and
+`EPERM` (a member exists that is not ours to signal, such as a setuid program) or any
+other failure means it may still have one. Only where every process-group
+signal is refused (OpenShell's seccomp filter fails them all with `EPERM`; detected by
+probing the agent's own group, once per thread) does the process table decide instead:
+a group counts as gone only when two complete listings in a row show no member of it,
+zombies included. On macOS the kernel withholds the
+environment of Apple platform binaries (`sh`, `zsh`, `sleep`, …), so the scan is almost
+never `sound` there and consumers get `unknown` rather than a false clear. Windows has
+no scan.
+
+**Processes outside the agent's tree.** Processes the agent never launched — started by
+an operator or a harness, for example with `openshell exec`, even under the agent's uid
+and in the same sandbox — are not agent work: they are not in the registry, never count
+in `attest`, and the host process census (E4) accounts for them. The scan cannot tell
+one from an escaped descendant of the agent only when it started after the agent and
+its environment cannot be read (an `openshell exec` session is a separate Landlock
+domain, so the agent cannot read it): it is then `opaque`, `sound` is false, and the
+answer stays `unknown` until it exits. One that started before the agent, or runs as
+another uid, has no effect.
 
 **Consumer rule after the agent exited** (`verifyOwnedJobRegistry(path, {
 expectedInvocation })` in `@oh-my-pi/pi-coding-agent/session/owned-job-registry`
@@ -721,14 +799,25 @@ implements it):
    string, `ownerMarker` and every `inheritedOwnerMarkers` entry with string
    `token`/`env` and a decimal-string or null `startId`); a start record without a string
    `jobId` and `kind`, an integer `pid`, a boolean `inProcess` and a decimal-string or
-   null `startId`; a record with a non-string `writer`; a record with no such header.
+   null `startId`, or with a `broker` that is not `{ pid: integer, startId:
+   decimal-string | null }` or a `daemon` that is not `{ id: string, meta: string }`; a
+   record with a non-string `writer`; a record with no such header.
    With `expectedInvocation`, no header for it → at best `unknown`.
 2. Any invocation still alive (pid + `startId`) → `live`: use `attest` instead; one
    whose identity cannot be read → at best `unknown`.
 3. A header counts as complete only when `complete` is exactly `true` and it lists no
    `incompleteReasons`; any other header, or any `incomplete` record → at best `unknown`.
 4. Open records, ignoring `internal`: `inProcess` → `unknown`; otherwise alive by pid +
-   `startId` → `blocked`; identity unreadable → at best `unknown`.
+   `startId` → `blocked`; identity unreadable → at best `unknown`. A record with a
+   `broker` (only `service` records have one) whose own process is gone is still work
+   while its broker is alive by pid + `startId` → `blocked` (the verdict's `live` entry
+   names it in `broker`); broker identity unreadable → at best `unknown`; broker gone →
+   ended. Consumers do not read `daemon`. Until the broker exits (a few seconds after
+   the last agent process of its scope disconnects, unless it hosts a persistent
+   service), this also blocks on a service that already exited after its agent crashed:
+   only the agent, which reads the broker's metadata, can tell that apart. Any other
+   agent process, presence or persistent service in the same broker scope keeps that
+   broker alive, so in a shared project scope this can last as long as they do.
 5. One scan for every token in any header's `ownerMarker` and
    `inheritedOwnerMarkers`: any live match → `blocked`; an unexaminable process started
    since the earliest of those invocations, a scan that reports hidden processes, or no
@@ -1118,6 +1207,9 @@ Receipts, one event each, all carrying `deliveryId`:
   without the usual empty-response retry.
 - `delivery_discarded` `{ reason }` when the session lets go of a queued
   record without admitting it: `new-session`, `session-switched`, `disposed`.
+  An extension `deliverMessage` made after the session closed input admission
+  (a passed quiesce or a hang-up) returns a handle already discarded with
+  `admission_closed`; RPC `deliver` then fails with `code: "admission_closed"`.
 - `delivery_cancelled` when `cancel_delivery` succeeded (only while `queued`).
 
 `delivery_settled` is emitted after the run's `agent_end`. A wake whose only
