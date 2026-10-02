@@ -1,4 +1,10 @@
-import type { Agent, AgentMessage, AgentToolResult, AgentTurnEndContext } from "@oh-my-pi/pi-agent-core";
+import {
+	type Agent,
+	type AgentMessage,
+	type AgentToolResult,
+	type AgentTurnEndContext,
+	markEngineInjected,
+} from "@oh-my-pi/pi-agent-core";
 import { invalidateMessageCache } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Model, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
@@ -165,14 +171,16 @@ export class PrewalkCoordinator {
 			this.#continuePending = true;
 		} else if (this.#continuePending) {
 			this.#continuePending = false;
-			this.#host.agent.steer({
-				role: "custom",
-				customType: PREWALK_CONTINUE_MESSAGE_TYPE,
-				content: prewalkContinuePrompt,
-				attribution: "agent",
-				display: false,
-				timestamp: Date.now(),
-			});
+			this.#host.agent.steer(
+				markEngineInjected({
+					role: "custom",
+					customType: PREWALK_CONTINUE_MESSAGE_TYPE,
+					content: prewalkContinuePrompt,
+					attribution: "agent",
+					display: false,
+					timestamp: Date.now(),
+				}),
+			);
 		}
 
 		const todoGateOpen = this.#todoSeen || !this.#host.getActiveToolNames().includes("todo");
@@ -183,14 +191,16 @@ export class PrewalkCoordinator {
 			if (!this.#planInjected) {
 				this.#planInjected = true;
 				this.#continuePending = true;
-				this.#host.agent.steer({
-					role: "custom",
-					customType: PREWALK_PLAN_MESSAGE_TYPE,
-					content: prewalkPlanPrompt,
-					display: false,
-					attribution: "agent",
-					timestamp: Date.now(),
-				});
+				this.#host.agent.steer(
+					markEngineInjected({
+						role: "custom",
+						customType: PREWALK_PLAN_MESSAGE_TYPE,
+						content: prewalkPlanPrompt,
+						display: false,
+						attribution: "agent",
+						timestamp: Date.now(),
+					}),
+				);
 				this.#host.emitNotice("info", "Prewalk: injected deep-plan nudge.", "prewalk");
 			}
 			return;
@@ -213,14 +223,16 @@ export class PrewalkCoordinator {
 			`Prewalk: switched to ${target.provider}/${target.id} after first ${action.toolName} call.`,
 			"prewalk",
 		);
-		this.#host.agent.steer({
-			role: "custom",
-			customType: PREWALK_CHECKLIST_MESSAGE_TYPE,
-			content: prewalkChecklistPrompt,
-			attribution: "agent",
-			display: false,
-			timestamp: Date.now(),
-		});
+		this.#host.agent.steer(
+			markEngineInjected({
+				role: "custom",
+				customType: PREWALK_CHECKLIST_MESSAGE_TYPE,
+				content: prewalkChecklistPrompt,
+				attribution: "agent",
+				display: false,
+				timestamp: Date.now(),
+			}),
+		);
 	}
 
 	/** Drops a pending prewalk hand-off (e.g. `prewalk.enabled` turned off); no-op when none is armed. */
@@ -260,14 +272,16 @@ export class PrewalkCoordinator {
 		this.#planInjected = true;
 		this.#continuePending = true;
 		this.#todoSeen = false;
-		this.#host.agent.steer({
-			role: "custom",
-			customType: PREWALK_PLAN_MESSAGE_TYPE,
-			content: prewalkPlanPrompt,
-			display: false,
-			attribution: "agent",
-			timestamp: Date.now(),
-		});
+		this.#host.agent.steer(
+			markEngineInjected({
+				role: "custom",
+				customType: PREWALK_PLAN_MESSAGE_TYPE,
+				content: prewalkPlanPrompt,
+				display: false,
+				attribution: "agent",
+				timestamp: Date.now(),
+			}),
+		);
 		this.#host.emitNotice(
 			"info",
 			`Prewalk: armed for ${target.provider}/${target.id} — will switch at the first edit/write once the todo list exists.`,
@@ -418,14 +432,16 @@ export class PrewalkCoordinator {
 			`Plan-yolo: plan approved, switched to ${planYolo.target.provider}/${planYolo.target.id} to implement "${resolvedTitle}".`,
 			"plan-yolo",
 		);
-		this.#host.agent.steer({
-			role: "custom",
-			customType: PLAN_YOLO_HANDOFF_MESSAGE_TYPE,
-			content: prompt.render(planYoloHandoffPrompt, { planFilePath, title: resolvedTitle }),
-			attribution: "agent",
-			display: false,
-			timestamp: Date.now(),
-		});
+		this.#host.agent.steer(
+			markEngineInjected({
+				role: "custom",
+				customType: PLAN_YOLO_HANDOFF_MESSAGE_TYPE,
+				content: prompt.render(planYoloHandoffPrompt, { planFilePath, title: resolvedTitle }),
+				attribution: "agent",
+				display: false,
+				timestamp: Date.now(),
+			}),
+		);
 		return {
 			content: [{ type: "text", text: `Plan approved. Implementing now with ${planYolo.target.id}.` }],
 			details: { planFilePath, title: resolvedTitle, planExists: true },
