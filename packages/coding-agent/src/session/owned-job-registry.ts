@@ -28,7 +28,9 @@ import {
 	scanProcessesByEnv,
 } from "@oh-my-pi/pi-natives";
 import { TERMINAL_STATES } from "@oh-my-pi/pi-tui/apps/ps-data";
+import type { DaemonSnapshot } from "@oh-my-pi/pi-tui/tools/daemon";
 import { isEnoent, logger } from "@oh-my-pi/pi-utils";
+import { parseDaemonSnapshot } from "../launch/protocol";
 
 export const OWNED_JOB_REGISTRY_VERSION = 1;
 /** Longest command text stored in a registry record. */
@@ -347,29 +349,14 @@ export function recordedWorkState(record: Pick<OwnedJobStartRecord, "pid" | "sta
 	return ownedProcessState(record.broker.pid, record.broker.startId);
 }
 
-/** What a daemon broker last published about one service (its `meta.json`). */
-interface ServiceHostState {
-	id: string;
-	state: string;
-	pid?: number;
-	startedAt?: number;
-}
-
-function readServiceHostState(meta: string): ServiceHostState | undefined {
+/**
+ * What a daemon broker last published about one service (the `daemon` of its `meta.json`),
+ * or `undefined` when that is unreadable or malformed: the caller then keeps the record open.
+ */
+function readServiceHostState(meta: string): DaemonSnapshot | undefined {
 	try {
 		const decoded: unknown = JSON.parse(fs.readFileSync(meta, "utf8"));
-		const daemon = isRecordObject(decoded) ? decoded.daemon : undefined;
-		if (!isRecordObject(daemon) || typeof daemon.id !== "string" || typeof daemon.state !== "string")
-			return undefined;
-		return {
-			id: daemon.id,
-			state: daemon.state,
-			pid: typeof daemon.pid === "number" && Number.isSafeInteger(daemon.pid) ? daemon.pid : undefined,
-			startedAt:
-				typeof daemon.startedAt === "number" && Number.isSafeInteger(daemon.startedAt)
-					? daemon.startedAt
-					: undefined,
-		};
+		return parseDaemonSnapshot(isRecordObject(decoded) ? decoded.daemon : undefined);
 	} catch {
 		return undefined;
 	}
@@ -873,7 +860,7 @@ export class OwnedJobRegistry {
 		// The broker replaced this service with another of the same name: not this one any more.
 		if (host.id !== record.daemon.id) return false;
 		if (Object.hasOwn(TERMINAL_STATES, host.state)) return false;
-		if (host.pid === undefined || host.startedAt === undefined) return true;
+		if (host.pid === undefined) return true;
 		const successor = this.registerProcess({
 			kind: "service",
 			jobId: `service:${host.id}:${host.startedAt}`,

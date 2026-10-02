@@ -315,6 +315,8 @@ export async function dispatchRpcSkillPrompt(input: {
 	extensionUserMessageTracker: RpcExtensionUserMessageTracker;
 	images?: ImageContent[];
 	isCurrent?: () => boolean;
+	/** Called synchronously when the skill prompt is admitted, before its run can start. */
+	onPromptAdmitted?: () => void;
 }): Promise<RpcSkillCommandResult | "cancelled" | null> {
 	const invocation = resolveRpcSkillInvocation(input.session, input.message);
 	if (!invocation) return null;
@@ -335,7 +337,10 @@ export async function dispatchRpcSkillPrompt(input: {
 				invocation,
 				input.streamingBehavior ?? "steer",
 				built,
-				onPromptAdmitted,
+				() => {
+					input.onPromptAdmitted?.();
+					onPromptAdmitted();
+				},
 				input.images,
 			),
 		results: input.results,
@@ -1763,6 +1768,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		// turn-dispatch window while input ahead of it drains and its hooks run, so a `deliver`
 		// read after it parks behind it instead of waking the idle session and getting the prompt
 		// refused as busy. Released once the prompt was admitted, queued, handled or dropped.
+		// Every input's hooks run under runHostInputHooks: a delivery they make (and may await)
+		// ignores these holds, since the input holding them cannot proceed until the hooks return.
 		const releaseDispatchHold =
 			command.type === "prompt" || command.type === "abort_and_prompt" ? session.holdTurnDispatch() : undefined;
 		const dispatched = inputGate.enqueue(async () => {
@@ -1774,7 +1781,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			let images = command.images;
 			const runner = session.extensionRunner;
 			if (runner?.hasHandlers("input")) {
-				const result = await runner.emitInput(text, images, "rpc");
+				const result = await session.runHostInputHooks(() => runner.emitInput(text, images, "rpc"));
 				if (!isCurrent()) return "cancelled";
 				if (result.handled) return "local";
 				if (result.text !== undefined) text = result.text;
@@ -1783,10 +1790,12 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			if (!isCurrent()) return "cancelled";
 			if (!text.trim() && !images?.length) return "local";
 			if (command.type === "steer") {
+				goalController.noteHostInput();
 				await session.steer(text, images, { literal: command.literal === true });
 				return "admitted";
 			}
 			if (command.type === "follow_up") {
+				goalController.noteHostInput();
 				await session.followUp(text, images, { literal: command.literal === true });
 				return "admitted";
 			}
@@ -1802,6 +1811,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					extensionUserMessageTracker,
 					images,
 					isCurrent,
+					onPromptAdmitted: () => goalController.noteHostInput(),
 				});
 				if (skillResult === "cancelled") return "cancelled";
 				if (skillResult) return "admitted";
@@ -1849,7 +1859,10 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 						images,
 						literal: command.literal === true,
 						...(command.type === "prompt" ? { streamingBehavior: command.streamingBehavior } : {}),
-						onPromptAdmitted,
+						onPromptAdmitted: () => {
+							goalController.noteHostInput();
+							onPromptAdmitted();
+						},
 					}),
 				results: promptResults,
 				onError: onPromptError(command.id, command.type),

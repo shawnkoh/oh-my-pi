@@ -277,6 +277,16 @@ dropped, the record wakes the session on its own. `steer` and `follow_up` do not
 hold turn dispatch. Wait for `delivery_accepted` and `delivery_settled` to learn what
 actually happened. Cancellation succeeds only before acceptance.
 
+An extension input hook may deliver a record itself (`pi.deliverMessage`) and wait for
+it to be accepted. Such a delivery, made inside the hook or in anything the hook awaits,
+is never held behind these holds: they belong to the hook's own input and to input
+queued behind it, which cannot proceed until the hook returns, so holding it would hang
+every later input. The record wakes the idle session at once, and the input then meets
+that running turn: a `prompt` without `streamingBehavior`, or an `abort_and_prompt`, is
+refused as busy (a same-id error response with the busy message and a `prompt_result`
+with `status: "error"`); a `prompt` with `streamingBehavior`, a `steer` or a `follow_up`
+is queued into the turn. The exemption ends when the hook returns.
+
 ### Login
 
 - `{ id?, type: "get_login_providers" }`
@@ -349,7 +359,7 @@ Data payloads are command-specific and defined in `rpc-types.ts`.
 - `agentInvoked: true`: the prompt was dispatched or queued for agent work; normal completion reports when the agent **yielded** — see [Yield vs settled](#yield-vs-settled). An abort that wins before dispatch can still report `true` with `status: "aborted"`. A prompt dispatched as a fresh turn reports the first run that started after it was accepted, so a late `agent_end` from an earlier run never completes it. A prompt queued into a live run (`streamingBehavior`) reports at the first yield after its message left the queue. An `agent_end` with `yielded: false` (the agent is retrying, compacting, or answering a stop-time reminder) never completes a prompt.
 - `status`: `"completed"`, `"aborted"` (interrupted by `abort`, `abort_and_prompt`, or a session transition, or dropped by an abort before dispatch), or `"error"`.
 - `error` (only with `status: "error"`): `{ message, provider?, model?, httpStatus?, retryable }`. `message` is the provider's error text with OMP-local diagnostics (such as saved request-dump paths) removed. `retryable` marks a transient failure; OMP's own automatic retries have already been exhausted. A prompt that fails before reaching the agent also gets the legacy error response with the same `id` before its `prompt_result`.
-- `run`, `promptEntryId` and `replyEntryIds` (capability `reply-attribution/1`). `run` is the engine-local ordinal of the run whose yield answered the prompt. A run spans retries and continuations up to that yield, and prompts reported with the same `run` were answered together, such as a follow-up folded into a live turn. `promptEntryId` is the session entry of the prompt's own user message. `replyEntryIds` are the assistant entries that followed it, up to the next user message; the last is the reply. A `literal` prompt is found by its exact text, unless another prompt answered by the same yield has the same text. Any other prompt is attributed only when it is the sole prompt answered and its run delivered a single user message. Every persisted user message counts: a host `steer`, an extension `sendUserMessage` or a subagent steer ends the preceding reply early and makes parsed prompts unattributable; skill prompts are never attributed. An external delivery or goal-mode context that arrives during the run also ends the preceding reply, without affecting which prompt is identified. A command that schedules agent work (for example an extension command calling `sendUserMessage`) is attributed to the run that work starts, not to a delivery wake that ran while its handler was working; if it schedules work from idle more than once, the last such run is reported. Work it queues into a live run joins that run and is reported at that run's yield, even if an earlier run already yielded while its handler worked. An incoming subagent message also ends the preceding reply. Entries are read at the yield. `replyEntryIds` is empty, and `promptEntryId` absent, rather than guessed when the prompt cannot be identified or the session or branch changed during the run. All three are absent for local-only commands.
+- `run`, `promptEntryId` and `replyEntryIds` (capability `reply-attribution/1`). `run` is the engine-local ordinal of the run whose yield answered the prompt. A run spans retries and continuations up to that yield, and prompts reported with the same `run` were answered together, such as a follow-up folded into a live turn. `promptEntryId` is the session entry of the prompt's own user message. `replyEntryIds` are the assistant entries that followed it, up to the next user message; the last is the reply. A `literal` prompt is found by its exact text, unless another prompt answered by the same yield has the same text. Any other prompt is attributed only when it is the sole prompt answered and its run delivered a single user message. Every persisted user message counts: a host `steer`, an extension `sendUserMessage` or a subagent steer ends the preceding reply early and makes parsed prompts unattributable; skill prompts are never attributed. An external delivery or goal-mode context that arrives during the run also ends the preceding reply, without affecting which prompt is identified. A command that schedules agent work (for example an extension command calling `sendUserMessage`) is attributed to the run that work starts, not to a delivery wake that ran while its handler was working; if it schedules work from idle more than once, the last such run is reported. Work it queues into a live run joins that run and is reported at that run's yield, even if an earlier run already yielded while its handler worked. An incoming subagent message also ends the preceding reply. Entries are read at the yield. `replyEntryIds` is empty, and `promptEntryId` absent, rather than guessed when the prompt cannot be identified or the session or branch changed during the run. A move to a sibling session file (a new session id whose `parentSession` is the old one, made when another process wrote the session file) keeps the transcript and is not a session change. All three are absent for local-only commands.
 - `sessionSettled`: whether the session is already done when the result is written — see [Yield vs settled](#yield-vs-settled). `false` means background work can still wake the agent; a `session_settled` frame follows once it has.
 
 A failed provider turn is not a failed command: the prompt response is still `success: true`, and the turn ends with a normal terminal `agent_end` whose last assistant message has `stopReason: "error"`. Use `prompt_result.status` rather than parsing that message.
@@ -525,22 +535,31 @@ contains `"rpc"`; this covers both `--mode rpc` and `--mode rpc-ui`. When enable
 turn, sent as a hidden `goal-continuation` message.
 
 - The turn starts once the yielding run has fully unwound. At that moment the goal
-  must still be active, the session idle with nothing queued, plan mode off, open
-  todos not all blocked, and the session not being disposed.
+  must still be active, the session idle with nothing queued and no host input in its
+  input hooks or setting up its turn (the continuation waits for that input; if it
+  starts a run, that run's end decides again), plan mode off, open todos not all
+  blocked, and the session not being disposed.
 - While the turn is decided but not yet started, `get_state.isSettled`,
   `prompt_result.sessionSettled` and `session_settled` treat the session as busy.
   `session_settled` follows if the continuation is abandoned.
 - `abort` stops continuation before the abort takes effect; the interrupted goal is
-  paused. Continuation also stops after a goal turn with no new tool activity.
-  Either way, the next host prompt, steer or follow-up (or `goal resume`) re-arms it.
+  paused. Only host input re-arms it: a `prompt`, `steer`, `follow_up` or
+  `abort_and_prompt` that reaches the session (not handled by an input hook; a
+  `prompt` once it is admitted), or `goal create`/`resume`. A turn the host did not
+  start (an extension's `sendUserMessage`, a delivery or job wake) does not.
+- Continuation also stops after a goal turn with no new tool activity. Host input
+  re-arms it, and so does the end of any turn that was not a goal continuation.
 - A session change leaves the previous goal and its tool behind and restores a goal
   journaled in the target session. This covers `new_session`, `switch_session`,
   `branch` and `open_session`, and the same changes made by extension commands. A
   change is detected by the transcript id, so a host-pinned `--provider-session-id`
   does not hide it. A goal turn that is waiting or becomes due while a change is in
   progress is held. If the change is cancelled, or leaves the session unchanged
-  (tree navigation, reopening the open session), the goal continues. While such a
-  turn is held, the session is not reported as settled.
+  (tree navigation, reopening the open session), the goal continues. A move to a
+  sibling session file (a new session id whose `parentSession` is the old one, made
+  when another process wrote the session file) keeps the session too: the goal
+  continues and a host abort stays in force. While such a turn is held, the session
+  is not reported as settled.
 
 When the agent completes the goal, the goal tool is removed again and
 `get_state.goal` becomes `null`.

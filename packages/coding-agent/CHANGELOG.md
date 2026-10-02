@@ -34,7 +34,7 @@
 - External deliveries are inside the quiesce boundary: a held delivery keeps `quiesce_and_exit` refused (`queuedInput`) and marks a hang-up `interrupted`, and `deliverMessage` after a passed quiesce or a hang-up returns a handle already discarded with `admission_closed` instead of one that can never be accepted
 - Interrupting a turn while a tool approval is pending now closes the dialog (RPC hosts receive `cancel`), and an approval answered after the call was aborted no longer runs the tool
 - In sandboxes without `pidfd_open` (OpenShell), a shell command that leaves a process running no longer marks the owned-job registry incomplete for the rest of the session, so a later `quiesce_and_exit` can attest `registryComplete: true`
-- A `deliver` read while an earlier RPC `prompt` or `abort_and_prompt` is still running its input hooks no longer wakes the idle session and gets that prompt refused as busy: the delivery waits for the prompt and reaches the model after it
+- A `deliver` read while an earlier RPC `prompt` or `abort_and_prompt` is still running its input hooks no longer wakes the idle session and gets that prompt refused as busy: the delivery waits for the prompt and reaches the model after it. A delivery an input hook makes itself (and may wait on) is not held, so the hook cannot hang its own or later input
 - A prompt whose RPC input hooks are still running after its `abort_and_prompt` was answered now counts as `queuedInput`, so `quiesce_and_exit` refuses instead of exiting before the prompt reaches the session
 
 ## [18.4.10] - 2026-10-02

@@ -50,6 +50,8 @@ export type RpcGoalSession = Pick<
 	| "isDisposed"
 	| "isSessionTransitioning"
 	| "hasAdmittedSubmission"
+	| "hasPendingTurnDispatch"
+	| "waitForPendingTurnDispatch"
 	| "queuedMessageCount"
 	| "reserveGoalContinuation"
 >;
@@ -64,9 +66,10 @@ export class RpcGoalController {
 	/** A continuation turn made no new progress; wait for the host before continuing. */
 	#suppressContinuation = false;
 	/**
-	 * Set by a host abort; only host action (a prompt, or `goal create`/`resume`) clears it.
-	 * Unlike {@link #suppressContinuation}, no turn's `agent_end` can re-arm it, so the
-	 * aborted turn's own end cannot schedule another goal turn whatever its activity.
+	 * Set by a host abort; only host input ({@link noteHostInput}, or `goal create`/`resume`)
+	 * clears it. Unlike {@link #suppressContinuation}, no turn's `agent_end` can re-arm it, so
+	 * the aborted turn's own end, an extension's `sendUserMessage`, a delivery or a job wake
+	 * cannot schedule another goal turn whatever its activity.
 	 */
 	#hostStopped = false;
 	/** A continuation has been decided and is waiting for the session to go idle. */
@@ -115,7 +118,7 @@ export class RpcGoalController {
 
 	/**
 	 * The host interrupted the session (`abort`). Stop automatic continuation until
-	 * the host acts again (a prompt, steer, follow-up, or `goal resume`/`create`).
+	 * the host acts again ({@link noteHostInput}, or `goal resume`/`create`).
 	 * Called before the abort starts, so the aborted run's own `agent_end` cannot
 	 * schedule another goal turn. The runtime separately pauses the interrupted goal.
 	 */
@@ -124,6 +127,16 @@ export class RpcGoalController {
 		this.#suppressContinuation = true;
 		this.#dropScheduled();
 		this.#continuationGeneration++;
+	}
+
+	/**
+	 * A host `prompt`, `steer`, `follow_up` or `abort_and_prompt` reached the session (its
+	 * input hooks did not handle it). Re-arms continuation after a host abort or a
+	 * no-progress stop. Call before that input can start or end a run, so its own
+	 * `agent_end` sees the re-armed state.
+	 */
+	noteHostInput(): void {
+		this.#resetContinuation();
 	}
 
 	get #state(): RpcGoalResult {
@@ -167,13 +180,18 @@ export class RpcGoalController {
 	 * Call after the change resolves, is cancelled, or throws. Only a change that
 	 * actually switched the transcript adopts the target session's goal. A cancelled
 	 * or no-op change (same session, for example tree navigation or reopening the
-	 * open session) leaves the running goal untouched and resumes continuation.
+	 * open session) leaves the running goal untouched and resumes continuation. So
+	 * does a sibling move (a new id for the same transcript after a write conflict),
+	 * which keeps a host abort in force.
 	 * Never throws; settlement is re-checked afterwards.
 	 */
 	async endSessionChange(): Promise<void> {
 		if (--this.#sessionChanges > 0) return;
+		const before = this.#sessionBeforeChange;
 		const switched =
-			this.#changeOverlappedReconcile || this.#session.sessionManager.getSessionId() !== this.#sessionBeforeChange;
+			this.#changeOverlappedReconcile ||
+			before === undefined ||
+			!this.#session.sessionManager.continuesSession(before);
 		this.#changeOverlappedReconcile = false;
 		this.#sessionBeforeChange = undefined;
 		this.#heldDuringChange = false;
@@ -353,11 +371,6 @@ export class RpcGoalController {
 	 * event so a continuation is admitted before settlement is evaluated.
 	 */
 	observe(event: AgentSessionEvent): void {
-		if (event.type === "message_start" && event.message.role === "user" && !event.message.synthetic) {
-			// A host prompt re-arms continuation after a no-progress stop.
-			this.#resetContinuation();
-			return;
-		}
 		if (event.type === "goal_updated") {
 			const status = event.state?.goal.status;
 			if (status === "dropped") {
@@ -440,6 +453,10 @@ export class RpcGoalController {
 			setImmediate(resolve);
 			await promise;
 			await this.#session.waitForIdle();
+			// Host input still in its input hooks, or a prompt setting up its turn, owns the
+			// next turn: wait for it to start its run (the idle check below then drops this
+			// continuation; that run's own agent_end decides again) or to bail.
+			while (this.#session.hasPendingTurnDispatch) await this.#session.waitForPendingTurnDispatch();
 			if (!this.#continuationScheduled || generation !== this.#continuationGeneration) {
 				this.#onContinuationDropped?.();
 				return;

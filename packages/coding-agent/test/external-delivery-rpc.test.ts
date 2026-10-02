@@ -128,6 +128,64 @@ describe("external delivery over RPC", () => {
 		expect(rpc.received.filter(frame => frame.type === "response" && frame.success === false)).toEqual([]);
 	}, 30_000);
 
+	/** Assistant replies so far, as the mock model's `seen:[...]` text. */
+	function replies(received: Frame[]): string[] {
+		return received
+			.filter(frame => frame.type === "message_end" && isRecord(frame.message) && frame.message.role === "assistant")
+			.map(frame => JSON.stringify(frame.message));
+	}
+
+	test("a prompt whose input hook delivers and awaits acceptance completes instead of hanging", async () => {
+		const rpc = start({ DELIVERY_FIXTURE_HOOK_DELIVERS: "1", DELIVERY_FIXTURE_MODEL_DELAY_MS: "100" });
+		await rpc.until(frame => frame.type === "ready");
+
+		// The hook's own delivery is not parked behind the prompt's dispatch hold: it wakes the
+		// idle session and is accepted, so the hook returns. The prompt then meets that running
+		// turn and, with no streamingBehavior, is refused as busy like any prompt during a turn.
+		await rpc.pipeline([{ id: "p1", type: "prompt", message: "deliver:from-hook" }]);
+		expect(await rpc.until(frame => frame.type === "response" && frame.id === "p1")).toMatchObject({
+			command: "prompt",
+			success: false,
+			error: expect.stringContaining("Agent is already processing"),
+		});
+		expect(await rpc.until(frame => frame.type === "prompt_result" && frame.id === "p1")).toMatchObject({
+			status: "error",
+		});
+		await rpc.until(frame => frame.type === "session_settled");
+		expect(replies(rpc.received)).toEqual([expect.stringContaining('seen:[\\"from-hook\\"]')]);
+
+		// With streamingBehavior the same prompt queues behind the hook's turn and completes.
+		await rpc.pipeline([{ id: "p2", type: "prompt", message: "deliver:second", streamingBehavior: "followUp" }]);
+		expect(await rpc.until(frame => frame.type === "prompt_result" && frame.id === "p2")).toMatchObject({
+			status: "completed",
+		});
+		expect(replies(rpc.received).at(-1)).toContain('seen:[\\"from-hook\\",\\"second\\",\\"deliver:second\\"]');
+	}, 30_000);
+
+	test("a steer whose input hook awaits its delivery does not deadlock a prompt queued behind it", async () => {
+		// The 50 ms hook delay lets the prompt (and its dispatch hold) enter the gate before
+		// the steer's hook delivers.
+		const rpc = start({
+			DELIVERY_FIXTURE_HOOK_DELIVERS: "1",
+			DELIVERY_FIXTURE_INPUT_HOOK_MS: "50",
+			DELIVERY_FIXTURE_MODEL_DELAY_MS: "100",
+		});
+		await rpc.until(frame => frame.type === "ready");
+
+		await rpc.pipeline([
+			{ id: "s1", type: "steer", message: "deliver:steered" },
+			{ id: "p2", type: "prompt", message: "after", streamingBehavior: "followUp" },
+		]);
+		expect(await rpc.until(frame => frame.type === "response" && frame.id === "s1")).toMatchObject({
+			success: true,
+		});
+		expect(await rpc.until(frame => frame.type === "prompt_result" && frame.id === "p2")).toMatchObject({
+			status: "completed",
+		});
+		expect(replies(rpc.received).at(-1)).toContain('seen:[\\"steered\\",\\"deliver:steered\\",\\"after\\"]');
+		expect(rpc.received.filter(frame => frame.type === "response" && frame.success === false)).toEqual([]);
+	}, 30_000);
+
 	test("deliver never parses commands, and receipts correlate by the engine-minted delivery id", async () => {
 		const rpc = start();
 		await rpc.until(frame => frame.type === "ready");

@@ -351,7 +351,11 @@ describe("RPC goal command", () => {
 
 describe("RpcGoalController continuation gate", () => {
 	const agentEnd = { type: "agent_end", messages: [], isTerminal: true } as unknown as AgentSessionEvent;
-	const hostInput = { type: "message_start", message: { role: "user", content: [] } } as unknown as AgentSessionEvent;
+	/** A non-synthetic user message entering the transcript, e.g. an extension's `sendUserMessage`. */
+	const userMessageStart = {
+		type: "message_start",
+		message: { role: "user", content: [] },
+	} as unknown as AgentSessionEvent;
 
 	function fakeSession(admit: (customType: string) => Promise<boolean>) {
 		let goalState: GoalModeState | undefined = {
@@ -369,6 +373,8 @@ describe("RpcGoalController continuation gate", () => {
 		};
 		let idle = Promise.withResolvers<void>();
 		idle.resolve();
+		let dispatch = Promise.withResolvers<void>();
+		dispatch.resolve();
 		const journal: string[] = [];
 		let tools: string[] = ["read"];
 		let journaledGoal = false;
@@ -376,6 +382,8 @@ describe("RpcGoalController continuation gate", () => {
 		resumed.resolve();
 		let threadResumes = 0;
 		const transcript = { id: "t1" };
+		/** Sibling moves: the id each sibling continued, keyed by the sibling's id. */
+		const siblingMovedFrom = new Map<string, string>();
 		/** Goal-continuation reservations the session currently holds (quiesce work). */
 		const reservations = { held: 0 };
 		const session = {
@@ -384,6 +392,12 @@ describe("RpcGoalController continuation gate", () => {
 			sessionId: "pinned-provider-id",
 			sessionManager: {
 				getSessionId: () => transcript.id,
+				continuesSession: (id: string) => {
+					for (let current: string | undefined = transcript.id; current; current = siblingMovedFrom.get(current)) {
+						if (current === id) return true;
+					}
+					return false;
+				},
 				buildSessionContext: () =>
 					journaledGoal
 						? {
@@ -408,6 +422,8 @@ describe("RpcGoalController continuation gate", () => {
 			isSessionTransitioning: false,
 			isStreaming: false,
 			hasAdmittedSubmission: false,
+			hasPendingTurnDispatch: false,
+			waitForPendingTurnDispatch: () => dispatch.promise,
 			queuedMessageCount: 0,
 			hasPendingAsyncWork: () => false,
 			settleAsyncWork: async () => {},
@@ -481,6 +497,20 @@ describe("RpcGoalController continuation gate", () => {
 				idle = Promise.withResolvers<void>();
 			},
 			release: () => idle.resolve(),
+			/** Host input enters its hooks: the session's turn dispatch is pending. */
+			holdDispatch: () => {
+				session.hasPendingTurnDispatch = true;
+				dispatch = Promise.withResolvers<void>();
+			},
+			releaseDispatch: () => {
+				session.hasPendingTurnDispatch = false;
+				dispatch.resolve();
+			},
+			/** A #13997 sibling move: same transcript, new id whose parent is the current one. */
+			siblingMove: (to: string) => {
+				siblingMovedFrom.set(to, transcript.id);
+				transcript.id = to;
+			},
 		};
 	}
 
@@ -500,7 +530,7 @@ describe("RpcGoalController continuation gate", () => {
 		// The host aborts (releasing 1), then re-arms; continuation 2 is decided.
 		controller.stopForHostAbort();
 		expect(reservations.held).toBe(0);
-		controller.observe(hostInput);
+		controller.noteHostInput();
 		controller.observe(agentEnd);
 		expect(reservations.held).toBe(1);
 		// Task 1 wakes while continuation 2 still waits on a later idle.
@@ -538,7 +568,7 @@ describe("RpcGoalController continuation gate", () => {
 		expect(admitted).toEqual([]);
 
 		// Host input re-arms it; the next yield continues exactly once.
-		controller.observe(hostInput);
+		controller.noteHostInput();
 		controller.observe(agentEnd);
 		controller.observe(agentEnd);
 		await nextMacrotask();
@@ -592,13 +622,15 @@ describe("RpcGoalController continuation gate", () => {
 		await nextMacrotask();
 		expect(admitted).toEqual(["goal-continuation", "goal-continuation"]);
 
-		// After a host abort, such a turn does not re-arm; only host input does.
+		// After a host abort, such a turn does not re-arm, and neither does a user message
+		// the host did not send (an extension's sendUserMessage); only host input does.
 		controller.stopForHostAbort();
 		controller.observe(agentEnd);
+		controller.observe(userMessageStart);
 		controller.observe(agentEnd);
 		await nextMacrotask();
 		expect(admitted).toEqual(["goal-continuation", "goal-continuation"]);
-		controller.observe(hostInput);
+		controller.noteHostInput();
 		controller.observe(agentEnd);
 		await nextMacrotask();
 		expect(admitted).toEqual(["goal-continuation", "goal-continuation", "goal-continuation"]);
@@ -657,6 +689,37 @@ describe("RpcGoalController continuation gate", () => {
 		expect(controller.continuationPending).toBe(false);
 	});
 
+	test("a continuation waits for host input still in its hooks, then yields to a run it starts", async () => {
+		const admitted: string[] = [];
+		const { session, controller, holdDispatch, releaseDispatch } = fakeSession(async customType => {
+			admitted.push(customType);
+			return true;
+		});
+
+		// A host prompt is in its input hooks when the run yields: the continuation waits.
+		holdDispatch();
+		controller.observe(agentEnd);
+		await nextMacrotask();
+		expect(admitted).toEqual([]);
+		expect(controller.continuationPending).toBe(true);
+		// The prompt is admitted and starts its run: the continuation drops; that run's end decides.
+		session.isStreaming = true;
+		releaseDispatch();
+		await nextMacrotask();
+		expect(admitted).toEqual([]);
+		expect(controller.continuationPending).toBe(false);
+
+		// An input its hooks handled starts no run: the continuation proceeds once they return.
+		session.isStreaming = false;
+		holdDispatch();
+		controller.observe(agentEnd);
+		await nextMacrotask();
+		expect(admitted).toEqual([]);
+		releaseDispatch();
+		await nextMacrotask();
+		expect(admitted).toEqual(["goal-continuation"]);
+	});
+
 	test("a change that stays in the same session holds, then resumes the goal without settling in between", async () => {
 		const admitted: string[] = [];
 		const { controller, hold, release, dropped } = fakeSession(async customType => {
@@ -699,6 +762,30 @@ describe("RpcGoalController continuation gate", () => {
 		// The old goal is left behind, and nothing continues it in the new transcript.
 		expect(goalState()).toBeUndefined();
 		expect(admitted).toEqual([]);
+	});
+
+	test("a sibling move during a change is the same session: the goal and a host abort stay in force", async () => {
+		const admitted: string[] = [];
+		const { controller, goalState, siblingMove, threadResumes } = fakeSession(async customType => {
+			admitted.push(customType);
+			return true;
+		});
+		controller.stopForHostAbort();
+		await controller.beginSessionChange();
+		// Another process wrote the transcript file meanwhile, so the session moved to a sibling.
+		siblingMove("t1-sibling");
+		await controller.endSessionChange();
+		await nextMacrotask();
+		// Not reconciled as a switch: the goal stays, and nothing re-arms the aborted goal.
+		expect(goalState()?.goal.id).toBe("g1");
+		expect(threadResumes()).toBe(0);
+		controller.observe(agentEnd);
+		await nextMacrotask();
+		expect(admitted).toEqual([]);
+		controller.noteHostInput();
+		controller.observe(agentEnd);
+		await nextMacrotask();
+		expect(admitted).toEqual(["goal-continuation"]);
 	});
 
 	test("a goal completed while a switch is pending is journaled in its own session", async () => {

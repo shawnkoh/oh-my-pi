@@ -13,6 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -3013,6 +3014,10 @@ export class AgentSession implements SettingsScope {
 	 *  command handler's whole run. External deliveries hold behind this window only. */
 	#turnDispatchPendingCount = 0;
 	#turnDispatchSettled: PromiseWithResolvers<void> | undefined;
+	/** The share of {@link #turnDispatchPendingCount} held by {@link holdTurnDispatch}. */
+	#hostInputHoldCount = 0;
+	/** Open while host input's own hooks run ({@link runHostInputHooks}). */
+	readonly #hostInputHookScope = new AsyncLocalStorage<{ open: boolean }>();
 
 	get hasPendingTurnDispatch(): boolean {
 		return this.#turnDispatchPendingCount > 0;
@@ -3047,7 +3052,33 @@ export class AgentSession implements SettingsScope {
 	 * release; call it once the input was admitted, queued, handled locally or dropped.
 	 */
 	holdTurnDispatch(): () => void {
-		return this.#enterTurnDispatch();
+		const leave = this.#enterTurnDispatch();
+		this.#hostInputHoldCount++;
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			this.#hostInputHoldCount--;
+			leave();
+		};
+	}
+
+	/**
+	 * Run host input's own hooks (e.g. RPC input hooks). A delivery made inside them, or in
+	 * anything they await, ignores every {@link holdTurnDispatch} hold: those holds are this
+	 * input's and input ordered behind it, which cannot proceed until the hooks return, so
+	 * parking a delivery the hooks wait on would hang them. Such a delivery wakes an idle
+	 * session at once, and the held input then meets a running turn (a prompt without
+	 * `streamingBehavior` is refused as busy). Prompts' own dispatch windows still apply.
+	 * The exemption ends when `hooks` settles, even for work it left running.
+	 */
+	async runHostInputHooks<T>(hooks: () => Promise<T>): Promise<T> {
+		const scope = { open: true };
+		try {
+			return await this.#hostInputHookScope.run(scope, hooks);
+		} finally {
+			scope.open = false;
+		}
 	}
 
 	/** Resolves once every currently admitted submission has dispatched, queued, or bailed. */
@@ -9352,12 +9383,14 @@ export class AgentSession implements SettingsScope {
 			return;
 		}
 		// A prompt past command handling that is still waiting on manual-compaction
-		// cleanup or setting up its turn owns the next turn: waking now would race
-		// it into AgentBusyError. Park the record in the bridge (a parked steer is
-		// re-steered by the aside provider if that turn starts, and always woken by
-		// the stranded resume if it does not); #resumeStrandedIrcAsides waits for
-		// the window to close.
-		if (this.hasPendingTurnDispatch) {
+		// cleanup or setting up its turn, or host input held in its hooks, owns the next
+		// turn: waking now would race it into AgentBusyError. Park the record in the bridge
+		// (a parked steer is re-steered by the aside provider if that turn starts, and
+		// always woken by the stranded resume if it does not); #resumeStrandedIrcAsides
+		// waits for the window to close. A delivery made by those hooks themselves is
+		// exempt from host holds (runHostInputHooks).
+		const exemptHolds = this.#hostInputHookScope.getStore()?.open === true ? this.#hostInputHoldCount : 0;
+		if (this.#turnDispatchPendingCount - exemptHolds > 0) {
 			owner.mechanism = owner.mode === "steer" ? "steer-boundary" : "aside";
 			this.#irc.queueAside([record]);
 			this.#resumeStrandedIrcAsides();

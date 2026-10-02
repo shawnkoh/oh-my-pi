@@ -888,6 +888,8 @@ export class SessionManager {
 	#persistenceNoticeCallbacks = new Set<(notice: SessionPersistenceNotice) => void>();
 	/** Every notice raised so far, replayed to each later subscriber. */
 	#persistenceNotices: SessionPersistenceNotice[] = [];
+	/** Sibling moves ({@link SessionPersistenceNotice}): the id each sibling continued, keyed by the sibling's id. */
+	#siblingMovedFrom = new Map<string, string>();
 	/**
 	 * This process's ownership claim on the file it last wrote (file storage
 	 * only). `release` is unset while another live process holds the file, and
@@ -1141,6 +1143,7 @@ export class SessionManager {
 		const previousSessionId = this.#sessionId;
 		const timestamp = nowIso();
 		this.#sessionId = mintSessionId();
+		this.#siblingMovedFrom.set(this.#sessionId, previousSessionId);
 		const to = path.join(path.dirname(from), `${fileSafeTimestamp(timestamp)}_${this.#sessionId}.jsonl`);
 		this.#header = {
 			...this.#header,
@@ -2968,6 +2971,18 @@ export class SessionManager {
 
 	getSessionId(): string {
 		return this.#sessionId;
+	}
+
+	/**
+	 * True when the current session is `sessionId`, or continues it through sibling moves
+	 * only: a move to a fresh file after a write conflict (see {@link SessionPersistenceNotice})
+	 * mints a new id for the same transcript. A fork, branch, new or opened session never does.
+	 */
+	continuesSession(sessionId: string): boolean {
+		for (let id: string | undefined = this.#sessionId; id !== undefined; id = this.#siblingMovedFrom.get(id)) {
+			if (id === sessionId) return true;
+		}
+		return false;
 	}
 
 	getSessionFile(): string | undefined {

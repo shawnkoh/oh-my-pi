@@ -742,7 +742,17 @@ describe.skipIf(process.platform === "win32")("owned-job registry: broker-hosted
 		stubIdentities(new Map([[FAKE_SERVICE_PID, { state: "gone" }]]));
 		const meta = path.join(tempDir.path(), "meta.json");
 		// Still running, but a different service: a `start` with `replace` took the name.
-		fs.writeFileSync(meta, JSON.stringify({ daemon: { id: "replacement", state: "running" } }));
+		const replacement = {
+			name: "svc",
+			id: "replacement",
+			state: "running",
+			createdAt: 2,
+			startedAt: 2,
+			restartCount: 0,
+			outputBytes: 0,
+			persist: false,
+		};
+		fs.writeFileSync(meta, JSON.stringify({ daemon: replacement }));
 		registry.registerProcess({
 			kind: "service",
 			jobId: "service:original:1",

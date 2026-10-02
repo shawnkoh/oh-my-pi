@@ -17,20 +17,39 @@ import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 // can prove what reached it. A prompt that starts with "/" is answered too, so
 // slash interpretation (or its absence) is observable.
 // DELIVERY_FIXTURE_INPUT_HOOK_MS: an RPC input hook that takes that long (async).
+// DELIVERY_FIXTURE_HOOK_DELIVERS=1: for input "deliver:<text>", the input hook delivers
+// <text> as an aside (source "hook") and waits for it to be accepted before returning.
 // DELIVERY_FIXTURE_MODEL_DELAY_MS: each model reply takes that long.
 const hookMs = Number(process.env.DELIVERY_FIXTURE_INPUT_HOOK_MS ?? 0);
+const hookDelivers = process.env.DELIVERY_FIXTURE_HOOK_DELIVERS === "1";
 const modelDelayMs = Number(process.env.DELIVERY_FIXTURE_MODEL_DELAY_MS ?? 0);
 const authStorage = await AuthStorage.create(path.join(process.cwd(), "auth.db"));
 authStorage.keys.setRuntime("anthropic", "test-key");
 const modelRegistry = new ModelRegistry(authStorage, path.join(process.cwd(), "models.yml"));
 const sessionManager = SessionManager.inMemory(process.cwd());
 let extensionRunner: ExtensionRunner | undefined;
-if (hookMs > 0) {
+if (hookMs > 0 || hookDelivers) {
 	const runtime = new ExtensionRuntime();
 	const extension = await loadExtensionFromFactory(
 		pi => {
-			pi.on("input", async () => {
-				await Bun.sleep(hookMs);
+			pi.on("input", async event => {
+				if (hookMs > 0) await Bun.sleep(hookMs);
+				if (hookDelivers && event.text.startsWith("deliver:")) {
+					const text = event.text.slice("deliver:".length);
+					const handle = pi.deliverMessage(
+						{
+							customType: "external-card",
+							content: "[card hook]",
+							display: true,
+							details: {
+								"omp.llm": { role: "user", content: [{ type: "text", text }] },
+								"omp.llm.source": "hook",
+							},
+						},
+						{ mode: "aside" },
+					);
+					await handle.accepted;
+				}
 				return undefined;
 			});
 		},
