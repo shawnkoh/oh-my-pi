@@ -195,6 +195,148 @@ impl Process {
 	}
 }
 
+/// Clock-independent identity of a process at a moment.
+#[napi(object)]
+pub struct ProcessIdentity {
+	/// running: exists and is not a zombie. gone: no such process
+	/// (ESRCH/ENOENT) or a zombie/dead entry. unreadable: exists (or cannot be
+	/// proven gone) but its identity cannot be read (EPERM, hidepid,
+	/// setuid/non-dumpable).
+	#[napi(ts_type = "'running' | 'gone' | 'unreadable'")]
+	pub state:      String,
+	/// Opaque start identity, decimal string, comparable only for equality
+	/// (and numerically within one host+boot): Linux raw `/proc/<pid>/stat`
+	/// field 22 (start ticks since boot), macOS
+	/// `pbi_start_tvsec*1_000_000+pbi_start_tvusec`, Windows raw creation
+	/// `FILETIME`. Present only when state === "running".
+	pub start_id:   Option<String>,
+	/// Display only: Unix epoch seconds (floor). Present only when
+	/// state === "running".
+	pub start_time: Option<i64>,
+}
+
+/// Current identity of `pid`; see `ProcessIdentity`.
+#[napi]
+pub fn process_identity(pid: i32) -> ProcessIdentity {
+	let identity = core_process::process_identity(pid);
+	let state = match identity.state {
+		core_process::IdentityState::Running => "running",
+		core_process::IdentityState::Gone => "gone",
+		core_process::IdentityState::Unreadable => "unreadable",
+	};
+	ProcessIdentity {
+		state:      state.to_owned(),
+		start_id:   identity.start_id.map(|id| id.to_string()),
+		start_time: identity
+			.start_time
+			.and_then(|secs| i64::try_from(secs).ok()),
+	}
+}
+
+/// A live process whose environment carries a marker token.
+#[napi(object)]
+pub struct MarkedProcess {
+	pub pid:        i32,
+	pub ppid:       i32,
+	/// Process group id when readable.
+	pub pgid:       Option<i32>,
+	/// OS start time, Unix epoch seconds (floor) — the same value as
+	/// `processIdentity(pid).startTime`. Display only.
+	pub start_time: Option<i64>,
+	/// Opaque start identity — the same value as
+	/// `processIdentity(pid).startId`.
+	pub start_id:   Option<String>,
+	/// Executable name (best effort, may be truncated).
+	pub command:    String,
+	/// The first of the requested tokens (in request order) the process
+	/// carries. Absent for `opaque` entries.
+	pub token:      Option<String>,
+}
+
+/// Result of `scanProcessesByEnv`.
+#[napi(object)]
+pub struct MarkedProcessScan {
+	/// False on platforms without an implementation (Windows), or when the
+	/// process table could not be listed: callers must treat the result as
+	/// unknown.
+	pub supported:  bool,
+	/// True when the platform may hide processes of this user from the scan
+	/// altogether (Linux `/proc` mounted with `hidepid` other than 0/off, or
+	/// whose mount options cannot be read): the result is not a complete
+	/// census, whatever `opaque` says. False on macOS.
+	pub hidden:     bool,
+	pub processes:  Vec<MarkedProcess>,
+	/// Candidate processes examined: those whose real, effective or saved uid
+	/// is the caller's, or whose uids cannot be read.
+	pub scanned:    u32,
+	/// Candidates that were alive but whose environment (or start time) could
+	/// not be read (not counting ones that exited mid-scan).
+	pub unreadable: u32,
+	/// Candidates whose environment came back empty. macOS withholds the
+	/// environment of Apple platform binaries (`/bin/sh`, `zsh`,
+	/// `/bin/sleep`, …), so a marker on such a process is not visible and it
+	/// is counted here instead.
+	pub redacted:   u32,
+	/// The unreadable and redacted processes whose start id is at or after
+	/// `opaqueSince`, or unknown (empty when `opaqueSince` was not given): the
+	/// only ones that could hide a marker set no earlier than that instant.
+	pub opaque:     Vec<MarkedProcess>,
+}
+
+fn to_napi(entry: core_process::MarkedProcess) -> MarkedProcess {
+	MarkedProcess {
+		pid:        entry.pid,
+		ppid:       entry.ppid,
+		pgid:       entry.pgid,
+		start_time: entry.start_time.and_then(|secs| i64::try_from(secs).ok()),
+		start_id:   entry.start_id.map(|id| id.to_string()),
+		command:    entry.command,
+		token:      entry.token,
+	}
+}
+
+/// Live processes of the calling user whose environment carries a marker.
+///
+/// Every live process of the calling user (excluding the caller itself) whose
+/// environment variable `name` is set and whose value, split on ',', contains
+/// any of `tokens` exactly; no tokens match nothing. A process is the user's
+/// when its real, effective or saved uid is the caller's (so setuid launches
+/// count); one whose uids cannot be read is examined too. `opaqueSince` is a
+/// `startId` of this host and boot (compared numerically): processes with an
+/// unexaminable environment whose start id is at or after it, or unknown, are
+/// listed in `opaque`.
+///
+/// # Errors
+/// Throws when `opaqueSince` is not a decimal start id.
+#[napi]
+pub fn scan_processes_by_env(
+	name: String,
+	tokens: Vec<String>,
+	opaque_since: Option<String>,
+) -> Result<MarkedProcessScan> {
+	let since = opaque_since
+		.map(|since| {
+			since.parse::<u64>().map_err(|_| {
+				napi::Error::new(
+					napi::Status::InvalidArg,
+					format!("opaqueSince must be a decimal startId, got {since:?}"),
+				)
+			})
+		})
+		.transpose()?;
+	let tokens: Vec<&str> = tokens.iter().map(String::as_str).collect();
+	let scan = core_process::scan_processes_by_env(&name, &tokens, since);
+	Ok(MarkedProcessScan {
+		supported:  scan.supported,
+		hidden:     scan.hidden,
+		processes:  scan.processes.into_iter().map(to_napi).collect(),
+		scanned:    scan.scanned,
+		unreadable: scan.unreadable,
+		redacted:   scan.redacted,
+		opaque:     scan.opaque.into_iter().map(to_napi).collect(),
+	})
+}
+
 /// Replace the current process image via `execvp(3)`.
 ///
 /// On success this never returns: the kernel tears down every other thread and
