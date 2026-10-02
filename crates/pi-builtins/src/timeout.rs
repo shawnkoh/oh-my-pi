@@ -90,13 +90,34 @@ impl clap::Parser for TimeoutCommand {}
 /// `brush_core::processes::Process::wait`), so delivering the *configured*
 /// signal requires knowing the child's pid/pgid; the shell reports those
 /// through its [`SpawnObserver`] hook.
+///
+/// Every report is also forwarded to the observer the enclosing run installed,
+/// so a `timeout N cmd` child still reaches the run's own spawn registry.
 #[derive(Default)]
-struct SpawnRecorder(Mutex<Vec<(i32, Option<i32>)>>);
+struct SpawnRecorder {
+	spawns: Mutex<Vec<(i32, Option<i32>)>>,
+	outer:  Option<Arc<dyn SpawnObserver>>,
+}
 
 impl SpawnObserver for SpawnRecorder {
 	fn on_spawn(&self, pid: i32, pgid: Option<i32>) {
-		if let Ok(mut spawns) = self.0.lock() {
+		if let Ok(mut spawns) = self.spawns.lock() {
 			spawns.push((pid, pgid));
+		}
+		if let Some(outer) = &self.outer {
+			outer.on_spawn(pid, pgid);
+		}
+	}
+
+	fn on_reparented_spawn(&self, pid: i32, pgid: Option<i32>) {
+		if let Some(outer) = &self.outer {
+			outer.on_reparented_spawn(pid, pgid);
+		}
+	}
+
+	fn on_unreported_spawn(&self) {
+		if let Some(outer) = &self.outer {
+			outer.on_unreported_spawn();
 		}
 	}
 }
@@ -105,7 +126,7 @@ impl SpawnRecorder {
 	/// Sends `signal` to every recorded child — its whole process group when
 	/// `group` is set — and reports whether any delivery succeeded.
 	fn signal(&self, signal: TrapSignal, group: bool) -> bool {
-		let spawns = match self.0.lock() {
+		let spawns = match self.spawns.lock() {
 			Ok(spawns) => spawns.clone(),
 			Err(_) => return false,
 		};
@@ -203,7 +224,10 @@ impl builtins::Command for TimeoutCommand {
 		};
 
 		let child_cancel = CancellationToken::new();
-		let spawns = Arc::new(SpawnRecorder::default());
+		let spawns = Arc::new(SpawnRecorder {
+			spawns: Mutex::default(),
+			outer:  context.params.spawn_observer().cloned(),
+		});
 		let mut params = context.params.clone();
 		// GNU runs the command in its own process group and signals the whole
 		// group; `--foreground` keeps it in the invoking group and signals
