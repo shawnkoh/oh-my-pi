@@ -1189,14 +1189,14 @@ export class AgentSession implements SettingsScope {
 		}
 	}
 
+	/** One pending re-offer of stranded records scheduled behind a prompt's dispatch window. */
+	#strandedResumeAfterAdmission = false;
+
 	/** A steer/follow-up can land after the agent loop's final queue poll, or
 	 *  after an abort stops an auto-continued queued turn. In both cases the
 	 *  agent-core queue still owns the message, but no loop is left to poll it.
 	 *  Runs whenever the session settles; the guard makes it a no-op when the
 	 *  queue was consumed normally or a new turn already started. */
-	/** One pending re-offer of stranded records scheduled behind a prompt's dispatch window. */
-	#strandedResumeAfterAdmission = false;
-
 	#drainStrandedQueuedMessages(): void {
 		if (this.#abortInProgress) return;
 		// Session transitions (newSession/`/new`, compact, model-switch, session-switch,
@@ -3008,9 +3008,9 @@ export class AgentSession implements SettingsScope {
 	}
 
 	/** Prompts past command handling that are waiting on manual-compaction cleanup
-	 *  or setting up their turn: narrower than {@link hasAdmittedSubmission}, which
-	 *  also spans an extension command handler's whole run. External deliveries
-	 *  hold behind this window only. */
+	 *  or setting up their turn, plus host input held by {@link holdTurnDispatch}:
+	 *  narrower than {@link hasAdmittedSubmission}, which also spans an extension
+	 *  command handler's whole run. External deliveries hold behind this window only. */
 	#turnDispatchPendingCount = 0;
 	#turnDispatchSettled: PromiseWithResolvers<void> | undefined;
 
@@ -3037,6 +3037,17 @@ export class AgentSession implements SettingsScope {
 				settled.resolve();
 			}
 		};
+	}
+
+	/**
+	 * Open the turn-dispatch window for input a host has accepted but not yet handed to
+	 * {@link prompt}, e.g. an RPC prompt whose input hooks are still running. External
+	 * deliveries park behind it as behind a prompt's own window, so they cannot wake the
+	 * idle session and turn that prompt into an AgentBusyError. Returns the idempotent
+	 * release; call it once the input was admitted, queued, handled locally or dropped.
+	 */
+	holdTurnDispatch(): () => void {
+		return this.#enterTurnDispatch();
 	}
 
 	/** Resolves once every currently admitted submission has dispatched, queued, or bailed. */

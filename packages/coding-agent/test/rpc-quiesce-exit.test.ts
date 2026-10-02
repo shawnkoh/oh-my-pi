@@ -307,6 +307,42 @@ describe.skipIf(process.platform === "win32")("RPC hang-up capture order", () =>
 	}, 30_000);
 });
 
+describe.skipIf(process.platform === "win32")("RPC quiesce with input in the ordered input gate", () => {
+	it("counts a prompt whose input hook is still running as queued input and refuses the quiesce", async () => {
+		using tempDir = TempDir.createSync("@omp-rpc-quiesce-gate-");
+		const rpc = new RpcProcess([process.execPath, path.join(import.meta.dir, "fixtures", "quiesce-rpc-agent.ts")], {
+			cwd: tempDir.path(),
+			env: {
+				...process.env,
+				PI_CODING_AGENT_DIR: tempDir.path(),
+				PI_NO_TITLE: "1",
+				QUIESCE_FIXTURE_INPUT_HOOK: "1",
+			},
+		});
+		try {
+			await rpc.waitFor(frame => frame.type === "ready", "ready");
+			// `abort_and_prompt` is answered once the abort is done, while its prompt is still in
+			// the input hook: no command is pending, yet the prompt has not reached the session.
+			const answered = await rpc.request({ id: "ap1", type: "abort_and_prompt", message: "gate-hold" });
+			expect(answered).toMatchObject({ success: true });
+			const attest = await rpc.request({ id: "a1", type: "attest", operationId: "op-g", nonce: "n-1" });
+			expect(attest.data?.counts).toMatchObject({ queuedInput: 1 });
+			const quiesce = await rpc.request({
+				id: "q1",
+				type: "quiesce_and_exit",
+				operationId: "op-g",
+				attempt: 1,
+				...boundTo(attest),
+				deadline: Date.now() + 30_000,
+			});
+			expect(quiesce.data).toMatchObject({ status: "refused", reason: "work_active" });
+		} finally {
+			rpc.child.kill("SIGKILL");
+			await rpc.child.exited;
+		}
+	}, 30_000);
+});
+
 // The real CLI entry in each protocol mode: proves the wiring main.ts does for `--mode rpc-ui`
 // (tool UI context, hasUI) keeps the same command table, capability advertisement and gate.
 describe.skipIf(process.platform === "win32").each(MODES)("CLI --mode %s quiesce_and_exit", mode => {

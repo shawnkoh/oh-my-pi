@@ -264,13 +264,18 @@ Both require `external-delivery/1` in `ready.capabilities`. See
 events.
 
 `deliver` and `cancel_delivery` are dispatched independently of the ordered
-native-input gate used by `prompt`, `steer`, `follow_up`, and `abort_and_prompt`.
-If a preceding prompt is still running its input hooks or preparing attachments,
-a later `deliver` can be acknowledged first. Its record can be held behind that
-prompt's turn-dispatch window and then admitted with the turn (or woken
-separately); neither command ID nor stdin order guarantees model inclusion
-before or after the prompt. Wait for `delivery_accepted` and `delivery_settled`
-to learn what actually happened. Cancellation succeeds only before acceptance.
+native-input gate used by `prompt`, `steer`, `follow_up`, and `abort_and_prompt`,
+so a `deliver` read after a `prompt` that is still running its input hooks or
+preparing attachments can be acknowledged first. Its record still never overtakes
+that prompt: from the moment a `prompt` or `abort_and_prompt` enters the gate until
+it is admitted (or queued, handled locally, or dropped), the session holds its turn
+dispatch, and a delivery arriving meanwhile is held instead of waking the idle
+session (waking it would get the prompt refused as busy). The held record reaches the
+model after the prompt: folded into the prompt's turn at a step boundary, or woken
+once that turn yields (`mechanism: "wake"`). When the prompt is handled locally or
+dropped, the record wakes the session on its own. `steer` and `follow_up` do not
+hold turn dispatch. Wait for `delivery_accepted` and `delivery_settled` to learn what
+actually happened. Cancellation succeeds only before acceptance.
 
 ### Login
 
@@ -555,11 +560,13 @@ read-only snapshot, then asks the process to exit only if nothing changed:
    `counts` has `streaming`, `queuedInput`, `asyncJobs`, `subagents`, `retainedJobs`,
    `detachedJobs`, `compacting`, `handoff`, `goalContinuationScheduled`,
    `scheduledTurns`; any non-zero value means work is outstanding. `queuedInput`
-   includes commands this process has read but not yet answered, notifications
-   received but not yet queued (MCP resource changes inside their debounce window),
-   and every [external delivery](#external-delivery) the session still holds (`queued`,
-   or `accepted` and not yet settled); commands still answered after the pass (the
-   read-only list below) are not counted.
+   includes commands this process has read but not yet answered, user input still in
+   the ordered input gate (waiting its turn, in input hooks or skill/attachment
+   preparation; an `abort_and_prompt` is answered before its prompt gets there),
+   notifications received but not yet queued (MCP resource changes inside their
+   debounce window), and every [external delivery](#external-delivery) the session
+   still holds (`queued`, or `accepted` and not yet settled); commands still answered
+   after the pass (the read-only list below) are not counted.
    `asyncJobs` and `subagents` count background jobs until their run has unwound,
    including a cancelled job that is still stopping; a parked subagent is not work.
    `scheduledTurns` includes turns scheduled to start, retry and TTSR resumes, event

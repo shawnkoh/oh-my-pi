@@ -2,16 +2,17 @@
 
 ## [Unreleased]
 
-### Fixed
-
-- Fixed `spawnedComplete` being `false` for every shell run that started an external command in OpenShell sandboxes, whose seccomp filter denies every process-group signal: where group signals are refused outright, whether such a command's process group is gone is now read from the process table (two empty listings in a row); elsewhere a refused group signal still means the group has a member, and only "no such process" from a group signal ever ends a group
-- Fixed `pkill` reporting "signalling pid N failed" for every process where `pidfd_open` is unavailable (OpenShell sandboxes); it now signals by pid after re-checking that the pid still names the selected process
-
-## [18.4.5] - 2026-09-30
 ### Added
 
 - Added `spawnedProcesses` and `spawnedComplete` to `Shell.run`/`executeShell` results. `spawnedProcesses` lists each process the command launched that is still alive when it resolves, with pid, process group, OS start time and `startId`. It includes the real process behind `nohup cmd &` (`reparented: true`) and processes of any user left in a process group the command or a `nohup` launch created, such as the sleep that `sh -c 'sleep 60 &'` or `nohup sh -c 'sleep 60 &' &` leaves behind (`groupMember: true`). `nohup cmd </dev/tty &`, which cannot detach, reports `cmd` itself. `spawnedComplete` is `false` when the list may be missing a process: one could not be identified, a `nohup` launch was never reported, or the process groups could not be fully listed. A run that throws has no list. Also added `processIdentity(pid)`, which reports whether a process is `running`, `gone` (including zombies) or `unreadable`, with a `startId` that stays the same if the system clock changes, so callers can tell later whether that exact process is still running, and its `startTime` for display.
 - Added `scanProcessesByEnv(name, tokens, opaqueSince?)`, which finds every live process of the current user whose environment variable `name` lists any of `tokens` among its comma-separated values, including double-forked daemons whose pid the caller never saw and setuid programs started by the user. Each match has pid, parent pid, process group, OS start time, `startId` and the `token` it carries. The result also reports how many processes were scanned, how many had an environment that could not be read and how many had an empty one, and lists (`opaque`) the ones whose `startId` is at or after `opaqueSince` (a `startId` string) or unknown. `hidden` is `true` when Linux `/proc` is mounted with `hidepid`, which can hide processes from the scan entirely. macOS hides the environment of its own system programs (`/bin/sh`, `zsh`, `/bin/sleep`, …), so a marker on those processes is not found. Windows returns `supported: false`.
+
+### Fixed
+
+- Fixed `spawnedComplete` being `false` for every shell run that started an external command in OpenShell sandboxes, whose seccomp filter denies every process-group signal: where group signals are refused outright, whether such a command's process group is gone is now read from the process table (two empty listings in a row); elsewhere a refused group signal still means the group has a member, and only "no such process" from a group signal ever ends a group
+- Fixed `pkill` reporting "signalling pid N failed" for every process where `pidfd_open` is unavailable (OpenShell sandboxes); it now signals by pid after re-checking that the pid still names the selected process
+- Fixed `spawnedComplete` being `false` for every shell run that left a process alive on Linux where `pidfd_open` is unavailable, such as OpenShell sandboxes whose seccomp filter fails it with `ENOSYS`: processes are now identified by their `/proc` start time there, are reported with their `startId`, and can still be signalled
+- Fixed `Shell.run` hanging forever with its command's process left a zombie on Linux where `pidfd_open` is unavailable (OpenShell sandboxes), once the host had spawned a subprocess of its own; waiting now retries reaping every 100 ms
 
 ## [18.4.10] - 2026-10-02
 
@@ -37,8 +38,6 @@
 ### Fixed
 
 - Fixed macOS spell checking and Apple word completion adding a duplicate terminal icon to the Dock for every omp session ([#12491](https://github.com/can1357/oh-my-pi/issues/12491))
-- Fixed `spawnedComplete` being `false` for every shell run that left a process alive on Linux where `pidfd_open` is unavailable, such as OpenShell sandboxes whose seccomp filter fails it with `ENOSYS`: processes are now identified by their `/proc` start time there, are reported with their `startId`, and can still be signalled
-- Fixed `Shell.run` hanging forever with its command's process left a zombie on Linux where `pidfd_open` is unavailable (OpenShell sandboxes), once the host had spawned a subprocess of its own; waiting now retries reaping every 100 ms
 - Fixed `computer.windows()` on macOS marking every window of the frontmost app as focused. One window is marked now: the app's accessibility focused window, or its frontmost window when Accessibility permission is not granted. With the permission, `computer.focusedWindow()` no longer returns a floating panel such as TextEdit's Fonts panel in front of the document ([#13673](https://github.com/can1357/oh-my-pi/pull/13673) by [@will-bogusz](https://github.com/will-bogusz)).
 - Fixed non-Latin prompts that quote code in backticks or fences losing most of their prose score, which made the typing predictor's vocabulary refuse to learn them ([#13758](https://github.com/can1357/oh-my-pi/pull/13758) by [@jchanghong023](https://github.com/jchanghong023)).
 - Fixed `computer.window(...).ax()` leaving out everything inside an unnamed container. On macOS, Reminders, Contacts, Notes and Font Book windows showed only their toolbar and window buttons, and Calendar lost its month grid; Windows and Linux trees now also keep content under unnamed containers such as custom panes, lists and fillers ([#13822](https://github.com/can1357/oh-my-pi/pull/13822) by [@will-bogusz](https://github.com/will-bogusz)).

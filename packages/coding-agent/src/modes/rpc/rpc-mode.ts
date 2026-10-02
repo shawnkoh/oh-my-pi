@@ -560,6 +560,7 @@ export class RpcUserInputGate {
 	#sequence = 0;
 	#validFrom = 0;
 	#acceptedAt = new WeakMap<object, number>();
+	#pending = 0;
 
 	/** Call from {@link RpcInputDispatcher.dispatch} before the handler is queued. */
 	accept(command: RpcCommand): void {
@@ -590,12 +591,25 @@ export class RpcUserInputGate {
 
 	/** Run user-input work in accept order. The tail releases when `work` settles, not when a model turn ends. */
 	enqueue<T>(work: () => Promise<T>): Promise<T> {
+		this.#pending++;
 		const run = this.#tail.then(work, work);
 		this.#tail = run.then(
-			() => {},
-			() => {},
+			() => {
+				this.#pending--;
+			},
+			() => {
+				this.#pending--;
+			},
 		);
 		return run;
+	}
+
+	/**
+	 * Input enqueued and not yet settled: waiting its turn, in its hooks or skill/image
+	 * preparation, or not yet admitted. The session cannot see it yet, so it is queued input.
+	 */
+	get pendingCount(): number {
+		return this.#pending;
 	}
 }
 
@@ -1735,8 +1749,14 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	const dispatchOrderedUserInput = (
 		command: OrderedUserInput,
 		ticket: RpcPromptTicket | undefined,
-	): Promise<OrderedInputOutcome> =>
-		inputGate.enqueue(async () => {
+	): Promise<OrderedInputOutcome> => {
+		// A prompt owns the next turn from the moment the gate takes it: hold the session's
+		// turn-dispatch window while input ahead of it drains and its hooks run, so a `deliver`
+		// read after it parks behind it instead of waking the idle session and getting the prompt
+		// refused as busy. Released once the prompt was admitted, queued, handled or dropped.
+		const releaseDispatchHold =
+			command.type === "prompt" || command.type === "abort_and_prompt" ? session.holdTurnDispatch() : undefined;
+		const dispatched = inputGate.enqueue(async () => {
 			const sessionId = session.sessionId;
 			const isCurrent = () =>
 				inputGate.isCurrent(command) && !shutdownState.requested && session.sessionId === sessionId;
@@ -1828,6 +1848,9 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			});
 			return "admitted";
 		});
+		if (releaseDispatchHold) void dispatched.then(releaseDispatchHold, releaseDispatchHold);
+		return dispatched;
+	};
 
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
@@ -2667,10 +2690,12 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		afterSerialCommand: () => shutdownCoordinator.checkShutdownRequested(),
 		acceptInput: command => inputGate.accept(command),
 	});
-	// Commands read but not yet answered are admitted input the session cannot see.
+	// Commands read but not yet answered, and ordered input still in the gate (an
+	// `abort_and_prompt` is answered before its prompt is admitted), are admitted input
+	// the session cannot see.
 	session.registerWorkSource({
 		kind: "queuedInput",
-		count: () => inputDispatcher.pendingCount + shutdownCoordinator.pendingCount,
+		count: () => inputDispatcher.pendingCount + shutdownCoordinator.pendingCount + inputGate.pendingCount,
 	});
 
 	// Keep the stdin reader moving: side-channel frames dispatch immediately,

@@ -30,12 +30,12 @@ describe("external delivery over RPC", () => {
 		await removeWithRetries(directory);
 	});
 
-	function start() {
+	function start(fixtureEnv: Record<string, string> = {}) {
 		const proc = Bun.spawn(
 			[process.execPath, path.join(import.meta.dir, "fixtures", "external-delivery-rpc-agent.ts")],
 			{
 				cwd: directory,
-				env: { ...process.env, PI_CODING_AGENT_DIR: directory, PI_NO_TITLE: "1", NO_COLOR: "1" },
+				env: { ...process.env, PI_CODING_AGENT_DIR: directory, PI_NO_TITLE: "1", NO_COLOR: "1", ...fixtureEnv },
 				stdin: "pipe",
 				stdout: "pipe",
 				stderr: "pipe",
@@ -71,7 +71,12 @@ describe("external delivery over RPC", () => {
 				if (match(frame)) return frame;
 			}
 		};
-		return { command, until, received, receive };
+		/** Writes several frames in one stdin write, so the engine reads them back to back. */
+		const pipeline = async (frames: object[]): Promise<void> => {
+			proc.stdin.write(frames.map(frame => `${JSON.stringify(frame)}\n`).join(""));
+			await proc.stdin.flush();
+		};
+		return { command, until, received, receive, pipeline };
 	}
 
 	test("the ready frame advertises the capability before any command", async () => {
@@ -86,6 +91,41 @@ describe("external delivery over RPC", () => {
 		expect(state.success).toBe(true);
 		expect(state.data).toMatchObject({ externalDeliveries: [] });
 		expect(isRecord(state.data) && state.data.capabilities).toEqual(ready.capabilities);
+	}, 30_000);
+
+	test("a deliver pipelined after a prompt whose input hook is still running waits for that prompt", async () => {
+		const rpc = start({ DELIVERY_FIXTURE_INPUT_HOOK_MS: "50", DELIVERY_FIXTURE_MODEL_DELAY_MS: "100" });
+		await rpc.until(frame => frame.type === "ready");
+
+		// One write: the deliver is read while the prompt's hook is still running.
+		await rpc.pipeline([
+			{ id: "p1", type: "prompt", message: "hello" },
+			{ id: "d1", type: "deliver", record: card("pipelined", "src-p"), options: { mode: "aside" } },
+		]);
+
+		const delivered = await rpc.until(frame => frame.type === "response" && frame.id === "d1");
+		expect(delivered).toMatchObject({ command: "deliver", success: true });
+		const deliveryId = delivered.deliveryId as string;
+		// The idle session was not woken under the prompt: the prompt is admitted, not refused as busy.
+		const prompted = await rpc.until(frame => frame.type === "response" && frame.id === "p1");
+		expect(prompted).toMatchObject({ command: "prompt", success: true });
+		const result = await rpc.until(frame => frame.type === "prompt_result" && frame.id === "p1");
+		expect(result).toMatchObject({ status: "completed" });
+		expect(result.error).toBeUndefined();
+
+		// The record waited behind the prompt's turn dispatch: the prompt reached the model alone
+		// first, then the held aside was admitted (here woken, since that turn had no step boundary
+		// left to fold it into) and the model saw it after the prompt.
+		const accepted = await rpc.until(frame => frame.type === "delivery_accepted" && frame.deliveryId === deliveryId);
+		expect(accepted).toMatchObject({ mode: "aside" });
+		const settled = await rpc.until(frame => frame.type === "delivery_settled" && frame.deliveryId === deliveryId);
+		expect(settled).toMatchObject({ included: true });
+		const replies = rpc.received
+			.filter(frame => frame.type === "message_end" && isRecord(frame.message) && frame.message.role === "assistant")
+			.map(frame => JSON.stringify(frame.message));
+		expect(replies[0]).toContain('seen:[\\"hello\\"]');
+		expect(replies.at(-1)).toContain('seen:[\\"hello\\",\\"pipelined\\"]');
+		expect(rpc.received.filter(frame => frame.type === "response" && frame.success === false)).toEqual([]);
 	}, 30_000);
 
 	test("deliver never parses commands, and receipts correlate by the engine-minted delivery id", async () => {
