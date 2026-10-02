@@ -61,6 +61,12 @@ export class RpcGoalController {
 	#previousContinuationActivity: string | undefined;
 	/** A continuation turn made no new progress; wait for the host before continuing. */
 	#suppressContinuation = false;
+	/**
+	 * Set by a host abort; only host action (a prompt, or `goal create`/`resume`) clears it.
+	 * Unlike {@link #suppressContinuation}, no turn's `agent_end` can re-arm it, so the
+	 * aborted turn's own end cannot schedule another goal turn whatever its activity.
+	 */
+	#hostStopped = false;
 	/** A continuation has been decided and is waiting for the session to go idle. */
 	#continuationScheduled = false;
 	/** Bumped by a host abort or session change; a waiting continuation from before is void. */
@@ -110,6 +116,7 @@ export class RpcGoalController {
 	 * schedule another goal turn. The runtime separately pauses the interrupted goal.
 	 */
 	stopForHostAbort(): void {
+		this.#hostStopped = true;
 		this.#suppressContinuation = true;
 		this.#continuationScheduled = false;
 		this.#continuationGeneration++;
@@ -290,6 +297,7 @@ export class RpcGoalController {
 		this.#pendingContinuationTurns = 0;
 		this.#previousContinuationActivity = undefined;
 		this.#suppressContinuation = false;
+		this.#hostStopped = false;
 	}
 
 	/**
@@ -362,6 +370,12 @@ export class RpcGoalController {
 			const activity = goalContinuationActivity(event.messages);
 			this.#suppressContinuation = activity.length === 0 || activity === this.#previousContinuationActivity;
 			this.#previousContinuationActivity = activity;
+		} else {
+			// As in the TUI: a turn that was not a goal continuation (a host prompt, a delivery
+			// or job wake, an extension-triggered turn) re-arms after a no-progress stop.
+			// A host abort stays in force (#hostStopped).
+			this.#suppressContinuation = false;
+			this.#previousContinuationActivity = undefined;
 		}
 		if (this.#session.getGoalModeState()?.mode === "exiting") {
 			// Journal now, while the transcript is certainly the one that completed the
@@ -380,7 +394,7 @@ export class RpcGoalController {
 	#continuationWanted(): boolean {
 		const session = this.#session;
 		if (!cfgGoalContinuationModes.get(session.settings).includes(RPC_GOAL_CONTINUATION_MODE)) return false;
-		if (this.#suppressContinuation || session.isDisposed) return false;
+		if (this.#hostStopped || this.#suppressContinuation || session.isDisposed) return false;
 		if (session.getPlanModeState()?.enabled) return false;
 		const state = session.getGoalModeState();
 		if (!state?.enabled || state.goal.status !== "active") return false;

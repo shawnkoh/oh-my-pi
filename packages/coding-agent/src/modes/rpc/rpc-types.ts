@@ -18,7 +18,7 @@ import type { SubagentEventPayload, SubagentLifecyclePayload, SubagentProgressPa
 import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 import type { RpcMessagesPage } from "./rpc-messages";
 import type { GoalModeState } from "../../goals/state";
-import type { RpcGoalResult } from "./rpc-goal";
+import type { RpcGoalOp, RpcGoalResult } from "./rpc-goal";
 
 // ============================================================================
 // RPC Commands (stdin)
@@ -48,7 +48,7 @@ export type RpcCommand =
 	| {
 			id?: string;
 			type: "goal";
-			op: "get" | "create" | "resume" | "pause" | "drop";
+			op: RpcGoalOp;
 			objective?: string;
 			token_budget?: number;
 	  }
