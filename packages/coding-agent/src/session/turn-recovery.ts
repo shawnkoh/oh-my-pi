@@ -555,6 +555,18 @@ export class TurnRecovery {
 	}
 
 	/**
+	 * Quiet completion of a delivery-owned evaluation: the empty final stop is
+	 * dropped from active context and the persisted branch is re-parented to
+	 * the stop's own parent, which is kept (unlike `acceptTerminalEmptyStop`,
+	 * which also prunes a custom prompt parent). No retry counter advances.
+	 */
+	async discardQuietDeliveryStop(assistantMessage: AssistantMessage): Promise<void> {
+		this.#emptyStopRetryCount = 0;
+		this.#unexpectedStopRetryCount = 0;
+		await this.#dropAssistantTurnDurably(assistantMessage);
+	}
+
+	/**
 	 * Continue past a provider-rejected function call that the replay-based
 	 * retry declined. Gemini reports `MALFORMED_FUNCTION_CALL` when the model
 	 * transcribes the call as text (`call:default_api:read{…}`, a tool_code
