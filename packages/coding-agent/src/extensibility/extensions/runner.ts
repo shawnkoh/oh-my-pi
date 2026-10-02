@@ -1263,9 +1263,11 @@ export class ExtensionRunner {
 	}
 
 	emitError(error: ExtensionError): void {
-		for (const listener of this.#errorListeners) {
-			listener(error);
-		}
+		this.eventScope(() => {
+			for (const listener of this.#errorListeners) {
+				listener(error);
+			}
+		});
 	}
 
 	hasHandlers(eventType: string): boolean {
@@ -1491,7 +1493,24 @@ export class ExtensionRunner {
 	#isSessionShutdownEvent(event: RunnerEmitEvent): event is Extract<RunnerEmitEvent, { type: "session_shutdown" }> {
 		return event.type === "session_shutdown";
 	}
-	async #runHandlerWithTimeout<TEvent extends { type: string }, R>(
+	/** Host-owned dispatch boundary. Input handlers retain their caller's admission scope. */
+	eventScope: <T>(dispatch: () => T) => T = dispatch => dispatch();
+
+	#runHandlerWithTimeout<TEvent extends { type: string }, R>(
+		handler: (event: TEvent, ctx: ExtensionContext) => Promise<R | undefined> | R | undefined,
+		event: TEvent,
+		ctx: ExtensionContext,
+		ext: Extension,
+		timeoutMs: number,
+		onFailure?: (kind: "timeout" | "error", message: string) => R,
+		outerSignal?: AbortSignal,
+	): Promise<R | undefined> {
+		const dispatch = () =>
+			this.#dispatchHandlerWithTimeout(handler, event, ctx, ext, timeoutMs, onFailure, outerSignal);
+		return event.type === "input" ? dispatch() : this.eventScope(dispatch);
+	}
+
+	async #dispatchHandlerWithTimeout<TEvent extends { type: string }, R>(
 		handler: (event: TEvent, ctx: ExtensionContext) => Promise<R | undefined> | R | undefined,
 		event: TEvent,
 		ctx: ExtensionContext,

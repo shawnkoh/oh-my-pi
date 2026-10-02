@@ -843,6 +843,118 @@ describe("external delivery (session)", () => {
 			expect(discarded.reason).toBe("new-session");
 		});
 
+		/** A file-backed session with a switch target and a `session_before_switch` hook held open:
+		 *  the transition is open while the agent is still connected and idle. */
+		async function heldSwitchSession() {
+			const sessionDir = path.join(tempDir.path(), "sessions");
+			const targetManager = SessionManager.create(tempDir.path(), sessionDir);
+			targetManager.appendMessage({ role: "user", content: "target", timestamp: Date.now() });
+			await targetManager.ensureOnDisk();
+			const targetFile = targetManager.getSessionFile();
+			if (!targetFile) throw new Error("Expected target session file");
+			await targetManager.close();
+			const hookReached = Promise.withResolvers<void>();
+			const releaseHook = Promise.withResolvers<void>();
+			const sessionManager = SessionManager.create(tempDir.path(), sessionDir);
+			const runtime = new ExtensionRuntime();
+			const extension = await loadExtensionFromFactory(
+				pi => {
+					pi.on("session_before_switch", async () => {
+						hookReached.resolve();
+						await releaseHook.promise;
+					});
+				},
+				tempDir.path(),
+				new EventBus(),
+				runtime,
+				"held-switch-hook",
+			);
+			const extensionRunner = new ExtensionRunner(
+				[extension],
+				runtime,
+				tempDir.path(),
+				sessionManager,
+				new ModelRegistry(authStorage),
+			);
+			const { mock, session: s } = makeSession({ sessionManager, extensionRunner });
+			return {
+				mock,
+				session: s,
+				targetFile,
+				hookReached: hookReached.promise,
+				releaseHook: () => releaseHook.resolve(),
+			};
+		}
+
+		/** Delivers a steer while the transition is open and the session idle: its wake is
+		 *  deferred, handed back, and the stranded resume sees it with the transition open. */
+		async function strandSteerInTransition(s: AgentSession, mock: MockModel): Promise<DeliveryHandle> {
+			const handle = s.deliverExternalMessage(card("steer-me"), { mode: "steer" });
+			await s.waitForIdle();
+			for (let i = 0; i < 25; i++) await setImmediate();
+			expect(handle.state()).toBe("queued");
+			expect(mock.calls).toHaveLength(0);
+			return handle;
+		}
+
+		async function settleAfterTransition(s: AgentSession): Promise<void> {
+			await s.waitForIdle();
+			for (let i = 0; i < 25; i++) await setImmediate();
+		}
+
+		it("a steer stranded while a switch is open wakes once the switch rolls back", async () => {
+			const { mock, session: s, targetFile, hookReached, releaseHook } = await heldSwitchSession();
+			const setSessionFileSpy = spyOn(SessionManager.prototype, "setSessionFile").mockImplementation(async () => {
+				throw new Error("forced switchSession failure");
+			});
+			let handle: DeliveryHandle;
+			try {
+				const switching = s.switchSession(targetFile);
+				await hookReached;
+				handle = await strandSteerInTransition(s, mock);
+				mock.push({ content: ["acted on the steer"] });
+				releaseHook();
+				await expect(switching).rejects.toThrow("forced switchSession failure");
+			} finally {
+				setSessionFileSpy.mockRestore();
+			}
+			await settleAfterTransition(s);
+			expect(handle.state()).toBe("settled");
+			expect(await handle.accepted).toMatchObject({ mode: "steer", mechanism: "wake" });
+			expect((await handle.settled).included).toBe(true);
+			expect(userTexts(mock, mock.calls.length - 1)).toEqual(["steer-me"]);
+		});
+
+		it("a steer stranded while a fork is open wakes in the forked session", async () => {
+			const { mock, session: s, hookReached, releaseHook } = await heldSwitchSession();
+			const forking = s.fork();
+			await hookReached;
+			const handle = await strandSteerInTransition(s, mock);
+			mock.push({ content: ["acted on the steer"] });
+			releaseHook();
+			await forking;
+			await settleAfterTransition(s);
+			expect(handle.state()).toBe("settled");
+			expect(await handle.accepted).toMatchObject({ mode: "steer", mechanism: "wake" });
+			expect((await handle.settled).included).toBe(true);
+		});
+
+		it("a steer stranded while a switch is open is discarded when it commits and never reaches the target", async () => {
+			const { mock, session: s, targetFile, hookReached, releaseHook } = await heldSwitchSession();
+			const switching = s.switchSession(targetFile);
+			await hookReached;
+			const handle = await strandSteerInTransition(s, mock);
+			releaseHook();
+			expect(await switching).toBe(true);
+			expect(handle.state()).toBe("discarded");
+			expect(await handle.discarded).toEqual({ reason: "session-switched" });
+			mock.push({ content: ["hello"] });
+			await s.prompt("hello");
+			await s.waitForIdle();
+			expect(mock.calls).toHaveLength(1);
+			expect(userTexts(mock, 0)).toEqual(["target", "hello"]);
+		});
+
 		it("does not wake into an admitted-but-not-started submission; the record folds into that turn", async () => {
 			// The real window: a prompt admitted while a manual /compact is in flight
 			// waits on compaction cleanup before its busy check. A delivery that
@@ -1040,6 +1152,756 @@ describe("external delivery (session)", () => {
 			const texts = mock.calls.flatMap((_, index) => userTexts(mock, index));
 			expect(texts).toContain("summarize the repository status");
 			expect(texts).toContain("mid-command");
+		});
+
+		// H2: a delivery made by held host input's own hooks is covered by that input even
+		// when another prompt's window parks it: once only host holds remain it wakes, and
+		// plan mode or a host interrupt does not gate that wake.
+		it.each(["in plan mode", "after a host abort"] as const)(
+			"a hook's own delivery parked behind another prompt's window wakes %s once that window closes without a turn (H2)",
+			async gate => {
+				const inCommand = Promise.withResolvers<void>();
+				const releaseCommand = Promise.withResolvers<void>();
+				const slow = slowTool();
+				const { mock, session: s } = makeSession({
+					tools: [slow.tool],
+					customCommands: [
+						{
+							path: "local.ts",
+							resolvedPath: "/virtual/local.ts",
+							source: "project",
+							command: {
+								name: "local",
+								description: "handled locally after an await",
+								execute: async () => {
+									inCommand.resolve();
+									await releaseCommand.promise;
+									return "";
+								},
+							},
+						},
+					],
+				});
+				if (gate === "in plan mode") {
+					s.setPlanModeState({ enabled: true, planFilePath: "local://PLAN.md" });
+				} else {
+					mock.push(toolCall("slow"));
+					const run = s.prompt("go");
+					await slow.started;
+					const aborting = s.abort({ reason: USER_INTERRUPT_LABEL });
+					slow.release();
+					await aborting;
+					await run.catch(() => {});
+					await s.waitForIdle();
+				}
+				const callsBefore = mock.calls.length;
+				const localCommand = s.prompt("/local");
+				await inCommand.promise;
+				// Host input held while its hook delivers and awaits acceptance, as rpc-mode runs it.
+				const releaseHold = s.holdTurnDispatch();
+				mock.push({ content: ["hook delivery handled"] });
+				const hook = s.runHostInputHooks(async () => {
+					const handle = s.deliverExternalMessage(card("from-hook"), { mode: "aside" });
+					await Promise.race([handle.accepted, handle.discarded]);
+					return handle;
+				});
+				for (let i = 0; i < 5; i++) await setImmediate();
+				expect(s.isStreaming).toBe(false);
+				expect(mock.calls).toHaveLength(callsBefore);
+				releaseCommand.resolve();
+				await expect(localCommand).resolves.toBe(false);
+				// Without the exemption the hook never completes (the test times out).
+				const handle = await hook;
+				releaseHold();
+				expect((await handle.settled).included).toBe(true);
+				await s.waitForIdle();
+				expect(mock.calls).toHaveLength(callsBefore + 1);
+				expect(userTexts(mock, callsBefore)).toContain("from-hook");
+			},
+		);
+
+		// J1: the H2 coverage lasts only while the hook runs. Once it returned, a later
+		// interrupt or plan mode holds its parked record, and nothing it woke pulls in
+		// records delivered outside the hook.
+		it.each(["a user abort", "plan mode"] as const)(
+			"a hook's parked record and an outside aside stay queued under %s that comes after the hook returned (J1)",
+			async gate => {
+				const inCommand = Promise.withResolvers<void>();
+				const releaseCommand = Promise.withResolvers<void>();
+				const { mock, session: s } = makeSession({
+					customCommands: [
+						{
+							path: "local.ts",
+							resolvedPath: "/virtual/local.ts",
+							source: "project",
+							command: {
+								name: "local",
+								description: "handled locally after an await",
+								execute: async () => {
+									inCommand.resolve();
+									await releaseCommand.promise;
+									return "";
+								},
+							},
+						},
+					],
+				});
+				const localCommand = s.prompt("/local");
+				await inCommand.promise;
+				const releaseHold = s.holdTurnDispatch();
+				const fromHook = await s.runHostInputHooks(async () =>
+					s.deliverExternalMessage(card("from-hook"), { mode: "aside" }),
+				);
+				releaseHold();
+				const outside = s.deliverExternalMessage(card("outside"), { mode: "aside" });
+				if (gate === "plan mode") s.setPlanModeState({ enabled: true, planFilePath: "local://PLAN.md" });
+				else await s.abort({ reason: USER_INTERRUPT_LABEL });
+				releaseCommand.resolve();
+				await expect(localCommand).resolves.toBe(false);
+				await s.waitForIdle();
+				for (let i = 0; i < 5; i++) await setImmediate();
+				expect(fromHook.state()).toBe("queued");
+				expect(outside.state()).toBe("queued");
+				expect(mock.calls).toHaveLength(0);
+			},
+		);
+
+		it("a tool's delivery inside the turn a hook's delivery woke stays queued after a user abort (J1)", async () => {
+			const holder: { session?: AgentSession; fromTool?: DeliveryHandle } = {};
+			const started = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const deliverer: AgentTool = {
+				name: "deliverer",
+				label: "deliverer",
+				description: "Delivers an aside, then blocks until released",
+				parameters: type({}),
+				execute: async () => {
+					holder.fromTool = holder.session?.deliverExternalMessage(card("from-tool"), { mode: "aside" });
+					started.resolve();
+					await release.promise;
+					return { content: [{ type: "text", text: "deliverer_DONE" }] };
+				},
+			};
+			const { mock, session: s } = makeSession({ tools: [deliverer] });
+			holder.session = s;
+			mock.push(toolCall("deliverer"));
+			const releaseHold = s.holdTurnDispatch();
+			// The hook keeps its scope open across the turn its own delivery wakes.
+			const hook = s.runHostInputHooks(async () => {
+				const handle = s.deliverExternalMessage(card("from-hook"), { mode: "aside" });
+				await handle.settled;
+				return handle;
+			});
+			await started.promise;
+			const aborting = s.abort({ reason: USER_INTERRUPT_LABEL });
+			release.resolve();
+			await aborting;
+			await hook;
+			releaseHold();
+			const callsAtAbort = mock.calls.length;
+			await s.waitForIdle();
+			for (let i = 0; i < 5; i++) await setImmediate();
+			expect(holder.fromTool?.state()).toBe("queued");
+			expect(mock.calls).toHaveLength(callsAtAbort);
+		});
+
+		// J2: a hook's own delivery parked as a pooled deferred wake must wake once the pool
+		// clears while only the hook's host hold remains; that hold lasts until the hook returns.
+		it("a hook's own delivery parked while pooled wakes when the pool clears under its host hold (J2)", async () => {
+			const { mock, session: s } = makeSession();
+			await s.setWorkPoolYieldItems([{ id: "pool#1", index: 1 }]);
+			const releaseHold = s.holdTurnDispatch();
+			mock.push({ content: ["hook delivery handled"] });
+			const hook = s.runHostInputHooks(async () => {
+				const handle = s.deliverExternalMessage(card("from-hook"), { mode: "aside" });
+				await Promise.race([handle.accepted, handle.discarded]);
+				return handle;
+			});
+			for (let i = 0; i < 5; i++) await setImmediate();
+			expect(mock.calls).toHaveLength(0);
+			await s.setWorkPoolYieldItems([]);
+			// Without the deferred-wake drain the hook never completes (the test times out).
+			const handle = await hook;
+			releaseHold();
+			expect((await handle.settled).included).toBe(true);
+			await s.waitForIdle();
+			expect(mock.calls).toHaveLength(1);
+			expect(userTexts(mock, 0)).toContain("from-hook");
+		});
+
+		// K1: a hook's own delivery made while a turn is running is exempt too; the turn may
+		// end after its last aside poll, leaving the record for the stranded resume under the
+		// hook's host hold.
+		it("a hook's own delivery made during a turn's final stream wakes under its host hold (K1)", async () => {
+			const { mock, session: s } = makeSession();
+			const streaming = Promise.withResolvers<void>();
+			const finish = Promise.withResolvers<void>();
+			mock.push(async () => {
+				streaming.resolve();
+				await finish.promise;
+				return { content: ["final"] };
+			});
+			mock.push({ content: ["hook delivery handled"] });
+			const run = s.prompt("go");
+			await streaming.promise;
+			const releaseHold = s.holdTurnDispatch();
+			const hook = s.runHostInputHooks(async () => {
+				const handle = s.deliverExternalMessage(card("from-hook"), { mode: "aside" });
+				await handle.settled;
+				return handle;
+			});
+			finish.resolve();
+			await run;
+			// Without the exemption the hook never completes (the test times out).
+			const handle = await hook;
+			releaseHold();
+			expect((await handle.settled).included).toBe(true);
+			expect(mock.calls).toHaveLength(2);
+			expect(userTexts(mock, 1)).toContain("from-hook");
+		});
+
+		it("a hook's own delivery made mid-tool wakes after a user abort under its host hold (K1)", async () => {
+			const slow = slowTool();
+			const { mock, session: s } = makeSession({ tools: [slow.tool] });
+			mock.push(toolCall("slow"));
+			const run = s.prompt("go");
+			await slow.started;
+			const releaseHold = s.holdTurnDispatch();
+			mock.push({ content: ["hook delivery handled"] });
+			const hook = s.runHostInputHooks(async () => {
+				const handle = s.deliverExternalMessage(card("from-hook"), { mode: "aside" });
+				await handle.settled;
+				return handle;
+			});
+			const aborting = s.abort({ reason: USER_INTERRUPT_LABEL });
+			slow.release();
+			await aborting;
+			await run.catch(() => {});
+			// Without the exemption the hook never completes (the test times out).
+			const handle = await hook;
+			releaseHold();
+			expect((await handle.settled).included).toBe(true);
+			expect(userTexts(mock, mock.calls.length - 1)).toContain("from-hook");
+		});
+
+		// The hook scope ends at every turn the hook starts, however it starts it: after its own
+		// delivery into a running turn settled, a tool's delivery inside a turn the hook then
+		// prompted is ordinary and stays queued under a user abort.
+		it("a hook's delivery into a running turn settles, and a tool's delivery in a turn the hook then prompts stays queued after a user abort (K1)", async () => {
+			const holder: { session?: AgentSession; fromTool?: DeliveryHandle } = {};
+			const started = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const deliverer: AgentTool = {
+				name: "deliverer",
+				label: "deliverer",
+				description: "Delivers an aside, then blocks until released",
+				parameters: type({}),
+				execute: async () => {
+					holder.fromTool = holder.session?.deliverExternalMessage(card("from-tool"), { mode: "aside" });
+					started.resolve();
+					await release.promise;
+					return { content: [{ type: "text", text: "deliverer_DONE" }] };
+				},
+			};
+			const { mock, session: s } = makeSession({ tools: [deliverer] });
+			holder.session = s;
+			const streaming = Promise.withResolvers<void>();
+			const finish = Promise.withResolvers<void>();
+			mock.push(async () => {
+				streaming.resolve();
+				await finish.promise;
+				return { content: ["first"] };
+			});
+			mock.push({ content: ["hook delivery handled"] });
+			mock.push(toolCall("deliverer"));
+			const first = s.prompt("first");
+			await streaming.promise;
+			const releaseHold = s.holdTurnDispatch();
+			const hook = s.runHostInputHooks(async () => {
+				const fromHook = s.deliverExternalMessage(card("from-hook"), { mode: "aside" });
+				await fromHook.settled;
+				await s.waitForIdle();
+				await s.prompt("second").catch(() => {});
+				return fromHook;
+			});
+			finish.resolve();
+			await first;
+			// Without the exemption the hook's delivery never settles and the tool never runs
+			// (the test times out).
+			await started.promise;
+			const aborting = s.abort({ reason: USER_INTERRUPT_LABEL });
+			release.resolve();
+			await aborting;
+			const fromHook = await hook;
+			releaseHold();
+			expect((await fromHook.settled).included).toBe(true);
+			await s.waitForIdle();
+			for (let i = 0; i < 5; i++) await setImmediate();
+			expect(holder.fromTool?.state()).toBe("queued");
+			const texts = mock.calls.flatMap((_, index) => userTexts(mock, index));
+			expect(texts).toContain("from-hook");
+			expect(texts).not.toContain("from-tool");
+		});
+
+		// L2: the deferred tail of a turn the hook's delivery woke (agent_end, the stranded
+		// drain) runs outside the hook's scope too, so an agent_end subscriber's aside is ordinary.
+		it.each(["a user abort", "plan mode"] as const)(
+			"an agent_end subscriber's aside after a turn the hook woke stays queued under %s",
+			async gate => {
+				const slow = slowTool();
+				const { mock, session: s } = makeSession({ tools: [slow.tool] });
+				if (gate === "plan mode") {
+					s.setPlanModeState({ enabled: true, planFilePath: "local://PLAN.md" });
+				} else {
+					mock.push(toolCall("slow"));
+					const run = s.prompt("go");
+					await slow.started;
+					const aborting = s.abort({ reason: USER_INTERRUPT_LABEL });
+					slow.release();
+					await aborting;
+					await run.catch(() => {});
+					await s.waitForIdle();
+				}
+				const callsBefore = mock.calls.length;
+				let fromEnd: DeliveryHandle | undefined;
+				s.subscribe(event => {
+					if (event.type === "agent_end" && !fromEnd) {
+						fromEnd = s.deliverExternalMessage(card("from-end"), { mode: "aside" });
+					}
+				});
+				const releaseHold = s.holdTurnDispatch();
+				mock.push({ content: ["hook delivery handled"] });
+				const hook = s.runHostInputHooks(async () => {
+					const handle = s.deliverExternalMessage(card("from-hook"), { mode: "aside" });
+					await handle.settled;
+					return handle;
+				});
+				const fromHook = await hook;
+				releaseHold();
+				expect((await fromHook.settled).included).toBe(true);
+				await s.waitForIdle();
+				for (let i = 0; i < 5; i++) await setImmediate();
+				expect(fromEnd?.state()).toBe("queued");
+				expect(mock.calls).toHaveLength(callsBefore + 1);
+			},
+		);
+
+		it("an agent_end subscriber's aside after a turn the hook prompted stays queued in plan mode", async () => {
+			const { mock, session: s } = makeSession();
+			s.setPlanModeState({ enabled: true, planFilePath: "local://PLAN.md" });
+			let fromEnd: DeliveryHandle | undefined;
+			s.subscribe(event => {
+				if (event.type === "agent_end" && !fromEnd) {
+					fromEnd = s.deliverExternalMessage(card("from-end"), { mode: "aside" });
+				}
+			});
+			const releaseHold = s.holdTurnDispatch();
+			mock.push({ content: ["prompted"] });
+			await s.runHostInputHooks(() => s.prompt("from-hook"));
+			releaseHold();
+			await s.waitForIdle();
+			for (let i = 0; i < 5; i++) await setImmediate();
+			expect(fromEnd?.state()).toBe("queued");
+			expect(mock.calls).toHaveLength(1);
+		});
+
+		for (const source of ["advisor", "goal", "mode-exit"] as const) {
+			it.each(source === "mode-exit" ? (["wake"] as const) : (["prompt", "wake"] as const))(
+				`I13j ${source} abort observer stays queued in an open hook (%s)`,
+				async start => {
+					const slow = slowTool();
+					const { mock, session: s } = makeSession({ tools: [slow.tool] });
+					let observed: DeliveryHandle | undefined;
+					s.subscribe(event => {
+						const matches =
+							source === "goal"
+								? event.type === "goal_updated" && event.goal?.status === "paused"
+								: event.type === "message_end" &&
+									event.message.role === "custom" &&
+									event.message.customType === (source === "advisor" ? "advisor" : "stranded-probe");
+						if (matches && !observed) observed = s.deliverExternalMessage(card("observer"), { mode: "aside" });
+					});
+					if (source === "goal") await s.goalRuntime.createGoal({ objective: "probe" });
+					const releaseHold = s.holdTurnDispatch();
+					mock.push(toolCall("slow"));
+					try {
+						await s.runHostInputHooks(async () => {
+							const run =
+								start === "prompt"
+									? s.prompt("go")
+									: s.deliverExternalMessage(card("go"), { mode: "aside" }).settled;
+							await slow.started;
+							if (source !== "goal") {
+								await s.sendCustomMessage(
+									{
+										customType: source === "advisor" ? "advisor" : "stranded-probe",
+										content: "stranded",
+										display: true,
+									},
+									{ deliverAs: source === "advisor" ? "steer" : "aside" },
+								);
+								releaseHold();
+							}
+							const aborting =
+								source === "mode-exit"
+									? s.runModeExitTeardown(() => s.abort({ reason: USER_INTERRUPT_LABEL }))
+									: s.abort({ reason: USER_INTERRUPT_LABEL });
+							slow.release();
+							await aborting;
+							await run;
+							await s.waitForIdle();
+							for (let i = 0; i < 10; i++) await setImmediate();
+							expect(observed?.state()).toBe("queued");
+							expect(mock.calls.flatMap((_, i) => userTexts(mock, i))).not.toContain("observer");
+						});
+					} finally {
+						slow.release();
+						releaseHold();
+					}
+				},
+			);
+		}
+
+		it.each(["session_before_compact", "session_compact"] as const)(
+			"I13j %s observer cannot wake a disconnected session",
+			async eventType => {
+				const manager = SessionManager.inMemory(tempDir.path());
+				const runtime = new ExtensionRuntime();
+				let observed: DeliveryHandle | undefined;
+				let callsDuringObserver: number | undefined;
+				const extension = await loadExtensionFromFactory(
+					pi => {
+						const observe = async () => {
+							observed = session!.deliverExternalMessage(card("observer"), { mode: "aside" });
+							for (let i = 0; i < 10; i++) await setImmediate();
+							callsDuringObserver = mock.calls.length;
+						};
+						if (eventType === "session_before_compact") pi.on("session_before_compact", observe);
+						else pi.on("session_compact", observe);
+						pi.on("session_before_compact", event => ({
+							compaction: {
+								summary: "summary",
+								firstKeptEntryId: event.preparation.firstKeptEntryId,
+								tokensBefore: event.preparation.tokensBefore,
+							},
+						}));
+					},
+					tempDir.path(),
+					new EventBus(),
+					runtime,
+					"compaction-observer",
+				);
+				const runner = new ExtensionRunner(
+					[extension],
+					runtime,
+					tempDir.path(),
+					manager,
+					new ModelRegistry(authStorage),
+				);
+				const { mock, session: s } = makeSession({
+					sessionManager: manager,
+					extensionRunner: runner,
+					compaction: true,
+				});
+				await s.prompt("seed");
+				await s.abort({ reason: USER_INTERRUPT_LABEL });
+				const before = mock.calls.length;
+				const releaseHold = s.holdTurnDispatch();
+				try {
+					await s.runHostInputHooks(async () => {
+						await s.compact();
+						await s.waitForIdle();
+						expect(callsDuringObserver).toBe(before);
+						expect(mock.calls).toHaveLength(before);
+						expect(observed?.state()).toBe("queued");
+					});
+				} finally {
+					releaseHold();
+				}
+				await s.prompt("resume");
+				expect((await observed!.settled).included).toBe(true);
+			},
+		);
+
+		it.each(["metadata", "session-change"] as const)(
+			"I13k %s observers and async descendants stay outside host hooks",
+			async kind => {
+				const manager = SessionManager.create(tempDir.path(), path.join(tempDir.path(), "sessions"));
+				const { session: s } = makeSession({ sessionManager: manager });
+				await s.prompt("seed");
+				await manager.ensureOnDisk();
+				await s.abort({ reason: USER_INTERRUPT_LABEL });
+				const releaseHold = s.holdTurnDispatch();
+				const observed: DeliveryHandle[] = [];
+				const observe = () => {
+					if (observed.length) return;
+					observed.push(s.deliverExternalMessage(card("observer"), { mode: "aside" }));
+					void setImmediate().then(() => {
+						observed.push(s.deliverExternalMessage(card("descendant"), { mode: "aside" }));
+					});
+				};
+				const unsubscribe =
+					kind === "metadata"
+						? s.subscribeCommandMetadataChanged(observe)
+						: s.registerSessionChangeCallback(observe);
+				try {
+					await s.runHostInputHooks(async () => {
+						if (kind === "metadata") s.setMCPPromptCommands([]);
+						else expect(await s.fork()).toBe(true);
+						for (let i = 0; i < 10; i++) await setImmediate();
+						await s.waitForIdle();
+						expect(observed.map(handle => handle.state())).toEqual(["queued", "queued"]);
+						const own = s.deliverExternalMessage(card("direct"), { mode: "aside" });
+						expect((await own.settled).included).toBe(true);
+					});
+				} finally {
+					unsubscribe();
+					releaseHold();
+				}
+				await s.prompt("resume");
+				for (const handle of observed) expect((await handle.settled).included).toBe(true);
+			},
+		);
+
+		it("I13l failed new-session header persistence retains identity and replayable provider context", async () => {
+			const dir = path.join(tempDir.path(), "sessions");
+			const manager = SessionManager.create(tempDir.path(), dir);
+			const { mock, agent, session: s } = makeSession({ sessionManager: manager });
+			await s.prompt("OLD-TRANSCRIPT");
+			await manager.ensureOnDisk();
+			await manager.flush();
+			const previousId = manager.getSessionId();
+			const previousFile = manager.getSessionFile()!;
+			const previousMessages = [...agent.state.messages];
+			const failure = new Error("injected new header persistence failure");
+			const ensure = spyOn(manager, "ensureOnDisk").mockRejectedValueOnce(failure);
+			try {
+				await expect(s.newSession()).rejects.toBe(failure);
+			} finally {
+				ensure.mockRestore();
+			}
+			expect(manager.getSessionId()).toBe(previousId);
+			expect(manager.getSessionFile()).toBe(previousFile);
+			expect(manager.buildSessionContext().messages).toEqual(previousMessages);
+			expect(agent.state.messages).toEqual(previousMessages);
+
+			await s.prompt("AFTER-FAILURE");
+			await manager.flush();
+			const reopened = await SessionManager.open(previousFile, dir);
+			expect(reopened.getSessionId()).toBe(previousId);
+			const transcript = (messages: Message[]) =>
+				messages.map(message => ({ role: message.role, content: message.content }));
+			expect(transcript(convertToLlm(reopened.buildSessionContext().messages))).toEqual(
+				transcript(convertToLlm(agent.state.messages)),
+			);
+			expect(userTexts(mock, 1)).toEqual(["OLD-TRANSCRIPT", "AFTER-FAILURE"]);
+			expect(transcript(mock.calls[1].context.messages)).toEqual(
+				transcript(convertToLlm(reopened.buildSessionContext().messages.slice(0, -1))),
+			);
+		});
+
+		it.each(["new", "switch"] as const)(
+			"I13k failed %s flush resumes parked and subsequent hook deliveries",
+			async action => {
+				const dir = path.join(tempDir.path(), "sessions");
+				const manager = SessionManager.create(tempDir.path(), dir);
+				const target = SessionManager.create(tempDir.path(), dir);
+				target.appendMessage({ role: "user", content: "target", timestamp: Date.now() });
+				await target.ensureOnDisk();
+				const { mock, session: s } = makeSession({ sessionManager: manager });
+				await s.prompt("seed");
+				await manager.ensureOnDisk();
+				const reached = Promise.withResolvers<void>();
+				const finish = Promise.withResolvers<void>();
+				const failure = new Error("injected flush failure");
+				const flush = spyOn(manager, "flush").mockImplementationOnce(async () => {
+					reached.resolve();
+					await finish.promise;
+					throw failure;
+				});
+				const releaseHold = s.holdTurnDispatch();
+				try {
+					await s.runHostInputHooks(async () => {
+						const transition = (
+							action === "new" ? s.newSession() : s.switchSession(target.getSessionFile()!)
+						).catch(error => error);
+						await reached.promise;
+						const parked = s.deliverExternalMessage(card("parked"), { mode: "aside" });
+						for (let i = 0; i < 10; i++) await setImmediate();
+						expect(parked.state()).toBe("queued");
+						expect(mock.calls).toHaveLength(1);
+						finish.resolve();
+						expect(await transition).toBe(failure);
+						flush.mockRestore();
+						const next = s.deliverExternalMessage(card("after-failure"), { mode: "aside" });
+						await Promise.all([parked, next].map(handle => Promise.race([handle.accepted, handle.discarded])));
+						expect((await parked.settled).included).toBe(true);
+						expect((await next.settled).included).toBe(true);
+						expect(userTexts(mock, 1)).toContain("seed");
+					});
+				} finally {
+					finish.resolve();
+					flush.mockRestore();
+					releaseHold();
+				}
+			},
+		);
+
+		it("I13k counts a parked owner once and retains accepted unsettled work", async () => {
+			const slow = slowTool();
+			const { mock, session: s } = makeSession({ tools: [slow.tool] });
+			const releaseHold = s.holdTurnDispatch();
+			const handle = s.deliverExternalMessage(card("counted"), { mode: "aside" });
+			for (let i = 0; i < 10; i++) await setImmediate();
+			expect(handle.state()).toBe("queued");
+			expect(s.getWorkCounts().queuedInput).toBe(1);
+			mock.push(toolCall("slow"));
+			releaseHold();
+			try {
+				await slow.started;
+				expect(handle.state()).toBe("accepted");
+				expect(s.getWorkCounts().queuedInput).toBe(1);
+			} finally {
+				slow.release();
+				await s.waitForIdle();
+			}
+			expect((await handle.settled).included).toBe(true);
+			expect(s.getWorkCounts().queuedInput).toBe(0);
+		});
+
+		it("I13j a hook awaits its own queued delivery across compaction without deadlock", async () => {
+			const manager = SessionManager.inMemory(tempDir.path());
+			const runtime = new ExtensionRuntime();
+			const reached = Promise.withResolvers<void>();
+			const finish = Promise.withResolvers<void>();
+			const extension = await loadExtensionFromFactory(
+				pi => {
+					pi.on("session_before_compact", async event => {
+						reached.resolve();
+						await finish.promise;
+						return {
+							compaction: {
+								summary: "summary",
+								firstKeptEntryId: event.preparation.firstKeptEntryId,
+								tokensBefore: event.preparation.tokensBefore,
+							},
+						};
+					});
+				},
+				tempDir.path(),
+				new EventBus(),
+				runtime,
+				"held-compaction",
+			);
+			const runner = new ExtensionRunner(
+				[extension],
+				runtime,
+				tempDir.path(),
+				manager,
+				new ModelRegistry(authStorage),
+			);
+			const { mock, session: s } = makeSession({
+				sessionManager: manager,
+				extensionRunner: runner,
+				compaction: true,
+			});
+			await s.prompt("seed");
+			await s.abort({ reason: USER_INTERRUPT_LABEL });
+			const before = mock.calls.length;
+			const releaseHold = s.holdTurnDispatch();
+			try {
+				const own = await s.runHostInputHooks(async () => {
+					const compacting = s.compact();
+					await reached.promise;
+					const handle = s.deliverExternalMessage(card("own"), { mode: "aside" });
+					for (let i = 0; i < 10; i++) await setImmediate();
+					const parked = handle.state();
+					const callsWhileDisconnected = mock.calls.length;
+					finish.resolve();
+					await compacting;
+					await Promise.race([handle.accepted, handle.discarded]);
+					expect(parked).toBe("queued");
+					expect(callsWhileDisconnected).toBe(before);
+					return handle;
+				});
+				expect((await own.settled).included).toBe(true);
+				expect(userTexts(mock, before)).toContain("own");
+			} finally {
+				finish.resolve();
+				releaseHold();
+			}
+		});
+
+		// M1 (I13h): an abort the hook itself calls flushes the turn's deferred agent_end outside the
+		// hook scope too, so an agent_end subscriber's aside stays an ordinary, interrupted delivery.
+		it("an agent_end subscriber's aside stays queued when the hook aborts the turn it prompted", async () => {
+			const slow = slowTool();
+			const { mock, session: s } = makeSession({ tools: [slow.tool] });
+			let fromEnd: DeliveryHandle | undefined;
+			s.subscribe(event => {
+				if (event.type === "agent_end" && !fromEnd) {
+					fromEnd = s.deliverExternalMessage(card("from-end"), { mode: "aside" });
+				}
+			});
+			const releaseHold = s.holdTurnDispatch();
+			mock.push(toolCall("slow"));
+			await s.runHostInputHooks(async () => {
+				const run = s.prompt("go");
+				await slow.started;
+				const aborting = s.abort({ reason: USER_INTERRUPT_LABEL });
+				slow.release();
+				await aborting;
+				await run.catch(() => {});
+				// Keep the hook open while the abort's tail drains.
+				for (let i = 0; i < 10; i++) await setImmediate();
+			});
+			releaseHold();
+			await s.waitForIdle();
+			for (let i = 0; i < 5; i++) await setImmediate();
+			expect(fromEnd?.state()).toBe("queued");
+			const texts = mock.calls.flatMap((_, index) => userTexts(mock, index));
+			expect(texts).not.toContain("from-end");
+		});
+
+		// I13i: abort's finally drains stranded asides; folding one emits message_end, and a
+		// subscriber's delivery there must not inherit the hook exemption either.
+		it("a delivery made while a hook-called abort folds a stranded aside stays queued", async () => {
+			const slow = slowTool();
+			const { mock, session: s } = makeSession({ tools: [slow.tool] });
+			let fromEnd: DeliveryHandle | undefined;
+			s.subscribe(event => {
+				if (
+					event.type === "message_end" &&
+					event.message.role === "custom" &&
+					event.message.customType === "ext-aside" &&
+					!fromEnd
+				) {
+					fromEnd = s.deliverExternalMessage(card("from-end"), { mode: "aside" });
+				}
+			});
+			const releaseHold = s.holdTurnDispatch();
+			mock.push(toolCall("slow"));
+			await s.runHostInputHooks(async () => {
+				const run = s.prompt("go");
+				await slow.started;
+				await s.sendCustomMessage(
+					{ customType: "ext-aside", content: "STRANDED", display: false, attribution: "agent" },
+					{ deliverAs: "aside" },
+				);
+				releaseHold();
+				const aborting = s.abort({ reason: USER_INTERRUPT_LABEL });
+				slow.release();
+				await aborting;
+				await run.catch(() => {});
+				// Keep the hook open while the stranded drain runs.
+				for (let i = 0; i < 10; i++) await setImmediate();
+			});
+			await s.waitForIdle();
+			for (let i = 0; i < 5; i++) await setImmediate();
+			expect(fromEnd).toBeDefined();
+			expect(fromEnd?.state()).toBe("queued");
+			const texts = mock.calls.flatMap((_, index) => userTexts(mock, index));
+			expect(texts).not.toContain("from-end");
 		});
 
 		// P1: a slash-prefixed prompt issued during a manual-compaction wait, with a
