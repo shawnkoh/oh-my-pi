@@ -1741,6 +1741,9 @@ export class AgentSession implements SettingsScope {
 		// Inclusion receipts observe the provider view after the whole configured
 		// converter (replay filtering, obfuscation) and before provider normalization.
 		this.agent.setConvertToLlm(this.#externalDeliveries.wrapConvertToLlm(this.agent.getConvertToLlm()));
+		// Every run starts outside host input's hook scope (runHostInputHooks), however it is
+		// started: the exemptions cover the hooks' own deliveries, never one made inside a turn.
+		this.agent.setRunScope(run => this.#hostInputHookScope.exit(run));
 		const prewalkHost: PrewalkCoordinatorHost = {
 			agent: this.agent,
 			sessionManager: this.sessionManager,
@@ -3098,19 +3101,20 @@ export class AgentSession implements SettingsScope {
 	}
 
 	/**
-	 * Run host input's own hooks (e.g. RPC input hooks). A delivery made inside them, or in
-	 * anything they await, while no turn is running ignores every {@link holdTurnDispatch}
-	 * hold while they run: those holds are this input's and input ordered behind it, which
-	 * cannot proceed until the hooks return, so parking a delivery the hooks wait on would
-	 * hang them. For the same reason, while they run it is covered by that input as host
-	 * action: a host interrupt or plan mode does not gate its wake (as if it set
-	 * `wakeAfterInterrupt`/`wakeInPlanMode`), and the interrupt latch is untouched.
+	 * Run host input's own hooks (e.g. RPC input hooks). A delivery the hooks make themselves
+	 * (inside them or in anything they await), whether or not a turn is running, ignores every
+	 * {@link holdTurnDispatch} hold while they run: those holds are this input's and input
+	 * ordered behind it, which cannot proceed until the hooks return, so parking a delivery
+	 * the hooks wait on would hang them. For the same reason, while they run it is covered by
+	 * that input as host action: a host interrupt or plan mode does not gate its wake (as if
+	 * it set `wakeAfterInterrupt`/`wakeInPlanMode`), and the interrupt latch is untouched.
 	 * Such a delivery wakes an idle session at once, and the held input then meets a running
 	 * turn (a prompt without `streamingBehavior` is refused as busy). Prompts' own dispatch
 	 * windows still apply; the delivery records its coverage (`ExternalDeliveryOwner.hostInputHooks`)
-	 * so it keeps every exemption when it resumes after such a window closes while `hooks` still
-	 * runs. Every exemption ends when `hooks` settles, even for work it left running; a delivery
-	 * made inside a turn it woke is ordinary.
+	 * so it keeps every exemption when it resumes after such a window closes, or after the turn
+	 * it was made during ends, while `hooks` still runs. Every exemption ends when `hooks`
+	 * settles, even for work it left running. A turn the hooks start (a woken delivery, a
+	 * prompt, a continuation) runs outside their scope, so a delivery made inside it is ordinary.
 	 */
 	async runHostInputHooks<T>(hooks: () => Promise<T>): Promise<T> {
 		const scope = { open: true };
@@ -9408,6 +9412,11 @@ export class AgentSession implements SettingsScope {
 
 	#scheduleExternalDelivery(owner: ExternalDeliveryOwner): void {
 		const record = owner.record;
+		// A delivery made by held host input's own hooks, while they run, is exempt from host
+		// holds, plan mode and the interrupt (runHostInputHooks), during a turn or not; a turn
+		// the hooks start runs outside their scope, so nothing made inside it is.
+		const hookScope = this.#hostInputHookScope.getStore();
+		if (hookScope?.open) owner.hostInputHooks = hookScope;
 		if (this.isStreaming) {
 			if (owner.mode === "steer") {
 				owner.mechanism = "steer-boundary";
@@ -9429,10 +9438,7 @@ export class AgentSession implements SettingsScope {
 		// (a parked steer is re-steered by the aside provider if that turn starts, and
 		// always woken by the stranded resume if it does not); #resumeStrandedIrcAsides
 		// waits for the window to close. A delivery made by those hooks themselves is
-		// exempt from host holds (runHostInputHooks), here and once parked, while they run;
-		// one made while streaming (a tool in a turn the hooks woke) is not hook input.
-		const hookScope = this.#hostInputHookScope.getStore();
-		if (hookScope?.open) owner.hostInputHooks = hookScope;
+		// exempt from host holds, here and once parked, while they run.
 		const inHostInputHooks = owner.hostInputHooks?.open === true;
 		const exemptHolds = inHostInputHooks ? this.#hostInputHoldCount : 0;
 		if (this.#turnDispatchPendingCount - exemptHolds > 0) {

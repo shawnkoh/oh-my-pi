@@ -1329,6 +1329,120 @@ describe("external delivery (session)", () => {
 			expect(userTexts(mock, 0)).toContain("from-hook");
 		});
 
+		// K1: a hook's own delivery made while a turn is running is exempt too; the turn may
+		// end after its last aside poll, leaving the record for the stranded resume under the
+		// hook's host hold.
+		it("a hook's own delivery made during a turn's final stream wakes under its host hold (K1)", async () => {
+			const { mock, session: s } = makeSession();
+			const streaming = Promise.withResolvers<void>();
+			const finish = Promise.withResolvers<void>();
+			mock.push(async () => {
+				streaming.resolve();
+				await finish.promise;
+				return { content: ["final"] };
+			});
+			mock.push({ content: ["hook delivery handled"] });
+			const run = s.prompt("go");
+			await streaming.promise;
+			const releaseHold = s.holdTurnDispatch();
+			const hook = s.runHostInputHooks(async () => {
+				const handle = s.deliverExternalMessage(card("from-hook"), { mode: "aside" });
+				await handle.settled;
+				return handle;
+			});
+			finish.resolve();
+			await run;
+			// Without the exemption the hook never completes (the test times out).
+			const handle = await hook;
+			releaseHold();
+			expect((await handle.settled).included).toBe(true);
+			expect(mock.calls).toHaveLength(2);
+			expect(userTexts(mock, 1)).toContain("from-hook");
+		});
+
+		it("a hook's own delivery made mid-tool wakes after a user abort under its host hold (K1)", async () => {
+			const slow = slowTool();
+			const { mock, session: s } = makeSession({ tools: [slow.tool] });
+			mock.push(toolCall("slow"));
+			const run = s.prompt("go");
+			await slow.started;
+			const releaseHold = s.holdTurnDispatch();
+			mock.push({ content: ["hook delivery handled"] });
+			const hook = s.runHostInputHooks(async () => {
+				const handle = s.deliverExternalMessage(card("from-hook"), { mode: "aside" });
+				await handle.settled;
+				return handle;
+			});
+			const aborting = s.abort({ reason: USER_INTERRUPT_LABEL });
+			slow.release();
+			await aborting;
+			await run.catch(() => {});
+			// Without the exemption the hook never completes (the test times out).
+			const handle = await hook;
+			releaseHold();
+			expect((await handle.settled).included).toBe(true);
+			expect(userTexts(mock, mock.calls.length - 1)).toContain("from-hook");
+		});
+
+		// The hook scope ends at every turn the hook starts, however it starts it: after its own
+		// delivery into a running turn settled, a tool's delivery inside a turn the hook then
+		// prompted is ordinary and stays queued under a user abort.
+		it("a hook's delivery into a running turn settles, and a tool's delivery in a turn the hook then prompts stays queued after a user abort (K1)", async () => {
+			const holder: { session?: AgentSession; fromTool?: DeliveryHandle } = {};
+			const started = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const deliverer: AgentTool = {
+				name: "deliverer",
+				label: "deliverer",
+				description: "Delivers an aside, then blocks until released",
+				parameters: type({}),
+				execute: async () => {
+					holder.fromTool = holder.session?.deliverExternalMessage(card("from-tool"), { mode: "aside" });
+					started.resolve();
+					await release.promise;
+					return { content: [{ type: "text", text: "deliverer_DONE" }] };
+				},
+			};
+			const { mock, session: s } = makeSession({ tools: [deliverer] });
+			holder.session = s;
+			const streaming = Promise.withResolvers<void>();
+			const finish = Promise.withResolvers<void>();
+			mock.push(async () => {
+				streaming.resolve();
+				await finish.promise;
+				return { content: ["first"] };
+			});
+			mock.push({ content: ["hook delivery handled"] });
+			mock.push(toolCall("deliverer"));
+			const first = s.prompt("first");
+			await streaming.promise;
+			const releaseHold = s.holdTurnDispatch();
+			const hook = s.runHostInputHooks(async () => {
+				const fromHook = s.deliverExternalMessage(card("from-hook"), { mode: "aside" });
+				await fromHook.settled;
+				await s.waitForIdle();
+				await s.prompt("second").catch(() => {});
+				return fromHook;
+			});
+			finish.resolve();
+			await first;
+			// Without the exemption the hook's delivery never settles and the tool never runs
+			// (the test times out).
+			await started.promise;
+			const aborting = s.abort({ reason: USER_INTERRUPT_LABEL });
+			release.resolve();
+			await aborting;
+			const fromHook = await hook;
+			releaseHold();
+			expect((await fromHook.settled).included).toBe(true);
+			await s.waitForIdle();
+			for (let i = 0; i < 5; i++) await setImmediate();
+			expect(holder.fromTool?.state()).toBe("queued");
+			const texts = mock.calls.flatMap((_, index) => userTexts(mock, index));
+			expect(texts).toContain("from-hook");
+			expect(texts).not.toContain("from-tool");
+		});
+
 		// P1: a slash-prefixed prompt issued during a manual-compaction wait, with a
 		// delivery arriving during that wait, must never be lost to the wake the
 		// parked delivery starts (the window is released only for a matched
