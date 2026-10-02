@@ -45,9 +45,13 @@ export class IrcBridge {
 		return this.#interrupts.length > 0 || this.#asides.length > 0 || this.#deferredWakes.length > 0;
 	}
 
-	/** Number of undelivered IRC records (interrupts, asides, deferred wakes). */
-	pendingCount(): number {
-		return this.#interrupts.length + this.#asides.length + this.#deferredWakes.length;
+	/** Undelivered records not already counted by the external-delivery owner registry. */
+	unownedPendingCount(): number {
+		let count = 0;
+		for (const record of this.#interrupts) if (!isOwnedAsideMessage(record)) count++;
+		for (const record of this.#asides) if (!isOwnedAsideMessage(record)) count++;
+		for (const record of this.#deferredWakes) if (!isOwnedAsideMessage(record)) count++;
+		return count;
 	}
 
 	/** Waits until every in-flight wake-turn relay has settled. */

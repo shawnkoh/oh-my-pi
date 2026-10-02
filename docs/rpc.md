@@ -296,7 +296,8 @@ the hook still runs, the record wakes then, still exempt from the host's holds, 
 interrupt and plan mode. The exemption covers only the hook's own deliveries, and only
 while the hook runs. Every session/agent event emission to subscribers and extension
 observer dispatch runs outside that scope, even when triggered by an API the hook calls
-(abort, compaction, goal updates, queue changes or session transitions). Promises,
+(abort, compaction, goal updates, queue changes or session transitions), including
+command-metadata, session-change and run-state subscribers. Promises,
 timers and callbacks created by those observers remain outside it. Input-hook dispatch
 itself retains the scope. Turns the hook starts and their settlement callbacks also run
 outside it. When the hook returns, a record of its own still parked waits like any other delivery.
@@ -313,9 +314,11 @@ while the hook runs:
   `accepted` nor `discarded`.
 - While the session's agent subscription is disconnected for compaction or a session
   transition, even a hook's own delivery stays queued, not accepted. Reconnection and
-  the stranded drain resume it (or the transition discards it). Start/await a compaction
-  the hook calls before awaiting its delivery's acceptance; an observer must not await
-  acceptance that depends on its own operation completing.
+  the stranded drain resume it (or the transition discards it). A failed, uncommitted
+  new-session or switch operation reconnects the retained session, including when
+  persistence flushing fails; its parked deliveries resume after the transition ends.
+  Start/await a compaction the hook calls before awaiting its delivery's acceptance;
+  an observer must not await acceptance that depends on its own operation completing.
 - Make the delivery in the hook's async context. A delivery handed to code that runs in
   a context the hook did not create (a worker or loop started before the hook, a native
   callback) is not exempt: it parks behind the hook's own input and is accepted only after
@@ -628,8 +631,10 @@ read-only snapshot, then asks the process to exit only if nothing changed:
    preparation; an `abort_and_prompt` is answered before its prompt gets there),
    notifications received but not yet queued (MCP resource changes inside their
    debounce window), and every [external delivery](#external-delivery) the session
-   still holds (`queued`, or `accepted` and not yet settled); commands still answered
-   after the pass (the read-only list below) are not counted.
+   still holds (`queued`, or `accepted` and not yet settled). Each owned delivery counts
+   once, even while parked in the bridge queue; accepted-but-unsettled owners remain
+   counted after leaving all queues. Commands still answered after the pass (the
+   read-only list below) are not counted.
    `asyncJobs` and `subagents` count background jobs until their run has unwound,
    including a cancelled job that is still stopping; a parked subagent is not work.
    `scheduledTurns` includes turns scheduled to start, retry and TTSR resumes, event

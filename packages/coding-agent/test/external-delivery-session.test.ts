@@ -1623,6 +1623,115 @@ describe("external delivery (session)", () => {
 			},
 		);
 
+		it.each(["metadata", "session-change"] as const)(
+			"I13k %s observers and async descendants stay outside host hooks",
+			async kind => {
+				const manager = SessionManager.create(tempDir.path(), path.join(tempDir.path(), "sessions"));
+				const { session: s } = makeSession({ sessionManager: manager });
+				await s.prompt("seed");
+				await manager.ensureOnDisk();
+				await s.abort({ reason: USER_INTERRUPT_LABEL });
+				const releaseHold = s.holdTurnDispatch();
+				const observed: DeliveryHandle[] = [];
+				const observe = () => {
+					if (observed.length) return;
+					observed.push(s.deliverExternalMessage(card("observer"), { mode: "aside" }));
+					void setImmediate().then(() => {
+						observed.push(s.deliverExternalMessage(card("descendant"), { mode: "aside" }));
+					});
+				};
+				const unsubscribe =
+					kind === "metadata"
+						? s.subscribeCommandMetadataChanged(observe)
+						: s.registerSessionChangeCallback(observe);
+				try {
+					await s.runHostInputHooks(async () => {
+						if (kind === "metadata") s.setMCPPromptCommands([]);
+						else expect(await s.fork()).toBe(true);
+						for (let i = 0; i < 10; i++) await setImmediate();
+						await s.waitForIdle();
+						expect(observed.map(handle => handle.state())).toEqual(["queued", "queued"]);
+						const own = s.deliverExternalMessage(card("direct"), { mode: "aside" });
+						expect((await own.settled).included).toBe(true);
+					});
+				} finally {
+					unsubscribe();
+					releaseHold();
+				}
+				await s.prompt("resume");
+				for (const handle of observed) expect((await handle.settled).included).toBe(true);
+			},
+		);
+
+		it.each(["new", "switch"] as const)(
+			"I13k failed %s flush resumes parked and subsequent hook deliveries",
+			async action => {
+				const dir = path.join(tempDir.path(), "sessions");
+				const manager = SessionManager.create(tempDir.path(), dir);
+				const target = SessionManager.create(tempDir.path(), dir);
+				target.appendMessage({ role: "user", content: "target", timestamp: Date.now() });
+				await target.ensureOnDisk();
+				const { mock, session: s } = makeSession({ sessionManager: manager });
+				await s.prompt("seed");
+				await manager.ensureOnDisk();
+				const reached = Promise.withResolvers<void>();
+				const finish = Promise.withResolvers<void>();
+				const failure = new Error("injected flush failure");
+				const flush = spyOn(manager, "flush").mockImplementationOnce(async () => {
+					reached.resolve();
+					await finish.promise;
+					throw failure;
+				});
+				const releaseHold = s.holdTurnDispatch();
+				try {
+					await s.runHostInputHooks(async () => {
+						const transition = (
+							action === "new" ? s.newSession() : s.switchSession(target.getSessionFile()!)
+						).catch(error => error);
+						await reached.promise;
+						const parked = s.deliverExternalMessage(card("parked"), { mode: "aside" });
+						for (let i = 0; i < 10; i++) await setImmediate();
+						expect(parked.state()).toBe("queued");
+						expect(mock.calls).toHaveLength(1);
+						finish.resolve();
+						expect(await transition).toBe(failure);
+						flush.mockRestore();
+						const next = s.deliverExternalMessage(card("after-failure"), { mode: "aside" });
+						await Promise.all([parked, next].map(handle => Promise.race([handle.accepted, handle.discarded])));
+						expect((await parked.settled).included).toBe(true);
+						expect((await next.settled).included).toBe(true);
+						expect(userTexts(mock, 1)).toContain("seed");
+					});
+				} finally {
+					finish.resolve();
+					flush.mockRestore();
+					releaseHold();
+				}
+			},
+		);
+
+		it("I13k counts a parked owner once and retains accepted unsettled work", async () => {
+			const slow = slowTool();
+			const { mock, session: s } = makeSession({ tools: [slow.tool] });
+			const releaseHold = s.holdTurnDispatch();
+			const handle = s.deliverExternalMessage(card("counted"), { mode: "aside" });
+			for (let i = 0; i < 10; i++) await setImmediate();
+			expect(handle.state()).toBe("queued");
+			expect(s.getWorkCounts().queuedInput).toBe(1);
+			mock.push(toolCall("slow"));
+			releaseHold();
+			try {
+				await slow.started;
+				expect(handle.state()).toBe("accepted");
+				expect(s.getWorkCounts().queuedInput).toBe(1);
+			} finally {
+				slow.release();
+				await s.waitForIdle();
+			}
+			expect((await handle.settled).included).toBe(true);
+			expect(s.getWorkCounts().queuedInput).toBe(0);
+		});
+
 		it("I13j a hook awaits its own queued delivery across compaction without deadlock", async () => {
 			const manager = SessionManager.inMemory(tempDir.path());
 			const runtime = new ExtensionRuntime();
