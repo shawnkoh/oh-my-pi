@@ -25,6 +25,7 @@ import { acquireTab } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervis
 import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
 import type { Browser, HTTPRequest, Page, Target } from "puppeteer-core";
 import { chromiumAvailable } from "./chromium-probe";
+import { OwnedJobRegistry, ownerToken } from "@oh-my-pi/pi-coding-agent/session/owned-job-registry";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
 let sharedHeadless: BrowserHandle | undefined;
@@ -256,6 +257,52 @@ describe("pickElectronTarget", () => {
 			await openError;
 			await marker.stop(true);
 			await existing.close();
+		}
+	}, 10_000);
+
+	test("records the app it launches in the owned-job registry and gives it the owner marker", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-browser-app-registry-"));
+		const executable = path.join(tempDir, path.basename(process.execPath));
+		await Bun.write(executable, Bun.file(process.execPath));
+		if (process.platform !== "win32") await fs.chmod(executable, 0o755);
+		const registry = new OwnedJobRegistry({
+			getSessionFile: () => path.join(tempDir, "session.jsonl"),
+			getSessionId: () => "session",
+			pollIntervalMs: 0,
+		});
+		OwnedJobRegistry.setInstance(registry);
+		const reported = Promise.withResolvers<string>();
+		const marker = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(request) {
+				reported.resolve(await request.text());
+				return new Response("ok");
+			},
+		});
+		const controller = new AbortController();
+		// The launched "app" reports the owner marker it inherited, then waits (no CDP).
+		const childScript = `await fetch(${JSON.stringify(marker.url.href)}, { method: "POST", body: process.env.OMP_OWNER ?? "" }); setInterval(() => {}, 1 << 30);`;
+		const appPath = await fs.realpath(executable);
+		const opened = acquireBrowser(
+			{ kind: "spawned", path: appPath, args: ["--eval", childScript] },
+			{ cwd: process.cwd(), signal: controller.signal },
+		).then(
+			() => undefined,
+			() => undefined,
+		);
+		try {
+			expect((await reported.promise).split(",")).toContain(ownerToken());
+			const launched = registry.openJobs().find(record => record.command.startsWith(appPath));
+			expect(launched).toMatchObject({ kind: "process", inProcess: false });
+			expect(registry.liveProcessCount()).toBe(1);
+		} finally {
+			controller.abort();
+			await opened;
+			await marker.stop(true);
+			registry.close();
+			OwnedJobRegistry.setInstance(undefined);
+			await fs.rm(tempDir, { recursive: true, force: true });
 		}
 	}, 10_000);
 

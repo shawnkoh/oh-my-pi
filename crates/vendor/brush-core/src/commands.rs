@@ -745,13 +745,14 @@ pub(crate) fn execute_external_command(
 		&& matches!(session_action, ChildSessionAction::TakeForeground)
 		&& context.shell.options().external_cmd_leads_session;
 
+	let mut reparented_pid_receiver = None;
 	match session_action {
 		ChildSessionAction::DetachSession => {
 			// setsid() creates the fresh session + process group; no process_group().
 			// A reparenting operand (`nohup cmd &`) additionally double-forks so it
 			// leaves the host's descendant tree and survives the teardown walk.
 			if context.params.detach_reparent {
-				cmd.detach_session_reparent();
+				reparented_pid_receiver = cmd.detach_session_reparent();
 			} else {
 				cmd.detach_session();
 			}
@@ -808,12 +809,39 @@ pub(crate) fn execute_external_command(
 			// Report the spawned child for scoped teardown. Skipped for reparented
 			// launches (`detach_reparent`, e.g. `nohup cmd &`): those double-fork
 			// out of the descendant tree and must survive the host's cancellation
-			// cleanup, so they are intentionally left unowned.
-			if !context.params.detach_reparent
-				&& let Some(observer) = context.params.spawn_observer()
-				&& let Some(pid) = pid
-			{
-				observer.on_spawn(pid, actual_pgid);
+			// cleanup, so they are intentionally left unowned. Their real
+			// (grandchild) process is reported through the separate
+			// `on_reparented_spawn` hook instead; on Unix the intermediate `pid`
+			// here has already exited. A launch whose real process cannot be
+			// named goes to `on_unreported_spawn`.
+			if let Some(observer) = context.params.spawn_observer() {
+				if let Some(receiver) = reparented_pid_receiver.take() {
+					match receiver.receive() {
+						Some((grandchild_pid, grandchild_pgid)) => {
+							observer.on_reparented_spawn(grandchild_pid, Some(grandchild_pgid));
+						},
+						None => observer.on_unreported_spawn(),
+					}
+				} else if let Some(pid) = pid {
+					if !context.params.detach_reparent {
+						observer.on_spawn(pid, actual_pgid);
+					} else if cfg!(not(unix))
+						|| !matches!(session_action, ChildSessionAction::DetachSession)
+					{
+						// The operand itself is the long-lived process: there is no
+						// reparenting primitive (non-Unix), or terminal stdin kept
+						// the launch from detaching and double-forking (`nohup cmd
+						// </dev/tty &`). Still unowned, so report it through the
+						// reparented hook rather than the teardown one.
+						observer.on_reparented_spawn(pid, actual_pgid);
+					} else {
+						// A double-forked launch without a report channel: `pid`
+						// is the intermediate, which has already exited.
+						observer.on_unreported_spawn();
+					}
+				} else {
+					observer.on_unreported_spawn();
+				}
 			}
 
 			let mut child_process = processes::ChildProcess::new(child, pid, actual_pgid);
