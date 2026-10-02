@@ -195,43 +195,91 @@ describe("RPC goal command", () => {
 	for (const input of ["prompt", "follow_up"] as const) {
 		test(`after a host abort, a host ${input} re-arms a goal the agent's goal tool resumes`, async () => {
 			const rpc = await start({ continuation: true, script: "abort-resume" });
-			const started = Promise.withResolvers<void>();
-			let agentEnds = 0;
-			/** Created when the host input is sent: the abort's own settle must not count. */
-			let settledAfterInput: PromiseWithResolvers<void> | undefined;
-			const unsubscribe = rpc.onSessionEvent(event => {
-				if (event.type === "agent_start") started.resolve();
-				if (event.type === "agent_end") agentEnds++;
-			});
-			const unsubscribeSettled = rpc.onSessionSettled(() => {
-				if (agentEnds > 0) settledAfterInput?.resolve();
-			});
-			const continuations = async () =>
-				(await rpc.getMessages()).filter(
-					message => message.role === "custom" && message.customType === "goal-continuation",
-				).length;
-			try {
-				await rpc.goal("create", { objective: "long task" });
-				await withTimeout(started.promise, 10_000, "Continuation turn never started");
-				await rpc.abort();
-				expect((await rpc.getState()).goal?.goal.status).toBe("paused");
-				const before = await continuations();
-				agentEnds = 0;
-				settledAfterInput = Promise.withResolvers<void>();
-				// The turn this input starts resumes the goal through the agent's goal tool, which
-				// does not re-arm continuation itself: only the host input that started it can.
-				if (input === "prompt") await rpc.prompt("pick the goal back up");
-				else await rpc.followUp("pick the goal back up");
-				await withTimeout(settledAfterInput.promise, 15_000, "Session never settled after the host input");
-				const state = await rpc.getState();
-				expect(state.goal?.goal.status).toBe("active");
-				expect(await continuations()).toBe(before + 1);
-			} finally {
-				unsubscribe();
-				unsubscribeSettled();
-			}
+			// The turn this input starts resumes the goal through the agent's goal tool, which
+			// does not re-arm continuation itself: only the host input that started it can.
+			const added = await continuationsAfterAbortAndResume(
+				rpc,
+				async () => {},
+				() => (input === "prompt" ? rpc.prompt("pick the goal back up") : rpc.followUp("pick the goal back up")),
+			);
+			expect(added).toBe(1);
 		}, 30_000);
 	}
+
+	/**
+	 * Creates a goal, aborts its slow continuation turn, runs `between`, then sends `input`
+	 * (whose turn resumes the goal through the agent's goal tool) and waits for the session
+	 * to settle. Returns the goal-continuation messages added after the abort.
+	 */
+	async function continuationsAfterAbortAndResume(
+		rpc: RpcClient,
+		between: () => Promise<void>,
+		input: () => Promise<unknown>,
+	): Promise<number> {
+		const started = Promise.withResolvers<void>();
+		let agentEnds = 0;
+		/** Created when the input is sent: the abort's own settle must not count. */
+		let settledAfterInput: PromiseWithResolvers<void> | undefined;
+		const unsubscribe = rpc.onSessionEvent(event => {
+			if (event.type === "agent_start") started.resolve();
+			if (event.type === "agent_end") agentEnds++;
+		});
+		const unsubscribeSettled = rpc.onSessionSettled(() => {
+			if (agentEnds > 0) settledAfterInput?.resolve();
+		});
+		const continuations = async () =>
+			(await rpc.getMessages()).filter(
+				message => message.role === "custom" && message.customType === "goal-continuation",
+			).length;
+		try {
+			await rpc.goal("create", { objective: "long task" });
+			await withTimeout(started.promise, 10_000, "Continuation turn never started");
+			await rpc.abort();
+			expect((await rpc.getState()).goal?.goal.status).toBe("paused");
+			const before = await continuations();
+			await between();
+			agentEnds = 0;
+			settledAfterInput = Promise.withResolvers<void>();
+			await input();
+			await withTimeout(settledAfterInput.promise, 15_000, "Session never settled after the input");
+			expect((await rpc.getState()).goal?.goal.status).toBe("active");
+			return (await continuations()) - before;
+		} finally {
+			unsubscribe();
+			unsubscribeSettled();
+		}
+	}
+
+	test("after a host abort, a refused steer does not re-arm a goal the agent's goal tool resumes", async () => {
+		const rpc = await start({ continuation: true, script: "abort-resume" });
+		const added = await continuationsAfterAbortAndResume(
+			rpc,
+			// An extension command cannot be queued as a steer: the session refuses it (RpcClient.steer
+			// does not surface the error response, so check that nothing was queued or run).
+			async () => {
+				const before = await rpc.getState();
+				await rpc.steer("/goaltest-navigate-here");
+				const after = await rpc.getState();
+				expect(after.queuedMessages.steering).toEqual([]);
+				expect(after.isStreaming).toBe(false);
+				expect(after.messageCount).toBe(before.messageCount);
+			},
+			// A turn the host did not start (an input hook's own sendUserMessage) resumes the goal.
+			() => rpc.prompt("goaltest-extension-turn"),
+		);
+		expect(added).toBe(0);
+	}, 30_000);
+
+	test("after a host abort, /retry re-arms a goal the agent's goal tool resumes", async () => {
+		const rpc = await start({ continuation: true, script: "abort-resume" });
+		// The retried turn (the aborted one, re-attempted) resumes the goal through the goal tool.
+		const added = await continuationsAfterAbortAndResume(
+			rpc,
+			async () => {},
+			() => rpc.prompt("/retry"),
+		);
+		expect(added).toBe(1);
+	}, 30_000);
 
 	test("a new session leaves the previous session's goal, goal tool and continuation behind", async () => {
 		const rpc = await start({ continuation: true, script: "idle" });

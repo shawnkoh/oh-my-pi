@@ -488,7 +488,7 @@ describe("SessionManager cross-process rewrite freshness", () => {
 		await moved.close();
 	});
 
-	it("continues the session through a sibling move, but not through a switch, fork or new session", async () => {
+	it("continues the session through a sibling move and a rolled-back switch, but not through a switch, fork or new session", async () => {
 		using tempDir = TempDir.createSync("@omp-session-continues-");
 		const creator = SessionManager.create(tempDir.path(), tempDir.path(), new FileSessionStorage());
 		await creator.ensureOnDisk();
@@ -516,6 +516,13 @@ describe("SessionManager cross-process rewrite freshness", () => {
 		expect(ours.continuesSession(original)).toBe(true);
 		expect(ours.continuesSession(sibling)).toBe(true);
 		expect(ours.continuesSession("unrelated")).toBe(false);
+
+		// A switch that rolls back (AgentSession's failure path) restores the lineage with the session.
+		const beforeSwitch = ours.captureState();
+		await ours.setSessionFile(contested);
+		ours.restoreState(beforeSwitch);
+		expect(ours.getSessionId()).toBe(sibling);
+		expect(ours.continuesSession(original)).toBe(true);
 
 		// Switching to the original file and back to the sibling are session changes, not moves.
 		const siblingFile = ours.getSessionFile();

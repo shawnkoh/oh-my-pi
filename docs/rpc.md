@@ -288,8 +288,11 @@ host input clears it). The record wakes the idle session at once, and the input 
 meets that running turn: a `prompt` without `streamingBehavior`, or an
 `abort_and_prompt`, is refused as busy (a same-id error response with the busy message
 and a `prompt_result` with `status: "error"`); a `prompt` with `streamingBehavior`, a
-`steer` or a `follow_up` is queued into the turn. The exemption ends when the hook
-returns.
+`steer` or a `follow_up` is queued into the turn. A prompt's own setup window (an
+earlier admitted prompt still setting up its turn) does hold it; when that window
+closes without starting a turn, the record wakes then, still exempt from the host's
+holds while the hook runs and still not held by the interrupt or plan mode. The
+exemption from holds ends when the hook returns.
 
 ### Login
 

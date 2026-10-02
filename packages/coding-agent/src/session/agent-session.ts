@@ -1193,6 +1193,23 @@ export class AgentSession implements SettingsScope {
 	/** One pending re-offer of stranded records scheduled behind a prompt's dispatch window. */
 	#strandedResumeAfterAdmission = false;
 
+	/** Re-offers stranded records as dispatch windows close: at every exit while host-input
+	 *  holds alone may remain (their hooks' own records go on then), and fully at the last. */
+	#resumeStrandedAfterTurnDispatch(): void {
+		if (this.#strandedResumeAfterAdmission) return;
+		this.#strandedResumeAfterAdmission = true;
+		this.#turnDispatchExited ??= Promise.withResolvers<void>();
+		void this.#turnDispatchExited.promise.then(() => {
+			this.#strandedResumeAfterAdmission = false;
+			if (!this.hasPendingTurnDispatch) {
+				this.#drainStrandedQueuedMessages();
+				return;
+			}
+			this.#resumeStrandedAfterTurnDispatch();
+			this.#resumeStrandedIrcAsides();
+		});
+	}
+
 	/** A steer/follow-up can land after the agent loop's final queue poll, or
 	 *  after an abort stops an auto-continued queued turn. In both cases the
 	 *  agent-core queue still owns the message, but no loop is left to poll it.
@@ -1255,19 +1272,21 @@ export class AgentSession implements SettingsScope {
 		// goes through the queued-message drain so records the window left in the
 		// agent queues (a parked steer re-steered by a provider poll that saw no
 		// turn) are drained too, not only the bridge.
+		let records: AgentMessage[];
 		if (this.hasPendingTurnDispatch) {
-			if (!this.#strandedResumeAfterAdmission) {
-				this.#strandedResumeAfterAdmission = true;
-				void this.waitForPendingTurnDispatch().finally(() => {
-					this.#strandedResumeAfterAdmission = false;
-					this.#drainStrandedQueuedMessages();
-				});
-			}
-			return;
+			this.#resumeStrandedAfterTurnDispatch();
+			// Records made by the open hooks of held host input ignore host holds
+			// (runHostInputHooks): once only those holds remain, they go on now.
+			if (this.#turnDispatchPendingCount > this.#hostInputHoldCount) return;
+			records = this.#irc.drainPending(
+				record => this.#externalDeliveries.ownerOf(record)?.hostInputHooks?.open !== true,
+			);
+			if (records.length === 0) return;
+		} else {
+			// Parked wake records resume alongside ordinary stranded asides; they were
+			// already decided wake-intended at deferral time.
+			records = [...this.#irc.drainDeferredWakes(), ...this.#irc.drainPending()];
 		}
-		// Parked wake records resume alongside ordinary stranded asides; they were
-		// already decided wake-intended at deferral time.
-		let records = [...this.#irc.drainDeferredWakes(), ...this.#irc.drainPending()];
 		if (this.#sessionTransitionDepth > 0) {
 			// An open transition defers every owned admission; waking them now would
 			// spin empty all-deferred runs. They resume when the transition settles.
@@ -1280,8 +1299,12 @@ export class AgentSession implements SettingsScope {
 			// Plan mode: fold stranded IRC asides into context without waking an
 			// autonomous turn. Convergence to ask/resolve stays user-driven. Owned
 			// external records never fold (they enter context only through their
-			// own admission): `wakeInPlanMode` wakes, otherwise they stay queued.
-			const { wake, held, rest } = this.#splitOwnedStrandedRecords(records, owner => owner.options.wakeInPlanMode);
+			// own admission): `wakeInPlanMode` wakes, otherwise they stay queued. A
+			// delivery made by held host input's hooks is covered by that input and wakes.
+			const { wake, held, rest } = this.#splitOwnedStrandedRecords(
+				records,
+				owner => owner.hostInputHooks !== undefined || owner.options.wakeInPlanMode,
+			);
 			this.#foldStrandedIrcAsidesIntoContext(rest);
 			this.#irc.queueAside(held);
 			if (wake.length > 0) this.#wakeForIrc(wake);
@@ -1294,9 +1317,10 @@ export class AgentSession implements SettingsScope {
 			// record that asked to wake after an interrupt — justifies waking a fresh turn here;
 			// extension/user asides fold into context like the plan-mode branch above, staying
 			// user-driven until the next deliberate prompt. The interrupt latch stays set.
+			// A delivery made by held host input's hooks is covered by that input and wakes.
 			const { wake, held, rest } = this.#splitOwnedStrandedRecords(
 				records,
-				owner => owner.options.wakeAfterInterrupt,
+				owner => owner.hostInputHooks !== undefined || owner.options.wakeAfterInterrupt,
 			);
 			const fold: AgentMessage[] = [];
 			for (const record of rest) {
@@ -3014,6 +3038,8 @@ export class AgentSession implements SettingsScope {
 	 *  command handler's whole run. External deliveries hold behind this window only. */
 	#turnDispatchPendingCount = 0;
 	#turnDispatchSettled: PromiseWithResolvers<void> | undefined;
+	/** Resolves at the next exit from any dispatch window. */
+	#turnDispatchExited: PromiseWithResolvers<void> | undefined;
 	/** The share of {@link #turnDispatchPendingCount} held by {@link holdTurnDispatch}. */
 	#hostInputHoldCount = 0;
 	/** Open while host input's own hooks run ({@link runHostInputHooks}). */
@@ -3041,6 +3067,9 @@ export class AgentSession implements SettingsScope {
 				this.#turnDispatchSettled = undefined;
 				settled.resolve();
 			}
+			const exited = this.#turnDispatchExited;
+			this.#turnDispatchExited = undefined;
+			exited?.resolve();
 		};
 	}
 
@@ -3072,7 +3101,9 @@ export class AgentSession implements SettingsScope {
 	 * if it set `wakeAfterInterrupt`/`wakeInPlanMode`), and the interrupt latch is untouched.
 	 * Such a delivery wakes an idle session at once, and the held input then meets a running
 	 * turn (a prompt without `streamingBehavior` is refused as busy). Prompts' own dispatch
-	 * windows still apply. The exemption ends when `hooks` settles, even for work it left running.
+	 * windows still apply; the delivery records its coverage (`ExternalDeliveryOwner.hostInputHooks`)
+	 * so it keeps both exemptions when it resumes after such a window closes. The hold exemption
+	 * ends when `hooks` settles, even for work it left running.
 	 */
 	async runHostInputHooks<T>(hooks: () => Promise<T>): Promise<T> {
 		const scope = { open: true };
@@ -9370,6 +9401,8 @@ export class AgentSession implements SettingsScope {
 
 	#scheduleExternalDelivery(owner: ExternalDeliveryOwner): void {
 		const record = owner.record;
+		const hookScope = this.#hostInputHookScope.getStore();
+		if (hookScope?.open) owner.hostInputHooks = hookScope;
 		if (this.isStreaming) {
 			if (owner.mode === "steer") {
 				owner.mechanism = "steer-boundary";
@@ -9391,8 +9424,8 @@ export class AgentSession implements SettingsScope {
 		// (a parked steer is re-steered by the aside provider if that turn starts, and
 		// always woken by the stranded resume if it does not); #resumeStrandedIrcAsides
 		// waits for the window to close. A delivery made by those hooks themselves is
-		// exempt from host holds (runHostInputHooks).
-		const inHostInputHooks = this.#hostInputHookScope.getStore()?.open === true;
+		// exempt from host holds (runHostInputHooks), here and once parked.
+		const inHostInputHooks = owner.hostInputHooks?.open === true;
 		const exemptHolds = inHostInputHooks ? this.#hostInputHoldCount : 0;
 		if (this.#turnDispatchPendingCount - exemptHolds > 0) {
 			owner.mechanism = owner.mode === "steer" ? "steer-boundary" : "aside";
@@ -9402,7 +9435,8 @@ export class AgentSession implements SettingsScope {
 		}
 		// A delivery made by host input's own hooks is covered by that input: it is the
 		// host action that ends an interrupt or acts in plan mode, and it cannot reach the
-		// session until the hooks return, so gating the delivery would hang them.
+		// session until the hooks return, so gating the delivery would hang them. The
+		// stranded resume honours the same coverage (#resumeStrandedIrcAsides).
 		const gated =
 			!inHostInputHooks &&
 			((this.#planModeState?.enabled === true && owner.options.wakeInPlanMode !== true) ||

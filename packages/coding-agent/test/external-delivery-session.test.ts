@@ -1042,6 +1042,72 @@ describe("external delivery (session)", () => {
 			expect(texts).toContain("mid-command");
 		});
 
+		// H2: a delivery made by held host input's own hooks is covered by that input even
+		// when another prompt's window parks it: once only host holds remain it wakes, and
+		// plan mode or a host interrupt does not gate that wake.
+		it.each(["in plan mode", "after a host abort"] as const)(
+			"a hook's own delivery parked behind another prompt's window wakes %s once that window closes without a turn (H2)",
+			async gate => {
+				const inCommand = Promise.withResolvers<void>();
+				const releaseCommand = Promise.withResolvers<void>();
+				const slow = slowTool();
+				const { mock, session: s } = makeSession({
+					tools: [slow.tool],
+					customCommands: [
+						{
+							path: "local.ts",
+							resolvedPath: "/virtual/local.ts",
+							source: "project",
+							command: {
+								name: "local",
+								description: "handled locally after an await",
+								execute: async () => {
+									inCommand.resolve();
+									await releaseCommand.promise;
+									return "";
+								},
+							},
+						},
+					],
+				});
+				if (gate === "in plan mode") {
+					s.setPlanModeState({ enabled: true, planFilePath: "local://PLAN.md" });
+				} else {
+					mock.push(toolCall("slow"));
+					const run = s.prompt("go");
+					await slow.started;
+					const aborting = s.abort({ reason: USER_INTERRUPT_LABEL });
+					slow.release();
+					await aborting;
+					await run.catch(() => {});
+					await s.waitForIdle();
+				}
+				const callsBefore = mock.calls.length;
+				const localCommand = s.prompt("/local");
+				await inCommand.promise;
+				// Host input held while its hook delivers and awaits acceptance, as rpc-mode runs it.
+				const releaseHold = s.holdTurnDispatch();
+				mock.push({ content: ["hook delivery handled"] });
+				const hook = s.runHostInputHooks(async () => {
+					const handle = s.deliverExternalMessage(card("from-hook"), { mode: "aside" });
+					await handle.accepted;
+					return handle;
+				});
+				for (let i = 0; i < 5; i++) await setImmediate();
+				expect(s.isStreaming).toBe(false);
+				expect(mock.calls).toHaveLength(callsBefore);
+				releaseCommand.resolve();
+				await expect(localCommand).resolves.toBe(false);
+				// Without the exemption the hook never completes (the test times out).
+				const handle = await hook;
+				releaseHold();
+				expect((await handle.settled).included).toBe(true);
+				await s.waitForIdle();
+				expect(mock.calls).toHaveLength(callsBefore + 1);
+				expect(userTexts(mock, callsBefore)).toContain("from-hook");
+			},
+		);
+
 		// P1: a slash-prefixed prompt issued during a manual-compaction wait, with a
 		// delivery arriving during that wait, must never be lost to the wake the
 		// parked delivery starts (the window is released only for a matched

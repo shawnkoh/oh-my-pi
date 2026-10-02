@@ -64,6 +64,16 @@ const { session } = await createAgentSession({
 					if (leaf) await ctx.navigateTree(leaf);
 				},
 			});
+			// GOAL_RPC_SCRIPT="abort-resume": the RPC input "goaltest-extension-turn" is handled by
+			// this input hook, which starts the next turn with the extension's own sendUserMessage
+			// (a turn the host did not start).
+			if (Bun.env.GOAL_RPC_SCRIPT === "abort-resume") {
+				pi.on("input", event => {
+					if (event.text !== "goaltest-extension-turn") return;
+					pi.sendUserMessage("pick the goal back up");
+					return { handled: true };
+				});
+			}
 		},
 	],
 });

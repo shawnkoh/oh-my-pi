@@ -674,6 +674,8 @@ interface SessionManagerStateSnapshot {
 	cwd: string;
 	sessionDir: string;
 	sessionId: string;
+	/** Sibling-move lineage ({@link SessionManager.continuesSession}); a restore puts it back. */
+	siblingLineage: string[];
 	sessionName: string | undefined;
 	titleSource: SessionTitleSource | undefined;
 	sessionFile: string | undefined;
@@ -2037,6 +2039,7 @@ export class SessionManager {
 			cwd: this.#cwd,
 			sessionDir: this.#sessionDir,
 			sessionId: this.#sessionId,
+			siblingLineage: [...this.#siblingLineage],
 			sessionName: this.#sessionName,
 			titleSource: this.#titleSource,
 			titleUpdatedAt: this.#titleUpdatedAt,
@@ -2092,6 +2095,8 @@ export class SessionManager {
 		this.#draftOnlySessionCleanupArmed = snapshot.draftOnlySessionCleanupArmed;
 		this.#fallbackRuntimeOnly = snapshot.fallbackRuntimeOnly;
 		this.#applyEntries(snapshot.header, [...snapshot.entries]);
+		// After #applyEntries: its id adoption resets the lineage on an id change.
+		this.#siblingLineage = [...snapshot.siblingLineage];
 		this.#additionalDirectories = snapshot.header.additionalDirectories ?? [];
 		this.#sessionName = snapshot.sessionName;
 

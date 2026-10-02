@@ -275,6 +275,12 @@ export class ExternalDeliveryOwner {
 	/** Times the loop deferred admission and the host re-queued the record. */
 	deferrals = 0;
 	requests = 0;
+	/**
+	 * Scope of the held host input's hooks that made this delivery (`AgentSession.runHostInputHooks`).
+	 * The input covers it as host action, so plan mode and a host interrupt never gate its wake;
+	 * while the scope is `open` it also ignores host-input dispatch holds, wherever it is parked.
+	 */
+	hostInputHooks: { readonly open: boolean } | undefined;
 	included = false;
 	producedOutput = false;
 	lastAssistant: AssistantMessage | undefined;
