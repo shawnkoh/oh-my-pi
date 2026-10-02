@@ -36,6 +36,7 @@
 - In sandboxes without `pidfd_open` (OpenShell), a shell command that leaves a process running no longer marks the owned-job registry incomplete for the rest of the session, so a later `quiesce_and_exit` can attest `registryComplete: true`
 - A `deliver` read while an earlier RPC `prompt` or `abort_and_prompt` is still running its input hooks no longer wakes the idle session and gets that prompt refused as busy: the delivery waits for the prompt and reaches the model after it. A delivery an input hook makes itself (and may wait on) is not held, not even by a host `abort` still in effect or plan mode, so the hook cannot hang its own or later input; when another prompt still setting up its turn holds it, it wakes once that prompt's setup ends without a turn, with the same exemptions
 - A prompt whose RPC input hooks are still running after its `abort_and_prompt` was answered now counts as `queuedInput`, so `quiesce_and_exit` refuses instead of exiting before the prompt reaches the session
+- A `steer` delivery left waiting while a session switch, fork or other transition was still open is no longer lost: it now wakes once a rolled-back switch or a fork settles, and a committed switch discards it with `session-switched`. Before, its receipts never arrived and `get_state.externalDeliveries` listed it as queued forever
 
 ## [18.4.10] - 2026-10-02
 

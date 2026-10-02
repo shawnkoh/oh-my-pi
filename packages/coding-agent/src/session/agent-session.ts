@@ -1289,9 +1289,13 @@ export class AgentSession implements SettingsScope {
 		}
 		if (this.#sessionTransitionDepth > 0) {
 			// An open transition defers every owned admission; waking them now would
-			// spin empty all-deferred runs. They resume when the transition settles.
-			const { held, rest } = this.#splitOwnedStrandedRecords(records, () => false);
-			this.#irc.queueAside(held);
+			// spin empty all-deferred runs. Every owned record, a steer included, stays
+			// queued: a commit retires it with a receipt, a rollback or a transcript-
+			// keeping transition resumes it when the transition settles.
+			const owned: AgentMessage[] = [];
+			const rest: AgentMessage[] = [];
+			for (const record of records) (this.#externalDeliveries.ownerOf(record) ? owned : rest).push(record);
+			this.#irc.queueAside(owned);
 			if (rest.length === 0) return;
 			records = rest;
 		}
