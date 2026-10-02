@@ -1640,6 +1640,16 @@ export interface ExtensionAPI {
 	 * context through the loop's own admission; the returned handle reports
 	 * acceptance (`mode`/`mechanism`), settlement, discard or cancellation.
 	 * Throws when the host lacks the capability — check `capabilities` first.
+	 * After the session closed input admission (a passed quiesce or a hang-up) the
+	 * record is not admitted: the handle is already discarded with `admission_closed`.
+	 *
+	 * `accepted` and `settled` never resolve for a discarded or cancelled record, and a
+	 * cancelled one resolves no promise at all (read `state()`). An `input` hook that waits
+	 * for its own delivery holds every later input until it returns, so it must race
+	 * `accepted` with `discarded` (a session change or shutdown discards the record), must
+	 * not cancel what it awaits, and must deliver in its own async context (code it calls,
+	 * and promises, timers and callbacks it creates): only such a delivery is exempt from the
+	 * holds, interrupt and plan mode its own input would otherwise impose (see `docs/rpc.md`).
 	 */
 	deliverMessage<T = unknown>(record: CustomMessagePayload<T>, options: DeliveryOptions): DeliveryHandle;
 
