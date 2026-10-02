@@ -488,7 +488,7 @@ describe("SessionManager cross-process rewrite freshness", () => {
 		await moved.close();
 	});
 
-	it("continues the session through a sibling move, but not through a fork or a new session", async () => {
+	it("continues the session through a sibling move, but not through a switch, fork or new session", async () => {
 		using tempDir = TempDir.createSync("@omp-session-continues-");
 		const creator = SessionManager.create(tempDir.path(), tempDir.path(), new FileSessionStorage());
 		await creator.ensureOnDisk();
@@ -516,6 +516,17 @@ describe("SessionManager cross-process rewrite freshness", () => {
 		expect(ours.continuesSession(original)).toBe(true);
 		expect(ours.continuesSession(sibling)).toBe(true);
 		expect(ours.continuesSession("unrelated")).toBe(false);
+
+		// Switching to the original file and back to the sibling are session changes, not moves.
+		const siblingFile = ours.getSessionFile();
+		if (!siblingFile) throw new Error("Expected sibling file");
+		await ours.setSessionFile(contested);
+		expect(ours.getSessionId()).toBe(original);
+		expect(ours.continuesSession(sibling)).toBe(false);
+		await ours.setSessionFile(siblingFile);
+		expect(ours.getSessionId()).toBe(sibling);
+		expect(ours.continuesSession(sibling)).toBe(true);
+		expect(ours.continuesSession(original)).toBe(false);
 
 		// A fork also points back through `parentSession`, yet it is another session.
 		await ours.fork();

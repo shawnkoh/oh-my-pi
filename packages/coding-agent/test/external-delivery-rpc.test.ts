@@ -162,6 +162,54 @@ describe("external delivery over RPC", () => {
 		expect(replies(rpc.received).at(-1)).toContain('seen:[\\"from-hook\\",\\"second\\",\\"deliver:second\\"]');
 	}, 30_000);
 
+	/** Sends `prompt "deliver:<text>"` and expects the documented busy trade-off: the hook's own
+	 *  delivery wakes the session and is accepted (so the hook returns), and the prompt is refused. */
+	async function expectHookDeliveryCompletes(
+		rpc: { pipeline(frames: object[]): Promise<void>; until(match: (frame: Frame) => boolean): Promise<Frame> },
+		id: string,
+		text: string,
+	) {
+		await rpc.pipeline([{ id, type: "prompt", message: `deliver:${text}` }]);
+		expect(await rpc.until(frame => frame.type === "response" && frame.id === id)).toMatchObject({
+			command: "prompt",
+			success: false,
+			error: expect.stringContaining("Agent is already processing"),
+		});
+		expect(await rpc.until(frame => frame.type === "prompt_result" && frame.id === id)).toMatchObject({
+			status: "error",
+		});
+		await rpc.until(
+			frame =>
+				frame.type === "message_end" &&
+				isRecord(frame.message) &&
+				frame.message.role === "assistant" &&
+				JSON.stringify(frame.message).includes(`\\"${text}\\"`),
+		);
+	}
+
+	test("after a host abort, a prompt whose input hook awaits its delivery still completes", async () => {
+		const rpc = start({ DELIVERY_FIXTURE_HOOK_DELIVERS: "1", DELIVERY_FIXTURE_MODEL_DELAY_MS: "100" });
+		await rpc.until(frame => frame.type === "ready");
+		await rpc.pipeline([{ id: "p1", type: "prompt", message: "hello" }]);
+		expect(await rpc.until(frame => frame.type === "prompt_result" && frame.id === "p1")).toMatchObject({
+			status: "completed",
+		});
+		// The abort latches the interrupt; only the held prompt behind the hook would clear it,
+		// so the hook's delivery (no wakeAfterInterrupt) is covered by that prompt instead.
+		expect(await rpc.command({ type: "abort" })).toMatchObject({ success: true });
+		await expectHookDeliveryCompletes(rpc, "p2", "after-abort");
+	}, 30_000);
+
+	test("in plan mode, a prompt whose input hook awaits its delivery still completes", async () => {
+		const rpc = start({
+			DELIVERY_FIXTURE_HOOK_DELIVERS: "1",
+			DELIVERY_FIXTURE_MODEL_DELAY_MS: "100",
+			DELIVERY_FIXTURE_PLAN_MODE: "1",
+		});
+		await rpc.until(frame => frame.type === "ready");
+		await expectHookDeliveryCompletes(rpc, "p1", "in-plan");
+	}, 30_000);
+
 	test("a steer whose input hook awaits its delivery does not deadlock a prompt queued behind it", async () => {
 		// The 50 ms hook delay lets the prompt (and its dispatch hold) enter the gate before
 		// the steer's hook delivers.

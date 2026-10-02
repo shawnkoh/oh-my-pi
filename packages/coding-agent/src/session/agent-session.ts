@@ -3067,10 +3067,12 @@ export class AgentSession implements SettingsScope {
 	 * Run host input's own hooks (e.g. RPC input hooks). A delivery made inside them, or in
 	 * anything they await, ignores every {@link holdTurnDispatch} hold: those holds are this
 	 * input's and input ordered behind it, which cannot proceed until the hooks return, so
-	 * parking a delivery the hooks wait on would hang them. Such a delivery wakes an idle
-	 * session at once, and the held input then meets a running turn (a prompt without
-	 * `streamingBehavior` is refused as busy). Prompts' own dispatch windows still apply.
-	 * The exemption ends when `hooks` settles, even for work it left running.
+	 * parking a delivery the hooks wait on would hang them. For the same reason it is covered
+	 * by that input as host action: a host interrupt or plan mode does not gate its wake (as
+	 * if it set `wakeAfterInterrupt`/`wakeInPlanMode`), and the interrupt latch is untouched.
+	 * Such a delivery wakes an idle session at once, and the held input then meets a running
+	 * turn (a prompt without `streamingBehavior` is refused as busy). Prompts' own dispatch
+	 * windows still apply. The exemption ends when `hooks` settles, even for work it left running.
 	 */
 	async runHostInputHooks<T>(hooks: () => Promise<T>): Promise<T> {
 		const scope = { open: true };
@@ -9333,7 +9335,8 @@ export class AgentSession implements SettingsScope {
 	 * plan mode only with `wakeInPlanMode`, after an operator interrupt only
 	 * with `wakeAfterInterrupt` (a `steer` always wakes; the interrupt latch is
 	 * untouched and stopped work is not resumed). A record waiting on one of
-	 * those gates stays queued until a turn drains it. Acceptance fires at the
+	 * those gates stays queued until a turn drains it; a record delivered from host
+	 * input's own hooks is not gated ({@link runHostInputHooks}). Acceptance fires at the
 	 * loop's commit, never when `agent.prompt()` resolves.
 	 *
 	 * Rejects with a synchronous throw only when the session is disposed. Once input admission
@@ -9389,16 +9392,21 @@ export class AgentSession implements SettingsScope {
 		// always woken by the stranded resume if it does not); #resumeStrandedIrcAsides
 		// waits for the window to close. A delivery made by those hooks themselves is
 		// exempt from host holds (runHostInputHooks).
-		const exemptHolds = this.#hostInputHookScope.getStore()?.open === true ? this.#hostInputHoldCount : 0;
+		const inHostInputHooks = this.#hostInputHookScope.getStore()?.open === true;
+		const exemptHolds = inHostInputHooks ? this.#hostInputHoldCount : 0;
 		if (this.#turnDispatchPendingCount - exemptHolds > 0) {
 			owner.mechanism = owner.mode === "steer" ? "steer-boundary" : "aside";
 			this.#irc.queueAside([record]);
 			this.#resumeStrandedIrcAsides();
 			return;
 		}
+		// A delivery made by host input's own hooks is covered by that input: it is the
+		// host action that ends an interrupt or acts in plan mode, and it cannot reach the
+		// session until the hooks return, so gating the delivery would hang them.
 		const gated =
-			(this.#planModeState?.enabled === true && owner.options.wakeInPlanMode !== true) ||
-			(this.#advisors.autoResumeSuppressed && owner.options.wakeAfterInterrupt !== true);
+			!inHostInputHooks &&
+			((this.#planModeState?.enabled === true && owner.options.wakeInPlanMode !== true) ||
+				(this.#advisors.autoResumeSuppressed && owner.options.wakeAfterInterrupt !== true));
 		if (gated && owner.mode === "aside") {
 			owner.mechanism = "aside";
 			this.#irc.queueAside([record]);

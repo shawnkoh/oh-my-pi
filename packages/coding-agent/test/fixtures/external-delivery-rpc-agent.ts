@@ -20,6 +20,7 @@ import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 // DELIVERY_FIXTURE_HOOK_DELIVERS=1: for input "deliver:<text>", the input hook delivers
 // <text> as an aside (source "hook") and waits for it to be accepted before returning.
 // DELIVERY_FIXTURE_MODEL_DELAY_MS: each model reply takes that long.
+// DELIVERY_FIXTURE_PLAN_MODE=1: the session starts in plan mode.
 const hookMs = Number(process.env.DELIVERY_FIXTURE_INPUT_HOOK_MS ?? 0);
 const hookDelivers = process.env.DELIVERY_FIXTURE_HOOK_DELIVERS === "1";
 const modelDelayMs = Number(process.env.DELIVERY_FIXTURE_MODEL_DELAY_MS ?? 0);
@@ -85,4 +86,7 @@ const session = new AgentSession({
 	modelRegistry,
 	extensionRunner,
 });
+if (process.env.DELIVERY_FIXTURE_PLAN_MODE === "1") {
+	session.setPlanModeState({ enabled: true, planFilePath: path.join(process.cwd(), "plan.md") });
+}
 await runRpcMode(session);

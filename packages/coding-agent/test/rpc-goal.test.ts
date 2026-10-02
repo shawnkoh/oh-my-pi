@@ -35,7 +35,7 @@ describe("RPC goal command", () => {
 
 	async function start(options: {
 		continuation: boolean;
-		script?: "complete" | "idle" | "slow";
+		script?: "complete" | "idle" | "slow" | "abort-resume";
 		plan?: boolean;
 		persist?: boolean;
 	}): Promise<RpcClient> {
@@ -191,6 +191,47 @@ describe("RPC goal command", () => {
 		expect(state.isStreaming).toBe(false);
 		expect(state.isSettled).toBe(true);
 	}, 30_000);
+
+	for (const input of ["prompt", "follow_up"] as const) {
+		test(`after a host abort, a host ${input} re-arms a goal the agent's goal tool resumes`, async () => {
+			const rpc = await start({ continuation: true, script: "abort-resume" });
+			const started = Promise.withResolvers<void>();
+			let agentEnds = 0;
+			/** Created when the host input is sent: the abort's own settle must not count. */
+			let settledAfterInput: PromiseWithResolvers<void> | undefined;
+			const unsubscribe = rpc.onSessionEvent(event => {
+				if (event.type === "agent_start") started.resolve();
+				if (event.type === "agent_end") agentEnds++;
+			});
+			const unsubscribeSettled = rpc.onSessionSettled(() => {
+				if (agentEnds > 0) settledAfterInput?.resolve();
+			});
+			const continuations = async () =>
+				(await rpc.getMessages()).filter(
+					message => message.role === "custom" && message.customType === "goal-continuation",
+				).length;
+			try {
+				await rpc.goal("create", { objective: "long task" });
+				await withTimeout(started.promise, 10_000, "Continuation turn never started");
+				await rpc.abort();
+				expect((await rpc.getState()).goal?.goal.status).toBe("paused");
+				const before = await continuations();
+				agentEnds = 0;
+				settledAfterInput = Promise.withResolvers<void>();
+				// The turn this input starts resumes the goal through the agent's goal tool, which
+				// does not re-arm continuation itself: only the host input that started it can.
+				if (input === "prompt") await rpc.prompt("pick the goal back up");
+				else await rpc.followUp("pick the goal back up");
+				await withTimeout(settledAfterInput.promise, 15_000, "Session never settled after the host input");
+				const state = await rpc.getState();
+				expect(state.goal?.goal.status).toBe("active");
+				expect(await continuations()).toBe(before + 1);
+			} finally {
+				unsubscribe();
+				unsubscribeSettled();
+			}
+		}, 30_000);
+	}
 
 	test("a new session leaves the previous session's goal, goal tool and continuation behind", async () => {
 		const rpc = await start({ continuation: true, script: "idle" });

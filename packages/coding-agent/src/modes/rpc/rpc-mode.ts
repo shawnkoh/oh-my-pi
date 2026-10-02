@@ -1789,14 +1789,17 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			}
 			if (!isCurrent()) return "cancelled";
 			if (!text.trim() && !images?.length) return "local";
+			// Re-armed only once the session queued the input (a refused steer or follow-up
+			// throws first). The await resumes in the same tick as the queue push, before any
+			// run the input feeds can make its model call and end.
 			if (command.type === "steer") {
-				goalController.noteHostInput();
 				await session.steer(text, images, { literal: command.literal === true });
+				goalController.noteHostInput();
 				return "admitted";
 			}
 			if (command.type === "follow_up") {
-				goalController.noteHostInput();
 				await session.followUp(text, images, { literal: command.literal === true });
+				goalController.noteHostInput();
 				return "admitted";
 			}
 			if (command.type === "prompt" && command.literal !== true) {
@@ -1835,6 +1838,9 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				if (builtinResult !== false) {
 					if (!("prompt" in builtinResult)) {
 						if (builtinResult.agentInvoked === true && ticket) {
+							// A builtin that runs the agent (`/retry`) is host input too; its turn is
+							// only scheduled, so re-arming here precedes that turn's end.
+							goalController.noteHostInput();
 							void session.waitForIdle().then(
 								() => promptResults.settle(ticket),
 								(idleError: unknown) =>

@@ -130,10 +130,10 @@ export class RpcGoalController {
 	}
 
 	/**
-	 * A host `prompt`, `steer`, `follow_up` or `abort_and_prompt` reached the session (its
-	 * input hooks did not handle it). Re-arms continuation after a host abort or a
-	 * no-progress stop. Call before that input can start or end a run, so its own
-	 * `agent_end` sees the re-armed state.
+	 * The session accepted a host `prompt` (admitted, or an agent-running builtin such as
+	 * `/retry`), `steer`, `follow_up` or `abort_and_prompt` that its input hooks did not
+	 * handle. Re-arms continuation after a host abort or a no-progress stop. Call before that
+	 * input's run can end, so its own `agent_end` sees the re-armed state.
 	 */
 	noteHostInput(): void {
 		this.#resetContinuation();

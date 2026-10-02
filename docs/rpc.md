@@ -281,11 +281,15 @@ An extension input hook may deliver a record itself (`pi.deliverMessage`) and wa
 it to be accepted. Such a delivery, made inside the hook or in anything the hook awaits,
 is never held behind these holds: they belong to the hook's own input and to input
 queued behind it, which cannot proceed until the hook returns, so holding it would hang
-every later input. The record wakes the idle session at once, and the input then meets
-that running turn: a `prompt` without `streamingBehavior`, or an `abort_and_prompt`, is
-refused as busy (a same-id error response with the busy message and a `prompt_result`
-with `status: "error"`); a `prompt` with `streamingBehavior`, a `steer` or a `follow_up`
-is queued into the turn. The exemption ends when the hook returns.
+every later input. For the same reason it counts as part of that host input: a host
+`abort` still in effect or plan mode does not hold it either, as if it had set
+`wakeAfterInterrupt` and `wakeInPlanMode` (the interrupt itself stays in effect until
+host input clears it). The record wakes the idle session at once, and the input then
+meets that running turn: a `prompt` without `streamingBehavior`, or an
+`abort_and_prompt`, is refused as busy (a same-id error response with the busy message
+and a `prompt_result` with `status: "error"`); a `prompt` with `streamingBehavior`, a
+`steer` or a `follow_up` is queued into the turn. The exemption ends when the hook
+returns.
 
 ### Login
 
@@ -544,9 +548,12 @@ turn, sent as a hidden `goal-continuation` message.
   `session_settled` follows if the continuation is abandoned.
 - `abort` stops continuation before the abort takes effect; the interrupted goal is
   paused. Only host input re-arms it: a `prompt`, `steer`, `follow_up` or
-  `abort_and_prompt` that reaches the session (not handled by an input hook; a
-  `prompt` once it is admitted), or `goal create`/`resume`. A turn the host did not
-  start (an extension's `sendUserMessage`, a delivery or job wake) does not.
+  `abort_and_prompt` that the session accepts (not handled by an input hook; a
+  `prompt` once it is admitted, or a builtin that runs the agent such as `/retry`; a
+  `steer` or `follow_up` once it is queued, so a refused one does not), or
+  `goal create`/`resume`. A turn the host did not start (an extension's
+  `sendUserMessage`, a delivery or job wake) does not, so a goal the agent's `goal`
+  tool resumes during such a turn stays stopped until host input.
 - Continuation also stops after a goal turn with no new tool activity. Host input
   re-arms it, and so does the end of any turn that was not a goal continuation.
 - A session change leaves the previous goal and its tool behind and restores a goal
@@ -1297,7 +1304,9 @@ sent as a fallback developer message.
 
 For `aside` only: idle in plan mode holds the record unless `wakeInPlanMode`
 is set; idle after an operator interrupt holds it unless `wakeAfterInterrupt`
-is set (the interrupt latch is not cleared). A `steer` always wakes. A record
+is set (the interrupt latch is not cleared). A record an RPC input hook delivers
+while it runs is not held by either (see
+[External delivery commands](#external-delivery-commands)). A `steer` always wakes. A record
 delivered while a prompt is waiting on manual-compaction cleanup or setting up
 its turn, or while a session transition is open, is held and folds into or
 follows that turn rather than racing it; a prompt that only runs an extension
