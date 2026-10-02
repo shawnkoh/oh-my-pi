@@ -425,7 +425,14 @@ export type RpcResponse =
 			data: { enabled: boolean; active: boolean };
 	  }
 	| { id?: string; type: "response"; command: "goal"; success: true; data: RpcGoalResult }
-	| { id?: string; type: "response"; command: "set_ask_dialog"; success: true; data: { enabled: boolean } }
+	| {
+			id?: string;
+			type: "response";
+			command: "set_ask_dialog";
+			success: true;
+			/** `rich` is present only when the request sent `rich: true` (`rich-ask/2`); true iff negotiated. */
+			data: { enabled: boolean; rich?: boolean };
+	  }
 	| {
 			id?: string;
 			type: "response";
