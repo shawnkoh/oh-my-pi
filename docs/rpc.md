@@ -278,8 +278,8 @@ hold turn dispatch. Wait for `delivery_accepted` and `delivery_settled` to learn
 actually happened. Cancellation succeeds only before acceptance.
 
 An extension input hook may deliver a record itself (`pi.deliverMessage`) and wait for
-it. Such a delivery, made in the hook's async context (code it calls, and promises,
-timers and callbacks it creates), is never held behind these holds while the hook runs,
+it. Such a delivery, made directly in the hook's own async code path (not from within
+event emissions or observers it triggers), is never held behind these holds while the hook runs,
 whether or not a turn is running: they belong to the hook's own input and to input
 queued behind it, which cannot proceed until the hook returns. For the same reason,
 while the hook runs it counts as part of that host input: a host `abort` still in effect
@@ -294,11 +294,12 @@ is queued into the turn. A prompt's own setup window (an earlier admitted prompt
 setting up its turn) does hold it; when that window closes without starting a turn while
 the hook still runs, the record wakes then, still exempt from the host's holds, the
 interrupt and plan mode. The exemption covers only the hook's own deliveries, and only
-while the hook runs. A turn the hook starts (one its record wakes, or a prompt it sends)
-runs outside it, and so does that turn's tail (the deferred `agent_end` and the settle
-drain), so a delivery made there (a tool's, or an `agent_end` subscriber's, for instance)
-is ordinary delivery. When the hook returns, a record of its own still parked waits like
-any other delivery.
+while the hook runs. Every session/agent event emission to subscribers and extension
+observer dispatch runs outside that scope, even when triggered by an API the hook calls
+(abort, compaction, goal updates, queue changes or session transitions). Promises,
+timers and callbacks created by those observers remain outside it. Input-hook dispatch
+itself retains the scope. Turns the hook starts and their settlement callbacks also run
+outside it. When the hook returns, a record of its own still parked waits like any other delivery.
 
 Every later RPC input waits until the hook returns; neither `abort` nor a session change
 ends a hook. So a hook that waits for its own delivery must observe every way it can end
@@ -310,6 +311,11 @@ while the hook runs:
   never resolve.
 - Do not `cancel()` a delivery the hook waits for: a cancelled record resolves neither
   `accepted` nor `discarded`.
+- While the session's agent subscription is disconnected for compaction or a session
+  transition, even a hook's own delivery stays queued, not accepted. Reconnection and
+  the stranded drain resume it (or the transition discards it). Start/await a compaction
+  the hook calls before awaiting its delivery's acceptance; an observer must not await
+  acceptance that depends on its own operation completing.
 - Make the delivery in the hook's async context. A delivery handed to code that runs in
   a context the hook did not create (a worker or loop started before the hook, a native
   callback) is not exempt: it parks behind the hook's own input and is accepted only after

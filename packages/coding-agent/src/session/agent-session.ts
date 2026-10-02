@@ -1222,13 +1222,6 @@ export class AgentSession implements SettingsScope {
 	 *  Runs whenever the session settles; the guard makes it a no-op when the
 	 *  queue was consumed normally or a new turn already started. */
 	#drainStrandedQueuedMessages(): void {
-		// The drain folds stranded asides and may wake a turn; its event emissions and
-		// everything they start run outside host input's hook scope (an abort's finally or a
-		// dispatch-window close can call it from inside a hook).
-		if (this.#hostInputHookScope.getStore() !== undefined) {
-			this.#hostInputHookScope.exit(() => this.#drainStrandedQueuedMessages());
-			return;
-		}
 		if (this.#abortInProgress) return;
 		// Session transitions (newSession/`/new`, compact, model-switch, session-switch,
 		// dispose) call #disconnectFromAgent() BEFORE `await abort()`, so abort's own
@@ -1432,6 +1425,10 @@ export class AgentSession implements SettingsScope {
 			this.#hostInputHookScope.exit(() => this.#wakeForIrc(records));
 			return;
 		}
+		if (this.#unsubscribeAgent === undefined) {
+			this.#irc.queueAside(records);
+			return;
+		}
 		if (this.#turnStartBlocked("irc wake")) {
 			// Kept with the bridge: disposal persists undelivered records.
 			this.#irc.queueAside(records);
@@ -1478,6 +1475,11 @@ export class AgentSession implements SettingsScope {
 		// the transition before building the turn from a consistent contract.
 		void this.whenWorkPoolYieldSettled()
 			.then(() => {
+				// Compaction/session transition may disconnect during the yield wait.
+				if (this.#unsubscribeAgent === undefined) {
+					this.#irc.queueAside(records);
+					return;
+				}
 				// Synchronous ownership check, atomic with the dispatch below:
 				// agent.prompt() claims streaming with no await in between, and the
 				// yield contract above mutates synchronously, so no install can
@@ -1851,6 +1853,9 @@ export class AgentSession implements SettingsScope {
 		this.#promptTemplates = config.promptTemplates ?? [];
 		this.#slashCommands = config.slashCommands ?? [];
 		this.#extensionRunner = config.extensionRunner;
+		if (this.#extensionRunner) {
+			this.#extensionRunner.eventScope = dispatch => this.#hostInputHookScope.exit(dispatch);
+		}
 		this.#cacheWarmer = config.cacheWarmer;
 		if (config.cacheWarmer) {
 			const warmer = config.cacheWarmer;
@@ -3126,9 +3131,9 @@ export class AgentSession implements SettingsScope {
 	}
 
 	/**
-	 * Run host input's own hooks (e.g. RPC input hooks). A delivery made in the hooks' async
-	 * context (code they call, and promises, timers and callbacks they create), whether or not
-	 * a turn is running, ignores every {@link holdTurnDispatch} hold while they run: those holds
+	 * Run host input's own hooks (e.g. RPC input hooks). A delivery made directly in the hooks'
+	 * async context (not within event emissions/observers they trigger), whether or not a turn
+	 * is running, ignores every {@link holdTurnDispatch} hold while they run: those holds
 	 * are this input's and input ordered behind it, which cannot proceed until the hooks
 	 * return. For the same reason, while they run it is covered by that input as host action:
 	 * a host interrupt or plan mode does not gate its wake (as if it set
@@ -3138,14 +3143,19 @@ export class AgentSession implements SettingsScope {
 	 * windows still apply; the delivery records its coverage (`ExternalDeliveryOwner.hostInputHooks`)
 	 * so it keeps every exemption when it resumes after such a window closes, or after the turn
 	 * it was made during ends, while `hooks` still runs. Every exemption ends when `hooks`
-	 * settles, even for work it left running. A turn the hooks start (a woken delivery, a
-	 * prompt, a continuation) and its tail (deferred `agent_end`, settle drain) run outside
-	 * their scope, so a delivery made there is ordinary.
+	 * settles, even for work it left running. Only deliveries made directly in the hook's
+	 * own code path are exempt: session/agent event emissions and extension observers
+	 * (including their async descendants) run outside its scope, even when the hook triggers
+	 * them. Input handlers themselves retain the scope. Turns and their settlement callbacks
+	 * also run outside it.
 	 *
 	 * Nothing here ends `hooks`, and input ordered behind it waits: a hook that awaits its own
 	 * delivery must race `accepted` with `discarded` (a committed session change or shutdown
 	 * discards it), must not cancel it (a cancelled record resolves neither), and must make it
 	 * in its own async context (a delivery from a context it did not create is not exempt).
+	 * Disconnection for compaction or a session transition parks even an exempt delivery
+	 * until reconnect. Start/await compaction before awaiting that delivery's acceptance;
+	 * an observer cannot await acceptance that depends on its own operation finishing.
 	 */
 	async runHostInputHooks<T>(hooks: () => Promise<T>): Promise<T> {
 		const scope = { open: true };
@@ -3828,6 +3838,10 @@ export class AgentSession implements SettingsScope {
 
 	/** Emit an event to all listeners */
 	#emit(event: AgentSessionEvent): void {
+		if (this.#hostInputHookScope.getStore() !== undefined) {
+			this.#hostInputHookScope.exit(() => this.#emit(event));
+			return;
+		}
 		if (ACTIVITY_EVENT_TYPES.has(event.type)) this.#activityEpoch++;
 		// Copy array before iteration to avoid mutation during iteration.
 		const listeners = [...this.#eventListeners];
@@ -3951,6 +3965,9 @@ export class AgentSession implements SettingsScope {
 	}
 
 	async #emitSessionEvent(event: AgentSessionEvent, options: { detachExtensions?: boolean } = {}): Promise<void> {
+		if (this.#hostInputHookScope.getStore() !== undefined) {
+			return this.#hostInputHookScope.exit(() => this.#emitSessionEvent(event, options));
+		}
 		if (event.type === "tool_execution_update") {
 			// Returned background calls have no later tool result to persist their
 			// terminal frame. Keep the latest update for future focus rebuilds;
@@ -4017,6 +4034,9 @@ export class AgentSession implements SettingsScope {
 	 * event/persistence pipeline during teardown.
 	 */
 	#handleAgentEvent = (event: AgentEvent): Promise<void> => {
+		if (this.#hostInputHookScope.getStore() !== undefined) {
+			return this.#hostInputHookScope.exit(() => this.#handleAgentEvent(event));
+		}
 		const processing = this.#dispatchAgentEvent(event);
 		this.#inFlightEventHandlers.add(processing);
 		void processing.finally(() => this.#inFlightEventHandlers.delete(processing)).catch(() => {});
@@ -9448,6 +9468,13 @@ export class AgentSession implements SettingsScope {
 		// the hooks start, and its tail, run outside their scope, so nothing made there is.
 		const hookScope = this.#hostInputHookScope.getStore();
 		if (hookScope?.open) owner.hostInputHooks = hookScope;
+		// A disconnected session cannot observe agent_start/end and settle an evaluation.
+		// Keep even hook-owned deliveries queued until the transition reconnects and drains.
+		if (this.#unsubscribeAgent === undefined) {
+			owner.mechanism = owner.mode === "steer" ? "steer-boundary" : "aside";
+			this.#irc.queueAside([record]);
+			return;
+		}
 		if (this.isStreaming) {
 			if (owner.mode === "steer") {
 				owner.mechanism = "steer-boundary";
