@@ -37,6 +37,8 @@ import {
 	type BeforeToolCallContext,
 	type BeforeToolCallResult,
 	EventLoopKeepalive,
+	isOwnedAsideMessage,
+	markEngineInjected,
 	type QueuedMessagePreparation,
 	resolveTelemetry,
 	type StreamFn,
@@ -335,6 +337,14 @@ import {
 	TOOL_EXECUTION_START_CUSTOM_TYPE,
 	type ToolExecutionStartData,
 } from "./exit-diagnostics";
+import {
+	type DeliveryHandle,
+	type DeliveryOptions,
+	ExternalDeliveries,
+	type ExternalDeliveryHost,
+	type ExternalDeliveryListing,
+	type ExternalDeliveryOwner,
+} from "./external-delivery";
 import { IrcBridge, type IrcBridgeHost } from "./irc-bridge";
 import {
 	buildLaunchCompletionBatchMessage,
@@ -865,6 +875,8 @@ export class AgentSession implements SettingsScope {
 	#asyncDeliveryEpoch = 0;
 
 	readonly #irc: IrcBridge;
+	/** Owned external records (`external-delivery/1`) and their evaluation receipts. */
+	readonly #externalDeliveries: ExternalDeliveries;
 	#ircWakeTurnObserver:
 		| ((records: AgentMessage[]) => ((error?: unknown) => void | Promise<void>) | undefined)
 		| undefined;
@@ -1008,6 +1020,9 @@ export class AgentSession implements SettingsScope {
 			this.#sessionTransitionSettled = undefined;
 			this.#resolveSessionTransition = undefined;
 			resolve?.();
+			// Owned external records deferred by this transition (or held stranded
+			// during it) resume now; the wake path refused them while it was open.
+			if (this.#externalDeliveries.hasQueued()) this.#resumeStrandedIrcAsides();
 		},
 	};
 	#promptSequence = 0;
@@ -1078,6 +1093,9 @@ export class AgentSession implements SettingsScope {
 		if (onSettled) this.#inFlightSettledCallbacks.push(onSettled);
 		this.#promptInFlightCount = Math.max(0, this.#promptInFlightCount - 1);
 		if (this.#promptInFlightCount !== 0) return;
+		// The evaluation settled (recovery waits included). A run still streaming
+		// here belongs to a successor whose own in-flight window settles it.
+		if (!this.agent.state.isStreaming) this.#externalDeliveries.settleEvaluation();
 		this.yieldQueue.requestIdleFlush();
 		this.#releasePowerAssertion();
 		this.#flushPendingAgentEnd();
@@ -1105,6 +1123,9 @@ export class AgentSession implements SettingsScope {
 	 *  agent-core queue still owns the message, but no loop is left to poll it.
 	 *  Runs whenever the session settles; the guard makes it a no-op when the
 	 *  queue was consumed normally or a new turn already started. */
+	/** One pending re-offer of stranded records scheduled behind a prompt's dispatch window. */
+	#strandedResumeAfterAdmission = false;
+
 	#drainStrandedQueuedMessages(): void {
 		if (this.#abortInProgress) return;
 		// Session transitions (newSession/`/new`, compact, model-switch, session-switch,
@@ -1157,32 +1178,101 @@ export class AgentSession implements SettingsScope {
 		// and race the transition's own reset — same rationale as #drainStrandedQueuedMessages.
 		if (this.#unsubscribeAgent === undefined) return;
 		if (this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages()) return;
+		// A prompt in its dispatch window owns the next turn; the parked owned
+		// records fold into it (or resume once the window closes). The re-offer
+		// goes through the queued-message drain so records the window left in the
+		// agent queues (a parked steer re-steered by a provider poll that saw no
+		// turn) are drained too, not only the bridge.
+		if (this.hasPendingTurnDispatch) {
+			if (!this.#strandedResumeAfterAdmission) {
+				this.#strandedResumeAfterAdmission = true;
+				void this.waitForPendingTurnDispatch().finally(() => {
+					this.#strandedResumeAfterAdmission = false;
+					this.#drainStrandedQueuedMessages();
+				});
+			}
+			return;
+		}
 		// Parked wake records resume alongside ordinary stranded asides; they were
 		// already decided wake-intended at deferral time.
-		const records = [...this.#irc.drainDeferredWakes(), ...this.#irc.drainPending()];
+		let records = [...this.#irc.drainDeferredWakes(), ...this.#irc.drainPending()];
+		if (this.#sessionTransitionDepth > 0) {
+			// An open transition defers every owned admission; waking them now would
+			// spin empty all-deferred runs. They resume when the transition settles.
+			const { held, rest } = this.#splitOwnedStrandedRecords(records, () => false);
+			this.#irc.queueAside(held);
+			if (rest.length === 0) return;
+			records = rest;
+		}
 		if (this.#planModeState?.enabled) {
 			// Plan mode: fold stranded IRC asides into context without waking an
-			// autonomous turn. Convergence to ask/resolve stays user-driven.
-			this.#foldStrandedIrcAsidesIntoContext(records);
+			// autonomous turn. Convergence to ask/resolve stays user-driven. Owned
+			// external records never fold (they enter context only through their
+			// own admission): `wakeInPlanMode` wakes, otherwise they stay queued.
+			const { wake, held, rest } = this.#splitOwnedStrandedRecords(records, owner => owner.options.wakeInPlanMode);
+			this.#foldStrandedIrcAsidesIntoContext(rest);
+			this.#irc.queueAside(held);
+			if (wake.length > 0) this.#wakeForIrc(wake);
 			return;
 		}
 		if (this.#advisors.autoResumeSuppressed) {
 			// A user interrupt is still in effect (clearQueue({ forInterrupt: true }) already
 			// dropped these same records from the agent-core queues to keep the run the user
-			// stopped from auto-resuming). Only a real peer IRC message justifies waking a fresh
-			// turn here; extension/user asides fold into context like the plan-mode branch above,
-			// staying user-driven until the next deliberate prompt.
-			const wake: AgentMessage[] = [];
+			// stopped from auto-resuming). Only a real peer IRC message — or an owned external
+			// record that asked to wake after an interrupt — justifies waking a fresh turn here;
+			// extension/user asides fold into context like the plan-mode branch above, staying
+			// user-driven until the next deliberate prompt. The interrupt latch stays set.
+			const { wake, held, rest } = this.#splitOwnedStrandedRecords(
+				records,
+				owner => owner.options.wakeAfterInterrupt,
+			);
 			const fold: AgentMessage[] = [];
-			for (const record of records) {
+			for (const record of rest) {
 				if (record.role === "custom" && record.customType === "irc:incoming") wake.push(record);
 				else fold.push(record);
 			}
 			this.#foldStrandedIrcAsidesIntoContext(fold);
+			this.#irc.queueAside(held);
 			if (wake.length > 0) this.#wakeForIrc(wake);
 			return;
 		}
 		this.#wakeForIrc(records);
+	}
+
+	/** Partitions stranded records into owned records that may wake (`wake`), owned records that
+	 *  must stay queued (`held`; a `steer` always wakes since it demands action) and the rest. */
+	#splitOwnedStrandedRecords(
+		records: AgentMessage[],
+		mayWake: (owner: ExternalDeliveryOwner) => boolean | undefined,
+	): { wake: AgentMessage[]; held: AgentMessage[]; rest: AgentMessage[] } {
+		const wake: AgentMessage[] = [];
+		const held: AgentMessage[] = [];
+		const rest: AgentMessage[] = [];
+		for (const record of records) {
+			const owner = this.#externalDeliveries.ownerOf(record);
+			if (!owner) rest.push(record);
+			else if (owner.mode === "steer" || mayWake(owner) === true) wake.push(record);
+			else held.push(record);
+		}
+		return { wake, held, rest };
+	}
+
+	/** A wake that lost to a running turn: owned `steer` records must still force a boundary
+	 *  (`agent.steer`), everything else rides the non-interrupting aside poll. */
+	#deferWakeBehindRunningTurn(records: AgentMessage[]): void {
+		const asides: AgentMessage[] = [];
+		for (const record of records) {
+			const owner = this.#externalDeliveries.ownerOf(record);
+			if (owner?.mode === "steer") {
+				owner.mechanism = "steer-boundary";
+				this.#allowQueuedMessageDrainRetry();
+				this.agent.steer(record);
+				continue;
+			}
+			if (owner) owner.mechanism = "aside";
+			asides.push(record);
+		}
+		if (asides.length > 0) this.#irc.queueAside(asides);
 	}
 
 	/** Persist stranded IRC/extension asides into context without starting a turn — shared by the
@@ -1222,8 +1312,12 @@ export class AgentSession implements SettingsScope {
 	 *  because #canAutoContinueForFollowUp suppresses follow-up auto-resume while a user interrupt is
 	 *  in effect, even though the wake left a provider-valid tail. */
 	#wakeForIrc(records: AgentMessage[]): void {
+		for (const record of records) {
+			const owner = this.#externalDeliveries.ownerOf(record);
+			if (owner) owner.mechanism = "wake";
+		}
 		if (this.#modeExitDrainSuppressionDepth > 0) {
-			this.#irc.queueAside(records);
+			this.#deferWakeBehindRunningTurn(records);
 			return;
 		}
 		// Park only a *blocked* follow-up (one a user interrupt is intentionally holding); an
@@ -1274,7 +1368,7 @@ export class AgentSession implements SettingsScope {
 					return;
 				}
 				if (this.agent.state.isStreaming) {
-					this.#irc.queueAside(records);
+					this.#deferWakeBehindRunningTurn(records);
 					logger.debug("IRC wake turn deferred behind the running turn");
 					return;
 				}
@@ -1294,7 +1388,7 @@ export class AgentSession implements SettingsScope {
 						this.#irc.queueDeferredWake(records);
 						logger.debug("IRC wake turn parked while pooled");
 					} else {
-						this.#irc.queueAside(records);
+						this.#deferWakeBehindRunningTurn(records);
 						logger.debug("IRC wake turn deferred behind the running turn");
 					}
 					return;
@@ -1362,6 +1456,7 @@ export class AgentSession implements SettingsScope {
 
 	#resetInFlight(): void {
 		this.#promptInFlightCount = 0;
+		this.#externalDeliveries.settleEvaluation({ aborted: true });
 		this.yieldQueue.requestIdleFlush();
 		this.#releasePowerAssertion();
 		this.#flushPendingAgentEnd();
@@ -1512,6 +1607,29 @@ export class AgentSession implements SettingsScope {
 			wakeForIrc: records => this.#wakeForIrc(records),
 		};
 		this.#irc = new IrcBridge(ircHost);
+		const externalDeliveryHost: ExternalDeliveryHost = {
+			isSessionTransitioning: () => this.#sessionTransitionDepth > 0,
+			isDisposed: () => this.#isDisposed,
+			requeue: records => this.#irc.queueAside(records),
+			removeQueued: record => {
+				this.#irc.removeRecord(record);
+				const steering = this.agent.peekSteeringQueue();
+				const followUp = this.agent.peekFollowUpQueue();
+				if (steering.includes(record) || followUp.includes(record)) {
+					this.agent.replaceQueues(
+						steering.filter(queued => queued !== record),
+						followUp.filter(queued => queued !== record),
+					);
+					this.#reconcileQueuedMessageDrain();
+				}
+			},
+			isClassifierRefusal: message => this.#recovery.isClassifierRefusal(message),
+		};
+		this.#externalDeliveries = new ExternalDeliveries(externalDeliveryHost);
+		this.agent.onDeferredMessages = messages => this.#externalDeliveries.onDeferred(messages);
+		// Inclusion receipts observe the provider view after the whole configured
+		// converter (replay filtering, obfuscation) and before provider normalization.
+		this.agent.setConvertToLlm(this.#externalDeliveries.wrapConvertToLlm(this.agent.getConvertToLlm()));
 		const prewalkHost: PrewalkCoordinatorHost = {
 			agent: this.agent,
 			sessionManager: this.sessionManager,
@@ -1814,23 +1932,51 @@ export class AgentSession implements SettingsScope {
 		// `wait` return early rather than miss a queued completion.
 		this.agent.hasBackgroundCompletions = () =>
 			this.yieldQueue.has(LAUNCH_COMPLETION_MESSAGE_TYPE) || this.yieldQueue.has(ASYNC_RESULT_MESSAGE_TYPE);
-		this.agent.setAsideMessageProvider(() => {
-			const thunks: AsideMessage[] = this.#irc.drainPending().map(record => () => record);
+		this.agent.setAsideMessageProvider(boundary => {
+			// Owned external records drain mid-work into any run, but at a stop
+			// boundary only into a delivery-owned one — otherwise they wait for a
+			// separately owned wake once this run settles (#resumeStrandedIrcAsides).
+			// While a session transition is open, admission would only defer and
+			// re-queue them (a hot loop at the boundary); the transition-settle hook
+			// re-offers held records through #resumeStrandedIrcAsides.
+			const holdOwned =
+				this.#sessionTransitionDepth > 0 ||
+				(boundary?.atStopBoundary === true && !this.#externalDeliveries.drainsOwnedAtStopBoundary());
+			const keep = holdOwned ? isOwnedAsideMessage : undefined;
+			const thunks: AsideMessage[] = [];
+			for (const record of this.#irc.drainPending(keep)) {
+				const owner = this.#externalDeliveries.ownerOf(record);
+				// A `steer` record parked in the bridge (deferred admission, transition
+				// hold) is never accepted as an aside: it re-enters through the
+				// steering queue and forces the next boundary.
+				if (owner?.mode === "steer") {
+					owner.mechanism = "steer-boundary";
+					this.agent.steer(record);
+					continue;
+				}
+				if (owner) owner.mechanism = "aside";
+				thunks.push(() => record);
+			}
 			thunks.push(...this.yieldQueue.drainLazy());
 			// Mid-run todo reconciliation — evaluated at injection time so a turn
 			// that flips a todo just before this poll suppresses the nudge.
-			thunks.push(() => this.#todo.takeMidRunNudge());
+			thunks.push(() => {
+				const nudge = this.#todo.takeMidRunNudge();
+				return nudge ? markEngineInjected(nudge) : nudge;
+			});
 			const contextNotesReminder = this.#experimentalContextNotesReminder;
 			if (contextNotesReminder) {
 				this.#experimentalContextNotesReminder = undefined;
 				if (contextNotesReminder.generation === this.#promptGeneration) {
-					thunks.push(() => ({
-						role: "custom",
-						customType: "experimental-context-notes-reminder",
-						content: contextNotesReminder.prompt,
-						display: false,
-						timestamp: Date.now(),
-					}));
+					thunks.push(() =>
+						markEngineInjected({
+							role: "custom",
+							customType: "experimental-context-notes-reminder",
+							content: contextNotesReminder.prompt,
+							display: false,
+							timestamp: Date.now(),
+						}),
+					);
 				}
 			}
 			return thunks;
@@ -2004,7 +2150,7 @@ export class AgentSession implements SettingsScope {
 				}
 			},
 			sendHiddenMessage: async message => {
-				await this.sendCustomMessage(
+				await this.#sendEngineMessage(
 					{
 						customType: message.customType,
 						content: message.content,
@@ -2753,6 +2899,38 @@ export class AgentSession implements SettingsScope {
 		return this.#admittedSubmissionCount > 0;
 	}
 
+	/** Prompts past command handling that are waiting on manual-compaction cleanup
+	 *  or setting up their turn: narrower than {@link hasAdmittedSubmission}, which
+	 *  also spans an extension command handler's whole run. External deliveries
+	 *  hold behind this window only. */
+	#turnDispatchPendingCount = 0;
+	#turnDispatchSettled: PromiseWithResolvers<void> | undefined;
+
+	get hasPendingTurnDispatch(): boolean {
+		return this.#turnDispatchPendingCount > 0;
+	}
+
+	/** Resolves once every prompt currently in its dispatch window has dispatched, queued, or bailed. */
+	waitForPendingTurnDispatch(): Promise<void> {
+		if (this.#turnDispatchPendingCount === 0) return Promise.resolve();
+		this.#turnDispatchSettled ??= Promise.withResolvers<void>();
+		return this.#turnDispatchSettled.promise;
+	}
+
+	#enterTurnDispatch(): () => void {
+		this.#turnDispatchPendingCount++;
+		let left = false;
+		return () => {
+			if (left) return;
+			left = true;
+			if (--this.#turnDispatchPendingCount === 0 && this.#turnDispatchSettled) {
+				const settled = this.#turnDispatchSettled;
+				this.#turnDispatchSettled = undefined;
+				settled.resolve();
+			}
+		};
+	}
+
 	/** Resolves once every currently admitted submission has dispatched, queued, or bailed. */
 	waitForAdmittedSubmissions(): Promise<void> {
 		if (this.#admittedSubmissionCount === 0) return Promise.resolve();
@@ -2846,7 +3024,7 @@ export class AgentSession implements SettingsScope {
 	 */
 	async #deliverRuleWarning(content: string, ruleNames: string[]): Promise<void> {
 		if (this.#isDisposed) return;
-		await this.sendCustomMessage(
+		await this.#sendEngineMessage(
 			{ customType: "ttsr-injection", content, display: false, details: { rules: ruleNames }, attribution: "agent" },
 			{ deliverAs: "aside" },
 		);
@@ -3484,6 +3662,8 @@ export class AgentSession implements SettingsScope {
 
 	#processAgentEvent = async (event: AgentEvent): Promise<void> => {
 		const eventPromptGeneration = this.#promptGeneration;
+		// Delivery receipts read the event stream in emission order, before any await.
+		this.#externalDeliveries.onAgentEvent(event);
 		// A fresh run supersedes the previously settled (and pruned) refusal
 		// turn: state-based lookups take over again.
 		if (event.type === "agent_start") {
@@ -3594,7 +3774,7 @@ export class AgentSession implements SettingsScope {
 			};
 			this.#pendingRewindReport = undefined;
 			this.#lastCompletedRewind = undefined;
-			this.agent.steer(checkpointReminder);
+			this.agent.steer(markEngineInjected(checkpointReminder));
 		}
 
 		// Local completion time for prompt→yield timing: stamped here, not by the
@@ -3807,7 +3987,7 @@ export class AgentSession implements SettingsScope {
 						"Fix the todo payload and call todo again before continuing.",
 						"</system-reminder>",
 					].join("\n");
-					await this.sendCustomMessage(
+					await this.#sendEngineMessage(
 						{
 							customType: "todo-error-reminder",
 							content: reminderText,
@@ -3993,6 +4173,28 @@ export class AgentSession implements SettingsScope {
 				return;
 			}
 			this.#lastSuccessfulYieldToolCallId = undefined;
+
+			// A delivery-owned evaluation (initial prompts all owned external records,
+			// no interactive input since) may end quietly: the empty assistant is
+			// removed and the branch re-parented without pruning its parent prompt,
+			// and no empty-stop retry, unexpected-stop classification or plan/todo/
+			// session-stop continuation runs. Ordinary recovery resumes the moment an
+			// interactive input joins.
+			if (this.#externalDeliveries.quietPrivilege(msg)) {
+				maintenanceRoute("delivery-quiet-stop");
+				await this.#recovery.discardQuietDeliveryStop(msg);
+				this.#recovery.resolveRetry();
+				// Quiet completions still count toward the context budget: run the
+				// ordinary compaction check so repeated quiet deliveries cannot grow
+				// the context unchecked until a non-quiet turn.
+				// `msg` was just discarded, so the terminal-answer probe would read the
+				// previous evaluation's stop: never let this check auto-continue.
+				const quietCompaction = this.#maintenance.checkCompaction(msg, true, true, false);
+				this.#trackPostPromptTask(quietCompaction);
+				const quietResult = await quietCompaction;
+				await emitAgentEndNotification(quietResult.continuationScheduled ? { willContinue: true } : undefined);
+				return;
+			}
 
 			// Empty-stop cleanup MUST run before any compaction continuation: an
 			// empty toolUse stop must be stripped from active context + session
@@ -4759,14 +4961,14 @@ export class AgentSession implements SettingsScope {
 		if (result?.decision !== "block") this.#sessionStopContinuationCount++;
 		this.#sessionStopHookActive = true;
 		this.#queueHiddenNextTurnMessage(
-			{
+			markEngineInjected({
 				role: "custom",
 				customType: "session-stop-continuation",
 				content: additionalContext,
 				display: false,
 				attribution: "agent",
 				timestamp: Date.now(),
-			},
+			}),
 			true,
 		);
 		return true;
@@ -5268,6 +5470,9 @@ export class AgentSession implements SettingsScope {
 		this.#memory.cancelLocalMemoryStartup();
 		this.#titleGenerationAbortController.abort();
 		this.#abortAutolearnCapture();
+		// Owned external records are retired (discarded receipts) before the flush,
+		// which only ever persists non-owned stranded records.
+		this.#externalDeliveries.retireAll("disposed");
 		this.#irc.flushPending();
 		this.yieldQueue.clear();
 		this.agent.setAsideMessageProvider(undefined);
@@ -6330,14 +6535,14 @@ export class AgentSession implements SettingsScope {
 		});
 		const content = formatEvalStateContext(session, { historyHasEval });
 		if (!content) return undefined;
-		return {
+		return markEngineInjected({
 			role: "custom",
 			customType: "eval-state-context",
 			content,
 			display: false,
 			attribution: "agent",
 			timestamp: Date.now(),
-		};
+		});
 	}
 
 	/**
@@ -6615,7 +6820,7 @@ export class AgentSession implements SettingsScope {
 				display: message.display,
 				details: message.details,
 			},
-			options ? { deliverAs: options.deliverAs } : undefined,
+			options ? { deliverAs: options.deliverAs, engineInjected: true } : { engineInjected: true },
 		);
 	}
 
@@ -6630,7 +6835,7 @@ export class AgentSession implements SettingsScope {
 				details: message.details,
 				attribution: message.attribution,
 			},
-			options ? { deliverAs: options.deliverAs } : undefined,
+			options ? { deliverAs: options.deliverAs, engineInjected: true } : { engineInjected: true },
 		);
 	}
 
@@ -6645,7 +6850,7 @@ export class AgentSession implements SettingsScope {
 				details: message.details,
 				attribution: message.attribution,
 			},
-			options ? { deliverAs: options.deliverAs } : undefined,
+			options ? { deliverAs: options.deliverAs, engineInjected: true } : { engineInjected: true },
 		);
 	}
 
@@ -6723,14 +6928,14 @@ export class AgentSession implements SettingsScope {
 			planContent: plan.content,
 		});
 
-		return {
+		return markEngineInjected({
 			role: "custom",
 			customType: "plan-mode-reference",
 			content,
 			display: false,
 			attribution: "agent",
 			timestamp: Date.now(),
-		};
+		});
 	}
 
 	#isScoutAvailable(): boolean {
@@ -6767,28 +6972,28 @@ export class AgentSession implements SettingsScope {
 			scoutAvailable: this.#isScoutAvailable(),
 		});
 
-		return {
+		return markEngineInjected({
 			role: "custom",
 			customType: "plan-mode-context",
 			content,
 			display: false,
 			attribution: "agent",
 			timestamp: Date.now(),
-		};
+		});
 	}
 
 	#buildGoalModeMessage(): CustomMessage | null {
 		const content = this.#goalRuntime.buildActivePrompt();
 		if (!content) return null;
 		const todoContext = this.#buildGoalTodoContext();
-		return {
+		return markEngineInjected({
 			role: "custom",
 			customType: "goal-mode-context",
 			content: prompt.render(goalModeContextPrompt, { goalContext: content, todoContext }),
 			display: false,
 			attribution: "agent",
 			timestamp: Date.now(),
-		};
+		});
 	}
 
 	#buildVibeModeMessage(): CustomMessage | null {
@@ -6975,13 +7180,23 @@ export class AgentSession implements SettingsScope {
 		// abort/preflight race hands the resume back via `release(false)`. A prompt
 		// arriving after the cleanup while an earlier parked prompt is still settling
 		// takes part in the same decision. No-op otherwise.
-		const release = await this.#maintenance.waitForManualCompactionCleanup();
-		const outcome: PromptDispatchOutcome = { sessionClaimed: false };
-		if (!release) return this.#dispatchPrompt(text, options, submittedAt, outcome);
+		// The turn-dispatch window opens here and is handed to #dispatchPrompt,
+		// which keeps it until the turn is set up (or releases it early for an
+		// extension command, which runs unheld). Dropping it between the wait
+		// and the command lookup would let a delivery parked during the wait
+		// wake a run under a slash-prefixed prompt (AgentBusyError).
+		const leaveWait = this.#enterTurnDispatch();
 		try {
-			return await this.#dispatchPrompt(text, options, submittedAt, outcome);
+			const release = await this.#maintenance.waitForManualCompactionCleanup();
+			const outcome: PromptDispatchOutcome = { sessionClaimed: false };
+			if (!release) return await this.#dispatchPrompt(text, options, submittedAt, outcome, leaveWait);
+			try {
+				return await this.#dispatchPrompt(text, options, submittedAt, outcome, leaveWait);
+			} finally {
+				release(outcome.sessionClaimed);
+			}
 		} finally {
-			release(outcome.sessionClaimed);
+			leaveWait();
 		}
 	}
 
@@ -6990,6 +7205,7 @@ export class AgentSession implements SettingsScope {
 		options: PromptOptions | undefined,
 		submittedAt: number,
 		outcome: PromptDispatchOutcome,
+		leaveWindow: () => void,
 	): Promise<boolean> {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		// Slash/custom-command handling below rewrites `text`; keep the original
@@ -6998,12 +7214,23 @@ export class AgentSession implements SettingsScope {
 		// Handle extension commands first (execute immediately, even during streaming)
 		if (expandPromptTemplates && text.startsWith("/")) {
 			if (options?.runCommands !== false) {
-				const handled = await this.#tryExecuteExtensionCommand(text, options?.onPromptAdmitted);
-				if (handled) {
-					return false;
+				// Extension command handlers run unheld: they may deliver and await
+				// receipts themselves (N3). The lookup is synchronous, so the window
+				// held since the compaction wait is released only once the prompt is
+				// known to be one — never in between (P1).
+				if (this.#extensionCommandFor(text)) {
+					leaveWindow();
+					const handled = await this.#tryExecuteExtensionCommand(text, options?.onPromptAdmitted);
+					if (handled) {
+						return false;
+					}
 				}
 
-				// Try custom commands (TypeScript slash commands)
+				// Custom TS and MCP-prompt commands produce the prompt text that
+				// becomes this turn (an MCP prompt fetches it over the network), so
+				// their run is part of the turn setup: a delivery arriving meanwhile
+				// must park, or the returning prompt would collide with the wake it
+				// started (AgentBusyError). The window is still held here.
 				const customResult = await this.#tryExecuteCustomCommand(text);
 				if (customResult !== null) {
 					if (customResult === "") {
@@ -7019,7 +7246,27 @@ export class AgentSession implements SettingsScope {
 				text = expandSlashCommand(text, this.#slashCommands);
 			}
 		}
+		// The turn setup runs inside the window handed in by #prompt (or, after
+		// an unmatched extension lookup, still inside it); the caller closes it.
+		return await this.#dispatchPromptTurn(text, options, submittedAt, outcome, typedText, expandPromptTemplates);
+	}
 
+	/** Synchronous extension-command lookup for a slash-prefixed prompt. */
+	#extensionCommandFor(text: string): boolean {
+		if (!this.#extensionRunner) return false;
+		const spaceIndex = text.indexOf(" ");
+		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
+		return this.#extensionRunner.getCommand(commandName) !== undefined;
+	}
+
+	async #dispatchPromptTurn(
+		text: string,
+		options: PromptOptions | undefined,
+		submittedAt: number,
+		outcome: PromptDispatchOutcome,
+		typedText: string,
+		expandPromptTemplates: boolean,
+	): Promise<boolean> {
 		// Expand file-based prompt templates if requested
 		const templated = expandPromptTemplates ? expandPromptTemplate(text, [...this.#promptTemplates]) : text;
 		const expandedText = options?.synthetic ? templated : this.#modelMentions.expandMentions(templated);
@@ -7246,13 +7493,19 @@ export class AgentSession implements SettingsScope {
 		// prompts and the CLI initial message arrive here and must neither start a
 		// turn against the disconnected session nor lose the session to the
 		// interrupted-turn resume once compaction ends.
-		const release = await this.#maintenance.waitForManualCompactionCleanup();
-		const outcome: PromptDispatchOutcome = { sessionClaimed: false };
-		if (!release) return this.#dispatchCustomPrompt(message, options, outcome);
+		// No command handling on this path: the whole call is a pending dispatch.
+		const leave = this.#enterTurnDispatch();
 		try {
-			return await this.#dispatchCustomPrompt(message, options, outcome);
+			const release = await this.#maintenance.waitForManualCompactionCleanup();
+			const outcome: PromptDispatchOutcome = { sessionClaimed: false };
+			if (!release) return await this.#dispatchCustomPrompt(message, options, outcome);
+			try {
+				return await this.#dispatchCustomPrompt(message, options, outcome);
+			} finally {
+				release(outcome.sessionClaimed);
+			}
 		} finally {
-			release(outcome.sessionClaimed);
+			leave();
 		}
 	}
 
@@ -8305,6 +8558,84 @@ export class AgentSession implements SettingsScope {
 		}
 	}
 
+	/**
+	 * Admit a directed external record (`external-delivery/1`) with honest receipts.
+	 *
+	 * The record becomes a `custom` message (`attribution: "agent"`, `display`
+	 * per payload, `details` as given) that owns its admission: it enters
+	 * context only through the loop's ADMIT/COMMIT hooks, never through a
+	 * flush or fold. Scheduling: a busy session queues an `aside` at the next
+	 * step boundary (mechanism `aside`) or steers a `steer` (mechanism
+	 * `steer-boundary`); an idle session wakes a turn (mechanism `wake`) — in
+	 * plan mode only with `wakeInPlanMode`, after an operator interrupt only
+	 * with `wakeAfterInterrupt` (a `steer` always wakes; the interrupt latch is
+	 * untouched and stopped work is not resumed). A record waiting on one of
+	 * those gates stays queued until a turn drains it. Acceptance fires at the
+	 * loop's commit, never when `agent.prompt()` resolves.
+	 *
+	 * Rejects with a synchronous throw only when the session is disposed.
+	 */
+	deliverExternalMessage<T = unknown>(record: CustomMessagePayload<T>, options: DeliveryOptions): DeliveryHandle {
+		if (this.#isDisposed) throw new Error("Cannot deliver to a disposed session");
+		if (options.mode !== "aside" && options.mode !== "steer") {
+			throw new Error(`Unknown delivery mode: ${String(options.mode)}`);
+		}
+		const owner = this.#externalDeliveries.create(normalizeCustomMessagePayload<T>(record), options);
+		this.#scheduleExternalDelivery(owner);
+		return owner.handle;
+	}
+
+	/** Cancels a still-queued external record. True iff it was queued. */
+	cancelExternalDelivery(deliveryId: string): boolean {
+		return this.#externalDeliveries.cancel(deliveryId);
+	}
+
+	/** External records held by this session (queued or accepted but unsettled). */
+	listExternalDeliveries(): ExternalDeliveryListing[] {
+		return this.#externalDeliveries.list();
+	}
+
+	#scheduleExternalDelivery(owner: ExternalDeliveryOwner): void {
+		const record = owner.record;
+		if (this.isStreaming) {
+			if (owner.mode === "steer") {
+				owner.mechanism = "steer-boundary";
+				this.#allowQueuedMessageDrainRetry();
+				this.agent.steer(record);
+				this.#scheduleIdleQueueDrain();
+				return;
+			}
+			owner.mechanism = "aside";
+			this.#irc.queueAside([record]);
+			// The run may settle before the loop polls again; the settle drain
+			// re-evaluates the stranded record (no-op while streaming).
+			this.#resumeStrandedIrcAsides();
+			return;
+		}
+		// A prompt past command handling that is still waiting on manual-compaction
+		// cleanup or setting up its turn owns the next turn: waking now would race
+		// it into AgentBusyError. Park the record in the bridge (a parked steer is
+		// re-steered by the aside provider if that turn starts, and always woken by
+		// the stranded resume if it does not); #resumeStrandedIrcAsides waits for
+		// the window to close.
+		if (this.hasPendingTurnDispatch) {
+			owner.mechanism = owner.mode === "steer" ? "steer-boundary" : "aside";
+			this.#irc.queueAside([record]);
+			this.#resumeStrandedIrcAsides();
+			return;
+		}
+		const gated =
+			(this.#planModeState?.enabled === true && owner.options.wakeInPlanMode !== true) ||
+			(this.#advisors.autoResumeSuppressed && owner.options.wakeAfterInterrupt !== true);
+		if (gated && owner.mode === "aside") {
+			owner.mechanism = "aside";
+			this.#irc.queueAside([record]);
+			return;
+		}
+		owner.mechanism = "wake";
+		this.#wakeForIrc([record]);
+	}
+
 	/** Queue a custom message without starting a turn, matching steer/follow-up/aside delivery. */
 	async #queueCustomMessage<T = unknown>(
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
@@ -8405,9 +8736,28 @@ export class AgentSession implements SettingsScope {
 			deliverAs?: "steer" | "followUp" | "nextTurn" | "aside";
 			queueChipText?: string;
 			acceptTerminalEmptyStop?: boolean;
+			/** The engine authored this record (a context frame the session rebuilds
+			 *  and resends): it is marked engine-injected so delivery receipts never
+			 *  count it as an input. Extension and operator messages leave it unset. */
+			engineInjected?: true;
 		},
 	): Promise<boolean> {
 		return this.#admitSubmission(() => this.#sendCustomMessage(message, options));
+	}
+
+	/** A custom message the engine itself authors (reminders, notices, rule
+	 *  warnings): same delivery paths as {@link sendCustomMessage}, but the record
+	 *  is marked engine-injected so receipts classify it by origin, not as input. */
+	#sendEngineMessage<T = unknown>(
+		message: CustomMessagePayload<T>,
+		options?: {
+			triggerTurn?: boolean;
+			deliverAs?: "steer" | "followUp" | "nextTurn" | "aside";
+			queueChipText?: string;
+			acceptTerminalEmptyStop?: boolean;
+		},
+	): Promise<boolean> {
+		return this.sendCustomMessage(message, { ...options, engineInjected: true });
 	}
 
 	async #sendCustomMessage<T = unknown>(
@@ -8417,6 +8767,8 @@ export class AgentSession implements SettingsScope {
 			deliverAs?: "steer" | "followUp" | "nextTurn" | "aside";
 			queueChipText?: string;
 			acceptTerminalEmptyStop?: boolean;
+			/** Internal: the engine authored this record (see {@link markEngineInjected}). */
+			engineInjected?: true;
 		},
 	): Promise<boolean> {
 		// An extension command parked on a manual compaction may fire this
@@ -8440,6 +8792,7 @@ export class AgentSession implements SettingsScope {
 		options:
 			| {
 					triggerTurn?: boolean;
+					engineInjected?: true;
 					deliverAs?: "steer" | "followUp" | "nextTurn" | "aside";
 					queueChipText?: string;
 					acceptTerminalEmptyStop?: boolean;
@@ -8470,6 +8823,7 @@ export class AgentSession implements SettingsScope {
 			timestamp: Date.now(),
 		};
 		const normalizedAppMessage = await this.#normalizeAgentMessageImages(appMessage);
+		if (options?.engineInjected) markEngineInjected(normalizedAppMessage);
 		if (this.isStreaming) {
 			// Queued into a turn the agent owns: that turn holds the session. Busy only
 			// from another prompt's setup claims nothing (that prompt decides).
@@ -8670,12 +9024,24 @@ export class AgentSession implements SettingsScope {
 		const keep: (m: AgentMessage) => boolean = options?.forInterrupt
 			? isAdvisorCard
 			: m => !isUserAuthoredQueuedMessage(m) && !isHiddenUserCompanion(m);
+		// An owned external record is never silently dropped: on an interrupt it
+		// moves to the IRC bridge and its owner keeps its receipts. Only `steer`
+		// records can be queued here, and a steer always wakes (contract), so the
+		// stranded resume starts its turn right after the abort settles —
+		// `wakeAfterInterrupt` is not consulted for it.
+		const parked: AgentMessage[] = [];
 		for (const message of [...steeringAll, ...followUpAll]) {
-			if (!keep(message) && message.role === "custom" && message.customType === "ttsr-injection") {
+			if (keep(message)) continue;
+			if (isOwnedAsideMessage(message)) {
+				parked.push(message);
+				continue;
+			}
+			if (message.role === "custom" && message.customType === "ttsr-injection") {
 				this.#ttsr.releaseDeferredReservationFromDetails(message.details);
 			}
 		}
 		this.agent.replaceQueues(steeringAll.filter(keep), followUpAll.filter(keep));
+		if (parked.length > 0) this.#irc.queueAside(parked);
 		this.#reconcileQueuedMessageDrain();
 		return { steering, followUp };
 	}
@@ -9351,6 +9717,7 @@ export class AgentSession implements SettingsScope {
 			// the same breath so an aside-queueing call still awaiting normalization for the
 			// outgoing session also drops its record instead of landing in this new one.
 			this.#irc.clearPending();
+			this.#externalDeliveries.retireAll("new-session");
 			this.#sessionGeneration++;
 			this.#scheduledHiddenNextTurnGeneration = undefined;
 			this.#queuedMessageDrainBlocked = false;
@@ -9614,14 +9981,16 @@ export class AgentSession implements SettingsScope {
 		const key = `${lane}#${window}`;
 		if (this.#anthropicWrapUpHinted === key) return;
 		this.#anthropicWrapUpHinted = key;
-		this.agent.steer({
-			role: "custom",
-			customType: "anthropic-usage-wrap-up",
-			content: anthropicUsageWrapUpPrompt,
-			attribution: "agent",
-			display: false,
-			timestamp: Date.now(),
-		});
+		this.agent.steer(
+			markEngineInjected({
+				role: "custom",
+				customType: "anthropic-usage-wrap-up",
+				content: anthropicUsageWrapUpPrompt,
+				attribution: "agent",
+				display: false,
+				timestamp: Date.now(),
+			}),
+		);
 	}
 
 	/** Sets or clears one model family's live service tier. */
@@ -9739,7 +10108,7 @@ export class AgentSession implements SettingsScope {
 				message => message.role === "custom" && message.customType === "skillful-notice",
 			);
 			if (hasReadableSkills && !alreadyAnnounced) {
-				await this.sendCustomMessage(
+				await this.#sendEngineMessage(
 					{
 						customType: "skillful-notice",
 						content: prompt.render(skillfulNoticePrompt, { skills: renderedSkills }),
@@ -10930,6 +11299,9 @@ export class AgentSession implements SettingsScope {
 				this.#advisors.restoreCost(costs, providersBySlug);
 			}
 			this.#bash.finishSessionTransition(bashTransition, true);
+			// Committed: every unaccepted owned record of the outgoing session — queued,
+			// deferred or drained but never inserted — is discarded with a receipt.
+			this.#externalDeliveries.retireAll("session-switched");
 			// Keep the old reservations during rollback; the target is committed now,
 			// so the snapshotted old queues can no longer be restored.
 			this.#releaseTtsrReservations(previousSteeringMessages);
@@ -10950,8 +11322,16 @@ export class AgentSession implements SettingsScope {
 			this.#memory.restorePromotionSnapshot(previousBaseSystemPromptBeforeMemoryPromotion);
 			this.agent.setSystemPrompt(previousSystemPrompt);
 			this.agent.replaceMessages(previousAgentMessages);
-			this.agent.replaceQueues(previousSteeringMessages, previousFollowUpMessages);
-			this.#irc.restorePending(previousIrcPending);
+			// Rolled back: no receipt. Records cancelled meanwhile stay out of every queue.
+			this.agent.replaceQueues(
+				this.#externalDeliveries.prune(previousSteeringMessages),
+				this.#externalDeliveries.prune(previousFollowUpMessages),
+			);
+			this.#irc.restorePending({
+				interrupts: this.#externalDeliveries.prune(previousIrcPending.interrupts),
+				asides: this.#externalDeliveries.prune(previousIrcPending.asides),
+				deferredWakes: this.#externalDeliveries.prune(previousIrcPending.deferredWakes),
+			});
 			this.#sessionGeneration = previousSessionGeneration;
 			generationSettled.resolve();
 			this.#sessionGenerationSettled = previousSessionGenerationSettled;
