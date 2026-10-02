@@ -59,6 +59,16 @@ export interface TextPrediction {
 	suggestion: PredictedWord | null;
 }
 
+/** Options for {@link requestTextPrediction}. */
+export interface TextPredictionRequestOptions {
+	/**
+	 * Answer only over a daemon connection this process already holds: never start the
+	 * broker or the daemon and never fetch SmolLM's weights. Without one there is no
+	 * suggestion. For a session that is exiting.
+	 */
+	connectedOnly?: boolean;
+}
+
 interface PendingRequest {
 	resolve(response: TextPredictResponse): void;
 	reject(error: Error): void;
@@ -238,10 +248,19 @@ class TextPredictionClient {
 	 * @throws when the daemon is unreachable or the engine reports an error
 	 * (e.g. it failed to load).
 	 */
-	async complete(engine: TextPredictMethod, before: string, prefix: string): Promise<TextPrediction> {
-		// SmolLM's weights download here, in the interactive process (shown in the
-		// download HUD), only once the user has chosen SmolLM.
-		if (engine === "smollm") prefetchSmolLmWeights();
+	async complete(
+		engine: TextPredictMethod,
+		before: string,
+		prefix: string,
+		options: TextPredictionRequestOptions = {},
+	): Promise<TextPrediction> {
+		if (options.connectedOnly) {
+			if (!this.connected) return { engine, suggestion: null };
+		} else if (engine === "smollm") {
+			// SmolLM's weights download here, in the interactive process (shown in the
+			// download HUD), only once the user has chosen SmolLM.
+			prefetchSmolLmWeights();
+		}
 		const response = await this.#request(
 			id => ({ id, op: "complete", method: engine, before, prefix }),
 			COMPLETE_TIMEOUT_MS,
@@ -249,6 +268,11 @@ class TextPredictionClient {
 		if (!response.ok) throw new Error(response.error);
 		if (response.op !== "complete") throw new Error(`text-predict: unexpected ${response.op} response`);
 		return { engine, suggestion: response.suggestion };
+	}
+
+	/** Whether this process holds an open daemon connection, so a request starts nothing. */
+	get connected(): boolean {
+		return this.#connection !== undefined && !this.#connection.closed;
 	}
 
 	/**
@@ -308,9 +332,15 @@ export function requestTextPrediction(
 	method: WordCompletionEngine,
 	before: string,
 	prefix: string,
+	options?: TextPredictionRequestOptions,
 ): Promise<TextPrediction> {
 	sharedClient ??= new TextPredictionClient();
-	return sharedClient.complete(resolveTextPredictMethod(method), before, prefix);
+	return sharedClient.complete(resolveTextPredictMethod(method), before, prefix, options);
+}
+
+/** Whether this process holds an open daemon connection: a request over it starts no helper. */
+export function hasTextPredictionConnection(): boolean {
+	return sharedClient?.connected ?? false;
 }
 
 /**

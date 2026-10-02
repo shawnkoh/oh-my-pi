@@ -204,7 +204,12 @@ function promptResultsFor(id: string, frames: object[] = []) {
 			hasAdmittedSubmission: false,
 			queuedMessageCount: 0,
 			hasPendingAsyncWork: () => false,
-			sessionManager: { getLeafId: () => null, getBranch: () => [], getSessionId: () => "s" },
+			sessionManager: {
+				getLeafId: () => null,
+				getBranch: () => [],
+				getSessionId: () => "s",
+				continuesSession: (id: string) => id === "s",
+			},
 		},
 		frame => frames.push(frame),
 	);

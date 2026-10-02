@@ -43,7 +43,7 @@ import {
 	type WordCompletionQuery,
 	wordCompletionQuery,
 } from "@oh-my-pi/pi-tui/prompt/word-completion";
-import { requestTextPrediction, textPredictionBackend } from "../../predict/client";
+import { hasTextPredictionConnection, requestTextPrediction, textPredictionBackend } from "../../predict/client";
 import type { AgentSession } from "../../session/agent-session";
 import { CACHE_WARMING_MODES } from "../../session/cache-warmer";
 import { findMostRecentNonEmptySession } from "../../session/session-listing";
@@ -141,10 +141,15 @@ export class RpcWordPredictor {
 	#busy = false;
 	#queued: QueuedWordPrediction | undefined;
 	readonly #request: typeof requestTextPrediction;
+	readonly #connectedOnly: () => boolean;
 
-	/** `request` is a test seam. */
-	constructor(request: typeof requestTextPrediction = requestTextPrediction) {
+	/**
+	 * `request` is a test seam. While `connectedOnly()` holds (read as each engine request
+	 * starts), predictions use only an already-open daemon connection and start nothing.
+	 */
+	constructor(request: typeof requestTextPrediction = requestTextPrediction, connectedOnly = () => false) {
 		this.#request = request;
+		this.#connectedOnly = connectedOnly;
 	}
 
 	/**
@@ -166,7 +171,9 @@ export class RpcWordPredictor {
 	async #run(engine: WordCompletionEngine, query: WordCompletionQuery): Promise<string | null> {
 		this.#busy = true;
 		try {
-			const { suggestion } = await this.#request(engine, query.before, query.prefix);
+			const { suggestion } = await this.#request(engine, query.before, query.prefix, {
+				connectedOnly: this.#connectedOnly(),
+			});
 			return suggestion?.suffix || null;
 		} finally {
 			this.#busy = false;
@@ -308,6 +315,8 @@ export async function dispatchRpcSkillPrompt(input: {
 	extensionUserMessageTracker: RpcExtensionUserMessageTracker;
 	images?: ImageContent[];
 	isCurrent?: () => boolean;
+	/** Called synchronously when the skill prompt is admitted, before its run can start. */
+	onPromptAdmitted?: () => void;
 }): Promise<RpcSkillCommandResult | "cancelled" | null> {
 	const invocation = resolveRpcSkillInvocation(input.session, input.message);
 	if (!invocation) return null;
@@ -328,7 +337,10 @@ export async function dispatchRpcSkillPrompt(input: {
 				invocation,
 				input.streamingBehavior ?? "steer",
 				built,
-				onPromptAdmitted,
+				() => {
+					input.onPromptAdmitted?.();
+					onPromptAdmitted();
+				},
 				input.images,
 			),
 		results: input.results,
@@ -560,6 +572,7 @@ export class RpcUserInputGate {
 	#sequence = 0;
 	#validFrom = 0;
 	#acceptedAt = new WeakMap<object, number>();
+	#pending = 0;
 
 	/** Call from {@link RpcInputDispatcher.dispatch} before the handler is queued. */
 	accept(command: RpcCommand): void {
@@ -590,12 +603,25 @@ export class RpcUserInputGate {
 
 	/** Run user-input work in accept order. The tail releases when `work` settles, not when a model turn ends. */
 	enqueue<T>(work: () => Promise<T>): Promise<T> {
+		this.#pending++;
 		const run = this.#tail.then(work, work);
 		this.#tail = run.then(
-			() => {},
-			() => {},
+			() => {
+				this.#pending--;
+			},
+			() => {
+				this.#pending--;
+			},
 		);
 		return run;
+	}
+
+	/**
+	 * Input enqueued and not yet settled: waiting its turn, in its hooks or skill/image
+	 * preparation, or not yet admitted. The session cannot see it yet, so it is queued input.
+	 */
+	get pendingCount(): number {
+		return this.#pending;
 	}
 }
 
@@ -1380,7 +1406,9 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	};
 
 	const extensionUserMessageTracker = new RpcExtensionUserMessageTracker();
-	const wordPredictor = new RpcWordPredictor();
+	// Once admission closes the session is exiting: predictions must not start the shared daemon
+	// (or its broker, or a weights download) after the exit decision.
+	const wordPredictor = new RpcWordPredictor(requestTextPrediction, () => session.isAdmissionClosed());
 	// A continuation abandoned while waiting leaves nothing to end the activity stretch: re-check settlement.
 	const goalController = new RpcGoalController(session, () => void settleWatcher.check());
 	// A scheduled or held goal turn will start a turn: every settle report treats it as busy,
@@ -1735,8 +1763,16 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	const dispatchOrderedUserInput = (
 		command: OrderedUserInput,
 		ticket: RpcPromptTicket | undefined,
-	): Promise<OrderedInputOutcome> =>
-		inputGate.enqueue(async () => {
+	): Promise<OrderedInputOutcome> => {
+		// A prompt owns the next turn from the moment the gate takes it: hold the session's
+		// turn-dispatch window while input ahead of it drains and its hooks run, so a `deliver`
+		// read after it parks behind it instead of waking the idle session and getting the prompt
+		// refused as busy. Released once the prompt was admitted, queued, handled or dropped.
+		// Every input's hooks run under runHostInputHooks: a delivery they make (and may await)
+		// ignores these holds, since the input holding them cannot proceed until the hooks return.
+		const releaseDispatchHold =
+			command.type === "prompt" || command.type === "abort_and_prompt" ? session.holdTurnDispatch() : undefined;
+		const dispatched = inputGate.enqueue(async () => {
 			const sessionId = session.sessionId;
 			const isCurrent = () =>
 				inputGate.isCurrent(command) && !shutdownState.requested && session.sessionId === sessionId;
@@ -1745,7 +1781,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			let images = command.images;
 			const runner = session.extensionRunner;
 			if (runner?.hasHandlers("input")) {
-				const result = await runner.emitInput(text, images, "rpc");
+				const result = await session.runHostInputHooks(() => runner.emitInput(text, images, "rpc"));
 				if (!isCurrent()) return "cancelled";
 				if (result.handled) return "local";
 				if (result.text !== undefined) text = result.text;
@@ -1754,10 +1790,12 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			if (!isCurrent()) return "cancelled";
 			if (!text.trim() && !images?.length) return "local";
 			if (command.type === "steer") {
+				goalController.noteHostInput();
 				await session.steer(text, images, { literal: command.literal === true });
 				return "admitted";
 			}
 			if (command.type === "follow_up") {
+				goalController.noteHostInput();
 				await session.followUp(text, images, { literal: command.literal === true });
 				return "admitted";
 			}
@@ -1773,6 +1811,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					extensionUserMessageTracker,
 					images,
 					isCurrent,
+					onPromptAdmitted: () => goalController.noteHostInput(),
 				});
 				if (skillResult === "cancelled") return "cancelled";
 				if (skillResult) return "admitted";
@@ -1820,7 +1859,10 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 						images,
 						literal: command.literal === true,
 						...(command.type === "prompt" ? { streamingBehavior: command.streamingBehavior } : {}),
-						onPromptAdmitted,
+						onPromptAdmitted: () => {
+							goalController.noteHostInput();
+							onPromptAdmitted();
+						},
 					}),
 				results: promptResults,
 				onError: onPromptError(command.id, command.type),
@@ -1828,6 +1870,9 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			});
 			return "admitted";
 		});
+		if (releaseDispatchHold) void dispatched.then(releaseDispatchHold, releaseDispatchHold);
+		return dispatched;
+	};
 
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
@@ -2561,7 +2606,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 					return error(id, "predict_word_feedback", "suggestion must be a string and accepted a boolean");
 				}
 				const method = cfgSpellingAutocomplete.get(session.settings);
-				if (method !== "off") {
+				// Like `predict_word`: an exiting session sends feedback only over an open connection.
+				if (method !== "off" && (!session.isAdmissionClosed() || hasTextPredictionConnection())) {
 					const query = wordQueryAt(command.text, command.cursor);
 					if (query) {
 						textPredictionBackend(method).feedback(
@@ -2667,10 +2713,12 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		afterSerialCommand: () => shutdownCoordinator.checkShutdownRequested(),
 		acceptInput: command => inputGate.accept(command),
 	});
-	// Commands read but not yet answered are admitted input the session cannot see.
+	// Commands read but not yet answered, and ordered input still in the gate (an
+	// `abort_and_prompt` is answered before its prompt is admitted), are admitted input
+	// the session cannot see.
 	session.registerWorkSource({
 		kind: "queuedInput",
-		count: () => inputDispatcher.pendingCount + shutdownCoordinator.pendingCount,
+		count: () => inputDispatcher.pendingCount + shutdownCoordinator.pendingCount + inputGate.pendingCount,
 	});
 
 	// Keep the stdin reader moving: side-channel frames dispatch immediately,

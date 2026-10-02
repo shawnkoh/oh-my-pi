@@ -13,6 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -1189,14 +1190,14 @@ export class AgentSession implements SettingsScope {
 		}
 	}
 
+	/** One pending re-offer of stranded records scheduled behind a prompt's dispatch window. */
+	#strandedResumeAfterAdmission = false;
+
 	/** A steer/follow-up can land after the agent loop's final queue poll, or
 	 *  after an abort stops an auto-continued queued turn. In both cases the
 	 *  agent-core queue still owns the message, but no loop is left to poll it.
 	 *  Runs whenever the session settles; the guard makes it a no-op when the
 	 *  queue was consumed normally or a new turn already started. */
-	/** One pending re-offer of stranded records scheduled behind a prompt's dispatch window. */
-	#strandedResumeAfterAdmission = false;
-
 	#drainStrandedQueuedMessages(): void {
 		if (this.#abortInProgress) return;
 		// Session transitions (newSession/`/new`, compact, model-switch, session-switch,
@@ -1686,7 +1687,12 @@ export class AgentSession implements SettingsScope {
 		const externalDeliveryHost: ExternalDeliveryHost = {
 			isSessionTransitioning: () => this.#sessionTransitionDepth > 0,
 			isDisposed: () => this.#isDisposed,
-			requeue: records => this.#irc.queueAside(records),
+			requeue: records => {
+				// A record handed back (deferred admission, drained but not inserted) is new
+				// pending work for an attestation taken before.
+				this.#activityEpoch++;
+				this.#irc.queueAside(records);
+			},
 			removeQueued: record => {
 				this.#irc.removeRecord(record);
 				const steering = this.agent.peekSteeringQueue();
@@ -3003,11 +3009,15 @@ export class AgentSession implements SettingsScope {
 	}
 
 	/** Prompts past command handling that are waiting on manual-compaction cleanup
-	 *  or setting up their turn: narrower than {@link hasAdmittedSubmission}, which
-	 *  also spans an extension command handler's whole run. External deliveries
-	 *  hold behind this window only. */
+	 *  or setting up their turn, plus host input held by {@link holdTurnDispatch}:
+	 *  narrower than {@link hasAdmittedSubmission}, which also spans an extension
+	 *  command handler's whole run. External deliveries hold behind this window only. */
 	#turnDispatchPendingCount = 0;
 	#turnDispatchSettled: PromiseWithResolvers<void> | undefined;
+	/** The share of {@link #turnDispatchPendingCount} held by {@link holdTurnDispatch}. */
+	#hostInputHoldCount = 0;
+	/** Open while host input's own hooks run ({@link runHostInputHooks}). */
+	readonly #hostInputHookScope = new AsyncLocalStorage<{ open: boolean }>();
 
 	get hasPendingTurnDispatch(): boolean {
 		return this.#turnDispatchPendingCount > 0;
@@ -3032,6 +3042,43 @@ export class AgentSession implements SettingsScope {
 				settled.resolve();
 			}
 		};
+	}
+
+	/**
+	 * Open the turn-dispatch window for input a host has accepted but not yet handed to
+	 * {@link prompt}, e.g. an RPC prompt whose input hooks are still running. External
+	 * deliveries park behind it as behind a prompt's own window, so they cannot wake the
+	 * idle session and turn that prompt into an AgentBusyError. Returns the idempotent
+	 * release; call it once the input was admitted, queued, handled locally or dropped.
+	 */
+	holdTurnDispatch(): () => void {
+		const leave = this.#enterTurnDispatch();
+		this.#hostInputHoldCount++;
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			this.#hostInputHoldCount--;
+			leave();
+		};
+	}
+
+	/**
+	 * Run host input's own hooks (e.g. RPC input hooks). A delivery made inside them, or in
+	 * anything they await, ignores every {@link holdTurnDispatch} hold: those holds are this
+	 * input's and input ordered behind it, which cannot proceed until the hooks return, so
+	 * parking a delivery the hooks wait on would hang them. Such a delivery wakes an idle
+	 * session at once, and the held input then meets a running turn (a prompt without
+	 * `streamingBehavior` is refused as busy). Prompts' own dispatch windows still apply.
+	 * The exemption ends when `hooks` settles, even for work it left running.
+	 */
+	async runHostInputHooks<T>(hooks: () => Promise<T>): Promise<T> {
+		const scope = { open: true };
+		try {
+			return await this.#hostInputHookScope.run(scope, hooks);
+		} finally {
+			scope.open = false;
+		}
 	}
 
 	/** Resolves once every currently admitted submission has dispatched, queued, or bailed. */
@@ -3200,7 +3247,10 @@ export class AgentSession implements SettingsScope {
 			this.#irc.pendingCount() +
 			this.yieldQueue.size() +
 			this.#admittedSubmissionCount +
-			this.#queuedInputsInFlight;
+			this.#queuedInputsInFlight +
+			// Every external delivery the session still holds (queued, or accepted but not
+			// settled), including ones outside the queues above.
+			this.#externalDeliveries.pendingCount();
 		const manager = this.#asyncJobManager;
 		if (manager) {
 			// The session that owns the process-wide manager answers for every owner's jobs.
@@ -6282,6 +6332,17 @@ export class AgentSession implements SettingsScope {
 	}
 
 	async #doDispose(options: AgentSessionDisposeOptions = {}): Promise<void> {
+		try {
+			await this.#disposeResources(options);
+		} finally {
+			// Disposal is over, finished or failed: this session no longer holds parked agents
+			// back. The refusal is process-wide, so a throwing teardown must not leave it set.
+			this.#releaseRevivalRefusal?.();
+			this.#releaseRevivalRefusal = undefined;
+		}
+	}
+
+	async #disposeResources(options: AgentSessionDisposeOptions): Promise<void> {
 		this.beginDispose(options.reason);
 		// Stop cache warming before the drain windows below: an armed tick firing
 		// mid-dispose would issue a paid warm request and persist usage into the
@@ -6421,9 +6482,6 @@ export class AgentSession implements SettingsScope {
 		// graph shed its heavy payloads even while the lifecycle adoption record's
 		// reviver closure still references the session object. Fixes #8003.
 		this.#releaseRetainedSessionMemory();
-		// Disposal is complete: this session no longer holds parked agents back.
-		this.#releaseRevivalRefusal?.();
-		this.#releaseRevivalRefusal = undefined;
 
 		// The deadline does not cancel the drain: a handler parked in a slow
 		// extension hook resumes afterwards and would repopulate exactly the
@@ -9278,10 +9336,17 @@ export class AgentSession implements SettingsScope {
 	 * those gates stays queued until a turn drains it. Acceptance fires at the
 	 * loop's commit, never when `agent.prompt()` resolves.
 	 *
-	 * Rejects with a synchronous throw only when the session is disposed.
+	 * Rejects with a synchronous throw only when the session is disposed. Once input admission
+	 * is closed (a passed quiesce or a hang-up), the record is not admitted: the returned handle
+	 * is already `discarded` with reason `admission_closed` and no owner is queued. Every
+	 * admitted record advances the activity epoch and counts as queued input until it settles.
 	 */
 	deliverExternalMessage<T = unknown>(record: CustomMessagePayload<T>, options: DeliveryOptions): DeliveryHandle {
 		if (this.#isDisposed) throw new Error("Cannot deliver to a disposed session");
+		if (this.#admissionClosedBy) {
+			return this.#externalDeliveries.refuse(normalizeCustomMessagePayload<T>(record), options, "admission_closed");
+		}
+		this.#activityEpoch++;
 		if (options.mode !== "aside" && options.mode !== "steer") {
 			throw new Error(`Unknown delivery mode: ${String(options.mode)}`);
 		}
@@ -9318,12 +9383,14 @@ export class AgentSession implements SettingsScope {
 			return;
 		}
 		// A prompt past command handling that is still waiting on manual-compaction
-		// cleanup or setting up its turn owns the next turn: waking now would race
-		// it into AgentBusyError. Park the record in the bridge (a parked steer is
-		// re-steered by the aside provider if that turn starts, and always woken by
-		// the stranded resume if it does not); #resumeStrandedIrcAsides waits for
-		// the window to close.
-		if (this.hasPendingTurnDispatch) {
+		// cleanup or setting up its turn, or host input held in its hooks, owns the next
+		// turn: waking now would race it into AgentBusyError. Park the record in the bridge
+		// (a parked steer is re-steered by the aside provider if that turn starts, and
+		// always woken by the stranded resume if it does not); #resumeStrandedIrcAsides
+		// waits for the window to close. A delivery made by those hooks themselves is
+		// exempt from host holds (runHostInputHooks).
+		const exemptHolds = this.#hostInputHookScope.getStore()?.open === true ? this.#hostInputHoldCount : 0;
+		if (this.#turnDispatchPendingCount - exemptHolds > 0) {
 			owner.mechanism = owner.mode === "steer" ? "steer-boundary" : "aside";
 			this.#irc.queueAside([record]);
 			this.#resumeStrandedIrcAsides();
