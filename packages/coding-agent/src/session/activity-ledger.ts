@@ -10,6 +10,9 @@ const servers = new Set<ServerActivityLedger>();
 
 const extensions = new Set<ExtensionActivityLedger>();
 
+/** Uncertainty left by disposed runners, deduplicated so it does not grow with session churn. */
+const retiredReasons = new Set<string>();
+
 /** Engine-wide ownership: disposing a session does not settle escaped extension work. */
 export class ExtensionActivityLedger {
 	readonly #holds = new Map<object, string>();
@@ -35,17 +38,17 @@ export class ExtensionActivityLedger {
 		};
 	}
 
-	/** Drop the runner reference, but retain holds and uncertainty after shutdown/parking. */
+	/** Drop the runner reference; holds stay until released and uncertainty stays process-wide. */
 	dispose(): void {
 		if (this.#disposed) return;
-		const reasons = this.completenessReasons();
-		this.completenessReasons = () => reasons;
+		for (const reason of this.completenessReasons()) retiredReasons.add(reason);
+		this.completenessReasons = () => [];
 		this.#disposed = true;
 		this.#prune();
 	}
 
 	#prune(): void {
-		if (this.#disposed && this.count === 0 && this.completenessReasons().length === 0) extensions.delete(this);
+		if (this.#disposed && this.count === 0) extensions.delete(this);
 	}
 
 	static outstandingWork(): number {
@@ -55,12 +58,15 @@ export class ExtensionActivityLedger {
 	}
 
 	static completenessReasons(): string[] {
-		return [...new Set([...extensions].flatMap(extension => extension.completenessReasons()))];
+		const reasons = new Set(retiredReasons);
+		for (const extension of extensions) for (const reason of extension.completenessReasons()) reasons.add(reason);
+		return [...reasons];
 	}
 
 	/** Tests sharing a process must explicitly isolate their simulated engines. */
 	static resetForTests(): void {
 		extensions.clear();
+		retiredReasons.clear();
 	}
 }
 
