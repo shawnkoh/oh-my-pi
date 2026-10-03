@@ -625,7 +625,7 @@ read-only snapshot, then asks the process to exit only if nothing changed:
 
 1. `attest` → `data`: `{ version: 1, operationId, nonce, epoch, instanceId,
    session: { id, file }, invocation: { pid, startId, startTime }, counts,
-   admission: "open" | "closed", registry: { path, complete, ownerScan }, observedAt }`.
+   admission: "open" | "closed", sealed: boolean, registry: { path, complete, ownerScan }, observedAt }`.
    `counts` has `streaming`, `queuedInput`, `asyncJobs`, `subagents`, `retainedJobs`,
    `detachedJobs`, `compacting`, `handoff`, `goalContinuationScheduled`,
    `scheduledTurns`; any non-zero value means work is outstanding. `queuedInput`
@@ -666,7 +666,7 @@ read-only snapshot, then asks the process to exit only if nothing changed:
    registry completeness → session file. A scan that registers work which exits before
    counting finishes therefore refuses strict retirement with `epoch_mismatch`.
    Strict also performs the Linux namespace census and checks the outstanding-activity
-   ledger described below. Both policies retain the same post-seal exit behaviour described below.
+   ledger described below. Only attested retirement retains the prior post-seal exit behaviour.
    There is no legacy capability alias or default policy.
 
    **Strict namespace census (Linux).** The owner must supply a single launch argv
@@ -721,13 +721,34 @@ read-only snapshot, then asks the process to exit only if nothing changed:
      connection the process already holds: without one, `predict_word` answers
      `suffix: null` and feedback is dropped, so neither starts the daemon, its broker
      or a model download after the pass.
-   - Exit without attestation → `data: { status: "exit_unattested", operationId,
+   - Strict commit point: after recording the exit, finalize the transcript, bind the
+     registry to the final file, then take fresh strict counts, census and ledger
+     coverage and recheck the live epoch and final-binding registry completeness.
+     Only after that final evaluation passes is the success attestation published.
+   - Strict post-seal failure → `data: { status: "sealed_blocked", operationId,
+     attempt, reason, snapshot: { epoch, counts, observedAt, census,
+     completenessReasons, registry }, progress: { finalized, bound, attested } }`.
+     Any failure in finalization, binding, final evaluation or publication leaves
+     admission closed and the transcript sealed. The process does not dispose or
+     schedule an exit; stdin EOF keeps it alive. Publication of a terminal
+     `kind: "sealed_blocked"` record is attempted even if a success record was
+     already published; failure to invalidate that record still does not permit exit.
+     `attest` remains available with `admission: "closed"`, `sealed: true` and the
+     sealed decision epoch.
+     A newer strict attempt on the same session object resumes incomplete
+     finalization/binding without appending another exit, then repeats final evaluation
+     and publication. Identity, deadline and epoch checks still apply; duplicate
+     attempts replay the memoized result and older attempts return `stale_attempt`.
+     Attested requests and unrelated admission closures return `admission_closed`.
+     Rejected retries never reopen admission. Recovery requires the existing RPC
+     channel; no reattachment transport or automatic replacement is provided.
+   - Attested exit without attestation → `data: { status: "exit_unattested", operationId,
      attempt, reason: "attestation_unavailable", error, snapshot }`. The session was
      idle and its transcript was made final, but the attestation could not be written.
      The process exits anyway, with code 1; there is no terminal attestation for this
      exit, so the consumer decides from the registry (`verifyOwnedJobRegistry`).
    - Refusal → `data: { status: "refused", operationId, attempt, reason, snapshot:
-     { epoch, counts, observedAt } }`. Admission is reopened and nothing is cancelled.
+     { epoch, counts, observedAt } }`. An evaluated pre-seal refusal reopens its own admission closure; nothing is cancelled.
      `reason` is one of `work_active`, `epoch_mismatch`, `deadline_expired`,
      `invocation_mismatch` (the `instanceId` belongs to another session object or
      process), `session_mismatch` (the session was switched since the attestation),
@@ -1911,7 +1932,7 @@ Failures are `success: false` with string `error`.
 - Malformed JSONL / parse-loop exceptions emit a `parse` error response and continue reading subsequent lines.
 - Empty `set_session_name` is rejected (`Session name cannot be empty`).
 - Extension UI responses and valid host-tool/host-URI updates/results with unknown `id` are ignored. These side-channel frames do not receive command response frames.
-- Normal termination occurs on stdin close, extension-triggered shutdown, or a passed `quiesce_and_exit`. Output/spool failures and unrecovered session-persistence failures are fatal.
+- Normal termination occurs on stdin close, extension-triggered shutdown, or a passed `quiesce_and_exit`, except that strict `sealed_blocked` prevents disposal and controlled exit (including stdin EOF). Output/spool failures and unrecovered session-persistence failures are fatal.
 - Session-persistence errors emit an unfiltered `{ type: "notice", level: "error", message, source: "session-persistence" }` frame and a stderr mirror. A recovered failure can still shut down normally; a failure still latched during disposal exits with code `1` after draining stdout.
 
 ## Compact Command Flows

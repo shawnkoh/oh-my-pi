@@ -1707,6 +1707,12 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	 * rejection with no latched store failure still surfaces to the caller.
 	 */
 	const disposeAndExit = async (): Promise<never> => {
+		if (session.isSealedBlocked) {
+			// A pending promise alone does not keep Bun alive after stdin EOF.
+			return new Promise<never>(() => {
+				setInterval(() => {}, 60_000);
+			});
+		}
 		try {
 			await session.dispose();
 		} catch (error) {
@@ -2747,6 +2753,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	hostUriBridge.clear("RPC client disconnected before host URI request completed");
 	await inputDispatcher.drain();
 	await shutdownCoordinator.drain();
+	if (session.isSealedBlocked) return disposeAndExit();
 	subagentRegistry?.dispose();
 	// Dispose the main session before exiting so the browser reaper and other
 	// bounded teardown run on the stdin-EOF path too (#5643). Idempotent: a

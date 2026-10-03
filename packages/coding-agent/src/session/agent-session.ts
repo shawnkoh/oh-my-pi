@@ -431,7 +431,12 @@ import {
 	SessionMaintenance,
 	type SessionMaintenanceHost,
 } from "./session-maintenance";
-import { cleanupEmptyMoveSession, copySessionArtifacts, type SessionManager } from "./session-manager";
+import {
+	cleanupEmptyMoveSession,
+	copySessionArtifacts,
+	type SessionManager,
+	type TranscriptDigest,
+} from "./session-manager";
 import { SessionMemory, type SessionMemoryHost } from "./session-memory";
 import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
@@ -1063,6 +1068,14 @@ export class AgentSession implements SettingsScope {
 	/** Random per-object id binding quiesce requests to the attestation they were built from. */
 	readonly #instanceId = crypto.randomUUID();
 	#terminalAttestation: TerminalAttestation | undefined;
+	#strictSeal:
+		| {
+				epoch: number;
+				progress: { finalized: boolean; bound: boolean; attested: boolean };
+				transcript: TranscriptDigest | null;
+				blocked: boolean;
+		  }
+		| undefined;
 	/** Lifts this session's refusal of subagent revivals, set once it decided to exit. */
 	#releaseRevivalRefusal: (() => void) | undefined;
 	/** Owned-job registry this session created (root sessions that own the async job manager). */
@@ -3337,6 +3350,10 @@ export class AgentSession implements SettingsScope {
 		return this.#terminalAttestation;
 	}
 
+	get isSealedBlocked(): boolean {
+		return this.#strictSeal?.blocked === true;
+	}
+
 	/** Synchronously count all outstanding work. Never awaits; safe to call with admission closed. */
 	getWorkCounts(strict = false): WorkCounts {
 		return this.#countWork(true, strict);
@@ -3417,11 +3434,11 @@ export class AgentSession implements SettingsScope {
 	/** Read-only snapshot of outstanding work, echoing the caller's operation id and nonce. */
 	attest(operationId: string, nonce: string): WorkAttestation {
 		const registry = this.ownedJobRegistry;
-		registry?.ensureHeader();
+		if (!this.#strictSeal) registry?.ensureHeader();
 		// Count first: the owner-marker scan inside may record (and so move the epoch past) a
 		// process nobody tracked yet. The attested epoch must include that registration.
 		const counts = this.getWorkCounts();
-		const epoch = this.#activityEpoch;
+		const epoch = this.#strictSeal?.epoch ?? this.#activityEpoch;
 		return {
 			version: WORK_ATTESTATION_VERSION,
 			operationId,
@@ -3432,6 +3449,7 @@ export class AgentSession implements SettingsScope {
 			invocation: currentInvocation(),
 			counts,
 			admission: this.#admissionClosedBy ? "closed" : "open",
+			sealed: this.#strictSeal !== undefined,
 			registry: {
 				path: registry?.path ?? null,
 				complete: this.#registryComplete(registry),
@@ -3450,8 +3468,8 @@ export class AgentSession implements SettingsScope {
 	 * not reached. On success it durably writes the terminal attestation next to the session
 	 * file and leaves admission closed; the host must then exit. On refusal it reopens
 	 * admission exactly as before and changes nothing else — no work is cancelled. If the
-	 * attestation cannot be written after the transcript was made final, the answer is
-	 * `exit_unattested`: the host exits anyway and consumers fall back to the registry.
+	 * attestation cannot be written after the transcript was made final, attested policy
+	 * returns `exit_unattested`; strict policy stays alive as `sealed_blocked` for retirement.
 	 * Each `(operationId, attempt)` of this session is evaluated once: repeating it returns
 	 * the original answer unchanged, and an older attempt is refused. Malformed requests and
 	 * requests for another session object or session never use up an attempt.
@@ -3520,6 +3538,11 @@ export class AgentSession implements SettingsScope {
 		refuse: (reason: QuiesceRefusalReason, counts?: WorkCounts) => QuiesceResult,
 	): QuiesceResult {
 		const { operationId, attempt } = request;
+		if (this.isSealedBlocked && !this.#isDisposed && request.completeness === "strict") {
+			if (Date.now() >= request.deadline) return refuse("deadline_expired");
+			if (request.epoch !== this.#strictSeal!.epoch) return refuse("epoch_mismatch");
+			return this.#retireStrictSeal(request);
+		}
 		if (this.#admissionClosedBy || this.#isDisposed) return refuse("admission_closed");
 
 		// Close admission before looking at anything. Nothing below awaits, so no input can
@@ -3554,6 +3577,15 @@ export class AgentSession implements SettingsScope {
 			assertAttestationWritable(terminalAttestationPath(sessionFile));
 			this.#recordSessionExit("quiesce");
 			sealed = true;
+			if (strict) {
+				this.#strictSeal = {
+					epoch,
+					progress: { finalized: false, bound: false, attested: false },
+					transcript: null,
+					blocked: true,
+				};
+				return this.#retireStrictSeal(request);
+			}
 			// The process exits from here on: a parked subagent must stay parked.
 			this.#releaseRevivalRefusal ??= AgentLifecycleManager.global().refuseRevivals("the session is exiting");
 			// An armed warm would still pay for a provider call after the decision.
@@ -3605,6 +3637,103 @@ export class AgentSession implements SettingsScope {
 					counts: counts ?? this.#safeCounts(),
 					observedAt: new Date().toISOString(),
 				},
+			};
+		}
+	}
+
+	/** Resume only incomplete preparation; every attempt re-evaluates the final binding. */
+	#retireStrictSeal(request: QuiesceRequest): QuiesceResult {
+		const state = this.#strictSeal!;
+		const { operationId, attempt } = request;
+		let counts = this.#safeCounts();
+		try {
+			this.#releaseRevivalRefusal ??= AgentLifecycleManager.global().refuseRevivals("the session is sealed");
+			this.#cacheWarmer?.cancel();
+			if (!state.progress.finalized) {
+				state.transcript = this.sessionManager.finalizeForExit();
+				state.progress.finalized = true;
+			}
+			const registry = this.ownedJobRegistry;
+			if (!state.progress.bound) {
+				if (!registry) throw new Error("registry_unavailable");
+				registry.ensureHeader();
+				state.progress.bound = true;
+			}
+			counts = this.getWorkCounts(true);
+			const completeness = this.#strictCompleteness();
+			counts.detachedJobs += this.#lastCensus?.work.length ?? 0;
+			if (hasOutstandingWork(counts)) throw new Error("work_active");
+			if (this.#activityEpoch !== state.epoch) throw new Error("epoch_mismatch");
+			if (!completeness.complete) throw new Error("completeness_unknown");
+			const session = this.#sessionIdentity();
+			if (!session.file) throw new Error("attestation_unavailable");
+			const attestation: TerminalAttestation = {
+				version: TERMINAL_ATTESTATION_VERSION,
+				kind: "quiesce",
+				operationId,
+				attempt,
+				session: { ...session, size: state.transcript?.size ?? null, sha256: state.transcript?.sha256 ?? null },
+				invocation: currentInvocation(),
+				instanceId: this.#instanceId,
+				epoch: state.epoch,
+				counts,
+				interrupted: false,
+				registryComplete: this.#registryComplete(registry),
+				registryPath: registry?.path ?? null,
+				ownerScan: this.#lastOwnerScan,
+				writtenAt: new Date().toISOString(),
+			};
+			const file = terminalAttestationPath(session.file);
+			writeTerminalAttestationSync(file, attestation);
+			state.progress.attested = true;
+			this.#terminalAttestation = attestation;
+			state.blocked = false;
+			return { status: "quiesced", operationId, attempt, attestation, path: file };
+		} catch (error) {
+			state.blocked = true;
+			this.sessionManager.seal();
+			const registry = this.ownedJobRegistry;
+			const terminal: TerminalAttestation = {
+				version: TERMINAL_ATTESTATION_VERSION,
+				kind: "sealed_blocked",
+				operationId,
+				attempt,
+				session: this.#sessionIdentity(),
+				invocation: currentInvocation(),
+				instanceId: this.#instanceId,
+				epoch: state.epoch,
+				counts,
+				interrupted: true,
+				registryComplete: this.#registryComplete(registry),
+				registryPath: registry?.path ?? null,
+				ownerScan: this.#lastOwnerScan,
+				writtenAt: new Date().toISOString(),
+			};
+			this.#terminalAttestation = terminal;
+			try {
+				if (terminal.session.file)
+					writeTerminalAttestationSync(terminalAttestationPath(terminal.session.file), terminal);
+			} catch (writeError) {
+				logger.error("Could not publish sealed-blocked attestation", { error: String(writeError) });
+			}
+			return {
+				status: "sealed_blocked",
+				operationId,
+				attempt,
+				reason: String(error),
+				snapshot: {
+					epoch: state.epoch,
+					counts,
+					observedAt: new Date().toISOString(),
+					census: this.#lastCensus ?? null,
+					completenessReasons: this.#lastCompletenessReasons ?? [],
+					registry: {
+						path: registry?.path ?? null,
+						complete: this.#registryComplete(registry),
+						ownerScan: this.#lastOwnerScan,
+					},
+				},
+				progress: { ...state.progress },
 			};
 		}
 	}
