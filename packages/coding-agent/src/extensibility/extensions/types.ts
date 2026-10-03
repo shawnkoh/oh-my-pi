@@ -532,7 +532,7 @@ export interface ExtensionContext {
 	/** Gracefully shutdown and exit. */
 	shutdown(): void;
 	/**
-	 * Protocol capabilities this host implements (`quiesce-exit/1`, `owned-jobs/1`).
+	 * Protocol capabilities this host implements (`quiesce-exit/2`, `owned-jobs/1`).
 	 * Empty when the host cannot quiesce and exit.
 	 */
 	capabilities: readonly string[];

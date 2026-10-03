@@ -158,6 +158,7 @@ export type RpcCommand =
 			id?: string;
 			type: "quiesce_and_exit";
 			operationId: string;
+			completeness: "strict" | "attested";
 			attempt: number;
 			epoch: number;
 			instanceId: string;

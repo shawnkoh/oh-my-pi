@@ -14,7 +14,7 @@ import { isEnoent, logger } from "@oh-my-pi/pi-utils";
 import { fsyncDirectory, type InvocationIdentity, type OwnerScanSummary, stripJsonl } from "./owned-job-registry";
 
 /** Capability: `attest` + `quiesce_and_exit` with a terminal attestation file. */
-export const QUIESCE_EXIT_CAPABILITY = "quiesce-exit/1";
+export const QUIESCE_EXIT_CAPABILITY = "quiesce-exit/2";
 /** Capability: durable owned-job registry next to the session file. */
 export const OWNED_JOBS_CAPABILITY = "owned-jobs/1";
 /** Capabilities advertised by hosts that wire quiesce-and-exit (RPC `get_state`, extension `ctx.capabilities`). */
@@ -164,6 +164,8 @@ export interface WorkAttestation {
 
 export interface QuiesceRequest {
 	operationId: string;
+	/** Strict requires complete work coverage; attested preserves counts-only retirement. */
+	completeness: "strict" | "attested";
 	/** Non-negative integer; each new attempt for an operation must use a higher number. */
 	attempt: number;
 	/** The epoch from the attestation the caller based its decision on. */
@@ -193,6 +195,7 @@ export type QuiesceRefusalReason =
 	| "deadline_expired"
 	| "epoch_mismatch"
 	| "work_active"
+	| "completeness_unknown"
 	| "attestation_unavailable";
 
 export interface TerminalAttestation {
@@ -234,7 +237,7 @@ export type QuiesceResult =
 			attempt: number;
 			reason: QuiesceRefusalReason;
 			/** Work observed while deciding (admission was closed at that instant). */
-			snapshot: { epoch: number; counts: WorkCounts; observedAt: string };
+			snapshot: { epoch: number; counts: WorkCounts; observedAt: string; registry?: OwnedJobRegistryState };
 	  }
 	| {
 			/**

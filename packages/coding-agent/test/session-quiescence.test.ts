@@ -132,6 +132,7 @@ describe("AgentSession quiesce-and-exit", () => {
 		const attested = s.attest("op-1", "nonce");
 		return {
 			operationId: "op-1",
+			completeness: "attested",
 			attempt: 1,
 			epoch: attested.epoch,
 			instanceId: attested.instanceId,
@@ -153,6 +154,65 @@ describe("AgentSession quiesce-and-exit", () => {
 		await started.promise;
 		unsubscribe();
 	}
+
+	it.each([undefined, null, "", "unknown", 1])(
+		"rejects completeness %j without consuming the attempt",
+		completeness => {
+			const s = createSession();
+			const valid = request(s);
+			const invalid = { ...valid, completeness } as unknown as QuiesceRequest;
+			if (completeness === undefined) delete (invalid as Partial<QuiesceRequest>).completeness;
+			expect(s.quiesceForExit(invalid)).toMatchObject({ status: "refused", reason: "invalid_request" });
+			expect(s.isAdmissionClosed()).toBe(false);
+			expect(s.quiesceForExit(valid)).toMatchObject({ status: "quiesced", attempt: valid.attempt });
+		},
+	);
+
+	it("refuses incomplete registry coverage only for strict retirement and memoizes the refusal", () => {
+		const s = createSession();
+		const registry = s.ownedJobRegistry!;
+		registry.beginPtyRun({ command: "finished PTY", cwd: tempDir.path() })();
+		const strict = request(s, { completeness: "strict" });
+		const result = s.quiesceForExit(strict);
+		expect(result).toMatchObject({
+			status: "refused",
+			reason: "completeness_unknown",
+			snapshot: { registry: { path: registry.path, complete: false } },
+		});
+		expect(s.isAdmissionClosed()).toBe(false);
+		expect(fs.existsSync(terminalAttestationPath(s.sessionFile!))).toBe(false);
+		expect(s.quiesceForExit({ ...strict, completeness: "attested" })).toBe(result);
+		expect(s.quiesceForExit(request(s, { attempt: 2 }))).toMatchObject({
+			status: "quiesced",
+			attestation: { registryComplete: false },
+		});
+	});
+
+	it("rechecks the strict epoch when a scan discovers a process that has already exited", () => {
+		const s = createSession();
+		const strict = request(s, { completeness: "strict" });
+		const registry = s.ownedJobRegistry!;
+		const scan = { supported: true, sound: true, scanned: 1, discovered: 1, opaque: [] };
+		vi.spyOn(registry, "scanAndCount").mockImplementationOnce(() => {
+			// Model the race deterministically, using real registration to advance the epoch.
+			const id = registry.registerProcess({
+				kind: "process",
+				pid: process.pid,
+				startId: "test-exited-process",
+				command: "discovered process",
+				discovered: true,
+			})!;
+			registry.end(id, "settled");
+			return { scan, live: 0 };
+		});
+		const result = s.quiesceForExit(strict);
+		expect(result).toMatchObject({ status: "refused", reason: "epoch_mismatch" });
+		if (result.status !== "refused") throw new Error("expected refusal");
+		expect(hasOutstandingWork(result.snapshot.counts)).toBe(false);
+		expect(result.snapshot.epoch).toBeGreaterThan(strict.epoch);
+		expect(result.snapshot.registry).toBeUndefined();
+		expect(s.isAdmissionClosed()).toBe(false);
+	});
 
 	it("exits an idle session with a durable attestation and admits nothing afterwards", async () => {
 		const s = createSession();
@@ -930,6 +990,7 @@ describe("AgentSession quiesce with an advisor", () => {
 		const attested = s.attest("op-1", "nonce");
 		return {
 			operationId: "op-1",
+			completeness: "attested",
 			attempt: 1,
 			epoch: attested.epoch,
 			instanceId: attested.instanceId,

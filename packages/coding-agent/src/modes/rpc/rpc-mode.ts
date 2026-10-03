@@ -2648,6 +2648,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		}
 		const result = session.quiesceForExit({
 			operationId: command.operationId,
+			completeness: command.completeness,
 			attempt: command.attempt,
 			epoch: command.epoch,
 			instanceId: command.instanceId,
