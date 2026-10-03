@@ -1,3 +1,4 @@
+import type { CensusIdentity } from "../session/namespace-census";
 /**
  * CLI argument parsing and help display
  */
@@ -23,6 +24,7 @@ export { getExtraHelpText };
 export type Mode = "text" | "json" | "rpc" | "acp" | "rpc-ui";
 
 export interface Args {
+	a13Identity?: CensusIdentity;
 	cwd?: string;
 	/** Workspace directories beyond cwd for this session (repeatable `--add-dir`). */
 	addDir?: string[];
@@ -241,6 +243,9 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 			args.splice(i + 1, 0, value);
 			equalsValueIndex = i + 1;
 		}
+		if (arg === "--a13-identity" && (equalsValueIndex === -1 || result.a13Identity !== undefined)) {
+			throw new CliUsageError("--a13-identity requires one --a13-identity=<json> argument.");
+		}
 
 		// Extension-registered flags take precedence over built-ins: a flag an
 		// extension owns (e.g. plan-mode's boolean `--plan`) is parsed with the
@@ -248,7 +253,7 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 		// value-taking built-in (`--plan`, `--model`, …) that branch would consume
 		// the following token — eating the user's message and setting the wrong
 		// built-in field — so registered flags shadow same-named built-ins here.
-		const extFlag = arg.startsWith("--") ? extensionFlags?.get(arg.slice(2)) : undefined;
+		const extFlag = arg.startsWith("--") && arg !== "--a13-identity" ? extensionFlags?.get(arg.slice(2)) : undefined;
 		if (extFlag) {
 			const flagName = arg.slice(2);
 			if (extFlag.type === "boolean") {

@@ -674,9 +674,36 @@ read-only snapshot, then asks the process to exit only if nothing changed:
    then checks deadline → pre-scan epoch → work active → live epoch after counting →
    registry completeness → session file. A scan that registers work which exits before
    counting finishes therefore refuses strict retirement with `epoch_mismatch`.
-   Strict currently checks registry coverage only, not a namespace census or an activity
-   ledger. Both policies retain the same post-seal exit behaviour described below.
+   Strict also performs the Linux namespace census described below; an activity
+   ledger is not yet included. Both policies retain the same post-seal exit behaviour described below.
    There is no legacy capability alias or default policy.
+
+   **Strict namespace census (Linux).** The owner must supply a single launch argv
+   element `--a13-identity=<json>` with exactly this schema:
+   `{"v":1,"boot":"12345678-1234-1234-1234-123456789abc","pid1Start":"123","canonical":{"pid":2,"start":"456"}}`.
+   Boot is a lowercase UUID, starts are decimal tick strings, and the canonical PID
+   is a safe integer greater than 1. Malformed, repeated, or split-form flags exit
+   with status 2 at startup. This is launch identity, not a setting or a guest-discovered
+   substitute for the owner's record.
+
+   Without identity strict refuses with `census-identity-missing`; non-Linux
+   platforms report `census-unsupported-platform`. Attested retirement does not run
+   the census. With admission closed, the census checks the proc mount for hidepid,
+   boot ID, and every numeric PID's `stat`, raw NUL-delimited `cmdline`, and status
+   `Uid` line; it never reads `environ`. Read failures, malformed fields, duplicate
+   PIDs, and unconfirmed disappearance are unknown. Zombies are gone.
+
+   Only the exact boundary (PID 1, recorded start, `openshell-sandb`), owner-recorded
+   canonical process (with `sleep infinity` argv corroboration), engine, exact
+   registered processes, idle internal helpers supervising no registered live service,
+   and exact identities from the injected idle-infrastructure provider are excluded
+   from additional work. The provider defaults to empty. Registered processes are
+   already counted; unmatched processes, including ppid-0 processes, are work.
+   Such work increases `detachedJobs` for the strict decision and refuses with
+   `work_active`. Two consecutive passes must agree on `(pid,start)` and classification,
+   with at most three comparisons before `census-unstable`. This does not make the
+   census atomic against privileged out-of-band launches; managed launch admission
+   must remain closed at the owner.
    - Pass → `data: { status: "quiesced", operationId, attempt, attestation, path }`.
      Before the attestation is written the transcript is made final (the exit record
      is appended, flushed and the file sealed), and `attestation.session` carries its
@@ -715,9 +742,11 @@ read-only snapshot, then asks the process to exit only if nothing changed:
      process), `session_mismatch` (the session was switched since the attestation),
      `stale_attempt`, `admission_closed`, `invalid_request`, `attestation_unavailable`
      (no session file, or the attestation directory is not writable).
-     Strict also returns `completeness_unknown` when registry coverage is incomplete;
-     only this refusal adds `snapshot.registry: { path, complete, ownerScan }`, captured
-     from the admission-closed scan. Missing or unknown `completeness` is
+     Strict also returns `completeness_unknown` when registry coverage or the namespace
+     census is incomplete. Strict `work_active` and `completeness_unknown` refusals
+     include `snapshot.registry: { path, complete, ownerScan }` and
+     `snapshot.census: { complete, work: [{ pid, comm, ppid }], reasons }`, captured
+     with admission closed. Missing or unknown `completeness` is
      `invalid_request` before admission closes and does not consume an attempt.
 
 Each `(operationId, attempt)` is evaluated once: repeating it returns the original

@@ -1,3 +1,4 @@
+import type { CensusResult } from "./namespace-census";
 /**
  * Input admission, work attestation and terminal attestation for an
  * {@link AgentSession}.
@@ -237,7 +238,13 @@ export type QuiesceResult =
 			attempt: number;
 			reason: QuiesceRefusalReason;
 			/** Work observed while deciding (admission was closed at that instant). */
-			snapshot: { epoch: number; counts: WorkCounts; observedAt: string; registry?: OwnedJobRegistryState };
+			snapshot: {
+				epoch: number;
+				counts: WorkCounts;
+				observedAt: string;
+				registry?: OwnedJobRegistryState;
+				census?: CensusResult;
+			};
 	  }
 	| {
 			/**

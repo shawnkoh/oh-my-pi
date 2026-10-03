@@ -34,6 +34,7 @@ import { isServiceTierOpenAISettingValue, SERVICE_TIER_OPENAI_VALUES } from "../
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { Args } from "./args";
 import { CliUsageError } from "./usage-error";
+import { parseCensusIdentity } from "../session/namespace-census";
 
 /**
  * Runtime dependencies injected into setters that need to validate input.
@@ -184,6 +185,13 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 	},
 	"--prompt-cache-key": (result, value) => {
 		result.providerPromptCacheKey = value;
+	},
+	"--a13-identity": (result, value) => {
+		try {
+			result.a13Identity = parseCensusIdentity(value);
+		} catch {
+			throw new CliUsageError("Invalid --a13-identity: expected the exact version 1 launch identity schema.");
+		}
 	},
 	"--session-dir": (result, value) => {
 		result.sessionDir = value;
