@@ -674,16 +674,18 @@ read-only snapshot, then asks the process to exit only if nothing changed:
    `{"v":1,"boot":"12345678-1234-1234-1234-123456789abc","pid1Start":"123","canonical":{"pid":2,"start":"456"}}`.
    Boot is a lowercase UUID, starts are decimal tick strings, and the canonical PID
    is a safe integer greater than 1. Malformed, repeated, or split-form flags exit
-   with status 2 at startup. This is launch identity, not a setting or a guest-discovered
-   substitute for the owner's record.
+   with status 2 and no stdout at the CLI entry, before help, version, license,
+   profile alias installation, or worker/command dispatch. The reserved flag is
+   validated wherever it occurs in argv, including after `--`. This is launch
+   identity, not a setting or a guest-discovered substitute for the owner's record.
 
-   On Linux, supplying the flag also verifies the launch identity before session
-   startup or any RPC output (including `ready`). The engine reads the trimmed
+   On Linux, supplying the flag also verifies the launch identity before any
+   stdout, including CLI help/version and RPC `ready`. The engine reads the trimmed
    `/proc/sys/kernel/random/boot_id` and field 22 of `/proc/1/stat`, parsed after
    the last `)`. Unreadable or malformed values produce exactly one stderr line,
    `juiz.a13-identity-unreadable`; either value differing from the owner record
-   produces `juiz.a13-identity-mismatch`. Both failures exit with status 3 without
-   a handshake, so the owner must not adopt the engine. This startup check applies
+   produces `juiz.a13-identity-mismatch`. Both failures exit with status 3 and no
+   stdout, so the owner must not adopt the engine. This startup check applies
    to every session mode, independent of retirement policy; it is skipped without
    the flag or on non-Linux platforms.
 

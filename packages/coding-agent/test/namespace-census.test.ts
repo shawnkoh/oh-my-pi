@@ -186,30 +186,69 @@ test("startup identity skips absent flags and non-Linux without reading proc", (
 	expect(checkStartupIdentity(identity, { platform: "darwin", procRoot: "/nonexistent" })).toBeUndefined();
 });
 
-test("RPC startup exits before any protocol output when launch identity cannot be verified", () => {
+test("CLI identity guard precedes launch, help, version, and other early output", () => {
 	const f = fixture();
 	for (const unreadable of [false, true]) {
 		if (unreadable) fs.unlinkSync(path.join(f.root, "1/stat"));
-		const argv = ["--mode", "rpc", `--a13-identity=${JSON.stringify({ ...identity, pid1Start: "11" })}`];
+		const flag = `--a13-identity=${JSON.stringify({ ...identity, pid1Start: "11" })}`;
+		for (const argv of [
+			["--mode", "rpc", flag],
+			["--mode", "rpc-ui", flag],
+			["--mode", "rpc", flag, "--help"],
+			["launch", "--mode", "rpc-ui", flag, "--help"],
+			["--version", "--mode", "rpc", flag],
+			["--license", flag],
+			["--smoke-test", flag],
+			["--profile", "guard-test", "--alias", "guard-test", flag],
+			["--help", "--", flag],
+		]) {
+			const child = Bun.spawnSync(
+				[
+					process.execPath,
+					"--eval",
+					`
+					import { runCli } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/cli.ts"))};
+					await runCli(${JSON.stringify(argv)}, {
+						platform: "linux", procRoot: ${JSON.stringify(f.root)}
+					});
+					`,
+				],
+				{ stdout: "pipe", stderr: "pipe", timeout: 30_000 },
+			);
+			expect(child.exitCode).toBe(3);
+			expect(child.stdout.toString()).toBe("");
+			expect(child.stderr.toString()).toBe(
+				`${unreadable ? "juiz.a13-identity-unreadable" : "juiz.a13-identity-mismatch"}\n`,
+			);
+		}
+	}
+});
+
+test("CLI rejects malformed, split, and duplicate identity before help", () => {
+	const flag = `--a13-identity=${JSON.stringify(identity)}`;
+	for (const args of [
+		["--a13-identity={}"],
+		["--a13-identity={bad"],
+		["--a13-identity", JSON.stringify(identity)],
+		[flag, flag],
+		["--", "--a13-identity={}"],
+	]) {
 		const child = Bun.spawnSync(
 			[
 				process.execPath,
 				"--eval",
 				`
-				import { runRootCommand } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/main.ts"))};
-				import { parseArgs } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/cli/args.ts"))};
-				const args = ${JSON.stringify(argv)};
-				await runRootCommand(parseArgs(args), args, {
-					startupIdentity: { platform: "linux", procRoot: ${JSON.stringify(f.root)} }
+				import { runCli } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/cli.ts"))};
+				await runCli(${JSON.stringify(["--mode", "rpc", ...args, "--help"])}, {
+					platform: "linux", procRoot: "/nonexistent"
 				});
-			`,
+				`,
 			],
 			{ stdout: "pipe", stderr: "pipe", timeout: 30_000 },
 		);
-		expect(child.exitCode).toBe(3);
+		expect(child.exitCode).toBe(2);
 		expect(child.stdout.toString()).toBe("");
-		expect(child.stderr.toString()).toBe(
-			`${unreadable ? "juiz.a13-identity-unreadable" : "juiz.a13-identity-mismatch"}\n`,
-		);
+		expect(child.stderr.toString()).toContain("Error:");
+		expect(child.stderr.toString()).toContain("--a13-identity");
 	}
 });
