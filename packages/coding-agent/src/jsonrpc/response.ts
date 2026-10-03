@@ -17,9 +17,6 @@ export function isJsonRpcResponse(message: unknown): message is JsonRpcResponse 
 	if (hasResult) return true;
 	const error = (message as JsonRpcResponse).error;
 	return (
-		error !== null &&
-		typeof error === "object" &&
-		Number.isInteger(error.code) &&
-		typeof error.message === "string"
+		error !== null && typeof error === "object" && Number.isInteger(error.code) && typeof error.message === "string"
 	);
 }

@@ -959,7 +959,10 @@ export class AgentSession implements SettingsScope {
 	#extensionRunner: ExtensionRunner | undefined = undefined;
 	#getEvalPreludes: (() => readonly EvalPreludeDefinition[]) | undefined;
 	#reconcileBrowserMcpFilter: AgentSessionConfig["reconcileBrowserMcpFilter"];
-	#censusConfig: Pick<AgentSessionConfig, "a13Identity" | "a13Instance" | "a13Extinct" | "namespaceCensus" | "idleInfrastructure">;
+	#censusConfig: Pick<
+		AgentSessionConfig,
+		"a13Identity" | "a13Instance" | "a13Extinct" | "namespaceCensus" | "idleInfrastructure"
+	>;
 	#lastCensus: CensusResult | undefined;
 	#lastCompletenessReasons: string[] | undefined;
 	#skillDescriptions: SkillDescriptionCatalog;
@@ -3801,9 +3804,7 @@ export class AgentSession implements SettingsScope {
 		const complete = registryComplete && this.#censusConfig.a13Instance !== undefined;
 		const reasons = registryComplete ? [] : ["registry_incomplete"];
 		if (!this.#censusConfig.a13Instance) reasons.push("instance_identity_missing");
-		const result = this.#ledgerCompleteness(
-			this.#censusCompleteness({ complete, reasons }),
-		);
+		const result = this.#ledgerCompleteness(this.#censusCompleteness({ complete, reasons }));
 		this.#lastCompletenessReasons = result.reasons;
 		return result;
 	}

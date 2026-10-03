@@ -159,7 +159,11 @@ describe("AgentSession quiesce-and-exit", () => {
 	});
 
 	it("missing instance refuses strict retirement but leaves attested retirement unchanged", () => {
-		const s = createSession({ ...sessionParts(), instance: false, census: { complete: true, work: [], reasons: [] } });
+		const s = createSession({
+			...sessionParts(),
+			instance: false,
+			census: { complete: true, work: [], reasons: [] },
+		});
 		const strict = s.quiesceForExit(request(s, { completeness: "strict" }));
 		expect(strict).toMatchObject({ status: "refused", reason: "completeness_unknown" });
 		if (strict.status !== "refused") throw new Error("expected refusal");
@@ -252,12 +256,16 @@ describe("AgentSession quiesce-and-exit", () => {
 
 	it("keeps a completed child's hold visible to main through parking and disposal", async () => {
 		let hold: { release(): void } | undefined;
-		const child = await createSessionWithExtension(api => {
-			api.workReporting = "complete";
-			api.on("agent_end", (_event, ctx) => {
-				hold = ctx.holdWork("child background effects");
-			});
-		}, "0-Child", "child");
+		const child = await createSessionWithExtension(
+			api => {
+				api.workReporting = "complete";
+				api.on("agent_end", (_event, ctx) => {
+					hold = ctx.holdWork("child background effects");
+				});
+			},
+			"0-Child",
+			"child",
+		);
 		const main = await createSessionWithExtension(api => {
 			api.workReporting = "complete";
 		});
@@ -624,49 +632,57 @@ describe("AgentSession quiesce-and-exit", () => {
 		expect(s.quiesceForExit(request(s))).toMatchObject({ status: "quiesced", attempt: 1 });
 	});
 
-	it.each([false, true])("recovers a real exit append failure on sealed retry (repeat failure: %s)", async repeatFailure => {
-		const s = createSession({ ...sessionParts(), census: { complete: true, work: [], reasons: [] } });
-		vi.spyOn(s.ownedJobRegistry!, "scanAndCount").mockReturnValue({
-			scan: { supported: true, sound: true, scanned: 1, discovered: 0, opaque: [] },
-			live: 0,
-		});
-		await s.prompt("materialize the transcript");
-		const req = request(s, { completeness: "strict" });
-		const write = fs.writeSync;
-		const failure = new Error("transient ENOSPC");
-		const writer = vi.spyOn(fs, "writeSync").mockImplementation((...args) => {
-			if (String(args[1]).includes('"session_exit"')) throw failure;
-			return Reflect.apply(write, fs, args);
-		});
-		const blocked = s.quiesceForExit(req);
-		expect(blocked).toMatchObject({ status: "sealed_blocked", progress: { finalized: false } });
-		expect(() => s.sessionManager.flushSync()).toThrow(failure);
-		writer.mockRestore();
-		let attempt = 2;
-		if (repeatFailure) {
-			const rename = fs.renameSync;
-			const publish = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
-				if (to === s.sessionFile) throw new Error("storage still unavailable");
-				return rename(from, to);
+	it.each([false, true])(
+		"recovers a real exit append failure on sealed retry (repeat failure: %s)",
+		async repeatFailure => {
+			const s = createSession({ ...sessionParts(), census: { complete: true, work: [], reasons: [] } });
+			vi.spyOn(s.ownedJobRegistry!, "scanAndCount").mockReturnValue({
+				scan: { supported: true, sound: true, scanned: 1, discovered: 0, opaque: [] },
+				live: 0,
 			});
-			expect(s.quiesceForExit({ ...req, attempt })).toMatchObject({
-				status: "sealed_blocked", progress: { finalized: false },
+			await s.prompt("materialize the transcript");
+			const req = request(s, { completeness: "strict" });
+			const write = fs.writeSync;
+			const failure = new Error("transient ENOSPC");
+			const writer = vi.spyOn(fs, "writeSync").mockImplementation((...args) => {
+				if (String(args[1]).includes('"session_exit"')) throw failure;
+				return Reflect.apply(write, fs, args);
 			});
+			const blocked = s.quiesceForExit(req);
+			expect(blocked).toMatchObject({ status: "sealed_blocked", progress: { finalized: false } });
 			expect(() => s.sessionManager.flushSync()).toThrow(failure);
-			publish.mockRestore();
-			attempt++;
-		}
-		expect(s.attest("sealed", "nonce")).toMatchObject({ admission: "closed", sealed: true, epoch: req.epoch });
-		s.sessionManager.appendCustomEntry("must_not_append", {});
-		const passed = s.quiesceForExit({ ...req, attempt });
-		expect(passed.status).toBe("quiesced");
-		expect(() => s.sessionManager.flushSync()).not.toThrow();
-		const entries = fs.readFileSync(s.sessionFile!, "utf8").trim().split("\n").map(line => JSON.parse(line));
-		expect(entries.filter(entry => entry.customType === "session_exit")).toHaveLength(1);
-		expect(entries.filter(entry => entry.customType === "must_not_append")).toEqual([]);
-		expect(readAttestation(s)).toMatchObject({ kind: "quiesce", attempt });
-		expect(s.attest("still-sealed", "nonce")).toMatchObject({ admission: "closed", sealed: true });
-	});
+			writer.mockRestore();
+			let attempt = 2;
+			if (repeatFailure) {
+				const rename = fs.renameSync;
+				const publish = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+					if (to === s.sessionFile) throw new Error("storage still unavailable");
+					return rename(from, to);
+				});
+				expect(s.quiesceForExit({ ...req, attempt })).toMatchObject({
+					status: "sealed_blocked",
+					progress: { finalized: false },
+				});
+				expect(() => s.sessionManager.flushSync()).toThrow(failure);
+				publish.mockRestore();
+				attempt++;
+			}
+			expect(s.attest("sealed", "nonce")).toMatchObject({ admission: "closed", sealed: true, epoch: req.epoch });
+			s.sessionManager.appendCustomEntry("must_not_append", {});
+			const passed = s.quiesceForExit({ ...req, attempt });
+			expect(passed.status).toBe("quiesced");
+			expect(() => s.sessionManager.flushSync()).not.toThrow();
+			const entries = fs
+				.readFileSync(s.sessionFile!, "utf8")
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line));
+			expect(entries.filter(entry => entry.customType === "session_exit")).toHaveLength(1);
+			expect(entries.filter(entry => entry.customType === "must_not_append")).toEqual([]);
+			expect(readAttestation(s)).toMatchObject({ kind: "quiesce", attempt });
+			expect(s.attest("still-sealed", "nonce")).toMatchObject({ admission: "closed", sealed: true });
+		},
+	);
 
 	it.each(["finalize", "bind", "counts", "evaluation_throw", "work", "unknown", "publish", "published_then_throw"])(
 		"retains a sealed strict session after %s failure and retires on a newer attempt",

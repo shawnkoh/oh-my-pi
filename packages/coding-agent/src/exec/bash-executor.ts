@@ -794,7 +794,10 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 					await trackBackgroundJobs(executionShell, result, registryContext);
 				},
 				() => {
-					registry?.markIncomplete("a shell run failed without reporting its spawned processes", "bash-background-uncounted");
+					registry?.markIncomplete(
+						"a shell run failed without reporting its spawned processes",
+						"bash-background-uncounted",
+					);
 				},
 			)
 			.finally(settleRun)
