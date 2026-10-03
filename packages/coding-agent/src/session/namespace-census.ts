@@ -100,7 +100,12 @@ export function namespaceCensus(options: CensusOptions): CensusResult {
 			if (
 				mount
 					.split(/[ ,]/)
-					.some(option => (option === "hidepid" || option.startsWith("hidepid=")) && option !== "hidepid=0")
+					.some(
+						option =>
+							(option === "hidepid" || option.startsWith("hidepid=")) &&
+							option !== "hidepid=0" &&
+							option !== "hidepid=off",
+					)
 			)
 				throw new Error("hidepid");
 			if (read("sys/kernel/random/boot_id").toString().trim() !== identity.boot) throw new Error("boot-mismatch");
