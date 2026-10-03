@@ -96,6 +96,10 @@ test("hidden mounts, malformed metadata, missing identity and canonical mismatch
 	expect(namespaceCensus({ identity, platform: "darwin" }).reasons).toEqual(["census-unsupported-platform"]);
 	fs.writeFileSync(path.join(f.root, "self/mountinfo"), "1 0 0:1 / /proc rw - proc proc rw,hidepid=2\n");
 	expect(namespaceCensus(f.options).reasons.join()).toContain("hidepid");
+	for (const disabled of ["hidepid=0", "hidepid=off"]) {
+		fs.writeFileSync(path.join(f.root, "self/mountinfo"), `1 0 0:1 / /proc rw - proc proc rw,${disabled}\n`);
+		expect(namespaceCensus(f.options).reasons.join()).not.toContain("hidepid");
+	}
 	fs.writeFileSync(path.join(f.root, "self/mountinfo"), "1 0 0:1 / /proc rw - proc proc rw\n");
 	fs.writeFileSync(path.join(f.root, "2/cmdline"), "sleep\0different\0");
 	expect(namespaceCensus(f.options).reasons.join()).toContain("canonical-mismatch");
