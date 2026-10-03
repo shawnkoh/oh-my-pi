@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	checkStartupIdentity,
 	namespaceCensus,
 	parseCensusIdentity,
 	parseProcStat,
@@ -145,4 +146,70 @@ test("ENOENT is gone only after relisting; changing starts never stabilize", () 
 		return fs.readFileSync(file);
 	};
 	expect(namespaceCensus(f.options).reasons).toEqual(["census-unstable"]);
+});
+
+test("startup identity matches trimmed boot and PID 1 start after the last parenthesis", () => {
+	const f = fixture();
+	f.add(1, "boundary ) with ) parentheses", 0, identity.pid1Start);
+	fs.writeFileSync(path.join(f.root, "sys/kernel/random/boot_id"), `${identity.boot}\n`);
+	expect(checkStartupIdentity(identity, f.options)).toBeUndefined();
+});
+
+test("startup identity rejects boot and PID 1 mismatches", () => {
+	const f = fixture();
+	expect(checkStartupIdentity({ ...identity, boot: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" }, f.options)).toBe(
+		"juiz.a13-identity-mismatch",
+	);
+	expect(checkStartupIdentity({ ...identity, pid1Start: "11" }, f.options)).toBe("juiz.a13-identity-mismatch");
+});
+
+test("startup identity fails closed on unreadable or malformed proc identity", () => {
+	const f = fixture();
+	const bootFile = path.join(f.root, "sys/kernel/random/boot_id");
+	fs.unlinkSync(bootFile);
+	expect(checkStartupIdentity(identity, f.options)).toBe("juiz.a13-identity-unreadable");
+	fs.writeFileSync(bootFile, "not-a-uuid");
+	expect(checkStartupIdentity(identity, f.options)).toBe("juiz.a13-identity-unreadable");
+	fs.writeFileSync(bootFile, identity.boot);
+	fs.writeFileSync(path.join(f.root, "1/stat"), "1 (bad) S 0 1");
+	expect(checkStartupIdentity(identity, f.options)).toBe("juiz.a13-identity-unreadable");
+	// Unreadable takes precedence even if the other component mismatches.
+	expect(checkStartupIdentity({ ...identity, boot: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" }, f.options)).toBe(
+		"juiz.a13-identity-unreadable",
+	);
+	fs.unlinkSync(path.join(f.root, "1/stat"));
+	expect(checkStartupIdentity(identity, f.options)).toBe("juiz.a13-identity-unreadable");
+});
+
+test("startup identity skips absent flags and non-Linux without reading proc", () => {
+	expect(checkStartupIdentity(undefined, { platform: "linux", procRoot: "/nonexistent" })).toBeUndefined();
+	expect(checkStartupIdentity(identity, { platform: "darwin", procRoot: "/nonexistent" })).toBeUndefined();
+});
+
+test("RPC startup exits before any protocol output when launch identity cannot be verified", () => {
+	const f = fixture();
+	for (const unreadable of [false, true]) {
+		if (unreadable) fs.unlinkSync(path.join(f.root, "1/stat"));
+		const argv = ["--mode", "rpc", `--a13-identity=${JSON.stringify({ ...identity, pid1Start: "11" })}`];
+		const child = Bun.spawnSync(
+			[
+				process.execPath,
+				"--eval",
+				`
+				import { runRootCommand } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/main.ts"))};
+				import { parseArgs } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/cli/args.ts"))};
+				const args = ${JSON.stringify(argv)};
+				await runRootCommand(parseArgs(args), args, {
+					startupIdentity: { platform: "linux", procRoot: ${JSON.stringify(f.root)} }
+				});
+			`,
+			],
+			{ stdout: "pipe", stderr: "pipe", timeout: 30_000 },
+		);
+		expect(child.exitCode).toBe(3);
+		expect(child.stdout.toString()).toBe("");
+		expect(child.stderr.toString()).toBe(
+			`${unreadable ? "juiz.a13-identity-unreadable" : "juiz.a13-identity-mismatch"}\n`,
+		);
+	}
 });
