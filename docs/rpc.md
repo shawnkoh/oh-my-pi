@@ -748,6 +748,10 @@ read-only snapshot, then asks the process to exit only if nothing changed:
      finalization/binding without appending another exit, then repeats final evaluation
      and publication. Identity, deadline and epoch checks still apply; duplicate
      attempts replay the memoized result and older attempts return `stale_attempt`.
+     A transient exit-record write failure is recovered by persisting the retained
+     authoritative transcript, including its existing exit record, while keeping the
+     seal in place. The persistence error clears only after a successful write;
+     another storage failure leaves `finalized: false` and `sealed_blocked`.
      Attested requests and unrelated admission closures return `admission_closed`.
      Rejected retries never reopen admission. Recovery requires the existing RPC
      channel; no reattachment transport or automatic replacement is provided.

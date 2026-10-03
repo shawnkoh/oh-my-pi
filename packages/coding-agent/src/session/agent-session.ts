@@ -3652,7 +3652,7 @@ export class AgentSession implements SettingsScope {
 			this.#releaseRevivalRefusal ??= AgentLifecycleManager.global().refuseRevivals("the session is sealed");
 			this.#cacheWarmer?.cancel();
 			if (!state.progress.finalized) {
-				state.transcript = this.sessionManager.finalizeForExit();
+				state.transcript = this.sessionManager.recoverFinalizationForExit();
 				state.progress.finalized = true;
 			}
 			const registry = this.ownedJobRegistry;
