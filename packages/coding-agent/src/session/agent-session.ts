@@ -14,7 +14,12 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
-import { idleSafeServerProcesses, outstandingServerWork } from "./activity-ledger";
+import {
+	ExtensionActivityLedger,
+	holdExtensionWork,
+	idleSafeServerProcesses,
+	outstandingServerWork,
+} from "./activity-ledger";
 import { cfgStrictIdleIdleSafeServers } from "./settings";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -1871,7 +1876,7 @@ export class AgentSession implements SettingsScope {
 		this.registerWorkSource({
 			kind: "scheduledTurns",
 			strictOnly: true,
-			count: () => this.#extensionRunner?.outstandingWork ?? 0,
+			count: ExtensionActivityLedger.outstandingWork,
 		});
 		if (this.#extensionRunner) {
 			this.#extensionRunner.eventScope = dispatch => this.#hostInputHookScope.exit(dispatch);
@@ -3695,7 +3700,7 @@ export class AgentSession implements SettingsScope {
 	}
 
 	#ledgerCompleteness(state: { complete: boolean; reasons: string[] }): { complete: boolean; reasons: string[] } {
-		const reasons = this.#extensionRunner?.workCompletenessReasons() ?? [];
+		const reasons = ExtensionActivityLedger.completenessReasons();
 		return { complete: state.complete && reasons.length === 0, reasons: [...state.reasons, ...reasons] };
 	}
 
@@ -8963,9 +8968,7 @@ export class AgentSession implements SettingsScope {
 		}
 
 		return {
-			holdWork: _reason => ({
-				release: this.registerWorkSource({ kind: "scheduledTurns", strictOnly: true, count: () => 1 }),
-			}),
+			holdWork: holdExtensionWork,
 			ui: noOpUIContext,
 			mode: "print",
 			hasUI: false,

@@ -758,9 +758,14 @@ Only strict retirement includes these sources in `scheduledTurns`:
   local server process exit does. Closing a remote transport does not prove remote work stopped.
 - LSP client requests, including cancelled/timed-out requests removed from the caller promise map,
   and queued/in-flight server-initiated requests such as `workspace/applyEdit`.
-- Extension `ctx.holdWork(reason)` holds. Every loaded extension must declare
+  MCP stdio and LSP settle only on a valid JSON-RPC 2.0 response with the matching id and exactly
+  one of `result` or a well-formed `error`. ID-only and malformed frames leave work unsettled.
+- Extension `ctx.holdWork(reason)` holds, aggregated across all runners in the engine, including
+  main and child sessions. Task completion, parking and runner/session disposal do not release
+  holds; only an explicit `release()` settles them. Every loaded extension must declare
   `pi.workReporting = "complete"`; otherwise strict completeness is unknown, with the extension
-  named in the refusal. Existing tool, subagent, goal-continuation and delivery counts are reused.
+  named in the refusal. Disposing an undeclared runner preserves its completeness uncertainty.
+  Existing tool, subagent, goal-continuation and delivery counts are reused.
 
 Live MCP/LSP processes are work by default. `strictIdle.idleSafeServers` (default `[]`) asserts an
 audited lifecycle/admission contract; it is not a general process allowlist. The census integration

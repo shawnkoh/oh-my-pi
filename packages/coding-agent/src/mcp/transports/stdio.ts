@@ -10,12 +10,12 @@ import * as path from "node:path";
 import { getProjectDir, readJsonl } from "@oh-my-pi/pi-utils";
 import type { Subprocess } from "bun";
 import { hostHasInheritableConsole } from "../../eval/py/spawn-options";
+import { isJsonRpcResponse } from "../../jsonrpc/response";
 import { ServerActivityLedger } from "../../session/activity-ledger";
 import type {
 	JsonRpcError,
 	JsonRpcMessage,
 	JsonRpcRequest,
-	JsonRpcResponse,
 	MCPRequestOptions,
 	MCPStdioServerConfig,
 	MCPTransport,
@@ -683,15 +683,16 @@ export class StdioTransport implements MCPTransport {
 			for (const m of message) this.#handleMessage(m);
 			return;
 		}
+		if (!message || typeof message !== "object") return;
 		// Server-to-client request: has both method and id
 		if ("method" in message && "id" in message && message.id != null) {
 			void this.#handleServerRequest(message as JsonRpcRequest);
 			return;
 		}
 
-		// Response to our request: has id
-		if ("id" in message && message.id != null) {
-			const response = message as JsonRpcResponse;
+		// Ignore malformed replies: neither caller cancellation nor an id alone settles work.
+		if (isJsonRpcResponse(message)) {
+			const response = message;
 			this.activity.replied(response.id);
 			const pending = this.#pendingRequests.get(response.id);
 			if (pending) {

@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import { isEnoent, logger, postmortem, ptree, stableStringifyJson, untilAborted } from "@oh-my-pi/pi-utils";
 import { MessageFramer } from "../jsonrpc/message-framing";
+import { isJsonRpcResponse } from "../jsonrpc/response";
 import { ServerActivityLedger } from "../session/activity-ledger";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { getConfig } from "./config";
@@ -448,11 +449,12 @@ export async function startMessageReader(client: LspClient): Promise<void> {
 				// kill the reader — later messages are still well-framed.
 				try {
 					const message: LspJsonRpcResponse | LspJsonRpcNotification = JSON.parse(messageText);
+					if (!message || typeof message !== "object") continue;
 
 					// Route message. A JSON-RPC message carrying a `method` is always
 					// server-originated: a request when it also has an `id`, a
-					// notification otherwise. A message with only an `id` is a response
-					// to one of our requests. Disambiguate on `method` FIRST: a
+					// notification otherwise. Only a valid result/error response can
+					// settle one of our requests. Disambiguate on `method` FIRST: a
 					// server's request ids live in its own id space and routinely
 					// collide with our in-flight client request ids (e.g. a
 					// basedpyright `workspace/configuration` pull arriving while a
@@ -491,7 +493,7 @@ export async function startMessageReader(client: LspClient): Promise<void> {
 								}
 							}
 						}
-					} else if ("id" in message && message.id !== undefined) {
+					} else if (isJsonRpcResponse(message)) {
 						// Response to one of our requests.
 						getLspActivity(client).replied(message.id);
 						const pending = client.pendingRequests.get(message.id);
