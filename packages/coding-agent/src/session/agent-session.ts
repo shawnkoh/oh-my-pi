@@ -3445,11 +3445,21 @@ export class AgentSession implements SettingsScope {
 				epoch: this.#activityEpoch,
 				counts: counts ?? this.#safeCounts(),
 				observedAt: new Date().toISOString(),
+				...(reason === "completeness_unknown"
+					? {
+							registry: {
+								path: this.ownedJobRegistry?.path ?? null,
+								complete: this.#registryComplete(this.ownedJobRegistry),
+								ownerScan: this.#lastOwnerScan,
+							},
+						}
+					: {}),
 			},
 		});
 		if (
 			typeof operationId !== "string" ||
 			operationId.length === 0 ||
+			(request.completeness !== "strict" && request.completeness !== "attested") ||
 			!Number.isSafeInteger(attempt) ||
 			attempt < 0 ||
 			!Number.isSafeInteger(request.epoch) ||
@@ -3492,6 +3502,8 @@ export class AgentSession implements SettingsScope {
 		let sealed = false;
 		let counts: WorkCounts | undefined;
 		try {
+			const strict = request.completeness === "strict";
+			if (strict) this.ownedJobRegistry?.ensureHeader();
 			const epoch = this.#activityEpoch;
 			counts = this.getWorkCounts();
 			const sessionFile = this.sessionManager.getSessionFile();
@@ -3499,6 +3511,8 @@ export class AgentSession implements SettingsScope {
 			if (Date.now() >= request.deadline) reason = "deadline_expired";
 			else if (epoch !== request.epoch) reason = "epoch_mismatch";
 			else if (hasOutstandingWork(counts)) reason = "work_active";
+			else if (strict && this.#activityEpoch !== request.epoch) reason = "epoch_mismatch";
+			else if (strict && !this.#strictCompleteness().complete) reason = "completeness_unknown";
 			else if (!sessionFile) reason = "attestation_unavailable";
 			if (reason || !sessionFile) {
 				this.#admissionClosedBy = undefined;
@@ -3620,6 +3634,12 @@ export class AgentSession implements SettingsScope {
 		return (
 			registry !== undefined && registry.complete && registry.path !== null && this.#lastOwnerScan?.sound === true
 		);
+	}
+
+	/** Single strict gate for registry coverage and future completeness inputs. */
+	#strictCompleteness(): { complete: boolean; reasons: string[] } {
+		const complete = this.#registryComplete(this.ownedJobRegistry);
+		return { complete, reasons: complete ? [] : ["registry_incomplete"] };
 	}
 
 	/**

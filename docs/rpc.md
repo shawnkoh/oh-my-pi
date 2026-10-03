@@ -46,7 +46,7 @@ The initial ready frame uses protocol v1 and advertises the opt-in lossless tran
   "supportedProtocolVersions": [1, 2],
   "maxFrameBytes": 1048576,
   "maxReassembledFrameBytes": 67108864,
-  "capabilities": ["literal-input/1", "tool-approval-binding/1", "reply-attribution/1", "external-delivery/1", "quiesce-exit/1", "owned-jobs/1", "rich-ask/2"]
+  "capabilities": ["literal-input/1", "tool-approval-binding/1", "reply-attribution/1", "external-delivery/1", "quiesce-exit/2", "owned-jobs/1", "rich-ask/2"]
 }
 ```
 
@@ -537,7 +537,15 @@ is re-armed.
     "contextWindow": 200000,
     "percent": 0.55
   },
-  "goal": null
+  "goal": null,
+  "capabilities": [
+    "literal-input/1",
+    "tool-approval-binding/1",
+    "reply-attribution/1",
+    "external-delivery/1",
+    "quiesce-exit/2",
+    "owned-jobs/1"
+  ]
 }
 ```
 
@@ -615,7 +623,7 @@ When the agent completes the goal, the goal tool is removed again and
 ### Quiesce and exit
 
 A client must check `ready.capabilities` (or `get_state.capabilities`) for
-`quiesce-exit/1` before sending `attest` or `quiesce_and_exit`, and for
+`quiesce-exit/2` before sending `attest` or `quiesce_and_exit`, and for
 `owned-jobs/1` before relying on the owned-job registry file.
 
 A supervisor that wants the agent to exit without interrupting work first takes a
@@ -651,7 +659,7 @@ read-only snapshot, then asks the process to exit only if nothing changed:
    `instanceId` is random per session object and process. `detachedJobs` counts live owned processes, including
    ones found by the owner-marker scan below; `registry.complete` is false unless that
    scan was `sound` and the session is persisted.
-2. `quiesce_and_exit` `{ operationId, attempt, epoch, instanceId, sessionId, deadline }`,
+2. `quiesce_and_exit` `{ operationId, attempt, completeness, epoch, instanceId, sessionId, deadline }`,
    with `epoch`, `instanceId` and `sessionId` (`session.id`) copied from the attestation
    the decision is based on. `deadline` is Unix epoch milliseconds compared against the
    agent host's clock (`Date.now()` in the agent process); a supervisor on another host
@@ -660,6 +668,15 @@ read-only snapshot, then asks the process to exit only if nothing changed:
    match, all counts zero, `epoch` unchanged and the deadline not reached — all without
    yielding, so no input can interleave. A session switch (`new_session`,
    `switch_session`, `open_session`, `branch` or `fork` to another session) also advances `epoch`.
+   `completeness` is required: `"attested"` preserves the counts-only decision
+   (deadline → pre-scan epoch → work active → session file), without a completeness
+   check. `"strict"` ensures the registry header before counting with admission closed,
+   then checks deadline → pre-scan epoch → work active → live epoch after counting →
+   registry completeness → session file. A scan that registers work which exits before
+   counting finishes therefore refuses strict retirement with `epoch_mismatch`.
+   Strict currently checks registry coverage only, not a namespace census or an activity
+   ledger. Both policies retain the same post-seal exit behaviour described below.
+   There is no legacy capability alias or default policy.
    - Pass → `data: { status: "quiesced", operationId, attempt, attestation, path }`.
      Before the attestation is written the transcript is made final (the exit record
      is appended, flushed and the file sealed), and `attestation.session` carries its
@@ -698,6 +715,10 @@ read-only snapshot, then asks the process to exit only if nothing changed:
      process), `session_mismatch` (the session was switched since the attestation),
      `stale_attempt`, `admission_closed`, `invalid_request`, `attestation_unavailable`
      (no session file, or the attestation directory is not writable).
+     Strict also returns `completeness_unknown` when registry coverage is incomplete;
+     only this refusal adds `snapshot.registry: { path, complete, ownerScan }`, captured
+     from the admission-closed scan. Missing or unknown `completeness` is
+     `invalid_request` before admission closes and does not consume an attempt.
 
 Each `(operationId, attempt)` is evaluated once: repeating it returns the original
 answer unchanged (so a retry after a lost response learns whether it passed), and a
