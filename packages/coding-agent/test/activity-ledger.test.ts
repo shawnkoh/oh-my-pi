@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { getLspActivity, sendRequest, startMessageReader } from "../src/lsp/client";
 import type { LspClient } from "../src/lsp/types";
 import { StdioTransport } from "../src/mcp/transports/stdio";
-import { idleSafeServerProcesses, ServerActivityLedger } from "../src/session/activity-ledger";
+import { ExtensionActivityLedger, idleSafeServerProcesses, ServerActivityLedger } from "../src/session/activity-ledger";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 // Real subprocess I/O and process-exit callbacks cannot be advanced with fake timers.
@@ -180,6 +180,30 @@ describe("strict outstanding-activity ledger", () => {
 		expect(server.idleSafeIdentity([server.name])).toBeUndefined();
 		expect(idleSafeServerProcesses([])).toEqual([]);
 		server.processExited();
+	});
+
+	it("keeps disposed extension uncertainty and holds without retaining released ledgers", () => {
+		ExtensionActivityLedger.resetForTests();
+		try {
+			const refs: WeakRef<ExtensionActivityLedger>[] = [];
+			for (let i = 0; i < 200; i++) {
+				const ledger = new ExtensionActivityLedger(() => ["extension_work_reporting_unknown:same-child"]);
+				refs.push(new WeakRef(ledger));
+				ledger.dispose();
+			}
+			const held = new ExtensionActivityLedger();
+			const hold = held.hold("background");
+			held.dispose();
+			expect(ExtensionActivityLedger.outstandingWork()).toBe(1);
+			hold.release();
+			expect(ExtensionActivityLedger.outstandingWork()).toBe(0);
+			expect(ExtensionActivityLedger.completenessReasons()).toEqual(["extension_work_reporting_unknown:same-child"]);
+			// Bun's GC scans the stack conservatively, so a few may survive; before the fix all 200 were retained.
+			Bun.gc(true);
+			expect(refs.filter(ref => ref.deref() !== undefined).length).toBeLessThan(refs.length / 2);
+		} finally {
+			ExtensionActivityLedger.resetForTests();
+		}
 	});
 
 	it.skipIf(process.platform !== "linux")("only excludes a contracted live process with a zero ledger", () => {
