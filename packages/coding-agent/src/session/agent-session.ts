@@ -959,7 +959,7 @@ export class AgentSession implements SettingsScope {
 	#extensionRunner: ExtensionRunner | undefined = undefined;
 	#getEvalPreludes: (() => readonly EvalPreludeDefinition[]) | undefined;
 	#reconcileBrowserMcpFilter: AgentSessionConfig["reconcileBrowserMcpFilter"];
-	#censusConfig: Pick<AgentSessionConfig, "a13Identity" | "namespaceCensus" | "idleInfrastructure">;
+	#censusConfig: Pick<AgentSessionConfig, "a13Identity" | "a13Instance" | "a13Extinct" | "namespaceCensus" | "idleInfrastructure">;
 	#lastCensus: CensusResult | undefined;
 	#lastCompletenessReasons: string[] | undefined;
 	#skillDescriptions: SkillDescriptionCatalog;
@@ -1708,6 +1708,8 @@ export class AgentSession implements SettingsScope {
 	constructor(config: AgentSessionConfig) {
 		this.#censusConfig = {
 			a13Identity: config.a13Identity,
+			a13Instance: config.a13Instance,
+			a13Extinct: config.a13Extinct,
 			namespaceCensus: config.namespaceCensus,
 			idleInfrastructure: config.idleInfrastructure,
 		};
@@ -3795,9 +3797,12 @@ export class AgentSession implements SettingsScope {
 
 	/** Single strict gate for registry coverage and future completeness inputs. */
 	#strictCompleteness(): { complete: boolean; reasons: string[] } {
-		const complete = this.#registryComplete(this.ownedJobRegistry);
+		const registryComplete = this.#registryComplete(this.ownedJobRegistry);
+		const complete = registryComplete && this.#censusConfig.a13Instance !== undefined;
+		const reasons = registryComplete ? [] : ["registry_incomplete"];
+		if (!this.#censusConfig.a13Instance) reasons.push("instance_identity_missing");
 		const result = this.#ledgerCompleteness(
-			this.#censusCompleteness({ complete, reasons: complete ? [] : ["registry_incomplete"] }),
+			this.#censusCompleteness({ complete, reasons }),
 		);
 		this.#lastCompletenessReasons = result.reasons;
 		return result;
@@ -3883,6 +3888,8 @@ export class AgentSession implements SettingsScope {
 
 	#initOwnedJobRegistry(manager: AsyncJobManager): void {
 		const registry = new OwnedJobRegistry({
+			currentInstance: this.#censusConfig.a13Instance,
+			extinct: this.#censusConfig.a13Extinct,
 			getSessionFile: () => this.sessionManager.getSessionFile(),
 			getSessionId: () => this.sessionManager.getSessionId(),
 			onRegister: () => {
@@ -3925,7 +3932,7 @@ export class AgentSession implements SettingsScope {
 			try {
 				retireTerminalAttestationSync(sessionFile);
 			} catch (error) {
-				registry.markIncomplete("a stale terminal attestation could not be retired");
+				registry.markIncomplete("a stale terminal attestation could not be retired", "attestation-retire-failed");
 				logger.warn("Failed to retire a stale terminal attestation", { sessionFile, error: String(error) });
 			}
 		}
@@ -11839,7 +11846,7 @@ export class AgentSession implements SettingsScope {
 		const refused = this.#refuseInput("python");
 		if (refused) return refused;
 		// Kernel code can start processes the owned-job registry never sees.
-		this.ownedJobRegistry?.markIncomplete("eval code can start untracked processes");
+		this.ownedJobRegistry?.markIncomplete("eval code can start untracked processes", "eval-untracked");
 		return this.#eval.executePython(code, onChunk, options);
 	}
 

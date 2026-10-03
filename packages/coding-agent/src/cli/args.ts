@@ -1,4 +1,5 @@
 import type { CensusIdentity } from "../session/namespace-census";
+import type { InstanceIdentity } from "../session/instance-identity";
 /**
  * CLI argument parsing and help display
  */
@@ -10,6 +11,7 @@ import { CLI_THINKING_LEVELS, type ConfiguredThinkingLevel, parseCliThinkingLeve
 import { BUILTIN_TOOL_NAMES, normalizeToolNames } from "../tools/builtin-names";
 import {
 	OPTIONAL_FLAGS,
+	parseInstanceArgs,
 	OPTIONAL_VALUE_FLAGS,
 	type ParseDeps,
 	PROFILE_BOOTSTRAP_BOUNDARY_ARG,
@@ -25,6 +27,8 @@ export type Mode = "text" | "json" | "rpc" | "acp" | "rpc-ui";
 
 export interface Args {
 	a13Identity?: CensusIdentity;
+	a13Instance?: InstanceIdentity;
+	a13Extinct?: InstanceIdentity[];
 	cwd?: string;
 	/** Workspace directories beyond cwd for this session (repeatable `--add-dir`). */
 	addDir?: string[];
@@ -183,6 +187,7 @@ function consumeBuiltInStringValue(flag: string, args: string[], valueIndex: num
 }
 
 export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { type: "boolean" | "string" }>): Args {
+	const instanceArgs = parseInstanceArgs(inputArgs);
 	// Work on a copy: the `--option=value` handling below splices the value
 	// into the array, and callers reuse the same argv (the post-extension
 	// reparse in `runRootCommand` parses it a second time). Mutating the input
@@ -190,6 +195,7 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 	const args = [...inputArgs];
 	const parseDeps = PARSE_DEPS;
 	const result: Args = {
+		...instanceArgs,
 		messages: [],
 		fileArgs: [],
 		unknownFlags: new Map(),
@@ -235,7 +241,10 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 		// value-taking built-in (`--plan`, `--model`, …) that branch would consume
 		// the following token — eating the user's message and setting the wrong
 		// built-in field — so registered flags shadow same-named built-ins here.
-		const extFlag = arg.startsWith("--") && arg !== "--a13-identity" ? extensionFlags?.get(arg.slice(2)) : undefined;
+		const extFlag =
+			arg.startsWith("--") && !["--a13-identity", "--a13-instance", "--a13-extinct"].includes(arg)
+				? extensionFlags?.get(arg.slice(2))
+				: undefined;
 		if (extFlag) {
 			const flagName = arg.slice(2);
 			if (extFlag.type === "boolean") {

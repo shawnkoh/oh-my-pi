@@ -923,7 +923,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 
 				const startTime = Date.now();
 				// Cell code can start processes the owned-job registry never sees.
-				OwnedJobRegistry.instance()?.markIncomplete("eval code can start untracked processes");
+				OwnedJobRegistry.instance()?.markIncomplete("eval code can start untracked processes", "eval-untracked");
 				let result: ExecutorBackendResult;
 				try {
 					result = await backend.execute(cell.code, {

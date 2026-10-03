@@ -70,7 +70,7 @@ import type {
  * process it owns.
  */
 function markDebugSessionUntracked(): void {
-	OwnedJobRegistry.instance()?.markIncomplete("debug sessions start processes the registry does not track");
+	OwnedJobRegistry.instance()?.markIncomplete("debug sessions start processes the registry does not track", "debug-untracked");
 }
 
 interface DapSession {

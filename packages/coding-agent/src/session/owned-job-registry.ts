@@ -31,6 +31,17 @@ import { TERMINAL_STATES } from "@oh-my-pi/pi-tui/apps/ps-data";
 import type { DaemonSnapshot } from "@oh-my-pi/pi-tui/tools/daemon";
 import { isEnoent, logger } from "@oh-my-pi/pi-utils";
 import { parseDaemonSnapshot } from "../launch/protocol";
+import {
+	canFence,
+	incompleteReason,
+	instanceIdentity,
+	instanceKey,
+	sameInstance,
+	reasonKey,
+	type IncompleteReason,
+	type InstanceIdentity,
+} from "./instance-identity";
+import { issuerKey } from "./instance-identity";
 
 export const OWNED_JOB_REGISTRY_VERSION = 1;
 /** Longest command text stored in a registry record. */
@@ -102,6 +113,7 @@ export interface OwnedJobStartRecord {
 	 * invocation's work from then on.
 	 */
 	adoptedFrom?: InvocationIdentity;
+	issuer?: InstanceIdentity | null;
 	/**
 	 * `service` only: the daemon broker hosting the service. The broker can relaunch the
 	 * service under a new pid (a restart backoff, a `restart` request), so the service is
@@ -129,6 +141,10 @@ export interface OwnedJobEndRecord {
 	/** The `writer` of the header this record belongs to. */
 	writer?: string;
 	endedAt: string;
+	reason?: "extinct";
+	targetStartId?: string;
+	issuer?: InstanceIdentity | null;
+	adoptedFrom?: InvocationIdentity;
 }
 
 export interface OwnedJobInvocationRecord {
@@ -138,7 +154,9 @@ export interface OwnedJobInvocationRecord {
 	sessionId: string;
 	/** False when this invocation cannot enumerate every process it owns. */
 	complete: boolean;
-	incompleteReasons?: string[];
+	incompleteReasons?: Array<IncompleteReason | string>;
+	instance?: InstanceIdentity;
+	extinctFenced?: Array<{ issuer: InstanceIdentity; category: string; count: number }>;
 	/** Environment marker inherited by processes this invocation spawns (see {@link OWNER_MARKER_ENV}). */
 	ownerMarker?: { env: string; token: string };
 	/**
@@ -160,11 +178,12 @@ export interface InheritedOwnerMarker {
 	token: string;
 	/** Start identity of the invocation that issued the token; `null` when it was unknown. */
 	startId: string | null;
+	issuer?: InstanceIdentity | null;
 }
 
 export interface OwnedJobIncompleteRecord {
 	type: "incomplete";
-	reason: string;
+	reason: IncompleteReason | string;
 	invocationPid: number;
 	/** The `writer` of the header this record belongs to. */
 	writer?: string;
@@ -228,6 +247,8 @@ interface OpenJob {
 }
 
 export interface OwnedJobRegistryOptions {
+	currentInstance?: InstanceIdentity;
+	extinct?: readonly InstanceIdentity[];
 	/** Current session JSONL path, or `null`/`undefined` when the session is not persisted. */
 	getSessionFile: () => string | null | undefined;
 	getSessionId: () => string;
@@ -387,7 +408,7 @@ export interface RegistrySegment {
 	/** Start records with no matching end (keyed by job id; ids restart per invocation). */
 	open: Map<string, OwnedJobStartRecord>;
 	/** Reasons from `incomplete` records. */
-	incomplete: string[];
+	incomplete: IncompleteReason[];
 }
 
 export interface ParsedRegistry {
@@ -427,7 +448,7 @@ function isHeader(value: Record<string, unknown>): value is Record<string, unkno
 		isStartIdValue(invocation.startId) &&
 		typeof value.sessionId === "string" &&
 		typeof value.complete === "boolean" &&
-		(reasons === undefined || (Array.isArray(reasons) && reasons.every(reason => typeof reason === "string"))) &&
+		(reasons === undefined || Array.isArray(reasons)) &&
 		(marker === undefined ||
 			(isRecordObject(marker) && typeof marker.env === "string" && typeof marker.token === "string")) &&
 		(value.inheritedOwnerMarkers === undefined || isOwnerMarkerList(value.inheritedOwnerMarkers)) &&
@@ -457,10 +478,19 @@ function isStartRecord(value: Record<string, unknown>): value is Record<string, 
  * The incomplete reasons a header states. A header counts as complete only when
  * `complete` is exactly `true` and it lists no reason.
  */
-export function headerIncompleteReasons(header: OwnedJobInvocationRecord): string[] {
-	const reasons = header.incompleteReasons ?? [];
+export function headerIncompleteReasons(header: OwnedJobInvocationRecord): IncompleteReason[] {
+	const reasons = (header.incompleteReasons ?? []).map(incompleteReason);
 	if (header.complete === true && reasons.length === 0) return [];
-	return reasons.length > 0 ? reasons : ["invocation incomplete"];
+	return reasons.length > 0
+		? reasons
+		: [{ category: "invocation-incomplete-unspecified", text: "invocation incomplete", issuer: null }];
+}
+
+/** Re-adoption retains the original invocation, not the latest carrier. */
+function openRecordKey(record: Pick<OwnedJobStartRecord, "jobId" | "adoptedFrom" | "issuer">): string {
+	return record.adoptedFrom
+		? JSON.stringify([record.jobId, record.adoptedFrom.pid, record.adoptedFrom.startId, issuerKey(record.issuer)])
+		: record.jobId;
 }
 
 /**
@@ -480,7 +510,28 @@ export class RegistryReader {
 	/** Keyed by `<pid>:<writer>`. */
 	readonly #latestByWriter = new Map<string, RegistrySegment>();
 	#pending = "";
+	/** A later duplicate header invalidates a previously unique historical target. */
+	readonly #extinctionEnds: Array<{ segment: RegistrySegment; record: OwnedJobStartRecord }> = [];
 
+	constructor(readonly options: VerifyOwnedJobRegistryOptions = {}) {}
+
+	/** Missing, malformed, or current-instance conflicts cannot acquire fence authority. */
+	issuer(value: unknown, header: OwnedJobInvocationRecord): InstanceIdentity | null {
+		const issuer = instanceIdentity(value);
+		const current = this.options.currentInstance;
+		const expected = this.options.expectedInvocation;
+		if (
+			issuer &&
+			current &&
+			instanceKey(issuer) === instanceKey(current) &&
+			(!sameInstance(issuer, current) ||
+				!expected ||
+				header.invocation.pid !== expected.pid ||
+				header.invocation.startId !== expected.startId)
+		)
+			return null;
+		return issuer;
+	}
 	/** Parse every complete line of `text` (appended to what was fed before). */
 	feed(text: string): void {
 		const lines = (this.#pending + text).split("\n");
@@ -501,30 +552,85 @@ export class RegistryReader {
 		try {
 			value = JSON.parse(line);
 		} catch {
-			this.problems.push("registry has a malformed record");
+			this.problems.push("parse-record-malformed: registry has a malformed record");
 			return;
 		}
 		if (!isRecordObject(value)) {
-			this.problems.push("registry has a malformed record");
+			this.problems.push("parse-record-malformed: registry has a malformed record");
 			return;
 		}
 		if (value.type === "invocation") {
 			if (!isHeader(value)) {
-				this.problems.push("registry has a malformed invocation header");
+				this.problems.push("parse-record-malformed: registry has a malformed invocation header");
 				return;
+			}
+			for (let i = this.#extinctionEnds.length - 1; i >= 0; i--) {
+				const ended = this.#extinctionEnds[i];
+				const header = ended.segment.header;
+				if (
+					header.invocation.pid !== value.invocation.pid ||
+					header.invocation.startId !== value.invocation.startId ||
+					header.writer !== value.writer
+				)
+					continue;
+				const key = openRecordKey(ended.record);
+				if (!ended.segment.open.has(key)) ended.segment.open.set(key, ended.record);
+				this.#extinctionEnds.splice(i, 1);
+				this.problems.push("parse-extinct-target: later header makes extinction target ambiguous");
 			}
 			const segment: RegistrySegment = { header: value, open: new Map(), incomplete: [] };
 			this.segments.push(segment);
 			this.#latestByPid.set(value.invocation.pid, segment);
+			const current = this.options.currentInstance;
+			const expected = this.options.expectedInvocation;
+			const isExpected =
+				expected && value.invocation.pid === expected.pid && value.invocation.startId === expected.startId;
+			if (
+				current &&
+				((isExpected &&
+					(!sameInstance(instanceIdentity(value.instance), current) ||
+						value.instance?.startKey !== current.startKey)) ||
+					(instanceKey(instanceIdentity(value.instance)) === instanceKey(current) && !isExpected))
+			) {
+				this.problems.push("issuer-conflict: current instance does not match invocation");
+			}
 			if (value.writer !== undefined) this.#latestByWriter.set(`${value.invocation.pid}:${value.writer}`, segment);
 			return;
 		}
 		if (value.type !== "start" && value.type !== "end" && value.type !== "incomplete") {
-			this.problems.push(`registry has a record of unknown type ${JSON.stringify(value.type)}`);
+			this.problems.push(
+				`parse-record-malformed: registry has a record of unknown type ${JSON.stringify(value.type)}`,
+			);
 			return;
 		}
 		if (value.writer !== undefined && typeof value.writer !== "string") {
-			this.problems.push(`registry has a ${value.type} record with a malformed writer`);
+			this.problems.push(`parse-record-malformed: registry has a ${value.type} record with a malformed writer`);
+			return;
+		}
+		if (value.type === "end" && value.reason === "extinct") {
+			const candidates = this.segments.filter(
+				segment =>
+					segment.header.invocation.pid === value.invocationPid &&
+					typeof value.targetStartId === "string" &&
+					segment.header.invocation.startId === value.targetStartId &&
+					segment.header.writer === value.writer,
+			);
+			const target = candidates.length === 1 ? candidates[0] : undefined;
+			const records = target ? [...target.open.values()].filter(record => record.jobId === value.jobId) : [];
+			const record = records.length === 1 ? records[0] : undefined;
+			const issuer = target && this.issuer(value.issuer, target.header);
+			if (
+				!target ||
+				!record ||
+				!sameInstance(record.issuer, issuer) ||
+				sameInstance(issuer, this.options.currentInstance) ||
+				!canFence("open-record-unended", issuer, this.options.extinct ?? [])
+			) {
+				this.problems.push("parse-extinct-target: unauthorized or ambiguous extinction target");
+				return;
+			}
+			target.open.delete(openRecordKey(record));
+			this.#extinctionEnds.push({ segment: target, record });
 			return;
 		}
 		const pid = value.invocationPid;
@@ -535,25 +641,52 @@ export class RegistryReader {
 					? this.#latestByPid.get(pid)
 					: this.#latestByWriter.get(`${pid}:${value.writer}`);
 		if (!segment) {
-			this.problems.push(`registry has a ${value.type} record with no invocation header`);
+			this.problems.push(
+				`parse-record-unattributable: registry has a ${value.type} record with no invocation header`,
+			);
 			return;
 		}
 		if (value.type === "incomplete") {
-			segment.incomplete.push(typeof value.reason === "string" ? value.reason : "incomplete");
+			const reason = incompleteReason(value.reason);
+			reason.issuer = this.issuer(reason.issuer, segment.header);
+			segment.incomplete.push(reason);
 		} else if (typeof value.jobId !== "string") {
-			this.problems.push(`registry has a ${value.type} record without a job id`);
+			this.problems.push(`parse-record-malformed: registry has a ${value.type} record without a job id`);
 		} else if (value.type === "start") {
-			if (isStartRecord(value)) segment.open.set(value.jobId, value);
-			else this.problems.push("registry has a malformed start record");
+			if (isStartRecord(value)) {
+				let issuer = this.issuer(
+					value.issuer === undefined && !value.adoptedFrom ? segment.header.instance : value.issuer,
+					segment.header,
+				);
+				if (
+					!value.adoptedFrom &&
+					value.issuer !== undefined &&
+					!sameInstance(issuer, instanceIdentity(segment.header.instance))
+				)
+					issuer = null;
+				if (value.adoptedFrom !== undefined && !isProcessRef(value.adoptedFrom)) issuer = null;
+				const record = { ...value, issuer };
+				segment.open.set(openRecordKey(record), record);
+			} else this.problems.push("parse-record-malformed: registry has a malformed start record");
 		} else {
-			segment.open.delete(value.jobId);
+			if (value.adoptedFrom !== undefined && isProcessRef(value.adoptedFrom)) {
+				segment.open.delete(
+					openRecordKey({
+						jobId: value.jobId,
+						adoptedFrom: value.adoptedFrom as InvocationIdentity,
+						issuer: instanceIdentity(value.issuer),
+					}),
+				);
+			} else {
+				segment.open.delete(value.jobId);
+			}
 		}
 	}
 }
 
 /** Parse a whole registry file (see {@link RegistryReader}). */
-export function parseOwnedJobRegistry(text: string): ParsedRegistry {
-	const reader = new RegistryReader();
+export function parseOwnedJobRegistry(text: string, options: VerifyOwnedJobRegistryOptions = {}): ParsedRegistry {
+	const reader = new RegistryReader(options);
 	reader.feed(text);
 	reader.finish();
 	return { segments: reader.segments, problems: reader.problems };
@@ -573,8 +706,14 @@ function earliestStartId(startIds: Iterable<string | null>): string {
 /** Every owner token a header asks consumers to scan for, with its issuing invocation's start id. */
 function headerMarkers(header: OwnedJobInvocationRecord): InheritedOwnerMarker[] {
 	const markers: InheritedOwnerMarker[] = [];
-	if (header.ownerMarker) markers.push({ token: header.ownerMarker.token, startId: header.invocation.startId });
-	for (const marker of header.inheritedOwnerMarkers ?? []) markers.push(marker);
+	if (header.ownerMarker)
+		markers.push({
+			token: header.ownerMarker.token,
+			startId: header.invocation.startId,
+			issuer: instanceIdentity(header.instance),
+		});
+	for (const marker of header.inheritedOwnerMarkers ?? [])
+		markers.push({ ...marker, issuer: instanceIdentity(marker.issuer) });
 	return markers;
 }
 
@@ -606,7 +745,8 @@ export class OwnedJobRegistry {
 	readonly #open = new Map<string, OpenJob>();
 	/** Files whose `invocation` header for this invocation was written successfully. */
 	readonly #headered = new Set<string>();
-	readonly #incompleteReasons: string[] = [];
+	readonly #incompleteReasons: IncompleteReason[] = [];
+	readonly #extinctFenced: Array<{ issuer: InstanceIdentity; category: string; count: number }> = [];
 	/** Incomplete reasons already persisted per file (in its header or an `incomplete` record). */
 	readonly #persistedReasons = new Map<string, Set<string>>();
 	/** Owner tokens of other invocations taken over from bound files, by token. */
@@ -632,10 +772,10 @@ export class OwnedJobRegistry {
 	constructor(options: OwnedJobRegistryOptions) {
 		this.#options = options;
 		if (process.platform === "win32") {
-			this.#incompleteReasons.push("platform: detached descendants are not tracked on Windows");
+			this.#noteIncomplete("platform: detached descendants are not tracked on Windows", "platform-untracked");
 		}
 		if (currentInvocation().startId === null) {
-			this.#incompleteReasons.push("invocation start identity unavailable");
+			this.#noteIncomplete("invocation start identity unavailable", "invocation-identity-unavailable");
 		}
 	}
 
@@ -650,11 +790,16 @@ export class OwnedJobRegistry {
 	 * while the session is not persisted (a registry with no file vouches for nothing).
 	 */
 	get complete(): boolean {
-		return this.#incompleteReasons.length === 0 && this.path !== null;
+		return (
+			this.#incompleteReasons.length === 0 &&
+			this.path !== null &&
+			(!this.#options.currentInstance || this.#inheritedMarkers.size === 0)
+		);
 	}
 
 	get incompleteReasons(): readonly string[] {
-		return this.path === null ? [...this.#incompleteReasons, "session is not persisted"] : this.#incompleteReasons;
+		const reasons = this.#incompleteReasons.map(reason => reason.text);
+		return this.path === null ? [...reasons, "session is not persisted"] : reasons;
 	}
 
 	/**
@@ -668,8 +813,8 @@ export class OwnedJobRegistry {
 	}
 
 	/** Mark this invocation's registry incomplete. Idempotent per reason. */
-	markIncomplete(reason: string): void {
-		if (!this.#incompleteReasons.includes(reason)) this.#incompleteReasons.push(reason);
+	markIncomplete(reason: string, category = "invocation-incomplete-unspecified"): void {
+		this.#noteIncomplete(reason, category);
 		const files = new Set(this.#headered);
 		const current = this.path;
 		if (current) files.add(current);
@@ -704,7 +849,7 @@ export class OwnedJobRegistry {
 	 * scan is sound. Returns the function that ends the run record.
 	 */
 	beginPtyRun(input: { command: string; cwd: string }): () => void {
-		this.markIncomplete(PTY_RUN_UNTRACKED);
+		this.markIncomplete(PTY_RUN_UNTRACKED, "pty-untracked");
 		const jobId = this.registerInProcessJob({ jobId: `pty-run:${++this.#ptyRuns}`, kind: "shell-run", ...input });
 		return () => this.end(jobId, "settled");
 	}
@@ -757,7 +902,10 @@ export class OwnedJobRegistry {
 		if (broker.startId != null) return { pid: broker.pid, startId: broker.startId };
 		const identity = readIdentity(broker.pid);
 		if (identity.state === "gone") {
-			this.markIncomplete("a service's daemon broker was gone when the service was recorded");
+			this.markIncomplete(
+				"a service's daemon broker was gone when the service was recorded",
+				"service-identity-unknown",
+			);
 			return undefined;
 		}
 		return { pid: broker.pid, startId: identity.startId ?? null };
@@ -774,11 +922,11 @@ export class OwnedJobRegistry {
 	): void {
 		const spawned = result.spawnedProcesses;
 		if (spawned === undefined) {
-			this.markIncomplete("shell backend does not report spawned processes");
+			this.markIncomplete("shell backend does not report spawned processes", "shell-backend-unreported");
 			return;
 		}
 		if (result.spawnedComplete === false) {
-			this.markIncomplete("a shell run could not report every process it spawned");
+			this.markIncomplete("a shell run could not report every process it spawned", "shell-backend-unreported");
 		}
 		for (const proc of spawned) {
 			this.registerProcess({
@@ -802,7 +950,8 @@ export class OwnedJobRegistry {
 		this.#open.delete(jobId);
 		const record: OwnedJobEndRecord = {
 			type: "end",
-			jobId,
+			jobId: open.record.jobId,
+			...(open.record.adoptedFrom ? { adoptedFrom: open.record.adoptedFrom, issuer: open.record.issuer } : {}),
 			how,
 			invocationPid: process.pid,
 			endedAt: new Date().toISOString(),
@@ -894,6 +1043,7 @@ export class OwnedJobRegistry {
 			}
 			this.#prunable.clear();
 			if (round === SCAN_SETTLE_ROUNDS) {
+				if (this.#options.currentInstance) this.markIncomplete("owner-marker scan did not settle", "scan-unsound");
 				return { scan: { ...summary, sound: false, discovered }, live };
 			}
 		}
@@ -937,6 +1087,7 @@ export class OwnedJobRegistry {
 			scan = scanProcessesByEnv(OWNER_MARKER_ENV, tokens, since);
 		} catch (error) {
 			logger.warn("Owner-marker scan failed", { error: String(error) });
+			if (this.#options.currentInstance) this.markIncomplete("owner-marker scan failed", "scan-unsound");
 			return { summary: { supported: false, sound: false, scanned: 0, discovered: 0, opaque: [] }, raw: undefined };
 		}
 		let discovered = 0;
@@ -957,6 +1108,8 @@ export class OwnedJobRegistry {
 			.filter(proc => !this.#tracks(proc.pid, proc.startId ?? null))
 			.map(proc => ({ pid: proc.pid, command: proc.command }));
 		const sound = scan.supported && !scan.hidden && opaque.length === 0;
+		if (!sound && this.#options.currentInstance)
+			this.markIncomplete("owner-marker scan unsupported, hidden or opaque", "scan-unsound");
 		return { summary: { supported: scan.supported, sound, scanned: scan.scanned, discovered, opaque }, raw: scan };
 	}
 
@@ -979,14 +1132,16 @@ export class OwnedJobRegistry {
 	 * the header that issued it, so consumers still scan it.
 	 */
 	#pruneInheritedMarkers(scan: MarkedProcessScan): void {
+		if (this.#options.currentInstance) return;
 		const carried = new Set(scan.processes.map(proc => proc.token));
 		const prunable = new Set<string>();
-		for (const token of this.#inheritedMarkers.keys()) {
+		for (const [key, marker] of this.#inheritedMarkers) {
+			const token = marker.token;
 			if (carried.has(token)) continue;
 			const issuer = tokenInvocation(token);
 			if (!issuer || issuer.pid === process.pid || this.#holdsWorkAdoptedFrom(issuer)) continue;
 			if (ownedProcessState(issuer.pid, issuer.startId) !== "gone") continue;
-			if (this.#prunable.has(token)) this.#inheritedMarkers.delete(token);
+			if (this.#prunable.has(token)) this.#inheritedMarkers.delete(key);
 			else prunable.add(token);
 		}
 		this.#prunable = prunable;
@@ -1024,6 +1179,7 @@ export class OwnedJobRegistry {
 	}
 
 	#start(record: OwnedJobStartRecord): void {
+		record.issuer = this.#options.currentInstance ?? null;
 		const file = this.path;
 		const open: OpenJob = { record, files: [] };
 		// Header and carried records are written before the new record joins `#open`, so it
@@ -1058,12 +1214,14 @@ export class OwnedJobRegistry {
 				...(reasons.length === 0 ? {} : { incompleteReasons: reasons }),
 				ownerMarker: { env: OWNER_MARKER_ENV, token: ownerToken() },
 				writer: this.#writerId,
+				...(this.#options.currentInstance ? { instance: this.#options.currentInstance } : {}),
+				...(this.#extinctFenced.length ? { extinctFenced: [...this.#extinctFenced] } : {}),
 				...(inherited.length === 0 ? {} : { inheritedOwnerMarkers: inherited }),
 				at: new Date().toISOString(),
 			};
 			if (this.#write(file, header)) {
 				this.#headered.add(file);
-				this.#persistedReasons.set(file, new Set(reasons));
+				this.#persistedReasons.set(file, new Set(reasons.map(reasonKey)));
 			}
 		}
 		this.#adopt(file, adopted);
@@ -1076,14 +1234,15 @@ export class OwnedJobRegistry {
 		const persisted = this.#persistedReasons.get(file);
 		if (!persisted) return;
 		for (const reason of this.#incompleteReasons) {
-			if (persisted.has(reason)) continue;
+			const key = reasonKey(reason);
+			if (persisted.has(key)) continue;
 			const record: OwnedJobIncompleteRecord = {
 				type: "incomplete",
 				reason,
 				invocationPid: process.pid,
 				at: new Date().toISOString(),
 			};
-			if (this.#write(file, record)) persisted.add(reason);
+			if (this.#write(file, record)) persisted.add(key);
 		}
 	}
 
@@ -1091,10 +1250,11 @@ export class OwnedJobRegistry {
 	#adopt(file: string, adopted: OwnedJobStartRecord[]): void {
 		const headered = this.#headered.has(file);
 		for (const record of adopted) {
-			if (this.#open.has(record.jobId)) continue;
+			const key = openRecordKey(record);
+			if (this.#open.has(key)) continue;
 			const open: OpenJob = { record, files: [] };
 			if (headered && this.#write(file, record)) open.files.push(file);
-			this.#open.set(record.jobId, open);
+			this.#open.set(key, open);
 			this.#ensureMonitor();
 		}
 	}
@@ -1154,12 +1314,13 @@ export class OwnedJobRegistry {
 			fs.closeSync(fd);
 		}
 		const { reader, generation } = state;
-		for (const problem of reader.problems.slice(state.problemsSeen)) this.#noteIncomplete(inheritedReason(problem));
+		for (const problem of reader.problems.slice(state.problemsSeen))
+			this.#noteIncomplete(inheritedReason(problem), problem.split(":", 1)[0], null);
 		state.problemsSeen = reader.problems.length;
 		const adopted: OwnedJobStartRecord[] = [];
 		reader.segments.forEach((segment, index) => {
 			if (segment.header.writer !== this.#writerId)
-				adopted.push(...this.#takeOver(segment, `${generation}:${index}`));
+				adopted.push(...this.#takeOver(segment, `${generation}:${index}`, file, reader));
 		});
 		return adopted;
 	}
@@ -1175,7 +1336,11 @@ export class OwnedJobRegistry {
 	/** A fresh read of `file` from its start, with its own take-over scope. */
 	#newRead(file: string, identity?: string): RegistryFileRead {
 		const state: RegistryFileRead = {
-			reader: new RegistryReader(),
+			reader: new RegistryReader({
+				currentInstance: this.#options.currentInstance,
+				extinct: this.#options.extinct,
+				expectedInvocation: currentInvocation(),
+			}),
 			offset: 0,
 			problemsSeen: 0,
 			tail: Buffer.alloc(0),
@@ -1223,46 +1388,100 @@ export class OwnedJobRegistry {
 	 * generation and the segment's index): re-reading acts only on what is new, and the same
 	 * writer's segment in another file, or in a file read again from its start, is its own.
 	 */
-	#takeOver(segment: RegistrySegment, scope: string): OwnedJobStartRecord[] {
+	#takeOver(segment: RegistrySegment, scope: string, file: string, reader: RegistryReader): OwnedJobStartRecord[] {
 		const me = currentInvocation();
 		const writer = segment.header.invocation;
 		const key = `${writer.pid}:${writer.startId ?? "unknown"}:${segment.header.writer ?? ""}`;
 		const segmentKey = `${scope}:${key}`;
+		const writerIssuer = this.#provenance(segment.header.instance, segment.header);
+		const foreignFenced =
+			!sameInstance(writerIssuer, this.#options.currentInstance) &&
+			canFence("foreign-invocation-unobservable", writerIssuer, this.#options.extinct ?? []);
 		if (!this.#handledForeign.has(segmentKey)) {
 			this.#handledForeign.add(segmentKey);
+			if (foreignFenced) this.#fence("foreign-invocation-unobservable", writerIssuer);
 			const ownToken = ownerToken();
+			if (!segment.header.ownerMarker)
+				this.#noteIncomplete("inherited invocation recorded no owner marker", "parse-marker-missing", null);
+			else if (segment.header.ownerMarker.env !== OWNER_MARKER_ENV)
+				this.#noteIncomplete("inherited owner-marker variable differs", "parse-marker-inconsistent", null);
 			for (const marker of headerMarkers(segment.header)) {
-				if (marker.token !== ownToken) this.#inheritedMarkers.set(marker.token, marker);
+				marker.issuer = this.#provenance(marker.issuer, segment.header);
+				if (this.#fence("owner-marker", marker.issuer)) continue;
+				if (
+					marker.token !== ownToken ||
+					(this.#options.currentInstance && !sameInstance(marker.issuer, this.#options.currentInstance))
+				) {
+					this.#inheritedMarkers.set(JSON.stringify([marker.token, issuerKey(marker.issuer)]), marker);
+				}
 			}
-			for (const reason of headerIncompleteReasons(segment.header)) this.#noteIncomplete(inheritedReason(reason));
+			for (const reason of headerIncompleteReasons(segment.header)) this.#inheritReason(reason, segment.header);
 		}
 		segment.incomplete.forEach((reason, reasonIndex) => {
 			const reasonKey = `${segmentKey}:incomplete:${reasonIndex}`;
 			if (this.#handledForeign.has(reasonKey)) return;
 			this.#handledForeign.add(reasonKey);
-			this.#noteIncomplete(inheritedReason(reason));
+			this.#inheritReason(reason, segment.header);
 		});
 		// This process's other session objects are not separate invocations: never "live work".
 		const sameProcess = writer.pid === me.pid;
-		const writerGone = sameProcess || ownedProcessState(writer.pid, writer.startId) === "gone";
+		const writerGone = foreignFenced || sameProcess || ownedProcessState(writer.pid, writer.startId) === "gone";
 		if (writerGone) this.#foreignInvocations.delete(key);
 		else this.#foreignInvocations.set(key, writer);
 		const adopted: OwnedJobStartRecord[] = [];
 		for (const record of segment.open.values()) {
+			const fenceKey = `${segmentKey}:extinct:${record.jobId}:${issuerKey(record.issuer)}`;
+			if (this.#handledForeign.has(fenceKey)) continue;
+			const targets = reader.segments.filter(
+				candidate =>
+					candidate.header.invocation.pid === writer.pid &&
+					candidate.header.invocation.startId === writer.startId &&
+					candidate.header.writer === segment.header.writer,
+			);
+			const jobs = [...segment.open.values()].filter(value => value.jobId === record.jobId);
+			if (
+				writer.startId !== null &&
+				targets.length === 1 &&
+				jobs.length === 1 &&
+				!sameInstance(record.issuer, this.#options.currentInstance) &&
+				canFence("open-record-unended", record.issuer, this.#options.extinct ?? [])
+			) {
+				if (
+					this.#write(file, {
+						type: "end",
+						reason: "extinct",
+						how: "exited",
+						jobId: record.jobId,
+						invocationPid: writer.pid,
+						writer: segment.header.writer,
+						targetStartId: writer.startId,
+						issuer: record.issuer!,
+						endedAt: new Date().toISOString(),
+					})
+				) {
+					this.#fence("open-record-unended", record.issuer);
+					this.#handledForeign.add(fenceKey);
+					continue;
+				}
+			}
 			if (record.kind === "internal") continue;
-			const recordKey = `${segmentKey}:${record.jobId}`;
+			const recordKey = `${segmentKey}:${openRecordKey(record)}:${issuerKey(record.issuer)}`;
 			if (this.#handledForeign.has(recordKey)) continue;
 			if (record.inProcess) {
 				// Unfinished only once its writer is gone; while it runs it is counted as live.
 				// Job ids are per writer: one equal to an id of this registry is a different job.
 				if (!writerGone) continue;
 				this.#handledForeign.add(recordKey);
-				this.#noteIncomplete(inheritedReason(`invocation ${writer.pid} left ${record.kind} work unfinished`));
+				this.#noteIncomplete(
+					inheritedReason(`invocation ${writer.pid} left ${record.kind} work unfinished`),
+					"open-record-unended",
+					record.issuer ?? null,
+				);
 				continue;
 			}
 			this.#handledForeign.add(recordKey);
 			// The same process (process job ids name pid and start identity) is already tracked.
-			if (this.#open.has(record.jobId) || recordedWorkState(record) === "gone") continue;
+			if (recordedWorkState(record) === "gone") continue;
 			const { carriedFrom: _carried, writer: _writer, ...rest } = record;
 			adopted.push({
 				...rest,
@@ -1275,8 +1494,50 @@ export class OwnedJobRegistry {
 	}
 
 	/** Add an incomplete reason without writing (the caller persists it with the header). */
-	#noteIncomplete(reason: string): void {
-		if (!this.#incompleteReasons.includes(reason)) this.#incompleteReasons.push(reason);
+	#noteIncomplete(
+		text: string,
+		category = "registry-io",
+		issuer: InstanceIdentity | null = this.#options.currentInstance ?? null,
+	): void {
+		const reason = { category, text, issuer };
+		const key = reasonKey(reason);
+		if (!this.#incompleteReasons.some(value => reasonKey(value) === key)) this.#incompleteReasons.push(reason);
+	}
+
+	#provenance(value: unknown, header: OwnedJobInvocationRecord): InstanceIdentity | null {
+		const issuer = instanceIdentity(value);
+		if (
+			issuer &&
+			this.#options.currentInstance &&
+			instanceKey(issuer) === instanceKey(this.#options.currentInstance) &&
+			(!sameInstance(issuer, this.#options.currentInstance) ||
+				header.invocation.pid !== currentInvocation().pid ||
+				header.invocation.startId !== currentInvocation().startId)
+		) {
+			this.#noteIncomplete("current instance claimed by another invocation", "issuer-conflict", null);
+			return null;
+		}
+		return issuer;
+	}
+
+	#inheritReason(reason: IncompleteReason, header: OwnedJobInvocationRecord): void {
+		const issuer = this.#provenance(reason.issuer, header);
+		if (!this.#fence(reason.category, issuer))
+			this.#noteIncomplete(inheritedReason(reason.text), reason.category, issuer);
+	}
+
+	#fence(category: string, issuer: InstanceIdentity | null | undefined): boolean {
+		if (
+			!canFence(category, issuer, this.#options.extinct ?? []) ||
+			sameInstance(issuer, this.#options.currentInstance)
+		)
+			return false;
+		const audit = this.#extinctFenced.find(
+			value => value.category === category && sameInstance(value.issuer, issuer),
+		);
+		if (audit) audit.count++;
+		else this.#extinctFenced.push({ category, issuer: issuer!, count: 1 });
+		return true;
 	}
 
 	#append(file: string, record: OwnedJobRecord): boolean {
@@ -1303,7 +1564,10 @@ export class OwnedJobRegistry {
 					fs.readSync(fd, last, 0, 1, size - 1);
 					if (last[0] !== 0x0a) separator = "\n";
 				}
-				const stamped = record.type === "invocation" ? record : { ...record, writer: this.#writerId };
+				const stamped =
+					record.type === "invocation" || (record.type === "end" && record.reason === "extinct")
+						? record
+						: { ...record, writer: this.#writerId };
 				fs.writeSync(fd, `${separator}${JSON.stringify(stamped)}\n`);
 				fs.fsyncSync(fd);
 			} finally {
@@ -1313,9 +1577,7 @@ export class OwnedJobRegistry {
 			return true;
 		} catch (error) {
 			// A registry that failed to persist a record cannot vouch for completeness.
-			if (!this.#incompleteReasons.includes(REGISTRY_WRITE_FAILED)) {
-				this.#incompleteReasons.push(REGISTRY_WRITE_FAILED);
-			}
+			this.#noteIncomplete(REGISTRY_WRITE_FAILED, "registry-io");
 			logger.warn("Owned job registry write failed", { file, error: String(error) });
 			return false;
 		}
@@ -1362,6 +1624,8 @@ export interface VerifyOwnedJobRegistryOptions {
 	 * have reached the file (every write failed), so the answer is at best `unknown`.
 	 */
 	expectedInvocation?: { pid: number; startId: string | null };
+	currentInstance?: InstanceIdentity;
+	extinct?: readonly InstanceIdentity[];
 }
 
 /**
@@ -1402,7 +1666,13 @@ export function verifyOwnedJobRegistry(file: string, options: VerifyOwnedJobRegi
 	} catch (error) {
 		return { status: "unknown", live, reasons: [`registry unreadable: ${String(error)}`] };
 	}
-	const { segments, problems } = parseOwnedJobRegistry(text);
+	const reader = new RegistryReader(options);
+	reader.feed(text);
+	reader.finish();
+	const { segments, problems } = reader;
+	const fence = (category: string, issuer: InstanceIdentity | null | undefined, header: OwnedJobInvocationRecord) =>
+		!sameInstance(issuer, options.currentInstance) &&
+		canFence(category, reader.issuer(issuer, header), options.extinct ?? []);
 	reasons.push(...problems);
 	if (segments.length === 0) reasons.push("registry has no invocation header");
 	const expected = options.expectedInvocation;
@@ -1416,11 +1686,13 @@ export function verifyOwnedJobRegistry(file: string, options: VerifyOwnedJobRegi
 		reasons.push(`invocation ${expected.pid} has no header in the registry`);
 	}
 	for (const { header, incomplete } of segments) {
-		reasons.push(...headerIncompleteReasons(header));
-		reasons.push(...incomplete);
+		for (const reason of [...headerIncompleteReasons(header), ...incomplete]) {
+			if (!fence(reason.category, reason.issuer, header)) reasons.push(reason.text);
+		}
 	}
 	for (const { header } of segments) {
 		const { invocation } = header;
+		if (fence("foreign-invocation-unobservable", instanceIdentity(header.instance), header)) continue;
 		const state = ownedProcessState(invocation.pid, invocation.startId);
 		if (state === "alive") {
 			return { status: "live", live, reasons: [`invocation ${invocation.pid} is still running`] };
@@ -1462,12 +1734,27 @@ export function verifyOwnedJobRegistry(file: string, options: VerifyOwnedJobRegi
 			env ??= header.ownerMarker.env;
 			if (header.ownerMarker.env !== env) reasons.push("registry uses more than one owner-marker variable");
 		}
-		for (const marker of headerMarkers(header)) markers.set(marker.token, marker);
+		for (const marker of headerMarkers(header)) {
+			if (fence("owner-marker", marker.issuer, header)) continue;
+			markers.set(JSON.stringify([marker.token, issuerKey(marker.issuer)]), marker);
+			if (
+				options.currentInstance &&
+				(!sameInstance(marker.issuer, options.currentInstance) ||
+					header.invocation.pid !== expected?.pid ||
+					header.invocation.startId !== expected?.startId)
+			) {
+				reasons.push("owner-marker: inherited issuer has no authorized extinction");
+			}
+		}
 	}
-	if (env !== undefined) {
+	if (env !== undefined && markers.size > 0) {
 		try {
 			const since = earliestStartId([...markers.values()].map(marker => marker.startId));
-			const scan = scanProcessesByEnv(env, [...markers.keys()], since);
+			const scan = scanProcessesByEnv(
+				env,
+				[...markers.values()].map(marker => marker.token),
+				since,
+			);
 			if (!scan.supported) reasons.push("owner-marker scan unsupported on this platform");
 			if (scan.hidden) reasons.push("owner-marker scan cannot see every process (hidepid)");
 			for (const proc of scan.opaque) reasons.push(`process ${proc.pid} (${proc.command}) environment unexaminable`);
