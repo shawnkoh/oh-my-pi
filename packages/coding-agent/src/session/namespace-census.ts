@@ -152,19 +152,25 @@ export function namespaceCensus(options: CensusOptions): CensusResult {
 					const status = read(`${pid}/status`).toString();
 					if (!/^Uid:\s+\d+\s+\d+\s+\d+\s+\d+\s*$/m.test(status)) throw new Error("malformed Uid");
 					if (cmdline.length && cmdline[cmdline.length - 1] !== 0) throw new Error("malformed cmdline");
-					if (proc.state === "Z" || proc.state === "X" || proc.state === "x") continue;
+					// A Z leader can still have live threads, so dead states are never skipped or allowlisted.
+					const live = proc.state !== "Z" && proc.state !== "X" && proc.state !== "x";
 					let classification = "work";
 					if (pid === 1) {
-						if (proc.start !== identity.pid1Start || proc.comm !== "openshell-sandb")
+						if (!live || proc.start !== identity.pid1Start || proc.comm !== "openshell-sandb")
 							throw new Error("boundary-mismatch");
 						boundary = true;
 						classification = "boundary";
 					} else if (pid === identity.canonical.pid) {
-						if (proc.start !== identity.canonical.start || !cmdline.equals(Buffer.from("sleep\0infinity\0")))
+						if (
+							!live ||
+							proc.start !== identity.canonical.start ||
+							!cmdline.equals(Buffer.from("sleep\0infinity\0"))
+						)
 							throw new Error("canonical-mismatch");
 						canonical = true;
 						classification = "canonical";
-					} else if (pid === (options.enginePid ?? process.pid)) classification = "engine";
+					} else if (!live) classification = "work";
+					else if (pid === (options.enginePid ?? process.pid)) classification = "engine";
 					else if (proc.ppid !== 0) {
 						const records =
 							options.registered?.filter(record => record.pid === pid && record.startId === proc.start) ?? [];
