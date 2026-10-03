@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import { isEnoent, logger, postmortem, ptree, stableStringifyJson, untilAborted } from "@oh-my-pi/pi-utils";
 import { MessageFramer } from "../jsonrpc/message-framing";
+import { ServerActivityLedger } from "../session/activity-ledger";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { getConfig } from "./config";
 import { applyWorkspaceEdit, type ExecutedWorkspaceChange } from "./edits";
@@ -35,6 +36,24 @@ const clientLocks = new Map<string, PendingClient>();
 const invalidatedClientKeys = new Set<string>();
 const clientReloadBarriers = new Map<string, Promise<unknown>>();
 const fileOperationLocks = new Map<string, Promise<void>>();
+const activityLedgers = new WeakMap<LspClient, ServerActivityLedger>();
+
+export function getLspActivity(client: LspClient): ServerActivityLedger {
+	let ledger = activityLedgers.get(client);
+	if (!ledger) {
+		ledger = new ServerActivityLedger("lsp", client.config.command);
+		activityLedgers.set(client, ledger);
+		if (client.proc.pid !== undefined && !client.proc.sharedMux) ledger.bindProcess(client.proc.pid);
+		const boundLedger = ledger;
+		void client.proc.exited.then(() => {
+			// A mux link ending does not prove the broker's shared server stopped.
+			if (client.proc.sharedMux) boundLedger.disconnected();
+			else boundLedger.processExited();
+		});
+	}
+	return ledger;
+}
+
 /**
  * URIs whose server overlay OMP has intentionally advanced ahead of the on-disk
  * file for an in-flight write/edit: the writethrough syncs the new (and possibly
@@ -399,7 +418,7 @@ function queueWriteMessage(
  * Start background message reader for a client.
  * Routes responses to pending requests and handles notifications.
  */
-async function startMessageReader(client: LspClient): Promise<void> {
+export async function startMessageReader(client: LspClient): Promise<void> {
 	if (client.isReading) return;
 	client.isReading = true;
 
@@ -445,7 +464,12 @@ async function startMessageReader(client: LspClient): Promise<void> {
 					if ("method" in message) {
 						if ("id" in message && message.id !== undefined) {
 							// Server-initiated request: must be answered.
-							await handleServerRequest(client, message as LspJsonRpcRequest);
+							const hold = getLspActivity(client).hold();
+							try {
+								await handleServerRequest(client, message as LspJsonRpcRequest);
+							} finally {
+								hold.release();
+							}
 						} else {
 							// Server notification
 							if (message.method === "textDocument/publishDiagnostics" && message.params) {
@@ -469,6 +493,7 @@ async function startMessageReader(client: LspClient): Promise<void> {
 						}
 					} else if ("id" in message && message.id !== undefined) {
 						// Response to one of our requests.
+						getLspActivity(client).replied(message.id);
 						const pending = client.pendingRequests.get(message.id);
 						if (pending) {
 							client.pendingRequests.delete(message.id);
@@ -503,6 +528,7 @@ async function startMessageReader(client: LspClient): Promise<void> {
 		}
 		client.pendingRequests.clear();
 	} finally {
+		getLspActivity(client).disconnected();
 		// Persist any unparsed remainder so a restarted reader resumes mid-message.
 		client.messageBuffer = framer.remainder();
 		reader.releaseLock();
@@ -1118,6 +1144,7 @@ export async function getOrCreateClient(
 			projectLoaded,
 			resolveProjectLoaded,
 		};
+		getLspActivity(client);
 
 		// Register crash recovery - remove client on process exit
 		proc.exited.then(() => {
@@ -1834,6 +1861,7 @@ export async function sendRequest(
 		},
 		method,
 	});
+	getLspActivity(client).sent(id);
 
 	// Write request. `queueWriteMessage(..., signal)` bounds the sink flush
 	// so a wedged server does not stall the write queue past the signal's

@@ -14,6 +14,8 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
+import { idleSafeServerProcesses, outstandingServerWork } from "./activity-ledger";
+import { cfgStrictIdleIdleSafeServers } from "./settings";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -932,6 +934,7 @@ export class AgentSession implements SettingsScope {
 	#reconcileBrowserMcpFilter: AgentSessionConfig["reconcileBrowserMcpFilter"];
 	#censusConfig: Pick<AgentSessionConfig, "a13Identity" | "namespaceCensus" | "idleInfrastructure">;
 	#lastCensus: CensusResult | undefined;
+	#lastCompletenessReasons: string[] | undefined;
 	#skillDescriptions: SkillDescriptionCatalog;
 	#promptSkillsSource: readonly Skill[] | undefined;
 	#promptSkills: readonly Skill[] = [];
@@ -1863,6 +1866,12 @@ export class AgentSession implements SettingsScope {
 		this.#promptTemplates = config.promptTemplates ?? [];
 		this.#slashCommands = config.slashCommands ?? [];
 		this.#extensionRunner = config.extensionRunner;
+		this.registerWorkSource({ kind: "scheduledTurns", strictOnly: true, count: outstandingServerWork });
+		this.registerWorkSource({
+			kind: "scheduledTurns",
+			strictOnly: true,
+			count: () => this.#extensionRunner?.outstandingWork ?? 0,
+		});
 		if (this.#extensionRunner) {
 			this.#extensionRunner.onActivity = () => this.noteActivity();
 			this.#extensionRunner.eventScope = dispatch => this.#hostInputHookScope.exit(dispatch);
@@ -3324,8 +3333,8 @@ export class AgentSession implements SettingsScope {
 	}
 
 	/** Synchronously count all outstanding work. Never awaits; safe to call with admission closed. */
-	getWorkCounts(): WorkCounts {
-		return this.#countWork(true);
+	getWorkCounts(strict = false): WorkCounts {
+		return this.#countWork(true, strict);
 	}
 
 	/**
@@ -3333,7 +3342,7 @@ export class AgentSession implements SettingsScope {
 	 * found processes); without it, `detachedJobs` counts only processes already recorded —
 	 * enough for answers that decide nothing (malformed, stale or foreign requests).
 	 */
-	#countWork(scan: boolean): WorkCounts {
+	#countWork(scan: boolean, strict = false): WorkCounts {
 		const counts = emptyWorkCounts();
 		counts.streaming = this.isStreaming || this.isBashRunning || this.isEvalRunning ? 1 : 0;
 		counts.queuedInput =
@@ -3395,7 +3404,9 @@ export class AgentSession implements SettingsScope {
 			(this.#sessionTransitionDepth > 0 ? 1 : 0);
 		counts.goalContinuationScheduled = this.#goalContinuationReservations;
 		this.#hostInputHookScope.exit(() => {
-			for (const source of this.#workSources) counts[source.kind] += Math.max(0, source.count());
+			for (const source of this.#workSources) {
+				if (!source.strictOnly || strict) counts[source.kind] += Math.max(0, source.count());
+			}
 		});
 		return counts;
 	}
@@ -3444,6 +3455,7 @@ export class AgentSession implements SettingsScope {
 	 */
 	quiesceForExit(request: QuiesceRequest): QuiesceResult {
 		this.#lastCensus = undefined;
+		this.#lastCompletenessReasons = undefined;
 		const { operationId, attempt } = request;
 		const refuse = (reason: QuiesceRefusalReason, counts?: WorkCounts): QuiesceResult => ({
 			status: "refused",
@@ -3457,6 +3469,7 @@ export class AgentSession implements SettingsScope {
 				...(request.completeness === "strict" && (reason === "completeness_unknown" || reason === "work_active")
 					? {
 							census: this.#lastCensus,
+							completenessReasons: this.#lastCompletenessReasons,
 							registry: {
 								path: this.ownedJobRegistry?.path ?? null,
 								complete: this.#registryComplete(this.ownedJobRegistry),
@@ -3515,7 +3528,7 @@ export class AgentSession implements SettingsScope {
 			const strict = request.completeness === "strict";
 			if (strict) this.ownedJobRegistry?.ensureHeader();
 			const epoch = this.#activityEpoch;
-			counts = this.getWorkCounts();
+			counts = this.getWorkCounts(strict);
 			const completeness = strict ? this.#strictCompleteness() : undefined;
 			if (strict) counts.detachedJobs += this.#lastCensus?.work.length ?? 0;
 			const sessionFile = this.sessionManager.getSessionFile();
@@ -3651,14 +3664,18 @@ export class AgentSession implements SettingsScope {
 	/** Single strict gate for registry coverage and future completeness inputs. */
 	#strictCompleteness(): { complete: boolean; reasons: string[] } {
 		const complete = this.#registryComplete(this.ownedJobRegistry);
-		return this.#censusCompleteness({ complete, reasons: complete ? [] : ["registry_incomplete"] });
+		const result = this.#ledgerCompleteness(
+			this.#censusCompleteness({ complete, reasons: complete ? [] : ["registry_incomplete"] }),
+		);
+		this.#lastCompletenessReasons = result.reasons;
+		return result;
 	}
 
 	#censusCompleteness(base: { complete: boolean; reasons: string[] }): { complete: boolean; reasons: string[] } {
 		const records = this.ownedJobRegistry?.openJobs() ?? [];
 		this.#lastCensus = (this.#censusConfig.namespaceCensus ?? namespaceCensus)({
 			identity: this.#censusConfig.a13Identity,
-			idleInfrastructure: this.#censusConfig.idleInfrastructure,
+			idleInfrastructure: this.#censusConfig.idleInfrastructure ?? (() => this.getIdleSafeServerProcesses()),
 			registered: records
 				.filter(record => !record.inProcess)
 				.map(record => ({
@@ -3677,6 +3694,16 @@ export class AgentSession implements SettingsScope {
 			complete: base.complete && this.#lastCensus.complete,
 			reasons: [...base.reasons, ...this.#lastCensus.reasons],
 		};
+	}
+
+	#ledgerCompleteness(state: { complete: boolean; reasons: string[] }): { complete: boolean; reasons: string[] } {
+		const reasons = this.#extensionRunner?.workCompletenessReasons() ?? [];
+		return { complete: state.complete && reasons.length === 0, reasons: [...state.reasons, ...reasons] };
+	}
+
+	/** Exact idleSafe identities for the strict namespace census; never used by attested retirement. */
+	getIdleSafeServerProcesses() {
+		return idleSafeServerProcesses(cfgStrictIdleIdleSafeServers.get(this.settings));
 	}
 
 	/**
@@ -8863,6 +8890,9 @@ export class AgentSession implements SettingsScope {
 		}
 
 		return {
+			holdWork: _reason => ({
+				release: this.registerWorkSource({ kind: "scheduledTurns", strictOnly: true, count: () => 1 }),
+			}),
 			ui: noOpUIContext,
 			mode: "print",
 			hasUI: false,

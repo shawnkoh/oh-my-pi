@@ -15,6 +15,8 @@ import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-in
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { ServerActivityLedger } from "@oh-my-pi/pi-coding-agent/session/activity-ledger";
+import * as activityLedger from "@oh-my-pi/pi-coding-agent/session/activity-ledger";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import type { DeliveryHandle } from "@oh-my-pi/pi-coding-agent/session/external-delivery";
 import type { CustomMessagePayload } from "@oh-my-pi/pi-coding-agent/session/messages";
@@ -62,6 +64,8 @@ describe("AgentSession quiesce-and-exit", () => {
 		providerGate = undefined;
 		// Retained shells are process-global; other suites' background jobs must not leak in.
 		vi.spyOn(bashExecutor, "retainedShellWorkCount").mockReturnValue(0);
+		// Other transport suites deliberately leave cancelled remote work unsettled.
+		vi.spyOn(activityLedger, "outstandingServerWork").mockReturnValue(0);
 	});
 
 	afterEach(async () => {
@@ -159,6 +163,74 @@ describe("AgentSession quiesce-and-exit", () => {
 			...overrides,
 		};
 	}
+
+	it("refuses unsettled server activity only under strict retirement", () => {
+		const server = new ServerActivityLedger("mcp", "session-ledger-test");
+		server.sent(1);
+		vi.spyOn(activityLedger, "outstandingServerWork").mockImplementation(() => server.count);
+		const s = createSession();
+		try {
+			const strict = s.quiesceForExit(request(s, { completeness: "strict" }));
+			expect(strict.status === "refused" && strict.reason).toBe("work_active");
+			if (strict.status === "refused") expect(strict.snapshot.counts.scheduledTurns).toBe(1);
+			expect(s.quiesceForExit(request(s, { attempt: 2 })).status).toBe("quiesced");
+		} finally {
+			server.processExited();
+		}
+	});
+
+	it("names an undeclared extension in strict refusal, without changing attested retirement", async () => {
+		const s = await createSessionWithExtension(() => {});
+		const strict = s.quiesceForExit(request(s, { completeness: "strict" }));
+		expect(strict.status).toBe("refused");
+		if (strict.status !== "refused") throw new Error("expected refusal");
+		expect(strict.reason).toBe("completeness_unknown");
+		expect(strict.snapshot.completenessReasons).toContain("extension_work_reporting_unknown:quiesce");
+		expect(s.quiesceForExit(request(s, { attempt: 2 })).status).toBe("quiesced");
+	});
+
+	it("counts extension holds only under strict and releases them idempotently", async () => {
+		const parts = sessionParts();
+		const runtime = new ExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			api => {
+				api.workReporting = "complete";
+			},
+			tempDir.path(),
+			new EventBus(),
+			runtime,
+			"reporting",
+		);
+		const runner = new ExtensionRunner(
+			[extension],
+			runtime,
+			tempDir.path(),
+			parts.sessionManager,
+			parts.modelRegistry,
+		);
+		parts.extensionRunner = runner;
+		const s = createSession(parts);
+		const first = runner.createContext().holdWork("background request");
+		const second = runner.createContext().holdWork("another request");
+		expect(runner.workCompletenessReasons()).toEqual([]);
+		expect(s.getWorkCounts(true).scheduledTurns).toBe(2);
+		expect(s.getWorkCounts().scheduledTurns).toBe(0);
+		const refusal = s.quiesceForExit(request(s, { completeness: "strict" }));
+		expect(refusal.status === "refused" && refusal.reason).toBe("work_active");
+		first.release();
+		first.release();
+		expect(s.getWorkCounts(true).scheduledTurns).toBe(1);
+		second.release();
+		expect(s.getWorkCounts(true).scheduledTurns).toBe(0);
+		extension.workReporting = undefined;
+		runner.setSuspendedExtensions(() => true);
+		const suspended = s.quiesceForExit(request(s, { attempt: 2, completeness: "strict" }));
+		expect(suspended.status === "refused" && suspended.reason).toBe("completeness_unknown");
+		if (suspended.status === "refused") {
+			expect(suspended.snapshot.completenessReasons).toContain("extension_work_reporting_unknown:reporting");
+		}
+		expect(s.quiesceForExit(request(s, { attempt: 3 })).status).toBe("quiesced");
+	});
 
 	function readAttestation(s: AgentSession): TerminalAttestation {
 		return JSON.parse(fs.readFileSync(terminalAttestationPath(s.sessionFile!), "utf8")) as TerminalAttestation;

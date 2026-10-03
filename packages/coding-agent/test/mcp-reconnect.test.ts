@@ -1,3 +1,4 @@
+import { ServerActivityLedger } from "../src/session/activity-ledger";
 import { describe, expect, it, vi } from "bun:test";
 import { createMCPJsonRpcError, MCPTransportError } from "@oh-my-pi/pi-coding-agent/mcp/errors";
 import type { MCPReconnect } from "@oh-my-pi/pi-coding-agent/mcp/tool-bridge";
@@ -21,6 +22,7 @@ import { logger } from "@oh-my-pi/pi-utils";
 /** Create a minimal mock transport where `request` is controlled by the caller. */
 function mockTransport(requestFn: (...args: Parameters<MCPTransport["request"]>) => Promise<unknown>): MCPTransport {
 	return {
+		activity: new ServerActivityLedger("mcp", "test"),
 		connected: true,
 		request: requestFn as MCPTransport["request"],
 		async notify() {},

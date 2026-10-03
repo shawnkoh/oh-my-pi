@@ -168,7 +168,7 @@ With `literal: true` (capability `literal-input/1`) input hooks run first with s
 ### Quiescence
 
 - `{ id?, type: "attest", operationId: string, nonce: string }`
-- `{ id?, type: "quiesce_and_exit", operationId: string, attempt: number, epoch: number, instanceId: string, sessionId: string, deadline: number }`
+- `{ id?, type: "quiesce_and_exit", operationId: string, attempt: number, completeness: "strict" | "attested", epoch: number, instanceId: string, sessionId: string, deadline: number }`
 
 Both run on receipt, ahead of any queued command; see [Quiesce and exit](#quiesce-and-exit).
 
@@ -674,8 +674,8 @@ read-only snapshot, then asks the process to exit only if nothing changed:
    then checks deadline → pre-scan epoch → work active → live epoch after counting →
    registry completeness → session file. A scan that registers work which exits before
    counting finishes therefore refuses strict retirement with `epoch_mismatch`.
-   Strict also performs the Linux namespace census described below; an activity
-   ledger is not yet included. Both policies retain the same post-seal exit behaviour described below.
+   Strict also performs the Linux namespace census and checks the outstanding-activity
+   ledger described below. Both policies retain the same post-seal exit behaviour described below.
    There is no legacy capability alias or default policy.
 
    **Strict namespace census (Linux).** The owner must supply a single launch argv
@@ -742,11 +742,13 @@ read-only snapshot, then asks the process to exit only if nothing changed:
      process), `session_mismatch` (the session was switched since the attestation),
      `stale_attempt`, `admission_closed`, `invalid_request`, `attestation_unavailable`
      (no session file, or the attestation directory is not writable).
-     Strict also returns `completeness_unknown` when registry coverage or the namespace
-     census is incomplete. Strict `work_active` and `completeness_unknown` refusals
-     include `snapshot.registry: { path, complete, ownerScan }` and
-     `snapshot.census: { complete, work: [{ pid, comm, ppid }], reasons }`, captured
-     with admission closed. Missing or unknown `completeness` is
+     Strict also returns `completeness_unknown` when registry coverage, the namespace
+     census or extension ledger coverage is incomplete. Strict `work_active` and
+     `completeness_unknown` refusals include `snapshot.registry: { path, complete, ownerScan }`,
+     `snapshot.census: { complete, work: [{ pid, comm, ppid }], reasons }` and
+     `snapshot.completenessReasons` (including
+     `extension_work_reporting_unknown:<extension label or path>`), captured with admission
+     closed. Missing or unknown `completeness` is
      `invalid_request` before admission closes and does not consume an attempt.
 
 Each `(operationId, attempt)` is evaluated once: repeating it returns the original
@@ -760,6 +762,27 @@ Every RPC command has an explicit admission classification. Once admission close
 `live_start`, `live_mute`, `live_stop` and `fork` are refused with `admission_closed`.
 Before closure, upstream's busy-fork refusal still applies; a successful fork invalidates
 attestations bound to the previous session identity.
+
+#### Strict outstanding-activity ledger
+
+Only strict retirement includes these sources in `scheduledTurns`:
+
+- MCP requests sent without a JSON-RPC result/error, across stdio, Streamable HTTP and legacy SSE.
+  Cancellation, timeout and transport loss do **not** settle a request. A late reply or observed
+  local server process exit does. Closing a remote transport does not prove remote work stopped.
+- LSP client requests, including cancelled/timed-out requests removed from the caller promise map,
+  and queued/in-flight server-initiated requests such as `workspace/applyEdit`.
+- Extension `ctx.holdWork(reason)` holds. Every loaded extension must declare
+  `pi.workReporting = "complete"`; otherwise strict completeness is unknown, with the extension
+  named in the refusal. Existing tool, subagent, goal-continuation and delivery counts are reused.
+
+Live MCP/LSP processes are work by default. `strictIdle.idleSafeServers` (default `[]`) asserts an
+audited lifecycle/admission contract; it is not a general process allowlist. The census integration
+can call `session.getIdleSafeServerProcesses()` for `{ pid, start, label }` identities of contracted
+servers with zero ledger items. `start` is Linux `/proc/<pid>/stat` field 22, captured at spawn and
+rechecked; unknown identities, disconnected readers and broker-shared LSP links are never provided.
+The lower-level provider is `idleSafeServerProcesses(names)` in `session/activity-ledger.ts`.
+This ledger does not detect unregistered external jobs or unrelated remote services.
 
 Extensions (`ctx.quiesceAndExit`) cannot quiesce from inside their own command or event
 handler: the running handler is outstanding work, so the answer is `work_active`.

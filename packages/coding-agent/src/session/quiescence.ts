@@ -86,6 +86,8 @@ export type WorkCountKind = keyof WorkCounts;
 /** Host-provided work that the session cannot see itself (see {@link AgentSession.registerWorkSource}). */
 export interface SessionWorkSource {
 	kind: WorkCountKind;
+	/** Included only in strict retirement; attested retains its existing decision. */
+	strictOnly?: boolean;
 	/** Synchronous count; must never await. */
 	count(): number;
 }
@@ -244,6 +246,7 @@ export type QuiesceResult =
 				observedAt: string;
 				registry?: OwnedJobRegistryState;
 				census?: CensusResult;
+				completenessReasons?: string[];
 			};
 	  }
 	| {
