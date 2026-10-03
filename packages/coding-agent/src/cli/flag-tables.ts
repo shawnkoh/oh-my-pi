@@ -35,6 +35,28 @@ import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { Args } from "./args";
 import { CliUsageError } from "./usage-error";
 import { parseCensusIdentity } from "../session/namespace-census";
+import type { CensusIdentity } from "../session/namespace-census";
+
+/** Validate the reserved identity flag before profile, worker, or command dispatch. */
+export function parseLaunchIdentityArgs(argv: readonly string[]) {
+	let identity: CensusIdentity | undefined;
+	for (const arg of argv) {
+		if (arg !== "--a13-identity" && !arg.startsWith("--a13-identity=")) continue;
+		if (arg === "--a13-identity" || identity !== undefined) {
+			throw new CliUsageError("--a13-identity requires one --a13-identity=<json> argument.");
+		}
+		identity = parseLaunchIdentityValue(arg.slice("--a13-identity=".length));
+	}
+	return identity;
+}
+
+function parseLaunchIdentityValue(value: string) {
+	try {
+		return parseCensusIdentity(value);
+	} catch {
+		throw new CliUsageError("Invalid --a13-identity: expected the exact version 1 launch identity schema.");
+	}
+}
 
 /**
  * Runtime dependencies injected into setters that need to validate input.
@@ -187,11 +209,7 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 		result.providerPromptCacheKey = value;
 	},
 	"--a13-identity": (result, value) => {
-		try {
-			result.a13Identity = parseCensusIdentity(value);
-		} catch {
-			throw new CliUsageError("Invalid --a13-identity: expected the exact version 1 launch identity schema.");
-		}
+		result.a13Identity = parseLaunchIdentityValue(value);
 	},
 	"--session-dir": (result, value) => {
 		result.sessionDir = value;
