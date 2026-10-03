@@ -29,6 +29,7 @@ export interface CensusOptions {
 	io?: { read(file: string): Buffer; list(root: string): string[] };
 }
 const decimal = (value: unknown): value is string => typeof value === "string" && /^(0|[1-9]\d*)$/.test(value);
+const bootId = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const object = (value: unknown): value is Record<string, unknown> =>
 	value !== null && typeof value === "object" && !Array.isArray(value);
 export function parseCensusIdentity(json: string): CensusIdentity {
@@ -38,7 +39,7 @@ export function parseCensusIdentity(json: string): CensusIdentity {
 		Object.keys(value).sort().join() !== "boot,canonical,pid1Start,v" ||
 		value.v !== 1 ||
 		typeof value.boot !== "string" ||
-		!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(value.boot) ||
+		!bootId.test(value.boot) ||
 		!decimal(value.pid1Start) ||
 		!object(value.canonical) ||
 		Object.keys(value.canonical).sort().join() !== "pid,start" ||
@@ -78,6 +79,25 @@ export function parseProcStat(text: string, pid: number) {
 		pgrp: Number(fields[2]),
 		start: fields[19]!,
 	};
+}
+
+export type StartupIdentityOptions = Pick<CensusOptions, "procRoot" | "platform">;
+
+/** Check the owner-recorded namespace before startup can emit protocol output. */
+export function checkStartupIdentity(
+	identity: CensusIdentity | undefined,
+	options: StartupIdentityOptions = {},
+): "juiz.a13-identity-unreadable" | "juiz.a13-identity-mismatch" | undefined {
+	if (!identity || (options.platform ?? process.platform) !== "linux") return;
+	const root = options.procRoot ?? "/proc";
+	try {
+		const boot = fs.readFileSync(path.join(root, "sys/kernel/random/boot_id"), "utf8").trim();
+		const pid1Start = parseProcStat(fs.readFileSync(path.join(root, "1/stat"), "utf8"), 1).start;
+		if (!bootId.test(boot)) return "juiz.a13-identity-unreadable";
+		if (boot !== identity.boot || pid1Start !== identity.pid1Start) return "juiz.a13-identity-mismatch";
+	} catch {
+		return "juiz.a13-identity-unreadable";
+	}
 }
 
 /** Synchronous: callers must close admission before invoking this census. Never reads environ. */

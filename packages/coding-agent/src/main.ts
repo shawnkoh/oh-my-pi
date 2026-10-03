@@ -110,6 +110,7 @@ import {
 	persistForeignSession,
 } from "./session/foreign-session-import";
 import type { ForeignSessionInfo, ForeignSessionSource, ForeignSessionStore } from "./session/foreign-session-store";
+import { checkStartupIdentity, type StartupIdentityOptions } from "./session/namespace-census";
 import { resolveResumableSession, type SessionInfo } from "./session/session-listing";
 import { ForkSourceNotFoundError, SessionManager, SessionMoveRefusedError } from "./session/session-manager";
 import { shouldShowStartupSplash } from "./startup-splash";
@@ -1682,6 +1683,7 @@ interface RunRootCommandDependencies {
 	createForeignSessionStore?: (source: ForeignSessionSource) => ForeignSessionStore;
 	settings?: Settings;
 	forceSetupWizard?: boolean;
+	startupIdentity?: StartupIdentityOptions;
 }
 const DEFAULT_RUN_ROOT_DEPENDENCIES: RunRootCommandDependencies = {};
 
@@ -1700,6 +1702,12 @@ export async function runRootCommand(
 	rawArgs: string[],
 	deps: RunRootCommandDependencies = DEFAULT_RUN_ROOT_DEPENDENCIES,
 ): Promise<void> {
+	// Shared by every session mode; fail before watchdogs, discovery or RPC output.
+	const identityError = checkStartupIdentity(parsed.a13Identity, deps.startupIdentity);
+	if (identityError) {
+		fsSync.writeSync(2, `${identityError}\n`);
+		process.exit(3);
+	}
 	logger.startTiming();
 	startStartupWatchdog();
 	try {

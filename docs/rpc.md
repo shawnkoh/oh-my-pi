@@ -686,6 +686,16 @@ read-only snapshot, then asks the process to exit only if nothing changed:
    with status 2 at startup. This is launch identity, not a setting or a guest-discovered
    substitute for the owner's record.
 
+   On Linux, supplying the flag also verifies the launch identity before session
+   startup or any RPC output (including `ready`). The engine reads the trimmed
+   `/proc/sys/kernel/random/boot_id` and field 22 of `/proc/1/stat`, parsed after
+   the last `)`. Unreadable or malformed values produce exactly one stderr line,
+   `juiz.a13-identity-unreadable`; either value differing from the owner record
+   produces `juiz.a13-identity-mismatch`. Both failures exit with status 3 without
+   a handshake, so the owner must not adopt the engine. This startup check applies
+   to every session mode, independent of retirement policy; it is skipped without
+   the flag or on non-Linux platforms.
+
    Without identity strict refuses with `census-identity-missing`; non-Linux
    platforms report `census-unsupported-platform`. Attested retirement does not run
    the census. With admission closed, the census checks the proc mount for hidepid,
