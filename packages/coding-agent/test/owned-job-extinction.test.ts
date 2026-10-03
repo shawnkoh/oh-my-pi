@@ -4,7 +4,15 @@ import * as path from "node:path";
 import * as natives from "@oh-my-pi/pi-natives";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { parseArgs } from "../src/cli/args";
-import { parseExtinctValue, parseInstanceValue, type InstanceIdentity } from "../src/session/instance-identity";
+import {
+	canFence,
+	incompleteReason,
+	instanceIdentity,
+	parseExtinctValue,
+	parseInstanceValue,
+	sameInstance,
+	type InstanceIdentity,
+} from "../src/session/instance-identity";
 import {
 	OwnedJobRegistry,
 	RegistryReader,
@@ -87,6 +95,33 @@ for (const vector of fixtures.registryCases)
 		const file = path.join(temp.path(), "vector.jobs.jsonl");
 		fs.writeFileSync(file, text);
 		expect<string>(verifyOwnedJobRegistry(file, options).status).toBe(vector.status);
+	});
+
+for (const vector of fixtures.provenanceRejectCases)
+	test(`shared provenance rejection: ${vector.name}`, () => {
+		const issuer = vector.issuer as InstanceIdentity;
+		expect(instanceIdentity(issuer)).toBeNull();
+		expect(incompleteReason({ category: "pty-untracked", text: "uncertainty", issuer }).issuer).toBeNull();
+		expect(canFence("pty-untracked", issuer, vector.extinct)).toBe(false);
+		expect(canFence("pty-untracked", issuer, [issuer])).toBe(false);
+		expect(sameInstance(issuer, A)).toBe(false);
+		expect(sameInstance(A, issuer)).toBe(false);
+	});
+
+for (const vector of fixtures.launchRejectCases)
+	test(`shared launch rejection before help: ${vector.name}`, () => {
+		const args = [
+			`--a13-instance=${JSON.stringify(vector.instance)}`,
+			`--a13-extinct=${JSON.stringify(vector.extinct)}`,
+		];
+		expect(() => parseArgs(args)).toThrow();
+		const child = Bun.spawnSync([process.execPath, path.join(import.meta.dir, "../src/cli.ts"), "--help", ...args], {
+			env: process.env,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(child.exitCode).toBe(2);
+		expect(child.stdout.toString()).toBe("");
 	});
 
 for (const [category, fenced] of Object.entries(fixtures.categories))
@@ -183,7 +218,13 @@ test("startup writes an authorized historical end and can reread it", () => {
 });
 
 test("unlisted, missing, malformed and contradictory provenance remain unknown", () => {
-	for (const issuer of [C, null, { ...A, generation: "01" }, { ...A, startKey: "contradictory" }]) {
+	for (const issuer of [
+		C,
+		null,
+		{ sandboxId: "S", generation: "1" },
+		{ ...A, generation: "01" },
+		{ ...A, startKey: "contradictory" },
+	]) {
 		registry?.close();
 		const prior = { ...header(), incompleteReasons: [{ category: "pty-untracked", text: "uncertainty", issuer }] };
 		bind([prior]);

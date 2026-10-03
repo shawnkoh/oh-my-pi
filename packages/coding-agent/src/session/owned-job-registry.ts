@@ -587,9 +587,7 @@ export class RegistryReader {
 				expected && value.invocation.pid === expected.pid && value.invocation.startId === expected.startId;
 			if (
 				current &&
-				((isExpected &&
-					(!sameInstance(instanceIdentity(value.instance), current) ||
-						value.instance?.startKey !== current.startKey)) ||
+				((isExpected && !sameInstance(instanceIdentity(value.instance), current)) ||
 					(instanceKey(instanceIdentity(value.instance)) === instanceKey(current) && !isExpected))
 			) {
 				this.problems.push("issuer-conflict: current instance does not match invocation");
