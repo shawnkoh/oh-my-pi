@@ -239,12 +239,12 @@ async function trackBackgroundJobs(
 	try {
 		live = await shell.liveBackgroundJobCount();
 	} catch {
-		registry?.markIncomplete("shell background jobs could not be counted");
+		registry?.markIncomplete("shell background jobs could not be counted", "bash-background-uncounted");
 		return;
 	}
 	if (live <= 0) return;
 	if (result.cancelled || result.timedOut) {
-		registry?.markIncomplete("a cancelled shell run left background jobs running");
+		registry?.markIncomplete("a cancelled shell run left background jobs running", "bash-background-uncounted");
 		return;
 	}
 	const jobId = registry?.registerInProcessJob({
@@ -265,7 +265,7 @@ async function trackBackgroundJobs(
 			},
 			() => {
 				// The shell can no longer be asked, so its jobs can no longer be vouched for.
-				registry?.markIncomplete("shell background jobs could not be counted");
+				registry?.markIncomplete("shell background jobs could not be counted", "bash-background-uncounted");
 				release();
 			},
 		);
@@ -794,12 +794,15 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 					await trackBackgroundJobs(executionShell, result, registryContext);
 				},
 				() => {
-					registry?.markIncomplete("a shell run failed without reporting its spawned processes");
+					registry?.markIncomplete(
+						"a shell run failed without reporting its spawned processes",
+						"bash-background-uncounted",
+					);
 				},
 			)
 			.finally(settleRun)
 			.catch(error => {
-				registry?.markIncomplete("shell run survivors could not be recorded");
+				registry?.markIncomplete("shell run survivors could not be recorded", "bash-background-uncounted");
 				logger.warn("Recording shell run survivors failed", { error: String(error) });
 			});
 		// After the run is tracked: a throwing probe must not leave the run record open.

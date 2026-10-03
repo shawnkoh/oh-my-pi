@@ -708,7 +708,7 @@ export class RpcClient {
 	}
 
 	/**
-	 * Read-only snapshot of outstanding work. Requires the `quiesce-exit/1` capability.
+	 * Read-only snapshot of outstanding work. Requires the `quiesce-exit/2` capability.
 	 */
 	async attest(operationId: string, nonce: string): Promise<WorkAttestation> {
 		const response = await this.#send({ type: "attest", operationId, nonce });

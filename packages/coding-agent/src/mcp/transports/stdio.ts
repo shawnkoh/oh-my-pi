@@ -10,11 +10,12 @@ import * as path from "node:path";
 import { getProjectDir, readJsonl } from "@oh-my-pi/pi-utils";
 import type { Subprocess } from "bun";
 import { hostHasInheritableConsole } from "../../eval/py/spawn-options";
+import { isJsonRpcResponse } from "../../jsonrpc/response";
+import { ServerActivityLedger } from "../../session/activity-ledger";
 import type {
 	JsonRpcError,
 	JsonRpcMessage,
 	JsonRpcRequest,
-	JsonRpcResponse,
 	MCPRequestOptions,
 	MCPStdioServerConfig,
 	MCPTransport,
@@ -534,6 +535,7 @@ export async function terminateStdioProcess(
  */
 export class StdioTransport implements MCPTransport {
 	#process: Subprocess<"pipe", "pipe", "pipe"> | null = null;
+	readonly activity = new ServerActivityLedger("mcp", "stdio");
 	#pendingRequests = new Map<
 		string | number,
 		{
@@ -601,6 +603,8 @@ export class StdioTransport implements MCPTransport {
 			windowsVerbatimArguments: spawnCommand.windowsVerbatimArguments,
 		});
 		this.#detached = spawnCommand.detached;
+		this.activity.bindProcess(this.#process.pid);
+		void this.#process.exited.then(() => this.activity.processExited());
 
 		this.#connected = true;
 
@@ -679,15 +683,17 @@ export class StdioTransport implements MCPTransport {
 			for (const m of message) this.#handleMessage(m);
 			return;
 		}
+		if (!message || typeof message !== "object") return;
 		// Server-to-client request: has both method and id
 		if ("method" in message && "id" in message && message.id != null) {
 			void this.#handleServerRequest(message as JsonRpcRequest);
 			return;
 		}
 
-		// Response to our request: has id
-		if ("id" in message && message.id != null) {
-			const response = message as JsonRpcResponse;
+		// Ignore malformed replies: neither caller cancellation nor an id alone settles work.
+		if (isJsonRpcResponse(message)) {
+			const response = message;
+			this.activity.replied(response.id);
 			const pending = this.#pendingRequests.get(response.id);
 			if (pending) {
 				this.#pendingRequests.delete(response.id);
@@ -708,6 +714,7 @@ export class StdioTransport implements MCPTransport {
 	}
 
 	async #handleServerRequest(request: JsonRpcRequest): Promise<void> {
+		const hold = this.activity.hold();
 		try {
 			if (!this.onRequest) {
 				this.#sendResponse(request.id, undefined, { code: -32601, message: "Method not found" });
@@ -717,6 +724,8 @@ export class StdioTransport implements MCPTransport {
 			this.#sendResponse(request.id, result);
 		} catch (error) {
 			this.#sendResponse(request.id, undefined, toJsonRpcError(error));
+		} finally {
+			hold.release();
 		}
 	}
 
@@ -733,6 +742,7 @@ export class StdioTransport implements MCPTransport {
 	#handleClose(error?: Error): void {
 		if (!this.#connected) return;
 		this.#connected = false;
+		this.activity.disconnected();
 
 		const closeError =
 			error ??
@@ -842,6 +852,7 @@ export class StdioTransport implements MCPTransport {
 			cleanup();
 			reject(normalizeMCPTransportError(error, { transport: "stdio", stage: "send" }));
 		};
+		this.activity.sent(id);
 		try {
 			// Never `await` write/flush. Bun's FileSink returns a pending Promise
 			// once the OS pipe buffer fills (default ~64 KB on POSIX), and a

@@ -30,6 +30,7 @@ describe("RPC goal continuation and quiesce", () => {
 		const attested = s.attest(`op-${attempt}`, "nonce");
 		return {
 			operationId: `op-${attempt}`,
+			completeness: "attested",
 			attempt: 1,
 			epoch: attested.epoch,
 			instanceId: attested.instanceId,

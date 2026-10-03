@@ -75,6 +75,7 @@ function boundTo(attest: Frame): Record<string, unknown> {
 	const data = attest.data ?? {};
 	const session = data.session;
 	return {
+		completeness: "attested",
 		epoch: data.epoch,
 		instanceId: data.instanceId,
 		sessionId: isRecord(session) ? session.id : undefined,
@@ -105,11 +106,31 @@ describe.skipIf(process.platform === "win32").each(MODES)("RPC quiesce_and_exit 
 		return String(state.data?.sessionFile);
 	}
 
+	it.each([undefined, "unknown"])(
+		"rejects completeness %j over the wire without consuming the attempt",
+		async completeness => {
+			const attest = await rpc.request({ id: "a-invalid", type: "attest", operationId: "invalid", nonce: "n" });
+			const request = {
+				type: "quiesce_and_exit",
+				operationId: "invalid",
+				attempt: 1,
+				...boundTo(attest),
+				deadline: Date.now() + 60_000,
+			};
+			const refused = await rpc.request({ ...request, id: "invalid", completeness });
+			expect(refused.data).toMatchObject({ status: "refused", reason: "invalid_request" });
+			const passed = await rpc.request({ ...request, id: "valid" });
+			expect(passed.data).toMatchObject({ status: "quiesced", attempt: 1 });
+			expect(await rpc.child.exited).toBe(0);
+		},
+		30_000,
+	);
+
 	it("advertises the capabilities and exits after a passed quiesce with the attestation on disk", async () => {
 		const state = await rpc.request({ id: "s1", type: "get_state" });
 		// One capability list: the ready frame advertises quiesce support and get_state repeats it.
 		const ready = await rpc.waitFor(frame => frame.type === "ready", "ready");
-		expect(ready.capabilities).toEqual(expect.arrayContaining(["quiesce-exit/1", "owned-jobs/1"]));
+		expect(ready.capabilities).toEqual(expect.arrayContaining(["quiesce-exit/2", "owned-jobs/1"]));
 		expect(state.data?.capabilities).toEqual(ready.capabilities);
 		const file = String(state.data?.sessionFile);
 
@@ -134,6 +155,40 @@ describe.skipIf(process.platform === "win32").each(MODES)("RPC quiesce_and_exit 
 		const onDisk = JSON.parse(fs.readFileSync(terminalAttestationPath(file), "utf8"));
 		expect(onDisk).toMatchObject({ kind: "quiesce", operationId: "op-1", attempt: 1, epoch, interrupted: false });
 	}, 30_000);
+
+	it.each([false, true])(
+		"keeps a strict blocked process alive (EOF=%s)",
+		async eof => {
+			const file = await sessionFile();
+			const target = terminalAttestationPath(file);
+			fs.mkdirSync(path.join(target, "occupied"), { recursive: true });
+			const attest = await rpc.request({ id: "strict-a", type: "attest", operationId: "strict", nonce: "n" });
+			const request = {
+				type: "quiesce_and_exit",
+				operationId: "strict",
+				attempt: 1,
+				...boundTo(attest),
+				completeness: "strict",
+				deadline: Date.now() + 30_000,
+			};
+			const blocked = await rpc.request({ ...request, id: "strict-q" });
+			expect(blocked.data).toMatchObject({ status: "sealed_blocked" });
+			const read = await rpc.request({ id: "sealed-a", type: "attest", operationId: "strict", nonce: "n2" });
+			expect(read.data).toMatchObject({ admission: "closed", sealed: true });
+			if (eof) rpc.child.stdin.end();
+			// Child-process EOF/liveness uses the platform clock, not the test process's fake timers.
+			await Bun.sleep(1_500);
+			expect(rpc.child.exitCode).toBeNull();
+			if (!eof) {
+				fs.rmSync(target, { recursive: true });
+				const passed = await rpc.request({ ...request, attempt: 2, id: "strict-retry" });
+				expect(passed.data).toMatchObject({ status: "quiesced" });
+				expect(await withTimeout(rpc.child.exited, 15_000, "strict retry did not exit")).toBe(0);
+				expect(JSON.parse(fs.readFileSync(target, "utf8"))).toMatchObject({ kind: "quiesce", attempt: 2 });
+			}
+		},
+		30_000,
+	);
 
 	it("refuses every mutating command after a passed quiesce and exits with the transcript as attested", async () => {
 		const file = await sessionFile();
@@ -461,7 +516,7 @@ describe.skipIf(process.platform === "win32").each(MODES)("CLI --mode %s quiesce
 	it("advertises capabilities, refuses later input and exits 0 with the attestation on disk", async () => {
 		const state = await rpc.request({ id: "s1", type: "get_state" });
 		const ready = await rpc.waitFor(frame => frame.type === "ready", "ready");
-		expect(ready.capabilities).toEqual(expect.arrayContaining(["quiesce-exit/1", "owned-jobs/1"]));
+		expect(ready.capabilities).toEqual(expect.arrayContaining(["quiesce-exit/2", "owned-jobs/1"]));
 		expect(state.data?.capabilities).toEqual(ready.capabilities);
 		const attest = await rpc.request({ id: "a1", type: "attest", operationId: "cli", nonce: "n" });
 		expect(attest.data).toMatchObject({ operationId: "cli", nonce: "n", admission: "open" });

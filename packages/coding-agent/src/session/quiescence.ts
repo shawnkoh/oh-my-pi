@@ -1,3 +1,4 @@
+import type { CensusResult } from "./namespace-census";
 /**
  * Input admission, work attestation and terminal attestation for an
  * {@link AgentSession}.
@@ -14,7 +15,7 @@ import { isEnoent, logger } from "@oh-my-pi/pi-utils";
 import { fsyncDirectory, type InvocationIdentity, type OwnerScanSummary, stripJsonl } from "./owned-job-registry";
 
 /** Capability: `attest` + `quiesce_and_exit` with a terminal attestation file. */
-export const QUIESCE_EXIT_CAPABILITY = "quiesce-exit/1";
+export const QUIESCE_EXIT_CAPABILITY = "quiesce-exit/2";
 /** Capability: durable owned-job registry next to the session file. */
 export const OWNED_JOBS_CAPABILITY = "owned-jobs/1";
 /** Capabilities advertised by hosts that wire quiesce-and-exit (RPC `get_state`, extension `ctx.capabilities`). */
@@ -85,6 +86,8 @@ export type WorkCountKind = keyof WorkCounts;
 /** Host-provided work that the session cannot see itself (see {@link AgentSession.registerWorkSource}). */
 export interface SessionWorkSource {
 	kind: WorkCountKind;
+	/** Included only in strict retirement; attested retains its existing decision. */
+	strictOnly?: boolean;
 	/** Synchronous count; must never await. */
 	count(): number;
 }
@@ -157,6 +160,7 @@ export interface WorkAttestation {
 	invocation: InvocationIdentity;
 	counts: WorkCounts;
 	admission: "open" | "closed";
+	sealed: boolean;
 	registry: OwnedJobRegistryState;
 	/** ISO-8601 timestamp. */
 	observedAt: string;
@@ -164,6 +168,8 @@ export interface WorkAttestation {
 
 export interface QuiesceRequest {
 	operationId: string;
+	/** Strict requires complete work coverage; attested preserves counts-only retirement. */
+	completeness: "strict" | "attested";
 	/** Non-negative integer; each new attempt for an operation must use a higher number. */
 	attempt: number;
 	/** The epoch from the attestation the caller based its decision on. */
@@ -193,11 +199,12 @@ export type QuiesceRefusalReason =
 	| "deadline_expired"
 	| "epoch_mismatch"
 	| "work_active"
+	| "completeness_unknown"
 	| "attestation_unavailable";
 
 export interface TerminalAttestation {
 	version: typeof TERMINAL_ATTESTATION_VERSION;
-	kind: "quiesce" | "hangup";
+	kind: "quiesce" | "hangup" | "sealed_blocked";
 	operationId?: string;
 	attempt?: number;
 	session: SessionIdentity;
@@ -229,12 +236,34 @@ export type QuiesceResult =
 			path: string;
 	  }
 	| {
+			status: "sealed_blocked";
+			operationId: string;
+			attempt: number;
+			reason: string;
+			snapshot: {
+				epoch: number;
+				counts: WorkCounts;
+				observedAt: string;
+				census: CensusResult | null;
+				completenessReasons: string[];
+				registry: OwnedJobRegistryState;
+			};
+			progress: { finalized: boolean; bound: boolean; attested: boolean };
+	  }
+	| {
 			status: "refused";
 			operationId: string;
 			attempt: number;
 			reason: QuiesceRefusalReason;
 			/** Work observed while deciding (admission was closed at that instant). */
-			snapshot: { epoch: number; counts: WorkCounts; observedAt: string };
+			snapshot: {
+				epoch: number;
+				counts: WorkCounts;
+				observedAt: string;
+				registry?: OwnedJobRegistryState;
+				census?: CensusResult;
+				completenessReasons?: string[];
+			};
 	  }
 	| {
 			/**

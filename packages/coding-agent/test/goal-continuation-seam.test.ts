@@ -93,7 +93,15 @@ describe("goal continuation reservation seam", () => {
 
 	function request(s: AgentSession, attempt: number): QuiesceRequest {
 		const { epoch, instanceId, session } = s.attest("op", "nonce");
-		return { operationId: "op", attempt, epoch, instanceId, sessionId: session.id, deadline: Date.now() + 60_000 };
+		return {
+			operationId: "op",
+			completeness: "attested",
+			attempt,
+			epoch,
+			instanceId,
+			sessionId: session.id,
+			deadline: Date.now() + 60_000,
+		};
 	}
 
 	it("never lets a quiesce pass between the terminal agent_end and the continuation submission", async () => {

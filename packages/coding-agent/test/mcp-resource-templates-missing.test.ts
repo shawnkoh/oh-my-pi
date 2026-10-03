@@ -1,3 +1,4 @@
+import { ServerActivityLedger } from "../src/session/activity-ledger";
 /**
  * Regression test: a server that declares the `resources` capability but does
  * NOT implement the optional `resources/templates/list` method answers with
@@ -26,6 +27,7 @@ const BUN_EXEC = process.execPath;
 /** Minimal mock transport where `request` is controlled by the caller. */
 function mockTransport(requestFn: (method: string) => Promise<unknown>): MCPTransport {
 	return {
+		activity: new ServerActivityLedger("mcp", "test"),
 		connected: true,
 		request: ((method: string) => requestFn(method)) as MCPTransport["request"],
 		async notify() {},

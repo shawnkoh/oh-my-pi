@@ -1,3 +1,5 @@
+import type { ServerActivityLedger } from "../session/activity-ledger";
+
 import type { MCPContent, MCPImageContent, MCPResourceContent, MCPTextContent } from "@oh-my-pi/pi-tui/tools/mcp";
 /**
  * MCP (Model Context Protocol) type definitions.
@@ -297,6 +299,7 @@ export interface MCPRequestOptions {
 
 /** Transport interface - abstracts stdio/http */
 export interface MCPTransport {
+	readonly activity: ServerActivityLedger;
 	/** Send a request and wait for response */
 	request<T = unknown>(method: string, params?: Record<string, unknown>, options?: MCPRequestOptions): Promise<T>;
 

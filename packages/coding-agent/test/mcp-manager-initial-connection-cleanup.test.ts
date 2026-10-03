@@ -1,3 +1,4 @@
+import { ServerActivityLedger } from "../src/session/activity-ledger";
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -14,6 +15,7 @@ const CONFIG: MCPStdioServerConfig = {
 };
 
 class FakeTransport implements MCPTransport {
+	readonly activity = new ServerActivityLedger("mcp", "test");
 	connected = true;
 	closeCalls = 0;
 	onClose?: () => void;
