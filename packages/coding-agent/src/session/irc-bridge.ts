@@ -45,9 +45,13 @@ export class IrcBridge {
 		return this.#interrupts.length > 0 || this.#asides.length > 0 || this.#deferredWakes.length > 0;
 	}
 
-	/** Number of undelivered IRC records (interrupts, asides, deferred wakes). */
-	pendingCount(): number {
-		return this.#interrupts.length + this.#asides.length + this.#deferredWakes.length;
+	/** Undelivered records not already counted by the external-delivery owner registry. */
+	unownedPendingCount(): number {
+		let count = 0;
+		for (const record of this.#interrupts) if (!isOwnedAsideMessage(record)) count++;
+		for (const record of this.#asides) if (!isOwnedAsideMessage(record)) count++;
+		for (const record of this.#deferredWakes) if (!isOwnedAsideMessage(record)) count++;
+		return count;
 	}
 
 	/** Waits until every in-flight wake-turn relay has settled. */
@@ -135,10 +139,13 @@ export class IrcBridge {
 		this.#deferredWakes.push(...records);
 	}
 
-	/** Takes parked wake records for a post-clear monitored wake, oldest first. */
-	drainDeferredWakes(): AgentMessage[] {
-		const records = this.#deferredWakes;
-		this.#deferredWakes = [];
+	/** Takes parked wake records for a post-clear monitored wake, oldest first. Records
+	 *  matching `keep` stay parked in place. */
+	drainDeferredWakes(keep?: (record: AgentMessage) => boolean): AgentMessage[] {
+		const records: AgentMessage[] = [];
+		const kept: AgentMessage[] = [];
+		for (const record of this.#deferredWakes) (keep?.(record) ? kept : records).push(record);
+		this.#deferredWakes = kept;
 		return records;
 	}
 
