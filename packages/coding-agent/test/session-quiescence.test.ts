@@ -41,6 +41,7 @@ import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import type { DaemonCompletionNotification } from "@oh-my-pi/pi-coding-agent/launch/protocol";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
+import type { CensusResult } from "../src/session/namespace-census";
 
 const SESSION_MANAGER_MODULE = path.join(import.meta.dir, "../src/session/session-manager.ts");
 
@@ -77,6 +78,7 @@ describe("AgentSession quiesce-and-exit", () => {
 		sessionManager: SessionManager;
 		modelRegistry: ModelRegistry;
 		extensionRunner?: ExtensionRunner;
+		census?: CensusResult;
 	}
 
 	function sessionParts(): SessionParts {
@@ -103,6 +105,7 @@ describe("AgentSession quiesce-and-exit", () => {
 		manager = new AsyncJobManager({ maxRunningJobs: 4 });
 		session = new AgentSession({
 			agent,
+			namespaceCensus: parts.census ? () => parts.census! : undefined,
 			sessionManager: parts.sessionManager,
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: parts.modelRegistry,
@@ -126,6 +129,20 @@ describe("AgentSession quiesce-and-exit", () => {
 		);
 		return createSession(parts);
 	}
+
+	it("strict census work refuses without changing attested retirement", () => {
+		const census: CensusResult = { complete: true, work: [{ pid: 999, comm: "unowned", ppid: 0 }], reasons: [] };
+		const s = createSession({ ...sessionParts(), census });
+		const result = s.quiesceForExit(request(s, { completeness: "strict" }));
+		expect(result.status).toBe("refused");
+		if (result.status !== "refused") throw new Error("expected refusal");
+		expect(result.reason).toBe("work_active");
+		expect(result.snapshot.counts.detachedJobs).toBe(1);
+		expect(result.snapshot.census).toEqual(census);
+		expect(
+			s.quiesceForExit(request(s, { operationId: "attested-after-census", completeness: "attested" })).status,
+		).toBe("quiesced");
+	});
 
 	/** A quiesce request built from a fresh attestation (its epoch, instance id and session). */
 	function request(s: AgentSession, overrides: Partial<QuiesceRequest> = {}): QuiesceRequest {

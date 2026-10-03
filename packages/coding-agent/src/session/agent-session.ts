@@ -295,6 +295,7 @@ import type {
 	SteerOptions,
 	UsageFallbackConfirmer,
 } from "./agent-session-types";
+import { namespaceCensus, type CensusResult } from "./namespace-census";
 import { writeArtifact } from "./artifacts";
 import { renderAttachmentSourceNotice } from "./attachment-source-notice";
 import { formatArtifactErrorNotice, type OutputMeta, stripOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
@@ -946,6 +947,8 @@ export class AgentSession implements SettingsScope {
 	#extensionRunner: ExtensionRunner | undefined = undefined;
 	#getEvalPreludes: (() => readonly EvalPreludeDefinition[]) | undefined;
 	#reconcileBrowserMcpFilter: AgentSessionConfig["reconcileBrowserMcpFilter"];
+	#censusConfig: Pick<AgentSessionConfig, "a13Identity" | "namespaceCensus" | "idleInfrastructure">;
+	#lastCensus: CensusResult | undefined;
 	#skillDescriptions: SkillDescriptionCatalog;
 	#promptSkillsSource: readonly Skill[] | undefined;
 	#promptSkills: readonly Skill[] = [];
@@ -1682,6 +1685,11 @@ export class AgentSession implements SettingsScope {
 	readonly tokenRate: TokenRateMeter;
 
 	constructor(config: AgentSessionConfig) {
+		this.#censusConfig = {
+			a13Identity: config.a13Identity,
+			namespaceCensus: config.namespaceCensus,
+			idleInfrastructure: config.idleInfrastructure,
+		};
 		this.agent = config.agent;
 		this.tokenRate = new TokenRateMeter(text => this.agent.tokenizer.countTokens(text));
 		this.#reseedTokenRate();
@@ -3433,6 +3441,7 @@ export class AgentSession implements SettingsScope {
 	 * requests for another session object or session never use up an attempt.
 	 */
 	quiesceForExit(request: QuiesceRequest): QuiesceResult {
+		this.#lastCensus = undefined;
 		const { operationId, attempt } = request;
 		const refuse = (reason: QuiesceRefusalReason, counts?: WorkCounts): QuiesceResult => ({
 			status: "refused",
@@ -3443,8 +3452,9 @@ export class AgentSession implements SettingsScope {
 				epoch: this.#activityEpoch,
 				counts: counts ?? this.#safeCounts(),
 				observedAt: new Date().toISOString(),
-				...(reason === "completeness_unknown"
+				...(request.completeness === "strict" && (reason === "completeness_unknown" || reason === "work_active")
 					? {
+							census: this.#lastCensus,
 							registry: {
 								path: this.ownedJobRegistry?.path ?? null,
 								complete: this.#registryComplete(this.ownedJobRegistry),
@@ -3504,13 +3514,15 @@ export class AgentSession implements SettingsScope {
 			if (strict) this.ownedJobRegistry?.ensureHeader();
 			const epoch = this.#activityEpoch;
 			counts = this.getWorkCounts();
+			const completeness = strict ? this.#strictCompleteness() : undefined;
+			if (strict) counts.detachedJobs += this.#lastCensus?.work.length ?? 0;
 			const sessionFile = this.sessionManager.getSessionFile();
 			let reason: QuiesceRefusalReason | undefined;
 			if (Date.now() >= request.deadline) reason = "deadline_expired";
 			else if (epoch !== request.epoch) reason = "epoch_mismatch";
 			else if (hasOutstandingWork(counts)) reason = "work_active";
 			else if (strict && this.#activityEpoch !== request.epoch) reason = "epoch_mismatch";
-			else if (strict && !this.#strictCompleteness().complete) reason = "completeness_unknown";
+			else if (strict && !completeness?.complete) reason = "completeness_unknown";
 			else if (!sessionFile) reason = "attestation_unavailable";
 			if (reason || !sessionFile) {
 				this.#admissionClosedBy = undefined;
@@ -3637,7 +3649,32 @@ export class AgentSession implements SettingsScope {
 	/** Single strict gate for registry coverage and future completeness inputs. */
 	#strictCompleteness(): { complete: boolean; reasons: string[] } {
 		const complete = this.#registryComplete(this.ownedJobRegistry);
-		return { complete, reasons: complete ? [] : ["registry_incomplete"] };
+		return this.#censusCompleteness({ complete, reasons: complete ? [] : ["registry_incomplete"] });
+	}
+
+	#censusCompleteness(base: { complete: boolean; reasons: string[] }): { complete: boolean; reasons: string[] } {
+		const records = this.ownedJobRegistry?.openJobs() ?? [];
+		this.#lastCensus = (this.#censusConfig.namespaceCensus ?? namespaceCensus)({
+			identity: this.#censusConfig.a13Identity,
+			idleInfrastructure: this.#censusConfig.idleInfrastructure,
+			registered: records
+				.filter(record => !record.inProcess)
+				.map(record => ({
+					pid: record.pid,
+					startId: record.startId,
+					kind: record.kind,
+					supervisesLiveService: records.some(
+						service =>
+							service.kind === "service" &&
+							service.broker?.pid === record.pid &&
+							service.broker.startId === record.startId,
+					),
+				})),
+		});
+		return {
+			complete: base.complete && this.#lastCensus.complete,
+			reasons: [...base.reasons, ...this.#lastCensus.reasons],
+		};
 	}
 
 	/**

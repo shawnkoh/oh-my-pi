@@ -1,3 +1,4 @@
+import type { CensusIdentity, CensusOptions, CensusResult } from "./namespace-census";
 import type {
 	Agent,
 	AgentMessage,
@@ -152,6 +153,9 @@ export interface InitialRetryFallbackState {
 
 /** Dependencies and initial state used to construct an AgentSession. */
 export interface AgentSessionConfig {
+	a13Identity?: CensusIdentity;
+	namespaceCensus?: (options: CensusOptions) => CensusResult;
+	idleInfrastructure?: CensusOptions["idleInfrastructure"];
 	agent: Agent;
 	/** Shared with the provider stream wrapper: current Codex Code Mode tool exposure snapshot for turn metadata. */
 	codeModeState?: { namespacesInfo?: unknown };
