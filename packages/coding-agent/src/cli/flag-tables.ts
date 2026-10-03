@@ -36,6 +36,32 @@ import type { Args } from "./args";
 import { CliUsageError } from "./usage-error";
 import { parseCensusIdentity } from "../session/namespace-census";
 import type { CensusIdentity } from "../session/namespace-census";
+import { type InstanceIdentity, parseInstanceValue, parseExtinctValue } from "../session/instance-identity";
+
+export function parseInstanceArgs(argv: readonly string[]): {
+	a13Instance?: InstanceIdentity;
+	a13Extinct?: InstanceIdentity[];
+} {
+	const result: { a13Instance?: InstanceIdentity; a13Extinct?: InstanceIdentity[] } = {};
+	const seen = new Set<string>();
+	for (const arg of argv) {
+		const flag = arg.split("=", 1)[0];
+		if (flag !== "--a13-instance" && flag !== "--a13-extinct") continue;
+		if (!arg.startsWith(`${flag}=`) || seen.has(flag))
+			throw new CliUsageError(`${flag} requires one ${flag}=<json> argument.`);
+		seen.add(flag);
+		try {
+			const value = arg.slice(flag.length + 1);
+			if (flag === "--a13-instance") result.a13Instance = parseInstanceValue(value);
+			else result.a13Extinct = parseExtinctValue(value);
+		} catch {
+			throw new CliUsageError(`Invalid ${flag}: expected the exact X2 instance schema and bounds.`);
+		}
+	}
+	if (seen.size === 1)
+		throw new CliUsageError("--a13-instance and --a13-extinct must both be present or both absent.");
+	return result;
+}
 
 /** Validate the reserved identity flag before profile, worker, or command dispatch. */
 export function parseLaunchIdentityArgs(argv: readonly string[]) {
@@ -210,6 +236,12 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 	},
 	"--a13-identity": (result, value) => {
 		result.a13Identity = parseLaunchIdentityValue(value);
+	},
+	"--a13-instance": (result, value) => {
+		result.a13Instance = parseInstanceValue(value);
+	},
+	"--a13-extinct": (result, value) => {
+		result.a13Extinct = parseExtinctValue(value);
 	},
 	"--session-dir": (result, value) => {
 		result.sessionDir = value;

@@ -698,6 +698,11 @@ read-only snapshot, then asks the process to exit only if nothing changed:
    to every session mode, independent of retirement policy; it is skipped without
    the flag or on non-Linux platforms.
 
+   Strict sandbox launches also pass the paired `--a13-instance=<json I>` and
+   `--a13-extinct=<json [I,...]>` flags described under **A′ extinction fencing**
+   below. Without an instance, strict completeness is UNKNOWN with
+   `instance_identity_missing`; attested retirement keeps its existing decision.
+
    Without identity strict refuses with `census-identity-missing`; non-Linux
    platforms report `census-unsupported-platform`. Attested retirement does not run
    the census. With admission closed, the census checks the proc mount for hidepid,
@@ -853,7 +858,8 @@ the consumer last observed through `attest` (or `get_state`).
 
 **Decide from both.** A clean terminal attestation is necessary, not sufficient: after
 observing that the process exited, a consumer must also run
-`verifyOwnedJobRegistry(path, { expectedInvocation })` with that invocation and treat
+`verifyOwnedJobRegistry(path, { expectedInvocation, currentInstance, extinct })` with the
+owner-recorded invocation, instance and persisted launch extinction list, and treat
 the session as clear only if the attestation is clean **and** the verdict is `clear`.
 The attestation describes what this invocation could see when it decided; the registry
 check also covers what happened afterwards or elsewhere (another invocation writing the
@@ -870,8 +876,11 @@ false` when some process may be untracked; `writer`, a random id of the registry
 `groupMember?`, `discovered?`, `carriedFrom?`, `adoptedFrom?`; `service` records also
 `broker?` and `daemon?`, below), `end` records, and
 `incomplete` records; `start`, `end` and `incomplete` records carry `invocationPid` and
-the `writer` of their header (records written before `writer` existed have none). A
-record belongs to the latest preceding header whose invocation has its `invocationPid`
+the `writer` of their header (records written before `writer` existed have none).
+The exception is `end` with `reason:"extinct"`, whose historical routing and authorization
+are specified below. Header reasons and `incomplete.reason` are now
+`{category, text, issuer}` records; legacy strings have null provenance and cannot be fenced.
+An ordinary record belongs to the latest preceding header whose invocation has its `invocationPid`
 and, when the record has a `writer`, the same `writer` — so two session objects in one
 process writing the same file never end or hide each other's jobs; job ids restart per
 header. `startId` is an opaque,
@@ -905,13 +914,15 @@ read of a file from its start:
   live process in `detachedJobs`, so no quiesce passes while it can still start work;
 - their owner tokens go into `inheritedOwnerMarkers` and are scanned from then on,
   counting unexaminable processes started since the earliest of those invocations; a
-  token stops being copied into new headers only when its invocation is gone, no open
+  token in a launch without `--a13-instance` stops being copied into new headers only when its invocation is gone, no open
   record was adopted from that invocation, and two consecutive scans that could examine
   every candidate process — tracked or not — found none carrying it, with no counted
   process exiting between those scans and their counts (the header that issued it still
   names it, so consumers keep scanning it). Two scans that each miss a carrier that
   forks and exits during its own scan could still drop a token whose child lives; only
   this invocation's later headers and attestations lose it;
+  With an instance binding, inherited tokens instead remain until owner-authorized
+  extinction, and unfenced inherited markers keep completeness UNKNOWN;
 - their incomplete state — a header that is not exactly `complete: true` with no reasons
   (every header, including a writer's repeated one), an `incomplete` record, an
   in-process job still open once its invocation is gone, an unparseable line — makes
@@ -1054,13 +1065,14 @@ answer stays `unknown` until it exits. One that started before the agent, or run
 another uid, has no effect.
 
 **Consumer rule after the agent exited** (`verifyOwnedJobRegistry(path, {
-expectedInvocation })` in `@oh-my-pi/pi-coding-agent/session/owned-job-registry`
-implements it):
+expectedInvocation, currentInstance, extinct })` in
+`@oh-my-pi/pi-coding-agent/session/owned-job-registry` implements it).
+Apply the A′ historical fence below first; the following rules apply to everything retained:
 1. Attribute each record to the latest preceding header with its `invocationPid` and,
    when the record has a `writer`, the same `writer`. At best `unknown` for: a malformed
    line; an unknown record type; a header whose fields do not have the types above
    (`invocation.pid` an integer, `invocation.startId` a decimal string or null,
-   `sessionId` a string, `complete` a boolean, `incompleteReasons` strings, `writer` a
+   `sessionId` a string, `complete` a boolean, `incompleteReasons` an array of reason records (legacy strings are never fenceable), `writer` a
    string, `ownerMarker` and every `inheritedOwnerMarkers` entry with string
    `token`/`env` and a decimal-string or null `startId`); a start record without a string
    `jobId` and `kind`, an integer `pid`, a boolean `inProcess` and a decimal-string or
@@ -1088,6 +1100,79 @@ implements it):
    since the earliest of those invocations, a scan that reports hidden processes, or no
    scan on the platform → at best `unknown`.
 6. Otherwise `clear`.
+
+#### A′ extinction fencing
+
+Launch inputs are reserved single argv elements, with JSON but no shell quote characters:
+
+```text
+--a13-instance={"sandboxId":"S","generation":"123","startKey":"boot:pid1Start"}
+--a13-extinct=[{"sandboxId":"S","generation":"122","startKey":"boot:oldPid1Start"}]
+```
+
+Both flags must appear exactly once, or both must be absent. Malformed, split,
+duplicate, unpaired, or out-of-bounds inputs exit 2 before startup (including `--help`).
+Instance objects have exactly `sandboxId`, `generation`, and optional `startKey`;
+unknown keys are rejected. Sandbox ID and start key are strings of at most 128 UTF-8
+bytes. Generation is a canonical decimal string (`0` or a nonzero digit followed by
+digits), at most 20 digits and at most `18446744073709551615`. Each serialized instance
+is at most 512 bytes; the extinct JSON is at most 40 KiB and 64 entries. Duplicate
+`(sandboxId,generation)` entries are rejected, even with different start keys.
+Start key corroborates the identity; a contradictory key never authorizes a fence.
+The current header must exactly match the supplied instance, including the optional key.
+
+The owner selects only its own reset-eligible causal fresh-Stop records for this
+Thread's sandbox, highest generation first, capped at 64. It persists the exact list
+with the launch and reuses that list for post-exit verification. Omitted generations
+remain unfenced. Registry content, including `extinctFenced`, never adds authority.
+Without the pair, there is no instance binding or fence; strict retirement refuses
+the missing instance, while attested retirement remains unchanged.
+
+New invocation headers carry `instance`. Inherited markers have
+`{token,startId,issuer}`, and header `incompleteReasons` and `incomplete.reason` use
+`{category,text,issuer}`. Adopted start records retain `issuer` and the original
+`adoptedFrom` across later takeovers. Missing, malformed or conflicting provenance
+is null and never fenceable. Dedupe includes issuer, plus marker token, reason
+category/text, or open job ID/original invocation respectively. Corroboration is
+retained in dedupe so conflicting keys are not lost. Another invocation claiming
+the current instance yields `issuer-conflict` and UNKNOWN.
+
+Only historical entries with an owner-listed issuer and one of these categories
+are fenceable: `owner-marker`, `pty-untracked`, `debug-untracked`, `eval-untracked`,
+`bash-background-uncounted`, `service-identity-unknown`, `scan-unsound`,
+`foreign-invocation-unobservable`, `open-record-unended`, `shell-backend-unreported`.
+Fresh failures, unknown categories, file integrity (`registry-io`,
+`attestation-retire-failed`), identity/parse failures and all other categories stay.
+Fenced markers no longer participate in scan tokens or the opaque baseline.
+`extinctFenced: [{issuer,category,count}]` on a new header is audit information only.
+
+Open jobs require a persisted historical end:
+
+```json
+{"type":"end","reason":"extinct","invocationPid":123,"writer":"original-writer","jobId":"job","targetStartId":"456","issuer":{"sandboxId":"S","generation":"122"}}
+```
+
+Before ordinary record attribution, find **all** headers matching the original PID,
+exact non-null `targetStartId`, and exact writer (including absence on both sides).
+Exactly one segment and one open matching job are required. Its issuer must match
+the end's issuer and the owner's extinct list, and must not be the current instance.
+Only then remove the job. Otherwise ignore the end, keep the job, and emit
+non-fenceable `parse-extinct-target`. A later duplicate header also invalidates the
+target. Ordinary ends retain latest-header attribution. Adopted ordinary ends carry
+the original `adoptedFrom` and `issuer` to distinguish colliding job IDs.
+
+**Trust boundary (option A):** historical registry provenance and categories are
+trusted as written by the engine; hostile guest rewriting is outside the A′
+guarantee. Fencing clears stale local bookkeeping only. The independent engine and
+owner censuses, which never consult the registry, decide local cessation. Fencing
+never settles activity or waits, authorizes replacement, or clears strict custody;
+a registry `clear` verdict alone proves none of those.
+
+**Shared TS/Go vectors:** `packages/coding-agent/test/fixtures/a13-extinction.json`
+contains the schema cases, complete category table and concrete JSONL record arrays.
+For each registry case, use its `options`, inject the top-level `observations`, and
+compare `openBySegment`, parser `problemCategories`, and verifier `status`.
+The Go mirror must consume the same fixture bytes, not independently copied cases.
 
 ### `set_fast_mode` payload
 

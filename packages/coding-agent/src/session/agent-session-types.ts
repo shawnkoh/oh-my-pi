@@ -1,4 +1,5 @@
 import type { CensusIdentity, CensusOptions, CensusResult } from "./namespace-census";
+import type { InstanceIdentity } from "./instance-identity";
 import type {
 	Agent,
 	AgentMessage,
@@ -154,6 +155,8 @@ export interface InitialRetryFallbackState {
 /** Dependencies and initial state used to construct an AgentSession. */
 export interface AgentSessionConfig {
 	a13Identity?: CensusIdentity;
+	a13Instance?: InstanceIdentity;
+	a13Extinct?: InstanceIdentity[];
 	namespaceCensus?: (options: CensusOptions) => CensusResult;
 	idleInfrastructure?: CensusOptions["idleInfrastructure"];
 	agent: Agent;

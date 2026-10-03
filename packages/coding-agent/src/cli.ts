@@ -30,7 +30,7 @@ import {
 } from "@oh-my-pi/pi-utils/dirs";
 
 import { declareWorkerHostEntry, installWorkerInbox, isWorkerHostSelector } from "@oh-my-pi/pi-utils/worker-host";
-import { parseLaunchIdentityArgs } from "./cli/flag-tables";
+import { parseLaunchIdentityArgs, parseInstanceArgs } from "./cli/flag-tables";
 import { checkStartupIdentity, type StartupIdentityOptions } from "./session/namespace-census";
 import { extractProfileFlags } from "./cli/profile-bootstrap";
 import {
@@ -490,6 +490,7 @@ export async function runCli(argv: string[], startupIdentity?: StartupIdentityOp
 	let identity;
 	try {
 		identity = parseLaunchIdentityArgs(argv);
+		parseInstanceArgs(argv);
 	} catch (error) {
 		// Static import would load the agent .env before profile bootstrap.
 		// Only the terminating usage-error path may load this graph this early.

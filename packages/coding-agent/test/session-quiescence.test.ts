@@ -86,6 +86,7 @@ describe("AgentSession quiesce-and-exit", () => {
 		modelRegistry: ModelRegistry;
 		extensionRunner?: ExtensionRunner;
 		census?: CensusResult;
+		instance?: boolean;
 	}
 
 	function sessionParts(): SessionParts {
@@ -112,6 +113,8 @@ describe("AgentSession quiesce-and-exit", () => {
 		manager = new AsyncJobManager({ maxRunningJobs: 4 });
 		session = new AgentSession({
 			agent,
+			a13Instance: parts.instance === false ? undefined : { sandboxId: "test-sandbox", generation: "1" },
+			a13Extinct: parts.instance === false ? undefined : [],
 			namespaceCensus: parts.census ? () => parts.census! : undefined,
 			sessionManager: parts.sessionManager,
 			settings: Settings.isolated({ "compaction.enabled": false }),
@@ -153,6 +156,15 @@ describe("AgentSession quiesce-and-exit", () => {
 		expect(
 			s.quiesceForExit(request(s, { operationId: "attested-after-census", completeness: "attested" })).status,
 		).toBe("quiesced");
+	});
+
+	it("missing instance refuses strict retirement but leaves attested retirement unchanged", () => {
+		const s = createSession({ ...sessionParts(), instance: false, census: { complete: true, work: [], reasons: [] } });
+		const strict = s.quiesceForExit(request(s, { completeness: "strict" }));
+		expect(strict).toMatchObject({ status: "refused", reason: "completeness_unknown" });
+		if (strict.status !== "refused") throw new Error("expected refusal");
+		expect(strict.snapshot.completenessReasons).toContain("instance_identity_missing");
+		expect(s.quiesceForExit(request(s, { operationId: "attested" })).status).toBe("quiesced");
 	});
 
 	/** A quiesce request built from a fresh attestation (its epoch, instance id and session). */

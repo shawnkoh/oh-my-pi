@@ -63,6 +63,8 @@ if (process.env.QUIESCE_FIXTURE_INPUT_HOOK === "1") {
 }
 const session = new AgentSession({
 	agent,
+	a13Instance: { sandboxId: "rpc-fixture", generation: "1" },
+	a13Extinct: [],
 	namespaceCensus: () => ({ complete: true, work: [], reasons: [] }),
 	sessionManager,
 	settings: Settings.isolated({

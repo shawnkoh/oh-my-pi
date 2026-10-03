@@ -1,0 +1,455 @@
+{
+	"version": "juiz.a13-extinction-fixtures/1",
+	"observations": {
+		"processState": "gone",
+		"ownerScan": { "supported": true, "hidden": false, "scanned": 0, "processes": [], "opaque": [] }
+	},
+	"categories": {
+		"owner-marker": true,
+		"pty-untracked": true,
+		"debug-untracked": true,
+		"eval-untracked": true,
+		"bash-background-uncounted": true,
+		"service-identity-unknown": true,
+		"scan-unsound": true,
+		"foreign-invocation-unobservable": true,
+		"open-record-unended": true,
+		"shell-backend-unreported": true,
+		"attestation-retire-failed": false,
+		"registry-io": false,
+		"invocation-identity-unavailable": false,
+		"platform-untracked": false,
+		"not-persisted": false,
+		"invocation-incomplete-unspecified": false,
+		"identity-unreadable": false,
+		"reason-malformed": false,
+		"parse-header-missing": false,
+		"parse-marker-missing": false,
+		"parse-marker-inconsistent": false,
+		"parse-record-malformed": false,
+		"parse-record-unattributable": false,
+		"parse-extinct-target": false,
+		"future-category": false,
+		"toString": false
+	},
+	"schemaCases": [
+		{ "name": "zero", "value": { "sandboxId": "S", "generation": "0" }, "valid": true },
+		{
+			"name": "uint64-max",
+			"value": { "sandboxId": "S", "generation": "18446744073709551615", "startKey": "boot:10" },
+			"valid": true
+		},
+		{ "name": "lossless", "value": { "sandboxId": "S", "generation": "9007199254740993" }, "valid": true },
+		{ "name": "number", "value": { "sandboxId": "S", "generation": 1 }, "valid": false },
+		{ "name": "leading-zero", "value": { "sandboxId": "S", "generation": "01" }, "valid": false },
+		{ "name": "negative", "value": { "sandboxId": "S", "generation": "-1" }, "valid": false },
+		{ "name": "plus", "value": { "sandboxId": "S", "generation": "+1" }, "valid": false },
+		{ "name": "exponent", "value": { "sandboxId": "S", "generation": "1e2" }, "valid": false },
+		{ "name": "overflow", "value": { "sandboxId": "S", "generation": "18446744073709551616" }, "valid": false },
+		{ "name": "extra-key", "value": { "sandboxId": "S", "generation": "1", "pid": 1 }, "valid": false },
+		{ "name": "missing-sandbox", "value": { "generation": "1" }, "valid": false },
+		{ "name": "null-key", "value": { "sandboxId": "S", "generation": "1", "startKey": null }, "valid": false }
+	],
+	"registryCases": [
+		{
+			"name": "authorized-historical-end",
+			"options": { "extinct": [{ "sandboxId": "S", "generation": "1" }] },
+			"records": [
+				{
+					"type": "invocation",
+					"version": 1,
+					"invocation": { "pid": 700001, "startId": "10" },
+					"sessionId": "test",
+					"complete": true,
+					"ownerMarker": { "env": "OMP_OWNER", "token": "old" },
+					"instance": { "sandboxId": "S", "generation": "1" }
+				},
+				{
+					"type": "start",
+					"invocationPid": 700001,
+					"jobId": "job",
+					"kind": "async-job",
+					"pid": 700001,
+					"startId": "10",
+					"inProcess": true
+				},
+				{
+					"type": "end",
+					"reason": "extinct",
+					"invocationPid": 700001,
+					"jobId": "job",
+					"targetStartId": "10",
+					"issuer": { "sandboxId": "S", "generation": "1" }
+				}
+			],
+			"openBySegment": [[]],
+			"problemCategories": [],
+			"status": "clear"
+		},
+		{
+			"name": "registry-cannot-authorize-its-issuer",
+			"options": { "extinct": [] },
+			"records": [
+				{
+					"type": "invocation",
+					"version": 1,
+					"invocation": { "pid": 700001, "startId": "10" },
+					"sessionId": "test",
+					"complete": true,
+					"ownerMarker": { "env": "OMP_OWNER", "token": "old" },
+					"instance": { "sandboxId": "S", "generation": "1" },
+					"extinctFenced": [
+						{ "issuer": { "sandboxId": "S", "generation": "1" }, "category": "open-record-unended", "count": 1 }
+					]
+				},
+				{
+					"type": "start",
+					"invocationPid": 700001,
+					"jobId": "job",
+					"kind": "async-job",
+					"pid": 700001,
+					"startId": "10",
+					"inProcess": true
+				},
+				{
+					"type": "end",
+					"reason": "extinct",
+					"invocationPid": 700001,
+					"jobId": "job",
+					"targetStartId": "10",
+					"issuer": { "sandboxId": "S", "generation": "1" }
+				}
+			],
+			"openBySegment": [["job"]],
+			"problemCategories": ["parse-extinct-target"],
+			"status": "unknown"
+		},
+		{
+			"name": "pid-reuse-targets-original-start",
+			"options": { "extinct": [{ "sandboxId": "S", "generation": "1" }] },
+			"records": [
+				{
+					"type": "invocation",
+					"version": 1,
+					"invocation": { "pid": 700001, "startId": "10" },
+					"sessionId": "test",
+					"writer": "w",
+					"complete": true,
+					"ownerMarker": { "env": "OMP_OWNER", "token": "old" },
+					"instance": { "sandboxId": "S", "generation": "1" }
+				},
+				{
+					"type": "start",
+					"invocationPid": 700001,
+					"writer": "w",
+					"jobId": "job",
+					"kind": "async-job",
+					"pid": 700001,
+					"startId": "10",
+					"inProcess": true
+				},
+				{
+					"type": "invocation",
+					"version": 1,
+					"invocation": { "pid": 700001, "startId": "20" },
+					"sessionId": "test",
+					"writer": "w",
+					"complete": true,
+					"ownerMarker": { "env": "OMP_OWNER", "token": "new" },
+					"instance": { "sandboxId": "S", "generation": "2" }
+				},
+				{
+					"type": "start",
+					"invocationPid": 700001,
+					"writer": "w",
+					"jobId": "job",
+					"kind": "async-job",
+					"pid": 700001,
+					"startId": "20",
+					"inProcess": true
+				},
+				{
+					"type": "end",
+					"reason": "extinct",
+					"invocationPid": 700001,
+					"writer": "w",
+					"jobId": "job",
+					"targetStartId": "10",
+					"issuer": { "sandboxId": "S", "generation": "1" }
+				}
+			],
+			"openBySegment": [[], ["job"]],
+			"problemCategories": [],
+			"status": "unknown"
+		},
+		{
+			"name": "ambiguous-historical-header",
+			"options": { "extinct": [{ "sandboxId": "S", "generation": "1" }] },
+			"records": [
+				{
+					"type": "invocation",
+					"version": 1,
+					"invocation": { "pid": 700001, "startId": "10" },
+					"sessionId": "test",
+					"complete": true,
+					"ownerMarker": { "env": "OMP_OWNER", "token": "old" },
+					"instance": { "sandboxId": "S", "generation": "1" }
+				},
+				{
+					"type": "start",
+					"invocationPid": 700001,
+					"jobId": "job",
+					"kind": "async-job",
+					"pid": 700001,
+					"startId": "10",
+					"inProcess": true
+				},
+				{
+					"type": "invocation",
+					"version": 1,
+					"invocation": { "pid": 700001, "startId": "10" },
+					"sessionId": "test",
+					"complete": true,
+					"ownerMarker": { "env": "OMP_OWNER", "token": "old" },
+					"instance": { "sandboxId": "S", "generation": "1" }
+				},
+				{
+					"type": "end",
+					"reason": "extinct",
+					"invocationPid": 700001,
+					"jobId": "job",
+					"targetStartId": "10",
+					"issuer": { "sandboxId": "S", "generation": "1" }
+				}
+			],
+			"openBySegment": [["job"], []],
+			"problemCategories": ["parse-extinct-target"],
+			"status": "unknown"
+		},
+		{
+			"name": "issuer-mismatch",
+			"options": { "extinct": [{ "sandboxId": "S", "generation": "2" }] },
+			"records": [
+				{
+					"type": "invocation",
+					"version": 1,
+					"invocation": { "pid": 700001, "startId": "10" },
+					"sessionId": "test",
+					"complete": true,
+					"ownerMarker": { "env": "OMP_OWNER", "token": "old" },
+					"instance": { "sandboxId": "S", "generation": "1" }
+				},
+				{
+					"type": "start",
+					"invocationPid": 700001,
+					"jobId": "job",
+					"kind": "async-job",
+					"pid": 700001,
+					"startId": "10",
+					"inProcess": true
+				},
+				{
+					"type": "end",
+					"reason": "extinct",
+					"invocationPid": 700001,
+					"jobId": "job",
+					"targetStartId": "10",
+					"issuer": { "sandboxId": "S", "generation": "2" }
+				}
+			],
+			"openBySegment": [["job"]],
+			"problemCategories": ["parse-extinct-target"],
+			"status": "unknown"
+		},
+		{
+			"name": "unreadable-start-never-targeted",
+			"options": { "extinct": [{ "sandboxId": "S", "generation": "1" }] },
+			"records": [
+				{
+					"type": "invocation",
+					"version": 1,
+					"invocation": { "pid": 700001, "startId": null },
+					"sessionId": "test",
+					"complete": true,
+					"ownerMarker": { "env": "OMP_OWNER", "token": "old" },
+					"instance": { "sandboxId": "S", "generation": "1" }
+				},
+				{
+					"type": "start",
+					"invocationPid": 700001,
+					"jobId": "job",
+					"kind": "async-job",
+					"pid": 700001,
+					"startId": null,
+					"inProcess": true
+				},
+				{
+					"type": "end",
+					"reason": "extinct",
+					"invocationPid": 700001,
+					"jobId": "job",
+					"targetStartId": null,
+					"issuer": { "sandboxId": "S", "generation": "1" }
+				}
+			],
+			"openBySegment": [["job"]],
+			"problemCategories": ["parse-extinct-target"],
+			"status": "unknown"
+		},
+		{
+			"name": "later-duplicate-header-invalidates-end",
+			"options": { "extinct": [{ "sandboxId": "S", "generation": "1" }] },
+			"records": [
+				{
+					"type": "invocation",
+					"version": 1,
+					"invocation": { "pid": 700001, "startId": "10" },
+					"sessionId": "test",
+					"complete": true,
+					"ownerMarker": { "env": "OMP_OWNER", "token": "old" },
+					"instance": { "sandboxId": "S", "generation": "1" }
+				},
+				{
+					"type": "start",
+					"invocationPid": 700001,
+					"jobId": "job",
+					"kind": "async-job",
+					"pid": 700001,
+					"startId": "10",
+					"inProcess": true
+				},
+				{
+					"type": "end",
+					"reason": "extinct",
+					"invocationPid": 700001,
+					"jobId": "job",
+					"targetStartId": "10",
+					"issuer": { "sandboxId": "S", "generation": "1" }
+				},
+				{
+					"type": "invocation",
+					"version": 1,
+					"invocation": { "pid": 700001, "startId": "10" },
+					"sessionId": "test",
+					"complete": true,
+					"ownerMarker": { "env": "OMP_OWNER", "token": "old" },
+					"instance": { "sandboxId": "S", "generation": "1" }
+				}
+			],
+			"openBySegment": [["job"], []],
+			"problemCategories": ["parse-extinct-target"],
+			"status": "unknown"
+		},
+		{
+			"name": "current-instance-under-foreign-invocation",
+			"options": {
+				"expectedInvocation": { "pid": 700002, "startId": "20" },
+				"currentInstance": { "sandboxId": "S", "generation": "2" },
+				"extinct": [{ "sandboxId": "S", "generation": "2" }]
+			},
+			"records": [
+				{
+					"type": "invocation",
+					"version": 1,
+					"invocation": { "pid": 700001, "startId": "10" },
+					"sessionId": "test",
+					"complete": false,
+					"ownerMarker": { "env": "OMP_OWNER", "token": "old" },
+					"instance": { "sandboxId": "S", "generation": "2" },
+					"incompleteReasons": [
+						{
+							"category": "pty-untracked",
+							"text": "uncertainty",
+							"issuer": { "sandboxId": "S", "generation": "2" }
+						}
+					]
+				},
+				{
+					"type": "invocation",
+					"version": 1,
+					"invocation": { "pid": 700002, "startId": "20" },
+					"sessionId": "test",
+					"complete": true,
+					"ownerMarker": { "env": "OMP_OWNER", "token": "new" },
+					"instance": { "sandboxId": "S", "generation": "2" }
+				}
+			],
+			"openBySegment": [[], []],
+			"problemCategories": ["issuer-conflict"],
+			"status": "unknown"
+		},
+		{
+			"name": "legacy-start-has-no-issuer",
+			"options": { "extinct": [{ "sandboxId": "S", "generation": "1" }] },
+			"records": [
+				{
+					"type": "invocation",
+					"version": 1,
+					"invocation": { "pid": 700001, "startId": "10" },
+					"sessionId": "test",
+					"complete": true,
+					"ownerMarker": { "env": "OMP_OWNER", "token": "old" }
+				},
+				{
+					"type": "start",
+					"invocationPid": 700001,
+					"jobId": "job",
+					"kind": "async-job",
+					"pid": 700001,
+					"startId": "10",
+					"inProcess": true
+				},
+				{
+					"type": "end",
+					"reason": "extinct",
+					"invocationPid": 700001,
+					"jobId": "job",
+					"targetStartId": "10",
+					"issuer": { "sandboxId": "S", "generation": "1" }
+				}
+			],
+			"openBySegment": [["job"]],
+			"problemCategories": ["parse-extinct-target"],
+			"status": "unknown"
+		},
+		{
+			"name": "current-instance-cannot-fence-fresh-work",
+			"options": {
+				"expectedInvocation": { "pid": 700001, "startId": "10" },
+				"currentInstance": { "sandboxId": "S", "generation": "1" },
+				"extinct": [{ "sandboxId": "S", "generation": "1" }]
+			},
+			"records": [
+				{
+					"type": "invocation",
+					"version": 1,
+					"invocation": { "pid": 700001, "startId": "10" },
+					"sessionId": "test",
+					"complete": true,
+					"ownerMarker": { "env": "OMP_OWNER", "token": "old" },
+					"instance": { "sandboxId": "S", "generation": "1" }
+				},
+				{
+					"type": "start",
+					"invocationPid": 700001,
+					"jobId": "job",
+					"kind": "async-job",
+					"pid": 700001,
+					"startId": "10",
+					"inProcess": true
+				},
+				{
+					"type": "end",
+					"reason": "extinct",
+					"invocationPid": 700001,
+					"jobId": "job",
+					"targetStartId": "10",
+					"issuer": { "sandboxId": "S", "generation": "1" }
+				}
+			],
+			"openBySegment": [["job"]],
+			"problemCategories": ["parse-extinct-target"],
+			"status": "unknown"
+		}
+	]
+}
