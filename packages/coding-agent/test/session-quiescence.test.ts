@@ -719,6 +719,95 @@ describe("AgentSession quiesce-and-exit", () => {
 		expect(s.quiesceForExit(request(s))).toMatchObject({ status: "quiesced", attempt: 1 });
 	});
 
+	it.each(["finalize", "bind", "counts", "evaluation_throw", "work", "unknown", "publish", "published_then_throw"])(
+		"retains a sealed strict session after %s failure and retires on a newer attempt",
+		async failure => {
+			const census: CensusResult = { complete: true, work: [], reasons: [] };
+			const s = createSession({ ...sessionParts(), census });
+			vi.spyOn(s.ownedJobRegistry!, "scanAndCount").mockReturnValue({
+				scan: { supported: true, sound: true, scanned: 1, discovered: 0, opaque: [] },
+				live: 0,
+			});
+			await s.prompt("materialize the transcript");
+			const req = request(s, { completeness: "strict" });
+			const finalize = s.sessionManager.finalizeForExit.bind(s.sessionManager);
+			const target = terminalAttestationPath(s.sessionFile!);
+			const bind = s.ownedJobRegistry!.ensureHeader.bind(s.ownedJobRegistry);
+			let finalizing = false;
+			let broken = true;
+			s.registerWorkSource({
+				kind: "scheduledTurns",
+				strictOnly: true,
+				count: () => {
+					if (broken && finalizing && failure === "evaluation_throw") throw new Error("count failed");
+					return broken && finalizing && failure === "counts" ? 1 : 0;
+				},
+			});
+			vi.spyOn(s.ownedJobRegistry!, "ensureHeader").mockImplementation(() => {
+				if (broken && finalizing && failure === "bind") throw new Error("bind failed");
+				return bind();
+			});
+			vi.spyOn(s.sessionManager, "finalizeForExit").mockImplementation(() => {
+				finalizing = true;
+				if (broken && failure === "finalize") throw new Error("finalize failed");
+				const digest = finalize();
+				if (broken && failure === "work") census.work = [{ pid: 999, comm: "late", ppid: 0 }];
+				if (broken && failure === "unknown") {
+					census.complete = false;
+					census.reasons = ["late_unknown"];
+				}
+				if (broken && failure === "publish") fs.mkdirSync(path.join(target, "occupied"), { recursive: true });
+				return digest;
+			});
+			const rename = fs.renameSync;
+			vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+				rename(from, to);
+				if (broken && failure === "published_then_throw" && to === target) {
+					broken = false;
+					throw new Error("publication bookkeeping failed");
+				}
+			});
+			const result = s.quiesceForExit(req);
+			expect(result.status).toBe("sealed_blocked");
+			expect(quiesceEndsProcess(result)).toBe(false);
+			expect(s.isSealedBlocked).toBe(true);
+			if (result.status !== "sealed_blocked") throw new Error("expected sealed block");
+			expect(result.progress).toEqual({
+				finalized: failure !== "finalize",
+				bound: failure !== "finalize" && failure !== "bind",
+				attested: false,
+			});
+			expect(s.quiesceForExit({ ...req, operationId: "late", deadline: 0 })).toMatchObject({
+				reason: "deadline_expired",
+			});
+			expect(s.quiesceForExit({ ...req, operationId: "epoch", epoch: req.epoch + 1 })).toMatchObject({
+				reason: "epoch_mismatch",
+			});
+			expect(s.quiesceForExit({ ...req, instanceId: "foreign" })).toMatchObject({ reason: "invocation_mismatch" });
+			expect(s.quiesceForExit({ ...req, sessionId: "foreign" })).toMatchObject({ reason: "session_mismatch" });
+			expect(s.attest("read", "n")).toMatchObject({ admission: "closed", sealed: true, epoch: req.epoch });
+			expect(s.quiesceForExit(req)).toBe(result);
+			expect(s.quiesceForExit({ ...req, attempt: 0 })).toMatchObject({ reason: "stale_attempt" });
+			expect(s.quiesceForExit({ ...req, operationId: "attested", completeness: "attested" })).toMatchObject({
+				reason: "admission_closed",
+			});
+			if (failure !== "publish") expect(readAttestation(s).kind).toBe("sealed_blocked");
+			const sealedBytes = fs.readFileSync(s.sessionFile!, "utf8");
+			s.sessionManager.appendCustomEntry("must_not_append", {});
+			expect(fs.readFileSync(s.sessionFile!, "utf8")).toBe(sealedBytes);
+			broken = false;
+			census.complete = true;
+			census.work = [];
+			census.reasons = [];
+			if (failure === "publish") fs.rmSync(target, { recursive: true });
+			const passed = s.quiesceForExit({ ...req, attempt: 2 });
+			expect(passed.status).toBe("quiesced");
+			expect(quiesceEndsProcess(passed)).toBe(true);
+			expect(readAttestation(s)).toMatchObject({ kind: "quiesce", attempt: 2 });
+			expect(fs.readFileSync(s.sessionFile!, "utf8")).toBe(sealedBytes);
+		},
+	);
+
 	it("exits unattested instead of wedging when the attestation cannot be written after the seal", async () => {
 		const s = createSession();
 		await s.prompt("materialize the transcript");

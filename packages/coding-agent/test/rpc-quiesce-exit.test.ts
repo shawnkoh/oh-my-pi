@@ -169,6 +169,40 @@ describe.skipIf(process.platform === "win32").each(MODES)("RPC quiesce_and_exit 
 		expect(onDisk).toMatchObject({ kind: "quiesce", operationId: "op-1", attempt: 1, epoch, interrupted: false });
 	}, 30_000);
 
+	it.each([false, true])(
+		"keeps a strict blocked process alive (EOF=%s)",
+		async eof => {
+			const file = await sessionFile();
+			const target = terminalAttestationPath(file);
+			fs.mkdirSync(path.join(target, "occupied"), { recursive: true });
+			const attest = await rpc.request({ id: "strict-a", type: "attest", operationId: "strict", nonce: "n" });
+			const request = {
+				type: "quiesce_and_exit",
+				operationId: "strict",
+				attempt: 1,
+				...boundTo(attest),
+				completeness: "strict",
+				deadline: Date.now() + 30_000,
+			};
+			const blocked = await rpc.request({ ...request, id: "strict-q" });
+			expect(blocked.data).toMatchObject({ status: "sealed_blocked" });
+			const read = await rpc.request({ id: "sealed-a", type: "attest", operationId: "strict", nonce: "n2" });
+			expect(read.data).toMatchObject({ admission: "closed", sealed: true });
+			if (eof) rpc.child.stdin.end();
+			// Child-process EOF/liveness uses the platform clock, not the test process's fake timers.
+			await Bun.sleep(1_500);
+			expect(rpc.child.exitCode).toBeNull();
+			if (!eof) {
+				fs.rmSync(target, { recursive: true });
+				const passed = await rpc.request({ ...request, attempt: 2, id: "strict-retry" });
+				expect(passed.data).toMatchObject({ status: "quiesced" });
+				expect(await withTimeout(rpc.child.exited, 15_000, "strict retry did not exit")).toBe(0);
+				expect(JSON.parse(fs.readFileSync(target, "utf8"))).toMatchObject({ kind: "quiesce", attempt: 2 });
+			}
+		},
+		30_000,
+	);
+
 	it("refuses every mutating command after a passed quiesce and exits with the transcript as attested", async () => {
 		const file = await sessionFile();
 		await rpc.request({ id: "p0", type: "prompt", message: "materialize the transcript" });

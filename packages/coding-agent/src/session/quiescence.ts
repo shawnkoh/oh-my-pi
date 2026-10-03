@@ -160,6 +160,7 @@ export interface WorkAttestation {
 	invocation: InvocationIdentity;
 	counts: WorkCounts;
 	admission: "open" | "closed";
+	sealed: boolean;
 	registry: OwnedJobRegistryState;
 	/** ISO-8601 timestamp. */
 	observedAt: string;
@@ -203,7 +204,7 @@ export type QuiesceRefusalReason =
 
 export interface TerminalAttestation {
 	version: typeof TERMINAL_ATTESTATION_VERSION;
-	kind: "quiesce" | "hangup";
+	kind: "quiesce" | "hangup" | "sealed_blocked";
 	operationId?: string;
 	attempt?: number;
 	session: SessionIdentity;
@@ -233,6 +234,21 @@ export type QuiesceResult =
 			attestation: TerminalAttestation;
 			/** Where the attestation was written. */
 			path: string;
+	  }
+	| {
+			status: "sealed_blocked";
+			operationId: string;
+			attempt: number;
+			reason: string;
+			snapshot: {
+				epoch: number;
+				counts: WorkCounts;
+				observedAt: string;
+				census: CensusResult | null;
+				completenessReasons: string[];
+				registry: OwnedJobRegistryState;
+			};
+			progress: { finalized: boolean; bound: boolean; attested: boolean };
 	  }
 	| {
 			status: "refused";

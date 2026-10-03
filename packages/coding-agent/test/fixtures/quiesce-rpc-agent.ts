@@ -63,6 +63,7 @@ if (process.env.QUIESCE_FIXTURE_INPUT_HOOK === "1") {
 }
 const session = new AgentSession({
 	agent,
+	namespaceCensus: () => ({ complete: true, work: [], reasons: [] }),
 	sessionManager,
 	settings: Settings.isolated({
 		"compaction.enabled": false,
@@ -72,6 +73,11 @@ const session = new AgentSession({
 	ownedAsyncJobManager: new AsyncJobManager({ maxRunningJobs: 4 }),
 	agentId: "Main",
 	extensionRunner,
+});
+// Deterministic namespace/owner observations; real host processes are outside this fixture.
+spyOn(session.ownedJobRegistry!, "scanAndCount").mockReturnValue({
+	scan: { supported: true, sound: true, scanned: 1, discovered: 0, opaque: [] },
+	live: 0,
 });
 if (process.env.QUIESCE_FIXTURE_PREDICT === "1") {
 	spyOn(predictClient, "requestTextPrediction").mockImplementation(async (_method, _before, _prefix, options) => {
