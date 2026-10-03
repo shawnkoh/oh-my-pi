@@ -1,3 +1,4 @@
+import { ServerActivityLedger } from "../../src/session/activity-ledger";
 import { beforeAll, describe, expect, it } from "bun:test";
 import type { AgentTool, AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -17,6 +18,7 @@ function toolFor(result: MCPToolCallResult | ((params: MCPToolCallParams) => MCP
 	const connection = {
 		name: "rhizome-mcp",
 		transport: {
+			activity: new ServerActivityLedger("mcp", "test"),
 			request: async (method: string, params: MCPToolCallParams) => {
 				if (method === "tools/call") return typeof result === "function" ? result(params) : result;
 				throw new Error(`unexpected method ${method}`);

@@ -285,14 +285,38 @@ Handlers and tool `execute` receive `ctx` with:
 - `compact(instructionsOrOptions?)`: accepts summary focus text or `CompactOptions`, including one-off `mode: "soft" | "remote" | "snapcompact"`, `onComplete`, `onError`, and `suppressContinuation`
 - `isIdle()`, `hasPendingMessages()`, `abort()`
 - `shutdown()`
+- `holdWork(reason)` — returns `{ release() }`; holds count as work during strict retirement, and release is idempotent
 - `capabilities` — `["quiesce-exit/2", "owned-jobs/1"]` when the host can quiesce and exit (interactive, RPC), else `[]`
-- `attest(operationId, nonce)` / `quiesceAndExit({ operationId, attempt, completeness, epoch, instanceId, sessionId, deadline })` — the same synchronous contract as the RPC commands ([RPC: Quiesce and exit](rpc.md#quiesce-and-exit)); `completeness` is required (`"strict"` or `"attested"`). Strict requires registry completeness; attested preserves counts-only retirement. On `status: "quiesced"` or `"exit_unattested"` the host exits after the call returns (code 0 or 1), even if its teardown fails or overruns 30 seconds. Call it from outside your own command or event handler: a running handler is outstanding work, so the answer from inside one is `work_active`
+- `attest(operationId, nonce)` / `quiesceAndExit({ operationId, attempt, completeness, epoch, instanceId, sessionId, deadline })` — the same synchronous contract as the RPC commands ([RPC: Quiesce and exit](rpc.md#quiesce-and-exit)); `completeness` is required (`"strict"` or `"attested"`). Strict requires registry and activity-ledger completeness; attested preserves counts-only retirement. On `status: "quiesced"` or `"exit_unattested"` the host exits after the call returns (code 0 or 1), even if its teardown fails or overruns 30 seconds. Call it from outside your own command or event handler: a running handler is outstanding work, so the answer from inside one is `work_active`
 - `getSystemPrompt()`
 - `isProjectTrusted()` — always `true`; OMP does not ask for per-directory trust before loading project inputs
 - `agent` — the agent this session runs: `{ kind: "main" | "sub", id, name, depth, parentId? }`. Factories are rebound to every subagent session (task tool, eval `agent()`, `/tan` clones), so a handler can check `ctx.agent.kind === "sub"` or the lowercased agent definition `name` (for example `"explore"`) to act only in subagents. Use `kind`, not `depth`: `depth` counts `task` nesting only, so `/tan` clones are subagents at depth 0 and report `name: "sub"`
 - `runEphemeralTurn(...)` (optional; see below)
 - `memory` (optional structured memory runtime — status/search/save across the configured backend)
 - `setInterval(fn, ms, ...args)` / `setTimeout(fn, ms, ...args)` / `clearTimer(timer)` — managed timers (see below)
+
+### Complete work reporting for strict retirement
+
+Declare `pi.workReporting = "complete"` in the extension factory only after accounting for all
+background activity. No declaration is inferred for third-party extensions. A loaded extension
+without it causes strict retirement to refuse with `completeness_unknown`, naming its label/path.
+Attested retirement is unchanged.
+
+```ts
+export default function (pi: ExtensionAPI) {
+  pi.workReporting = "complete";
+  pi.on("session_start", (_event, ctx) => {
+    const work = ctx.holdWork("initial background synchronization");
+    void synchronize().finally(() => work.release());
+  });
+}
+```
+
+Acquire the hold **before** scheduling or starting work; release only when effects have settled,
+not merely when the caller cancels or stops waiting. Repeated releases are harmless. Awaited tools
+and event handlers already have session work counts; holds cover work that escapes those lifetimes,
+including effectful timers. The declaration is a contract, not automatic instrumentation of timers,
+network calls or external jobs.
 
 ### Ephemeral side turns (`ctx.runEphemeralTurn`)
 

@@ -703,6 +703,18 @@ export class ExtensionRunner {
 		)) as AgentToolResult<TDetails>;
 	}
 
+	readonly #workHolds = new Map<object, string>();
+
+	get outstandingWork(): number {
+		return this.#workHolds.size;
+	}
+
+	workCompletenessReasons(): string[] {
+		return this.getLoadedExtensions()
+			.filter(extension => extension.workReporting !== "complete")
+			.map(extension => `extension_work_reporting_unknown:${extension.label ?? extension.path}`);
+	}
+
 	constructor(
 		private readonly extensions: Extension[],
 		private readonly runtime: ExtensionRuntime,
@@ -1364,6 +1376,15 @@ export class ExtensionRunner {
 		const getModel = model ? () => model : this.#getModel;
 		const runEphemeralTurn = this.#runEphemeralTurnFn;
 		return {
+			holdWork: reason => {
+				const token = {};
+				this.#workHolds.set(token, reason);
+				return {
+					release: () => {
+						this.#workHolds.delete(token);
+					},
+				};
+			},
 			ui: this.#uiContext,
 			mode: this.#mode,
 			getContextUsage: () => this.#getContextUsageFn(),

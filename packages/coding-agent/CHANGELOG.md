@@ -26,6 +26,7 @@
 ### Changed
 
 - Quiesce requests now require `completeness: "strict" | "attested"` under `quiesce-exit/2`, with no legacy alias or default. Attested preserves counts-only retirement; strict initializes the registry before counting, rechecks the live epoch after the scan and refuses incomplete registry coverage with `completeness_unknown` and `snapshot.registry`. Missing or invalid completeness does not consume an attempt. Post-seal exit behaviour is unchanged
+- Strict retirement now counts unsettled MCP/LSP requests (including cancellations and timeouts), server-initiated requests and extension `ctx.holdWork(reason)` holds. Loaded extensions must declare `pi.workReporting = "complete"` or strict refuses with a reason naming the extension. `strictIdle.idleSafeServers` supplies contracted, zero-ledger Linux process identities to the census provider; attested retirement remains unchanged.
 - A shell `&` job that runs in-process, such as `{ sleep 1; cmd; } &`, now counts as a live background job, so its shell is kept alive (and its `retained-shell` registry record open) until it finishes, including after the agent session releases its shells
 
 ### Fixed
