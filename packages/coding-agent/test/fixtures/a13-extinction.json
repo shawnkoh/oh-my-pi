@@ -33,27 +33,95 @@
 		"toString": false
 	},
 	"schemaCases": [
-		{ "name": "zero", "value": { "sandboxId": "S", "generation": "0" }, "valid": true },
+		{ "name": "zero", "value": { "sandboxId": "S", "generation": "0", "startKey": "boot:10" }, "valid": true },
 		{
 			"name": "uint64-max",
 			"value": { "sandboxId": "S", "generation": "18446744073709551615", "startKey": "boot:10" },
 			"valid": true
 		},
-		{ "name": "lossless", "value": { "sandboxId": "S", "generation": "9007199254740993" }, "valid": true },
-		{ "name": "number", "value": { "sandboxId": "S", "generation": 1 }, "valid": false },
-		{ "name": "leading-zero", "value": { "sandboxId": "S", "generation": "01" }, "valid": false },
-		{ "name": "negative", "value": { "sandboxId": "S", "generation": "-1" }, "valid": false },
-		{ "name": "plus", "value": { "sandboxId": "S", "generation": "+1" }, "valid": false },
-		{ "name": "exponent", "value": { "sandboxId": "S", "generation": "1e2" }, "valid": false },
-		{ "name": "overflow", "value": { "sandboxId": "S", "generation": "18446744073709551616" }, "valid": false },
-		{ "name": "extra-key", "value": { "sandboxId": "S", "generation": "1", "pid": 1 }, "valid": false },
-		{ "name": "missing-sandbox", "value": { "generation": "1" }, "valid": false },
+		{ "name": "lossless", "value": { "sandboxId": "S", "generation": "9007199254740993", "startKey": "boot:10" }, "valid": true },
+		{ "name": "number", "value": { "sandboxId": "S", "generation": 1, "startKey": "boot:10" }, "valid": false },
+		{ "name": "leading-zero", "value": { "sandboxId": "S", "generation": "01", "startKey": "boot:10" }, "valid": false },
+		{ "name": "negative", "value": { "sandboxId": "S", "generation": "-1", "startKey": "boot:10" }, "valid": false },
+		{ "name": "plus", "value": { "sandboxId": "S", "generation": "+1", "startKey": "boot:10" }, "valid": false },
+		{ "name": "exponent", "value": { "sandboxId": "S", "generation": "1e2", "startKey": "boot:10" }, "valid": false },
+		{ "name": "overflow", "value": { "sandboxId": "S", "generation": "18446744073709551616", "startKey": "boot:10" }, "valid": false },
+		{ "name": "extra-key", "value": { "sandboxId": "S", "generation": "1", "startKey": "boot:10", "pid": 1 }, "valid": false },
+		{ "name": "missing-sandbox", "value": { "generation": "1", "startKey": "boot:10" }, "valid": false },
+		{ "name": "missing-start-key", "value": { "sandboxId": "S", "generation": "1" }, "valid": false },
 		{ "name": "null-key", "value": { "sandboxId": "S", "generation": "1", "startKey": null }, "valid": false }
+	],
+	"launchRejectCases": [
+		{
+			"name": "instance-missing-start-key",
+			"instance": { "sandboxId": "S", "generation": "1" },
+			"extinct": []
+		},
+		{
+			"name": "extinct-entry-missing-start-key",
+			"instance": { "sandboxId": "S", "generation": "2", "startKey": "boot:20" },
+			"extinct": [
+				{ "sandboxId": "S", "generation": "0", "startKey": "boot:0" },
+				{ "sandboxId": "S", "generation": "1" }
+			]
+		}
+	],
+	"provenanceRejectCases": [
+		{
+			"name": "issuer-missing-start-key",
+			"issuer": { "sandboxId": "S", "generation": "1" },
+			"extinct": [{ "sandboxId": "S", "generation": "1", "startKey": "boot:10" }]
+		}
 	],
 	"registryCases": [
 		{
+			"name": "historical-header-and-end-missing-start-key",
+			"options": { "extinct": [{ "sandboxId": "S", "generation": "1", "startKey": "boot:10" }] },
+			"records": [
+				{
+					"type": "invocation", "version": 1,
+					"invocation": { "pid": 700001, "startId": "10" },
+					"sessionId": "test", "complete": true,
+					"ownerMarker": { "env": "OMP_OWNER", "token": "old" },
+					"instance": { "sandboxId": "S", "generation": "1" }
+				},
+				{
+					"type": "start", "invocationPid": 700001, "jobId": "job",
+					"kind": "async-job", "pid": 700001, "startId": "10", "inProcess": true
+				},
+				{
+					"type": "end", "reason": "extinct", "invocationPid": 700001,
+					"jobId": "job", "targetStartId": "10",
+					"issuer": { "sandboxId": "S", "generation": "1" }
+				}
+			],
+			"openBySegment": [["job"]],
+			"problemCategories": ["parse-extinct-target"],
+			"status": "unknown"
+		},
+		{
+			"name": "current-header-missing-start-key",
+			"options": {
+				"expectedInvocation": { "pid": 700001, "startId": "10" },
+				"currentInstance": { "sandboxId": "S", "generation": "1", "startKey": "boot:10" },
+				"extinct": []
+			},
+			"records": [
+				{
+					"type": "invocation", "version": 1,
+					"invocation": { "pid": 700001, "startId": "10" },
+					"sessionId": "test", "complete": true,
+					"ownerMarker": { "env": "OMP_OWNER", "token": "old" },
+					"instance": { "sandboxId": "S", "generation": "1" }
+				}
+			],
+			"openBySegment": [[]],
+			"problemCategories": ["issuer-conflict"],
+			"status": "unknown"
+		},
+		{
 			"name": "authorized-historical-end",
-			"options": { "extinct": [{ "sandboxId": "S", "generation": "1" }] },
+			"options": { "extinct": [{ "sandboxId": "S", "generation": "1", "startKey": "boot:10" }] },
 			"records": [
 				{
 					"type": "invocation",
@@ -62,7 +130,7 @@
 					"sessionId": "test",
 					"complete": true,
 					"ownerMarker": { "env": "OMP_OWNER", "token": "old" },
-					"instance": { "sandboxId": "S", "generation": "1" }
+					"instance": { "sandboxId": "S", "generation": "1", "startKey": "boot:10" }
 				},
 				{
 					"type": "start",
@@ -79,7 +147,7 @@
 					"invocationPid": 700001,
 					"jobId": "job",
 					"targetStartId": "10",
-					"issuer": { "sandboxId": "S", "generation": "1" }
+					"issuer": { "sandboxId": "S", "generation": "1", "startKey": "boot:10" }
 				}
 			],
 			"openBySegment": [[]],
@@ -97,9 +165,9 @@
 					"sessionId": "test",
 					"complete": true,
 					"ownerMarker": { "env": "OMP_OWNER", "token": "old" },
-					"instance": { "sandboxId": "S", "generation": "1" },
+					"instance": { "sandboxId": "S", "generation": "1", "startKey": "boot:10" },
 					"extinctFenced": [
-						{ "issuer": { "sandboxId": "S", "generation": "1" }, "category": "open-record-unended", "count": 1 }
+						{ "issuer": { "sandboxId": "S", "generation": "1", "startKey": "boot:10" }, "category": "open-record-unended", "count": 1 }
 					]
 				},
 				{
@@ -117,7 +185,7 @@
 					"invocationPid": 700001,
 					"jobId": "job",
 					"targetStartId": "10",
-					"issuer": { "sandboxId": "S", "generation": "1" }
+					"issuer": { "sandboxId": "S", "generation": "1", "startKey": "boot:10" }
 				}
 			],
 			"openBySegment": [["job"]],
@@ -126,7 +194,7 @@
 		},
 		{
 			"name": "pid-reuse-targets-original-start",
-			"options": { "extinct": [{ "sandboxId": "S", "generation": "1" }] },
+			"options": { "extinct": [{ "sandboxId": "S", "generation": "1", "startKey": "boot:10" }] },
 			"records": [
 				{
 					"type": "invocation",
@@ -136,7 +204,7 @@
 					"writer": "w",
 					"complete": true,
 					"ownerMarker": { "env": "OMP_OWNER", "token": "old" },
-					"instance": { "sandboxId": "S", "generation": "1" }
+					"instance": { "sandboxId": "S", "generation": "1", "startKey": "boot:10" }
 				},
 				{
 					"type": "start",
@@ -156,7 +224,7 @@
 					"writer": "w",
 					"complete": true,
 					"ownerMarker": { "env": "OMP_OWNER", "token": "new" },
-					"instance": { "sandboxId": "S", "generation": "2" }
+					"instance": { "sandboxId": "S", "generation": "2", "startKey": "boot:20" }
 				},
 				{
 					"type": "start",
@@ -175,7 +243,7 @@
 					"writer": "w",
 					"jobId": "job",
 					"targetStartId": "10",
-					"issuer": { "sandboxId": "S", "generation": "1" }
+					"issuer": { "sandboxId": "S", "generation": "1", "startKey": "boot:10" }
 				}
 			],
 			"openBySegment": [[], ["job"]],
@@ -184,7 +252,7 @@
 		},
 		{
 			"name": "ambiguous-historical-header",
-			"options": { "extinct": [{ "sandboxId": "S", "generation": "1" }] },
+			"options": { "extinct": [{ "sandboxId": "S", "generation": "1", "startKey": "boot:10" }] },
 			"records": [
 				{
 					"type": "invocation",
@@ -193,7 +261,7 @@
 					"sessionId": "test",
 					"complete": true,
 					"ownerMarker": { "env": "OMP_OWNER", "token": "old" },
-					"instance": { "sandboxId": "S", "generation": "1" }
+					"instance": { "sandboxId": "S", "generation": "1", "startKey": "boot:10" }
 				},
 				{
 					"type": "start",
@@ -211,7 +279,7 @@
 					"sessionId": "test",
 					"complete": true,
 					"ownerMarker": { "env": "OMP_OWNER", "token": "old" },
-					"instance": { "sandboxId": "S", "generation": "1" }
+					"instance": { "sandboxId": "S", "generation": "1", "startKey": "boot:10" }
 				},
 				{
 					"type": "end",
@@ -219,7 +287,7 @@
 					"invocationPid": 700001,
 					"jobId": "job",
 					"targetStartId": "10",
-					"issuer": { "sandboxId": "S", "generation": "1" }
+					"issuer": { "sandboxId": "S", "generation": "1", "startKey": "boot:10" }
 				}
 			],
 			"openBySegment": [["job"], []],
@@ -228,7 +296,7 @@
 		},
 		{
 			"name": "issuer-mismatch",
-			"options": { "extinct": [{ "sandboxId": "S", "generation": "2" }] },
+			"options": { "extinct": [{ "sandboxId": "S", "generation": "2", "startKey": "boot:20" }] },
 			"records": [
 				{
 					"type": "invocation",
@@ -237,7 +305,7 @@
 					"sessionId": "test",
 					"complete": true,
 					"ownerMarker": { "env": "OMP_OWNER", "token": "old" },
-					"instance": { "sandboxId": "S", "generation": "1" }
+					"instance": { "sandboxId": "S", "generation": "1", "startKey": "boot:10" }
 				},
 				{
 					"type": "start",
@@ -254,7 +322,7 @@
 					"invocationPid": 700001,
 					"jobId": "job",
 					"targetStartId": "10",
-					"issuer": { "sandboxId": "S", "generation": "2" }
+					"issuer": { "sandboxId": "S", "generation": "2", "startKey": "boot:20" }
 				}
 			],
 			"openBySegment": [["job"]],
@@ -263,7 +331,7 @@
 		},
 		{
 			"name": "unreadable-start-never-targeted",
-			"options": { "extinct": [{ "sandboxId": "S", "generation": "1" }] },
+			"options": { "extinct": [{ "sandboxId": "S", "generation": "1", "startKey": "boot:10" }] },
 			"records": [
 				{
 					"type": "invocation",
@@ -272,7 +340,7 @@
 					"sessionId": "test",
 					"complete": true,
 					"ownerMarker": { "env": "OMP_OWNER", "token": "old" },
-					"instance": { "sandboxId": "S", "generation": "1" }
+					"instance": { "sandboxId": "S", "generation": "1", "startKey": "boot:10" }
 				},
 				{
 					"type": "start",
@@ -289,7 +357,7 @@
 					"invocationPid": 700001,
 					"jobId": "job",
 					"targetStartId": null,
-					"issuer": { "sandboxId": "S", "generation": "1" }
+					"issuer": { "sandboxId": "S", "generation": "1", "startKey": "boot:10" }
 				}
 			],
 			"openBySegment": [["job"]],
@@ -298,7 +366,7 @@
 		},
 		{
 			"name": "later-duplicate-header-invalidates-end",
-			"options": { "extinct": [{ "sandboxId": "S", "generation": "1" }] },
+			"options": { "extinct": [{ "sandboxId": "S", "generation": "1", "startKey": "boot:10" }] },
 			"records": [
 				{
 					"type": "invocation",
@@ -307,7 +375,7 @@
 					"sessionId": "test",
 					"complete": true,
 					"ownerMarker": { "env": "OMP_OWNER", "token": "old" },
-					"instance": { "sandboxId": "S", "generation": "1" }
+					"instance": { "sandboxId": "S", "generation": "1", "startKey": "boot:10" }
 				},
 				{
 					"type": "start",
@@ -324,7 +392,7 @@
 					"invocationPid": 700001,
 					"jobId": "job",
 					"targetStartId": "10",
-					"issuer": { "sandboxId": "S", "generation": "1" }
+					"issuer": { "sandboxId": "S", "generation": "1", "startKey": "boot:10" }
 				},
 				{
 					"type": "invocation",
@@ -333,7 +401,7 @@
 					"sessionId": "test",
 					"complete": true,
 					"ownerMarker": { "env": "OMP_OWNER", "token": "old" },
-					"instance": { "sandboxId": "S", "generation": "1" }
+					"instance": { "sandboxId": "S", "generation": "1", "startKey": "boot:10" }
 				}
 			],
 			"openBySegment": [["job"], []],
@@ -344,8 +412,8 @@
 			"name": "current-instance-under-foreign-invocation",
 			"options": {
 				"expectedInvocation": { "pid": 700002, "startId": "20" },
-				"currentInstance": { "sandboxId": "S", "generation": "2" },
-				"extinct": [{ "sandboxId": "S", "generation": "2" }]
+				"currentInstance": { "sandboxId": "S", "generation": "2", "startKey": "boot:20" },
+				"extinct": [{ "sandboxId": "S", "generation": "2", "startKey": "boot:20" }]
 			},
 			"records": [
 				{
@@ -355,12 +423,12 @@
 					"sessionId": "test",
 					"complete": false,
 					"ownerMarker": { "env": "OMP_OWNER", "token": "old" },
-					"instance": { "sandboxId": "S", "generation": "2" },
+					"instance": { "sandboxId": "S", "generation": "2", "startKey": "boot:20" },
 					"incompleteReasons": [
 						{
 							"category": "pty-untracked",
 							"text": "uncertainty",
-							"issuer": { "sandboxId": "S", "generation": "2" }
+							"issuer": { "sandboxId": "S", "generation": "2", "startKey": "boot:20" }
 						}
 					]
 				},
@@ -371,7 +439,7 @@
 					"sessionId": "test",
 					"complete": true,
 					"ownerMarker": { "env": "OMP_OWNER", "token": "new" },
-					"instance": { "sandboxId": "S", "generation": "2" }
+					"instance": { "sandboxId": "S", "generation": "2", "startKey": "boot:20" }
 				}
 			],
 			"openBySegment": [[], []],
@@ -380,7 +448,7 @@
 		},
 		{
 			"name": "legacy-start-has-no-issuer",
-			"options": { "extinct": [{ "sandboxId": "S", "generation": "1" }] },
+			"options": { "extinct": [{ "sandboxId": "S", "generation": "1", "startKey": "boot:10" }] },
 			"records": [
 				{
 					"type": "invocation",
@@ -405,7 +473,7 @@
 					"invocationPid": 700001,
 					"jobId": "job",
 					"targetStartId": "10",
-					"issuer": { "sandboxId": "S", "generation": "1" }
+					"issuer": { "sandboxId": "S", "generation": "1", "startKey": "boot:10" }
 				}
 			],
 			"openBySegment": [["job"]],
@@ -416,8 +484,8 @@
 			"name": "current-instance-cannot-fence-fresh-work",
 			"options": {
 				"expectedInvocation": { "pid": 700001, "startId": "10" },
-				"currentInstance": { "sandboxId": "S", "generation": "1" },
-				"extinct": [{ "sandboxId": "S", "generation": "1" }]
+				"currentInstance": { "sandboxId": "S", "generation": "1", "startKey": "boot:10" },
+				"extinct": [{ "sandboxId": "S", "generation": "1", "startKey": "boot:10" }]
 			},
 			"records": [
 				{
@@ -427,7 +495,7 @@
 					"sessionId": "test",
 					"complete": true,
 					"ownerMarker": { "env": "OMP_OWNER", "token": "old" },
-					"instance": { "sandboxId": "S", "generation": "1" }
+					"instance": { "sandboxId": "S", "generation": "1", "startKey": "boot:10" }
 				},
 				{
 					"type": "start",
@@ -444,7 +512,7 @@
 					"invocationPid": 700001,
 					"jobId": "job",
 					"targetStartId": "10",
-					"issuer": { "sandboxId": "S", "generation": "1" }
+					"issuer": { "sandboxId": "S", "generation": "1", "startKey": "boot:10" }
 				}
 			],
 			"openBySegment": [["job"]],

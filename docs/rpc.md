@@ -1098,14 +1098,15 @@ Launch inputs are reserved single argv elements, with JSON but no shell quote ch
 
 Both flags must appear exactly once, or both must be absent. Malformed, split,
 duplicate, unpaired, or out-of-bounds inputs exit 2 before startup (including `--help`).
-Instance objects have exactly `sandboxId`, `generation`, and optional `startKey`;
-unknown keys are rejected. Sandbox ID and start key are strings of at most 128 UTF-8
+Instance objects have exactly the three required fields `sandboxId`, `generation`,
+and `startKey`; missing or unknown keys are rejected. Sandbox ID and start key are strings of at most 128 UTF-8
 bytes. Generation is a canonical decimal string (`0` or a nonzero digit followed by
 digits), at most 20 digits and at most `18446744073709551615`. Each serialized instance
 is at most 512 bytes; the extinct JSON is at most 40 KiB and 64 entries. Duplicate
 `(sandboxId,generation)` entries are rejected, even with different start keys.
-Start key corroborates the identity; a contradictory key never authorizes a fence.
-The current header must exactly match the supplied instance, including the optional key.
+Start key is required corroboration, not independent authority; fencing requires
+exact equality of all three fields. The current header must exactly match the
+supplied instance; a header without `startKey` yields UNKNOWN.
 
 The owner selects only its own reset-eligible causal fresh-Stop records for this
 Thread's sandbox, highest generation first, capped at 64. It persists the exact list
@@ -1117,8 +1118,8 @@ the missing instance, while attested retirement remains unchanged.
 New invocation headers carry `instance`. Inherited markers have
 `{token,startId,issuer}`, and header `incompleteReasons` and `incomplete.reason` use
 `{category,text,issuer}`. Adopted start records retain `issuer` and the original
-`adoptedFrom` across later takeovers. Missing, malformed or conflicting provenance
-is null and never fenceable. Dedupe includes issuer, plus marker token, reason
+`adoptedFrom` across later takeovers. Missing, malformed or conflicting provenance,
+including an instance without `startKey`, is null and never fenceable. Dedupe includes issuer, plus marker token, reason
 category/text, or open job ID/original invocation respectively. Corroboration is
 retained in dedupe so conflicting keys are not lost. Another invocation claiming
 the current instance yields `issuer-conflict` and UNKNOWN.
@@ -1135,7 +1136,7 @@ Fenced markers no longer participate in scan tokens or the opaque baseline.
 Open jobs require a persisted historical end:
 
 ```json
-{"type":"end","reason":"extinct","invocationPid":123,"writer":"original-writer","jobId":"job","targetStartId":"456","issuer":{"sandboxId":"S","generation":"122"}}
+{"type":"end","reason":"extinct","invocationPid":123,"writer":"original-writer","jobId":"job","targetStartId":"456","issuer":{"sandboxId":"S","generation":"122","startKey":"boot:oldPid1Start"}}
 ```
 
 Before ordinary record attribution, find **all** headers matching the original PID,

@@ -2,7 +2,7 @@
 export interface InstanceIdentity {
 	sandboxId: string;
 	generation: string;
-	startKey?: string;
+	startKey: string;
 }
 
 export interface IncompleteReason {
@@ -18,12 +18,12 @@ export function instanceIdentity(value: unknown): InstanceIdentity | null {
 	if (typeof v.sandboxId !== "string" || Buffer.byteLength(v.sandboxId) > 128) return null;
 	if (typeof v.generation !== "string" || !/^(0|[1-9][0-9]{0,19})$/.test(v.generation)) return null;
 	if (BigInt(v.generation) > 18446744073709551615n) return null;
-	if ("startKey" in v && (typeof v.startKey !== "string" || Buffer.byteLength(v.startKey) > 128)) return null;
+	if (typeof v.startKey !== "string" || Buffer.byteLength(v.startKey) > 128) return null;
 	if (Buffer.byteLength(JSON.stringify(v)) > 512) return null;
 	return {
 		sandboxId: v.sandboxId,
 		generation: v.generation,
-		...(v.startKey === undefined ? {} : { startKey: v.startKey as string }),
+		startKey: v.startKey,
 	};
 }
 
@@ -41,8 +41,10 @@ export function sameInstance(a: InstanceIdentity | null | undefined, b: Instance
 	return (
 		!!a &&
 		!!b &&
-		instanceKey(a) === instanceKey(b) &&
-		(a.startKey === undefined || b.startKey === undefined || a.startKey === b.startKey)
+		typeof a.startKey === "string" &&
+		a.sandboxId === b.sandboxId &&
+		a.generation === b.generation &&
+		a.startKey === b.startKey
 	);
 }
 
