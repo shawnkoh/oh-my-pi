@@ -67,9 +67,16 @@ test("last closing parenthesis, zombies, and ppid zero work", () => {
 	});
 	expect(namespaceCensus(f.options)).toEqual({
 		complete: true,
-		work: [{ pid: 4, comm: "a ) b", ppid: 0 }],
+		work: [
+			{ pid: 4, comm: "a ) b", ppid: 0 },
+			{ pid: 5, comm: "zombie", ppid: 1 },
+		],
 		reasons: [],
 	});
+	// A zombie engine pid is never the engine, and a dead canonical main is never allowlisted.
+	expect(namespaceCensus({ ...f.options, enginePid: 5 }).work).toContainEqual({ pid: 5, comm: "zombie", ppid: 1 });
+	f.add(2, "sleep", 1, "20", "Z");
+	expect(namespaceCensus(f.options).reasons.join()).toContain("canonical-mismatch");
 });
 test("registered identities are counted once; internal helpers require exact idle evidence", () => {
 	const f = fixture();

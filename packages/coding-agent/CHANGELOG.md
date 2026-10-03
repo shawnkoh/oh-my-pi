@@ -4,7 +4,7 @@
 
 ### Added
 
-- Strict quiesce now requires an owner-supplied `--a13-identity=<json>` and a stable Linux PID-namespace census. Unmatched processes count as work; hidden/unreadable proc metadata, identity mismatches, missing identity and unsupported platforms fail closed. Refusals carry census work and reasons; attested retirement is unchanged.
+- Strict quiesce now requires an owner-supplied `--a13-identity=<json>` and a stable Linux PID-namespace census. Unmatched processes count as work, as do zombie/dead processes (a zombie leader can still have live threads); a dead pid 1 or canonical main fails closed. Hidden/unreadable proc metadata, identity mismatches, missing identity and unsupported platforms fail closed. Refusals carry census work and reasons; attested retirement is unchanged.
 - On Linux, `--a13-identity` now verifies boot ID and PID 1 start ticks before session startup or any RPC handshake. Unreadable/malformed proc identity or a mismatch exits 3 with one `juiz.a13-identity-unreadable` or `juiz.a13-identity-mismatch` stderr line; malformed flags still exit 2. No startup check runs without the flag or on non-Linux.
 - Added `--goal <objective>` for interactive launches: it starts a fresh session in goal mode and begins working on the objective immediately, without typing `/goal` ([#13879](https://github.com/can1357/oh-my-pi/pull/13879) by [@shawnkoh](https://github.com/shawnkoh))
 - Added the default-off `goal.toolDefault` setting, which lets agents start goal mode themselves in ordinary sessions; an explicit `--tools=...,goal` now also exposes the tool while the default stays hidden ([#13877](https://github.com/can1357/oh-my-pi/pull/13877) by [@shawnkoh](https://github.com/shawnkoh))
