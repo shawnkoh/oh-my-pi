@@ -35,6 +35,7 @@ import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import { type Theme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { AsyncJobSnapshot } from "../../session/agent-session";
+import { ExtensionActivityLedger } from "../../session/activity-ledger";
 import { EXTERNAL_DELIVERY_CAPABILITY } from "../../session/external-delivery";
 import { SESSION_CAPABILITIES } from "../../session/quiescence";
 import { MAIN_AGENT_ID } from "../../registry/agent-registry";
@@ -449,6 +450,7 @@ export async function emitSessionShutdownEvent(extensionRunner: ExtensionRunner 
 	} finally {
 		extensionRunner.disposeFileFallbacks();
 		extensionRunner.clearManagedTimers();
+		extensionRunner.disposeWorkReporting();
 	}
 }
 
@@ -720,16 +722,20 @@ export class ExtensionRunner {
 		)) as AgentToolResult<TDetails>;
 	}
 
-	readonly #workHolds = new Map<object, string>();
+	readonly #workActivity = new ExtensionActivityLedger(() => this.workCompletenessReasons());
 
 	get outstandingWork(): number {
-		return this.#workHolds.size;
+		return this.#workActivity.count;
 	}
 
 	workCompletenessReasons(): string[] {
 		return this.getLoadedExtensions()
 			.filter(extension => extension.workReporting !== "complete")
 			.map(extension => `extension_work_reporting_unknown:${extension.label ?? extension.path}`);
+	}
+
+	disposeWorkReporting(): void {
+		this.#workActivity.dispose();
 	}
 
 	constructor(
@@ -1412,15 +1418,7 @@ export class ExtensionRunner {
 		const getModel = model ? () => model : this.#getModel;
 		const runEphemeralTurn = this.#runEphemeralTurnFn;
 		return {
-			holdWork: reason => {
-				const token = {};
-				this.#workHolds.set(token, reason);
-				return {
-					release: () => {
-						this.#workHolds.delete(token);
-					},
-				};
-			},
+			holdWork: reason => this.#workActivity.hold(reason),
 			ui: this.#uiContext,
 			mode: this.#mode,
 			getContextUsage: () => this.#getContextUsageFn(),

@@ -15,7 +15,7 @@ import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-in
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { ServerActivityLedger } from "@oh-my-pi/pi-coding-agent/session/activity-ledger";
+import { ExtensionActivityLedger, ServerActivityLedger } from "@oh-my-pi/pi-coding-agent/session/activity-ledger";
 import * as activityLedger from "@oh-my-pi/pi-coding-agent/session/activity-ledger";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import type { DeliveryHandle } from "@oh-my-pi/pi-coding-agent/session/external-delivery";
@@ -58,6 +58,7 @@ describe("AgentSession quiesce-and-exit", () => {
 	let providerGate: PromiseWithResolvers<void> | undefined;
 
 	beforeEach(() => {
+		ExtensionActivityLedger.resetForTests();
 		tempDir = TempDir.createSync("@omp-quiesce-");
 		authStorage = createInMemoryAuthStorage();
 		authStorage.keys.setRuntime("anthropic", "test-key");
@@ -73,6 +74,7 @@ describe("AgentSession quiesce-and-exit", () => {
 		const current = session;
 		session = undefined;
 		if (current) await current.dispose();
+		ExtensionActivityLedger.resetForTests();
 		authStorage.close();
 		AsyncJobManager.resetForTests();
 		vi.restoreAllMocks();
@@ -93,7 +95,7 @@ describe("AgentSession quiesce-and-exit", () => {
 		};
 	}
 
-	function createSession(parts: SessionParts = sessionParts()): AgentSession {
+	function createSession(parts: SessionParts = sessionParts(), agentId = "Main"): AgentSession {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("expected bundled model");
 		mock = createMockModel({
@@ -115,16 +117,20 @@ describe("AgentSession quiesce-and-exit", () => {
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: parts.modelRegistry,
 			ownedAsyncJobManager: manager,
-			agentId: "Main",
+			agentId,
 			...(parts.extensionRunner ? { extensionRunner: parts.extensionRunner } : {}),
 		});
 		return session;
 	}
 
-	async function createSessionWithExtension(factory: ExtensionFactory): Promise<AgentSession> {
+	async function createSessionWithExtension(
+		factory: ExtensionFactory,
+		agentId = "Main",
+		label = "quiesce",
+	): Promise<AgentSession> {
 		const parts = sessionParts();
 		const runtime = new ExtensionRuntime();
-		const extension = await loadExtensionFromFactory(factory, tempDir.path(), new EventBus(), runtime, "quiesce");
+		const extension = await loadExtensionFromFactory(factory, tempDir.path(), new EventBus(), runtime, label);
 		parts.extensionRunner = new ExtensionRunner(
 			[extension],
 			runtime,
@@ -132,7 +138,7 @@ describe("AgentSession quiesce-and-exit", () => {
 			parts.sessionManager,
 			parts.modelRegistry,
 		);
-		return createSession(parts);
+		return createSession(parts, agentId);
 	}
 
 	it("strict census work refuses without changing attested retirement", () => {
@@ -230,6 +236,58 @@ describe("AgentSession quiesce-and-exit", () => {
 			expect(suspended.snapshot.completenessReasons).toContain("extension_work_reporting_unknown:reporting");
 		}
 		expect(s.quiesceForExit(request(s, { attempt: 3 })).status).toBe("quiesced");
+	});
+
+	it("keeps a completed child's hold visible to main through parking and disposal", async () => {
+		let hold: { release(): void } | undefined;
+		const child = await createSessionWithExtension(api => {
+			api.workReporting = "complete";
+			api.on("agent_end", (_event, ctx) => {
+				hold = ctx.holdWork("child background effects");
+			});
+		}, "0-Child", "child");
+		const main = await createSessionWithExtension(api => {
+			api.workReporting = "complete";
+		});
+		try {
+			await child.prompt("complete the child task");
+			expect(child.isStreaming).toBe(false);
+			expect(hold).toBeDefined();
+			for (const parked of [false, true]) {
+				if (parked) await child.dispose();
+				const refusal = main.quiesceForExit(request(main, { completeness: "strict", attempt: parked ? 2 : 1 }));
+				expect(refusal.status === "refused" && refusal.reason).toBe("work_active");
+				expect(main.getWorkCounts(true).scheduledTurns).toBe(1);
+				expect(main.getWorkCounts().scheduledTurns).toBe(0);
+			}
+			hold!.release();
+			hold!.release();
+			expect(main.getWorkCounts(true).scheduledTurns).toBe(0);
+		} finally {
+			hold?.release();
+			await child.dispose();
+		}
+	});
+
+	it("names a child-only undeclared extension in main strict completeness, even after disposal", async () => {
+		const child = await createSessionWithExtension(() => {}, "0-Child", "child-only");
+		const main = await createSessionWithExtension(api => {
+			api.workReporting = "complete";
+		});
+		try {
+			for (const disposed of [false, true]) {
+				if (disposed) await child.dispose();
+				const refusal = main.quiesceForExit(request(main, { completeness: "strict", attempt: disposed ? 2 : 1 }));
+				expect(refusal.status === "refused" && refusal.reason).toBe("completeness_unknown");
+				if (refusal.status === "refused") {
+					expect(refusal.snapshot.completenessReasons).toContain("extension_work_reporting_unknown:child-only");
+					expect(refusal.snapshot.completenessReasons).not.toContain("extension_work_reporting_unknown:quiesce");
+				}
+			}
+			expect(main.quiesceForExit(request(main, { attempt: 3 })).status).toBe("quiesced");
+		} finally {
+			await child.dispose();
+		}
 	});
 
 	function readAttestation(s: AgentSession): TerminalAttestation {

@@ -298,8 +298,11 @@ Handlers and tool `execute` receive `ctx` with:
 ### Complete work reporting for strict retirement
 
 Declare `pi.workReporting = "complete"` in the extension factory only after accounting for all
-background activity. No declaration is inferred for third-party extensions. A loaded extension
-without it causes strict retirement to refuse with `completeness_unknown`, naming its label/path.
+background activity. No declaration is inferred for third-party extensions. Accounting covers
+every extension runner in the engine process, including child sessions and suspended extensions.
+An extension without the declaration causes strict retirement to refuse with `completeness_unknown`,
+naming its label/path, even when retirement is requested by another session. Disposing an undeclared
+runner retains that uncertainty: shutdown cannot prove its unreported background work has stopped.
 Attested retirement is unchanged.
 
 ```ts
@@ -313,10 +316,11 @@ export default function (pi: ExtensionAPI) {
 ```
 
 Acquire the hold **before** scheduling or starting work; release only when effects have settled,
-not merely when the caller cancels or stops waiting. Repeated releases are harmless. Awaited tools
-and event handlers already have session work counts; holds cover work that escapes those lifetimes,
-including effectful timers. The declaration is a contract, not automatic instrumentation of timers,
-network calls or external jobs.
+not merely when the caller cancels or stops waiting. Holds remain counted across task completion,
+parking and runner/session disposal until explicitly released. Repeated releases are harmless.
+Awaited tools and event handlers already have session work counts; holds cover work that escapes
+those lifetimes, including effectful timers. The declaration is a contract, not automatic
+instrumentation of timers, network calls or external jobs.
 
 ### Ephemeral side turns (`ctx.runEphemeralTurn`)
 

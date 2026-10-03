@@ -8,6 +8,69 @@ export interface IdleSafeProcess {
 
 const servers = new Set<ServerActivityLedger>();
 
+const extensions = new Set<ExtensionActivityLedger>();
+
+/** Engine-wide ownership: disposing a session does not settle escaped extension work. */
+export class ExtensionActivityLedger {
+	readonly #holds = new Map<object, string>();
+	#disposed = false;
+
+	constructor(private completenessReasons: () => string[] = () => []) {
+		extensions.add(this);
+	}
+
+	get count(): number {
+		return this.#holds.size;
+	}
+
+	hold(reason: string): { release(): void } {
+		const token = {};
+		this.#holds.set(token, reason);
+		extensions.add(this);
+		return {
+			release: () => {
+				this.#holds.delete(token);
+				this.#prune();
+			},
+		};
+	}
+
+	/** Drop the runner reference, but retain holds and uncertainty after shutdown/parking. */
+	dispose(): void {
+		if (this.#disposed) return;
+		const reasons = this.completenessReasons();
+		this.completenessReasons = () => reasons;
+		this.#disposed = true;
+		this.#prune();
+	}
+
+	#prune(): void {
+		if (this.#disposed && this.count === 0 && this.completenessReasons().length === 0) extensions.delete(this);
+	}
+
+	static outstandingWork(): number {
+		let count = 0;
+		for (const extension of extensions) count += extension.count;
+		return count;
+	}
+
+	static completenessReasons(): string[] {
+		return [...new Set([...extensions].flatMap(extension => extension.completenessReasons()))];
+	}
+
+	/** Tests sharing a process must explicitly isolate their simulated engines. */
+	static resetForTests(): void {
+		extensions.clear();
+	}
+}
+
+export function holdExtensionWork(reason: string): { release(): void } {
+	const ledger = new ExtensionActivityLedger();
+	const hold = ledger.hold(reason);
+	ledger.dispose();
+	return hold;
+}
+
 /** Transport promises can reject before work settles. Only wire replies or process death settle requests. */
 export class ServerActivityLedger {
 	readonly #requests = new Set<string | number>();

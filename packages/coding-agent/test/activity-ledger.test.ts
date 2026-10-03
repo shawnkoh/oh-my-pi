@@ -16,6 +16,20 @@ async function until(predicate: () => boolean): Promise<void> {
 	}
 }
 
+// Every frame must leave request 1 unsettled: malformed shapes or a different request id.
+const nonSettlingReplies: unknown[] = [
+	{ jsonrpc: "2.0", id: 1 },
+	{ jsonrpc: "1.0", id: 1, result: null },
+	{ jsonrpc: "2.0", id: 1, error: null },
+	{ jsonrpc: "2.0", id: 1, error: { code: "bad", message: "bad" } },
+	{ jsonrpc: "2.0", id: 1, error: { code: -1 } },
+	{ jsonrpc: "2.0", id: 1, result: null, error: { code: -1, message: "bad" } },
+	{ jsonrpc: "2.0", id: "1", result: null },
+	{ jsonrpc: "2.0", id: 2, result: null },
+	null,
+	42,
+];
+
 describe("strict outstanding-activity ledger", () => {
 	it.each(["result", "error", "exit"])("keeps cancelled MCP work until %s", async outcome => {
 		const transport = new StdioTransport({
@@ -28,6 +42,10 @@ describe("strict outstanding-activity ledger", () => {
 				readline.createInterface({input:process.stdin}).on('line', line => {
 					const msg = JSON.parse(line);
 					if (msg.method === 'wait') pending = msg.id;
+					if (msg.method === 'frame') {
+						console.log(JSON.stringify(msg.params.frame));
+						console.log(JSON.stringify({jsonrpc:'2.0', method:'frame-read'}));
+					}
 					if (msg.method === 'settle') {
 						if (${JSON.stringify(outcome)} === 'exit') process.exit(0);
 						console.log(JSON.stringify({jsonrpc:'2.0', id:pending,
@@ -46,6 +64,15 @@ describe("strict outstanding-activity ledger", () => {
 			abort.abort(new Error("cancelled by caller"));
 			await expect(request).rejects.toThrow("cancelled by caller");
 			expect(transport.activity.count).toBe(1);
+			for (const frame of nonSettlingReplies) {
+				const read = Promise.withResolvers<void>();
+				transport.onNotification = method => {
+					if (method === "frame-read") read.resolve();
+				};
+				await transport.notify("frame", { frame });
+				await read.promise;
+				expect(transport.activity.count).toBe(1);
+			}
 			await transport.notify("settle");
 			await until(() => transport.activity.count === 0);
 		} finally {
@@ -53,7 +80,7 @@ describe("strict outstanding-activity ledger", () => {
 		}
 	});
 
-	it("counts LSP cancellation until a late wire reply, not promise rejection", async () => {
+	it.each(["result", "error"])("counts LSP cancellation until a valid late %s reply", async outcome => {
 		const fixture = lspFixture();
 		const reader = startMessageReader(fixture.client);
 		try {
@@ -66,7 +93,22 @@ describe("strict outstanding-activity ledger", () => {
 			await expect(request).rejects.toThrow("cancelled");
 			expect(fixture.client.pendingRequests.size).toBe(0);
 			expect(getLspActivity(fixture.client).count).toBe(1);
-			fixture.receive({ jsonrpc: "2.0", id: 1, error: { code: -32800, message: "cancelled" } });
+			for (const frame of nonSettlingReplies) {
+				const version = fixture.client.diagnosticsVersion;
+				fixture.receive(frame);
+				fixture.receive({
+					jsonrpc: "2.0",
+					method: "textDocument/publishDiagnostics",
+					params: { uri: "file:///ledger-marker", diagnostics: [] },
+				});
+				await until(() => fixture.client.diagnosticsVersion > version);
+				expect(getLspActivity(fixture.client).count).toBe(1);
+			}
+			fixture.receive({
+				jsonrpc: "2.0",
+				id: 1,
+				...(outcome === "error" ? { error: { code: -32800, message: "cancelled" } } : { result: null }),
+			});
 			await until(() => getLspActivity(fixture.client).count === 0);
 		} finally {
 			fixture.close();
@@ -219,7 +261,7 @@ function lspFixture(blockWrite = false, sharedMux = false) {
 		close,
 		written,
 		release,
-		receive: (message: object) => {
+		receive: (message: unknown) => {
 			const body = JSON.stringify(message);
 			controller.enqueue(Buffer.from(`Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`));
 		},
