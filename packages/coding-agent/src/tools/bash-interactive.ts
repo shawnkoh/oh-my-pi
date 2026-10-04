@@ -7,6 +7,7 @@ import { Settings } from "../config/settings";
 import { OutputSink, type OutputSummary } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { TerminalGraphicsDecoder } from "../utils/terminal-graphics";
 import { resolveOutputMaxColumns, resolveOutputSinkArtifactMaxBytes, resolveOutputSinkHeadBytes } from "./output-meta";
+import { OwnedJobRegistry, ownerMarkerEnv } from "../session/owned-job-registry";
 
 export interface BashInteractiveResult extends OutputSummary {
 	exitCode: number | undefined;
@@ -28,6 +29,8 @@ export async function runInteractiveBashPty(
 		artifactId?: string;
 	},
 ): Promise<BashInteractiveResult> {
+	// A PTY run reports no spawned processes, so the registry can no longer vouch for every
+	// process; the run itself is recorded so a crash mid-run leaves an open record.
 	const settings = await Settings.init();
 	// Load the xterm Terminal ctor here (async boundary) — the ui.custom factory below is sync.
 	const XtermTerminal = await loadXtermTerminal();
@@ -47,6 +50,7 @@ export async function runInteractiveBashPty(
 		artifactMaxBytes: resolveOutputSinkArtifactMaxBytes(settings),
 		maxColumns: resolveOutputMaxColumns(settings),
 	});
+	const endPtyRun = OwnedJobRegistry.instance()?.beginPtyRun({ command: options.command, cwd: options.cwd });
 	try {
 		const result = await ui.custom<BashInteractiveResult>(
 			(tui, uiTheme, _keybindings, done) => {
@@ -109,9 +113,9 @@ export async function runInteractiveBashPty(
 							command: options.command,
 							cwd: options.cwd,
 							timeoutMs: options.timeoutMs,
-							// A real TERM so editors, pagers, and TUIs behave like a normal
-							// terminal; direnv's values win over everything.
-							env: { ...interactiveShellEnv, TERM: "xterm-256color", ...options.env },
+							// Preserve lifecycle-rebuilt shell env; the owner marker must win
+							// over user overrides so escaped descendants remain attributable.
+							env: { ...interactiveShellEnv, TERM: "xterm-256color", ...options.env, ...ownerMarkerEnv() },
 							signal: options.signal,
 							cols,
 							rows,
@@ -136,6 +140,7 @@ export async function runInteractiveBashPty(
 		);
 		return result;
 	} finally {
+		endPtyRun?.();
 		await sink.dispose();
 	}
 }

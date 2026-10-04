@@ -30,6 +30,7 @@ from omp_rpc import (
     parse_notification,
     parse_session_state,
 )
+from omp_rpc._wire import parse_quiesce_result, QuiescedResult
 
 
 GOAL = {
@@ -45,6 +46,31 @@ GOAL = {
 
 
 class ProtocolParsingTests(unittest.TestCase):
+    def test_quiesce_result_and_attestation_version(self) -> None:
+        raw = {
+            "status": "quiesced", "operationId": "op", "attempt": 1, "path": "s.terminal.json",
+            "attestation": {
+                "version": 1, "kind": "quiesce", "session": {"id": "s", "file": None},
+                "invocation": {"pid": 1, "startId": None, "startTime": None},
+                "instanceId": "i", "epoch": 2,
+                "counts": dict.fromkeys([
+                    "streaming", "queuedInput", "asyncJobs", "subagents", "retainedJobs",
+                    "detachedJobs", "compacting", "handoff", "goalContinuationScheduled", "scheduledTurns",
+                ], 0),
+                "interrupted": False, "registryComplete": True, "registryPath": None,
+                "ownerScan": None, "writtenAt": "now",
+            },
+        }
+        result = parse_quiesce_result(raw)
+        self.assertIsInstance(result, QuiescedResult)
+        self.assertEqual(result.attestation.session.id, "s")
+        self.assertEqual(result.attestation.version, 1)
+        for invalid in [2, "1", True, None]:
+            with self.subTest(version=invalid), self.assertRaises(ValueError):
+                parse_quiesce_result({**raw, "attestation": {**raw["attestation"], "version": invalid}})
+        with self.assertRaises(ValueError):
+            parse_quiesce_result({**raw, "status": "future"})
+
     def test_parse_session_state_goal(self) -> None:
         base = {"sessionId": "s", "goal": None}
         self.assertIsNone(parse_session_state(base).goal)

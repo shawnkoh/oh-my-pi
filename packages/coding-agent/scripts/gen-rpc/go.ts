@@ -564,11 +564,9 @@ class GoEmitter {
 		for (const field of def.fields) {
 			if (field.required && field.type.kind === "literal") {
 				const value = field.type.value;
-				if (typeof value === "number")
-					throw new Error(`${def.name}.${field.key}: numeric constants are not supported`);
 				constants.push(`${JSON.stringify(field.key)}:${JSON.stringify(value)}`);
 				decode.push(
-					`\td.constant(${goString(field.key)}, ${typeof value === "string" ? goString(value) : value})\n`,
+					`\td.constant(${goString(field.key)}, ${typeof value === "string" ? goString(value) : typeof value === "number" ? `float64(${value})` : value})\n`,
 				);
 				continue;
 			}
@@ -699,8 +697,8 @@ class GoEmitter {
 			return parts.join("\n");
 		}
 		const result = this.#def(command.result);
-		if (result.kind !== "object") throw new Error(`${command.name}: result must be an object`);
 		if (command.unwrap) {
+			if (result.kind !== "object") throw new Error(`${command.name}: unwrapped result must be an object`);
 			if (command.nullable) throw new Error(`${command.name}: nullable unwrapped results are not supported`);
 			const field = result.fields.find(candidate => candidate.key === command.unwrap);
 			if (!field) throw new Error(`${command.name}: unwrap field ${command.unwrap} not in ${command.result}`);

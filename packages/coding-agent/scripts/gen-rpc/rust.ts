@@ -207,15 +207,23 @@ class RustEmitter {
 	}
 
 	#literal(value: string | number | boolean): string {
-		if (typeof value === "number") throw new Error("numeric constants are not supported");
+		if (typeof value === "number" && !Number.isSafeInteger(value)) {
+			throw new Error("numeric constants must be safe integers");
+		}
 		const name = `Lit${pascal(String(value))}`;
 		return this.#register(name, () => {
 			const check =
-				typeof value === "string" ? `value.as_str() == Some(${str(value)})` : `value.as_bool() == Some(${value})`;
+				typeof value === "string"
+					? `value.as_str() == Some(${str(value)})`
+					: typeof value === "number"
+						? `value.as_i64() == Some(${value})`
+						: `value.as_bool() == Some(${value})`;
 			const write =
 				typeof value === "string"
 					? `serializer.serialize_str(${str(value)})`
-					: `serializer.serialize_bool(${value})`;
+					: typeof value === "number"
+						? `serializer.serialize_i64(${value})`
+						: `serializer.serialize_bool(${value})`;
 			const shown = JSON.stringify(value);
 			return [
 				`/// The constant \`${shown}\`.`,
@@ -600,10 +608,10 @@ class RustEmitter {
 		let output = "()";
 		let decode = "\t\tlet _ = data;\n\t\tOk(())";
 		if (command.result) {
-			const result = this.#object(command.result);
 			let project = "";
 			output = command.result;
 			if (command.unwrap) {
+				const result = this.#object(command.result);
 				const plan = this.#planFields(result, result.fields).find(
 					candidate => candidate.field.key === command.unwrap,
 				);

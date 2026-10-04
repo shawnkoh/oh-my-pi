@@ -1,6 +1,34 @@
 use omp_rpc::*;
 use serde_json::{Value, json};
 
+#[test]
+fn quiesce_result_and_attestation_version() {
+	let mut raw = json!({
+		"status": "quiesced", "operationId": "op", "attempt": 1, "path": "s.terminal.json",
+		"attestation": {
+			"version": 1, "kind": "quiesce", "session": {"id": "s", "file": null},
+			"invocation": {"pid": 1, "startId": null, "startTime": null},
+			"instanceId": "i", "epoch": 2,
+			"counts": {"streaming":0,"queuedInput":0,"asyncJobs":0,"subagents":0,"retainedJobs":0,
+				"detachedJobs":0,"compacting":0,"handoff":0,"goalContinuationScheduled":0,"scheduledTurns":0},
+			"interrupted": false, "registryComplete": true, "registryPath": null,
+			"ownerScan": null, "writtenAt": "now"
+		}
+	});
+	let decoded: QuiesceResult = serde_json::from_value(raw.clone()).unwrap();
+	assert!(
+		matches!(&decoded, QuiesceResult::Quiesced(value) if value.attestation.session.id == "s")
+	);
+	assert_eq!(serde_json::to_value(decoded).unwrap()["attestation"]["version"], json!(1));
+	for invalid in [json!(2), json!("1"), json!(true), Value::Null] {
+		raw["attestation"]["version"] = invalid;
+		assert!(serde_json::from_value::<QuiesceResult>(raw.clone()).is_err());
+	}
+	raw["attestation"]["version"] = json!(1);
+	raw["status"] = json!("future");
+	assert!(serde_json::from_value::<QuiesceResult>(raw).is_err());
+}
+
 fn notification(frame: Value) -> Result<RpcNotification, serde_json::Error> {
 	serde_json::from_value(frame)
 }
