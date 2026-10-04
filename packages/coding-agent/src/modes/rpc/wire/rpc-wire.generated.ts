@@ -366,6 +366,14 @@ export interface ModelInfo {
 	compat?: Record<string, unknown>;
 }
 
+/** Exact call and evaluated arguments decided by a tool-approval select. */
+export interface ToolApprovalBinding {
+	toolCallId: string;
+	toolName: string;
+	arguments: unknown;
+	reason?: string;
+}
+
 export type QueueMode = "all" | "one-at-a-time";
 
 export type InterruptMode = "immediate" | "wait";
@@ -988,6 +996,9 @@ export interface PromptResultEvent {
 	sessionSettled: boolean;
 	id?: string;
 	error?: PromptError;
+	run?: number;
+	promptEntryId?: string;
+	replyEntryIds?: string[];
 }
 
 /** The session went quiet: the last run yielded and no background work can wake it. */
@@ -1148,6 +1159,7 @@ export interface SelectUiRequest {
 	title: string;
 	options: string[];
 	optionDetails?: SelectOptionDetail[];
+	approval?: ToolApprovalBinding;
 	timeout?: number;
 }
 
@@ -1185,6 +1197,7 @@ export interface AskUiRequest {
 	method: "ask";
 	questions: AskQuestion[];
 	timeout?: number;
+	acceptImages?: boolean;
 }
 
 /** Close the dialog opened by request `targetId`; a later answer to it is ignored. */
@@ -1252,6 +1265,9 @@ export interface AskAnswer {
 	id: string;
 	selectedOptions: string[];
 	customInput?: string;
+	customInputImages?: ImageContent[];
+	note?: string;
+	noteImages?: ImageContent[];
 }
 
 /** Answers a `select`, `input`, or `editor` request. */
@@ -1283,8 +1299,15 @@ export interface AnswersUiResponse {
 	answers: AskAnswer[];
 }
 
+/** Redirects a negotiated rich ask dialog to chat. */
+export interface ChatUiResponse {
+	type: "extension_ui_response";
+	id: string;
+	chat: true;
+}
+
 /** Host reply to an extension UI request; variants share `type` and differ by their payload key. */
-export type ExtensionUiResponse = ValueUiResponse | ConfirmUiResponse | CancelUiResponse | AnswersUiResponse;
+export type ExtensionUiResponse = ValueUiResponse | ConfirmUiResponse | CancelUiResponse | AnswersUiResponse | ChatUiResponse;
 
 export interface HostToolCallRequest {
 	type: "host_tool_call";
@@ -1417,18 +1440,21 @@ export interface PromptParams {
 	/** Images attached to the message. */
 	images?: ImageContent[];
 	streamingBehavior?: StreamingBehavior;
+	literal?: boolean;
 }
 
 export interface SteerParams {
 	message: string;
 	/** Images attached to the message. */
 	images?: ImageContent[];
+	literal?: boolean;
 }
 
 export interface FollowUpParams {
 	message: string;
 	/** Images attached to the message. */
 	images?: ImageContent[];
+	literal?: boolean;
 }
 
 export interface DeliverParams {
@@ -1461,6 +1487,7 @@ export interface AbortAndPromptParams {
 	message: string;
 	/** Images attached to the message. */
 	images?: ImageContent[];
+	literal?: boolean;
 }
 
 export interface NewSessionParams {
@@ -1483,10 +1510,12 @@ export interface GoalParams {
 
 export interface SetAskDialogParams {
 	enabled: boolean;
+	rich?: boolean;
 }
 
 export interface SetAskDialogResult {
 	enabled: boolean;
+	rich?: boolean;
 }
 
 export interface GetAvailableCommandsResult {

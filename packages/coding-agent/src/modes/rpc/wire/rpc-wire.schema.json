@@ -180,7 +180,7 @@
 				"params": "SetAskDialogParams",
 				"result": "SetAskDialogResult",
 				"nullable": false,
-				"unwrap": "enabled",
+				"unwrap": null,
 				"timeoutMs": null,
 				"completion": null,
 				"clientOmit": []
@@ -2088,6 +2088,27 @@
 				"maxTokens"
 			],
 			"description": "Model descriptor: the client-relevant subset of the server's model record."
+		},
+		"ToolApprovalBinding": {
+			"type": "object",
+			"properties": {
+				"toolCallId": {
+					"type": "string"
+				},
+				"toolName": {
+					"type": "string"
+				},
+				"arguments": {},
+				"reason": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"toolCallId",
+				"toolName",
+				"arguments"
+			],
+			"description": "Exact call and evaluated arguments decided by a tool-approval select."
 		},
 		"QueueMode": {
 			"enum": [
@@ -4232,6 +4253,18 @@
 				},
 				"error": {
 					"$ref": "#/$defs/PromptError"
+				},
+				"run": {
+					"type": "integer"
+				},
+				"promptEntryId": {
+					"type": "string"
+				},
+				"replyEntryIds": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
 				}
 			},
 			"required": [
@@ -4714,6 +4747,9 @@
 						"$ref": "#/$defs/SelectOptionDetail"
 					}
 				},
+				"approval": {
+					"$ref": "#/$defs/ToolApprovalBinding"
+				},
 				"timeout": {
 					"type": "integer"
 				}
@@ -4834,6 +4870,9 @@
 				},
 				"timeout": {
 					"type": "integer"
+				},
+				"acceptImages": {
+					"type": "boolean"
 				}
 			},
 			"required": [
@@ -5083,6 +5122,21 @@
 				},
 				"customInput": {
 					"type": "string"
+				},
+				"customInputImages": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/ImageContent"
+					}
+				},
+				"note": {
+					"type": "string"
+				},
+				"noteImages": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/ImageContent"
+					}
 				}
 			},
 			"required": [
@@ -5177,6 +5231,26 @@
 			],
 			"description": "Answers an `ask` request: one `AskAnswer` per question, in question order."
 		},
+		"ChatUiResponse": {
+			"type": "object",
+			"properties": {
+				"type": {
+					"const": "extension_ui_response"
+				},
+				"id": {
+					"type": "string"
+				},
+				"chat": {
+					"const": true
+				}
+			},
+			"required": [
+				"type",
+				"id",
+				"chat"
+			],
+			"description": "Redirects a negotiated rich ask dialog to chat."
+		},
 		"ExtensionUiResponse": {
 			"anyOf": [
 				{
@@ -5190,6 +5264,9 @@
 				},
 				{
 					"$ref": "#/$defs/AnswersUiResponse"
+				},
+				{
+					"$ref": "#/$defs/ChatUiResponse"
 				}
 			],
 			"description": "Host reply to an extension UI request; variants share `type` and differ by their payload key."
@@ -5667,6 +5744,9 @@
 				},
 				"streamingBehavior": {
 					"$ref": "#/$defs/StreamingBehavior"
+				},
+				"literal": {
+					"type": "boolean"
 				}
 			},
 			"required": [
@@ -5685,6 +5765,9 @@
 						"$ref": "#/$defs/ImageContent"
 					},
 					"description": "Images attached to the message."
+				},
+				"literal": {
+					"type": "boolean"
 				}
 			},
 			"required": [
@@ -5703,6 +5786,9 @@
 						"$ref": "#/$defs/ImageContent"
 					},
 					"description": "Images attached to the message."
+				},
+				"literal": {
+					"type": "boolean"
 				}
 			},
 			"required": [
@@ -5795,6 +5881,9 @@
 						"$ref": "#/$defs/ImageContent"
 					},
 					"description": "Images attached to the message."
+				},
+				"literal": {
+					"type": "boolean"
 				}
 			},
 			"required": [
@@ -5853,6 +5942,9 @@
 			"properties": {
 				"enabled": {
 					"type": "boolean"
+				},
+				"rich": {
+					"type": "boolean"
 				}
 			},
 			"required": [
@@ -5863,6 +5955,9 @@
 			"type": "object",
 			"properties": {
 				"enabled": {
+					"type": "boolean"
+				},
+				"rich": {
 					"type": "boolean"
 				}
 			},

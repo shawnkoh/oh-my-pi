@@ -10,6 +10,10 @@ import { absentAs, doc, type WireDefs } from "./dsl";
 const JSON_OBJECT = "Record<string, unknown>";
 
 export const stateDefs = {
+	ToolApprovalBinding: doc(
+		{ toolCallId: "string", toolName: "string", arguments: "unknown", "reason?": "string" },
+		"Exact call and evaluated arguments decided by a tool-approval select.",
+	),
 	QueueMode: "'all' | 'one-at-a-time'",
 	InterruptMode: "'immediate' | 'wait'",
 	StreamingBehavior: "'steer' | 'followUp'",
