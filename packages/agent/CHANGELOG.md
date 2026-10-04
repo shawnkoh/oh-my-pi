@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `Agent.setRunScope(scope)` wraps the start of every run (`prompt` and `continue`), so a host can start runs outside its own async context
+
 ## [18.6.0] - 2026-10-03
 
 ### Fixed
@@ -30,9 +34,6 @@
 ### Fixed
 
 - Fixed lenient argument validation for tools such as `yield`: malformed tool-call JSON is now reported to the model instead of causing the tool to run with empty arguments.
-### Added
-
-- `Agent.setRunScope(scope)` wraps the start of every run (`prompt` and `continue`), so a host can start runs outside its own async context
 
 ## [18.4.10] - 2026-10-02
 
