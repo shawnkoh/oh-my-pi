@@ -5186,6 +5186,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				notificationDebounceTimers.clear();
 			};
 			postmortem.register("mcp-notification-cleanup", clearDebounceTimers);
+			// An armed debounce timer is a notification already received but not yet queued.
+			session.registerWorkSource({ kind: "queuedInput", count: () => notificationDebounceTimers.size });
 			mcpManager.setOnResourcesChanged((serverName, uri) => {
 				logger.debug("MCP resources changed", { path: `mcp:${serverName}`, uri });
 				if (!cfgMcpNotifications.get(settings)) return;

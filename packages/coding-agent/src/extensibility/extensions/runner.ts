@@ -36,6 +36,7 @@ import type { MemoryRuntimeContext } from "../../memory-backend";
 import { type Theme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { AsyncJobSnapshot } from "../../session/agent-session";
 import { EXTERNAL_DELIVERY_CAPABILITY } from "../../session/external-delivery";
+import { SESSION_CAPABILITIES } from "../../session/quiescence";
 import { MAIN_AGENT_ID } from "../../registry/agent-registry";
 import type { SessionManager } from "../../session/session-manager";
 import { addFileDeleteFallback, addFileWriteFallback } from "../../tools/file-write-fallback";
@@ -508,6 +509,14 @@ export class ExtensionRunner {
 	#compactFn: (instructionsOrOptions?: string | CompactOptions) => Promise<void> = async () => {};
 	#getSystemPromptFn: () => string[] = () => [];
 	#runEphemeralTurnFn?: ExtensionContextActions["runEphemeralTurn"];
+	#attestFn?: ExtensionContextActions["attest"];
+	#quiesceAndExitFn?: ExtensionContextActions["quiesceAndExit"];
+	#activeHandlers = 0;
+
+	/** Includes host-dispatched hooks and timed-out handlers until their actual work settles. */
+	get activeHandlers(): number {
+		return this.#activeHandlers;
+	}
 	#ephemeralTurnBlocker = new AsyncLocalStorage<string | undefined>();
 	#getAsyncJobSnapshotFn: () => AsyncJobSnapshot | null = () => null;
 	#newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
@@ -812,6 +821,8 @@ export class ExtensionRunner {
 		this.#compactFn = contextActions.compact;
 		this.#getSystemPromptFn = contextActions.getSystemPrompt;
 		this.#runEphemeralTurnFn = contextActions.runEphemeralTurn;
+		this.#attestFn = contextActions.attest;
+		this.#quiesceAndExitFn = contextActions.quiesceAndExit;
 
 		// Command context actions (optional, only for interactive mode)
 		if (commandContextActions) {
@@ -1388,6 +1399,15 @@ export class ExtensionRunner {
 			abort: () => this.#abortFn(),
 			hasPendingMessages: () => this.#hasPendingMessagesFn(),
 			shutdown: () => this.#shutdownHandler(),
+			capabilities: this.#quiesceAndExitFn ? SESSION_CAPABILITIES : [],
+			attest: (operationId, nonce) => {
+				if (!this.#attestFn) throw new Error("attest is not available in this mode");
+				return this.#attestFn(operationId, nonce);
+			},
+			quiesceAndExit: request => {
+				if (!this.#quiesceAndExitFn) throw new Error("quiesceAndExit is not available in this mode");
+				return this.#quiesceAndExitFn(request);
+			},
 			getSystemPrompt: () => this.#getSystemPromptFn(),
 			runEphemeralTurn: runEphemeralTurn
 				? async options => {
@@ -1516,28 +1536,33 @@ export class ExtensionRunner {
 			handlerResult = await withActiveSettings(this.settings, () =>
 				raceHandlerWithTimeout(
 					async (handlerSignal, budget) => {
-						registrationScope.signal = handlerSignal;
-						let result: R | undefined;
+						this.#activeHandlers++;
 						try {
-							const handlerContext = createHandlerContext(
-								ctx,
-								handlerSignal,
-								event.type === "tool_call" ? budget : undefined,
-							);
-							result = await this.#toolRegistrationScope.run(registrationScope, () =>
-								handler(event, handlerContext),
-							);
-						} catch (error) {
-							handlerFailure = { error };
+							registrationScope.signal = handlerSignal;
+							let result: R | undefined;
+							try {
+								const handlerContext = createHandlerContext(
+									ctx,
+									handlerSignal,
+									event.type === "tool_call" ? budget : undefined,
+								);
+								result = await this.#toolRegistrationScope.run(registrationScope, () =>
+									handler(event, handlerContext),
+								);
+							} catch (error) {
+								handlerFailure = { error };
+							} finally {
+								registrationScope.closed = true;
+							}
+							try {
+								await this.#flushToolRegistrations(registrationScope.pending);
+							} catch (error) {
+								handlerFailure ??= { error };
+							}
+							return result;
 						} finally {
-							registrationScope.closed = true;
+							this.#activeHandlers--;
 						}
-						try {
-							await this.#flushToolRegistrations(registrationScope.pending);
-						} catch (error) {
-							handlerFailure ??= { error };
-						}
-						return result;
 					},
 					timeoutMs,
 					signal,
