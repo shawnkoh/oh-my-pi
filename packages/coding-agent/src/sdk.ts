@@ -1,3 +1,5 @@
+import type { CensusIdentity } from "./session/namespace-census";
+import type { InstanceIdentity } from "./session/instance-identity";
 import * as path from "node:path";
 import {
 	Agent,
@@ -619,6 +621,9 @@ export interface CreateAgentSessionOptions {
 	providerSessionId?: string;
 	/** Optional provider-facing prompt cache key, distinct from request lineage. */
 	providerPromptCacheKey?: string;
+	a13Identity?: CensusIdentity;
+	a13Instance?: InstanceIdentity;
+	a13Extinct?: InstanceIdentity[];
 	/** Whether `providerPromptCacheKey` is caller-pinned or inherited from a full fork. */
 	providerPromptCacheKeySource?: "explicit" | "fork";
 	/** Absolute wall-clock deadline in Unix epoch milliseconds. */
@@ -4465,6 +4470,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// block createAgentSession for tens of seconds while the whole file is
 		// streamed and parsed on the main thread.
 		session = new AgentSession({
+			a13Identity: options.a13Identity,
+			a13Instance: options.a13Instance,
+			a13Extinct: options.a13Extinct,
 			codeModeState,
 			cacheWarmer,
 			advisorWatchdogPrompt,

@@ -212,6 +212,14 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		}
 	}
 
+	get workReporting(): "complete" | undefined {
+		return this.extension.workReporting;
+	}
+
+	set workReporting(value: "complete" | undefined) {
+		this.extension.workReporting = value;
+	}
+
 	on<F extends HandlerFn>(event: string, handler: F): void {
 		const list = this.extension.handlers.get(event) ?? [];
 		list.push(handler);

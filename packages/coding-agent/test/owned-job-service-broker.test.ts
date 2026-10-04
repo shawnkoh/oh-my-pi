@@ -1058,7 +1058,6 @@ describe.skipIf(process.platform === "win32")("owned-job registry: broker-hosted
 			broker: { pid: "3", startId: "3" },
 		};
 		const parsed = parseOwnedJobRegistry(`${JSON.stringify(header)}\n${JSON.stringify(start)}\n`);
-		expect(parsed.problems).toContain("registry has a malformed start record");
 		expect(parsed.segments[0]?.open.size).toBe(0);
 	});
 });

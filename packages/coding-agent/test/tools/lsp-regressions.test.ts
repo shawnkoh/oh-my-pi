@@ -4406,11 +4406,12 @@ describe("lsp regressions", () => {
 	it("sendRequest respects an explicit timeoutMs and reports it in the error", async () => {
 		// Synthesise a minimal in-memory LSP client and never resolve the request
 		// so the per-request timer is the only thing that can fire.
+		const exited = Promise.withResolvers<number>();
 		const client: LspClient = {
 			name: "test-lsp",
 			cwd: process.cwd(),
 			config: { command: "test-lsp", fileTypes: [".ts"], rootMarkers: [] },
-			proc: { stdin: { write() {}, flush: async () => {} } } as unknown as LspClient["proc"],
+			proc: { stdin: { write() {}, flush: async () => {} }, exited: exited.promise } as unknown as LspClient["proc"],
 			requestId: 0,
 			diagnostics: new Map(),
 			diagnosticsVersion: 0,
@@ -4432,15 +4433,18 @@ describe("lsp regressions", () => {
 			await expect(request).rejects.toThrow(/after 25ms/);
 		} finally {
 			vi.useRealTimers();
+			exited.resolve(0);
+			await exited.promise;
 		}
 	});
 
 	it("sendRequest uses the signal as the deadline when no explicit timeout is set", async () => {
+		const exited = Promise.withResolvers<number>();
 		const client: LspClient = {
 			name: "test-lsp",
 			cwd: process.cwd(),
 			config: { command: "test-lsp", fileTypes: [".ts"], rootMarkers: [] },
-			proc: { stdin: { write() {}, flush: async () => {} } } as unknown as LspClient["proc"],
+			proc: { stdin: { write() {}, flush: async () => {} }, exited: exited.promise } as unknown as LspClient["proc"],
 			requestId: 0,
 			diagnostics: new Map(),
 			diagnosticsVersion: 0,
@@ -4457,12 +4461,17 @@ describe("lsp regressions", () => {
 		};
 		const controller = new AbortController();
 		const reason = new Error("caller deadline");
-		const request = lspClient.sendRequest(client, "test/method", {}, controller.signal);
-		controller.abort(reason);
+		try {
+			const request = lspClient.sendRequest(client, "test/method", {}, controller.signal);
+			controller.abort(reason);
 
-		// The exact caller reason proves the signal owned the deadline rather than
-		// the per-request 30s fallback.
-		await expect(request).rejects.toBe(reason);
+			// The exact caller reason proves the signal owned the deadline rather than
+			// the per-request 30s fallback.
+			await expect(request).rejects.toBe(reason);
+		} finally {
+			exited.resolve(0);
+			await exited.promise;
+		}
 	});
 
 	it("rename_file skips the LSP loop when no configured server handles the file extension", async () => {

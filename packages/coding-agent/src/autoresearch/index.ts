@@ -30,6 +30,8 @@ import type { ExperimentResult } from "@oh-my-pi/pi-tui/tools/autoresearch";
 const EXPERIMENT_TOOL_NAMES = ["init_experiment", "run_experiment", "log_experiment", "update_notes"];
 
 export const createAutoresearchExtension: ExtensionFactory = api => {
+	// Experiments stay inside awaited tools; resumption uses the session's counted next-turn queue.
+	api.workReporting = "complete";
 	const runtimeStore = createRuntimeStore();
 	const dashboard = createDashboardController();
 

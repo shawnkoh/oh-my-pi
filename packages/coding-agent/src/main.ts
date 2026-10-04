@@ -1364,6 +1364,9 @@ export async function buildSessionOptions(
 	if (parsed.providerSessionId) {
 		options.providerSessionId = parsed.providerSessionId;
 	}
+	options.a13Identity = parsed.a13Identity;
+	options.a13Instance = parsed.a13Instance;
+	options.a13Extinct = parsed.a13Extinct;
 	if (parsed.providerPromptCacheKey) {
 		options.providerPromptCacheKey = parsed.providerPromptCacheKey;
 		options.providerPromptCacheKeySource = "explicit";

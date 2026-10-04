@@ -3199,6 +3199,11 @@ export interface ShellRunResult {
   /** Shell working directory after command completion. */
   workingDir?: string
   /**
+   * Live background jobs at settlement; absent when they could not be
+   * counted.
+   */
+  liveBackgroundJobs?: number
+  /**
    * Processes this run launched that were still alive when it resolved,
    * identity-pinned (pid + start id), including the real process of
    * reparented launches such as `nohup cmd &` and leftover members of

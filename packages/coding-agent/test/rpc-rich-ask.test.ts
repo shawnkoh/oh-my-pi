@@ -159,13 +159,19 @@ async function runAskHost(
 		fixturePath,
 		`
 import { createMockModel } from ${JSON.stringify(path.resolve(import.meta.dir, "../../ai/src/providers/mock.ts"))};
+import { getBundledModel } from ${JSON.stringify(path.resolve(import.meta.dir, "../../catalog/src/models.ts"))};
 import { createAgentSession, Settings } from ${JSON.stringify(path.join(sourceDir, "sdk.ts"))};
 import { runRpcMode } from ${JSON.stringify(path.join(sourceDir, "modes/rpc/rpc-mode.ts"))};
+import { AuthStorage } from ${JSON.stringify(path.join(sourceDir, "session/auth-storage.ts"))};
 import { initTheme } from ${JSON.stringify(path.resolve(import.meta.dir, "../../tui/src/theme/theme.ts"))};
 globalThis.fetch = async () => { throw new Error("Offline ask fixture refuses network"); };
 initTheme();
+const authStorage = await AuthStorage.create("auth.db");
+authStorage.keys.setRuntime("anthropic", "test-key");
 const { session, setToolUIContext } = await createAgentSession({
   cwd: process.cwd(),
+  model: getBundledModel("anthropic", "claude-sonnet-4-5"),
+  authStorage,
   toolNames: ["ask"],
   interactivePrompts: true,
   enableMCP: false,

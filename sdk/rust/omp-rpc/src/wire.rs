@@ -2657,6 +2657,7 @@ pub struct WorkAttestation {
 	pub invocation: InvocationIdentity,
 	pub counts: WorkCounts,
 	pub admission: WorkAttestationAdmission,
+	pub sealed: bool,
 	pub registry: OwnedJobRegistryState,
 	#[serde(rename = "observedAt")]
 	pub observed_at: String,
@@ -2666,6 +2667,7 @@ pub struct WorkAttestation {
 pub struct QuiesceRequest {
 	#[serde(rename = "operationId")]
 	pub operation_id: String,
+	pub completeness: QuiesceRequestCompleteness,
 	pub attempt: f64,
 	pub epoch: f64,
 	#[serde(rename = "instanceId")]
@@ -2693,6 +2695,8 @@ pub enum QuiesceRefusalReason {
 	EpochMismatch,
 	#[serde(rename = "work_active")]
 	WorkActive,
+	#[serde(rename = "completeness_unknown")]
+	CompletenessUnknown,
 	#[serde(rename = "attestation_unavailable")]
 	AttestationUnavailable,
 }
@@ -2709,6 +2713,7 @@ impl QuiesceRefusalReason {
 			Self::DeadlineExpired => "deadline_expired",
 			Self::EpochMismatch => "epoch_mismatch",
 			Self::WorkActive => "work_active",
+			Self::CompletenessUnknown => "completeness_unknown",
 			Self::AttestationUnavailable => "attestation_unavailable",
 		}
 	}
@@ -2742,11 +2747,61 @@ pub struct TerminalAttestation {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CensusProcess {
+	pub pid: f64,
+	pub comm: String,
+	pub ppid: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CensusResult {
+	pub complete: bool,
+	pub work: Vec<CensusProcess>,
+	pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QuiesceSnapshot {
 	pub epoch: f64,
 	pub counts: WorkCounts,
 	#[serde(rename = "observedAt")]
 	pub observed_at: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub registry: Option<OwnedJobRegistryState>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub census: Option<CensusResult>,
+	#[serde(rename = "completenessReasons", default, skip_serializing_if = "Option::is_none")]
+	pub completeness_reasons: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SealedQuiesceSnapshot {
+	pub epoch: f64,
+	pub counts: WorkCounts,
+	#[serde(rename = "observedAt")]
+	pub observed_at: String,
+	pub registry: OwnedJobRegistryState,
+	#[serde(deserialize_with = "Deserialize::deserialize")]
+	pub census: Option<CensusResult>,
+	#[serde(rename = "completenessReasons")]
+	pub completeness_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QuiesceProgress {
+	pub finalized: bool,
+	pub bound: bool,
+	pub attested: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QuiesceSealedBlockedResult {
+	#[serde(rename = "operationId")]
+	pub operation_id: String,
+	pub attempt: f64,
+	pub reason: String,
+	pub snapshot: SealedQuiesceSnapshot,
+	pub progress: QuiesceProgress,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2782,6 +2837,7 @@ pub enum QuiesceResult {
 	Quiesced(QuiescedResult),
 	Refused(QuiesceRefusedResult),
 	ExitUnattested(QuiesceUnattestedResult),
+	SealedBlocked(QuiesceSealedBlockedResult),
 }
 
 impl QuiesceResult {
@@ -2791,6 +2847,7 @@ impl QuiesceResult {
 			Some("quiesced") => |value| serde_json::from_value(value).map(Self::Quiesced),
 			Some("refused") => |value| serde_json::from_value(value).map(Self::Refused),
 			Some("exit_unattested") => |value| serde_json::from_value(value).map(Self::ExitUnattested),
+			Some("sealed_blocked") => |value| serde_json::from_value(value).map(Self::SealedBlocked),
 			other => {
 				return Err(serde_json::Error::custom(format!("unknown QuiesceResult status {other:?}")));
 			}
@@ -2805,6 +2862,7 @@ impl Serialize for QuiesceResult {
 			Self::Quiesced(member) => serialize_tagged(member, &[("status", "quiesced")], serializer),
 			Self::Refused(member) => serialize_tagged(member, &[("status", "refused")], serializer),
 			Self::ExitUnattested(member) => serialize_tagged(member, &[("status", "exit_unattested")], serializer),
+			Self::SealedBlocked(member) => serialize_tagged(member, &[("status", "sealed_blocked")], serializer),
 		}
 	}
 }
@@ -4179,7 +4237,7 @@ impl<'de> Deserialize<'de> for RpcAgentEvent {
 	}
 }
 
-/// First frame after startup; capabilities include quiesce-exit/1 and owned-jobs/1. Transport fields are absent on servers without protocol v2.
+/// First frame after startup; capabilities include quiesce-exit/2 and owned-jobs/1. Transport fields are absent on servers without protocol v2.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReadyEvent {
 	#[serde(rename = "protocolVersion", default, skip_serializing_if = "Option::is_none")]
@@ -5125,7 +5183,7 @@ pub struct HostUriSchemeDefinition {
 /// Unsolicited outbound frame (everything except responses and host tool/URI requests), discriminated by `type`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RpcNotification {
-	/// First frame after startup; capabilities include quiesce-exit/1 and owned-jobs/1. Transport fields are absent on servers without protocol v2.
+	/// First frame after startup; capabilities include quiesce-exit/2 and owned-jobs/1. Transport fields are absent on servers without protocol v2.
 	Ready(ReadyEvent),
 	DeliveryAccepted(DeliveryAcceptedEvent),
 	DeliverySettled(DeliverySettledEvent),
@@ -5934,11 +5992,31 @@ impl WorkAttestationAdmission {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum QuiesceRequestCompleteness {
+	#[serde(rename = "strict")]
+	Strict,
+	#[serde(rename = "attested")]
+	Attested,
+}
+
+impl QuiesceRequestCompleteness {
+	/// Wire value.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Strict => "strict",
+			Self::Attested => "attested",
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TerminalAttestationKind {
 	#[serde(rename = "quiesce")]
 	Quiesce,
 	#[serde(rename = "hangup")]
 	Hangup,
+	#[serde(rename = "sealed_blocked")]
+	SealedBlocked,
 }
 
 impl TerminalAttestationKind {
@@ -5947,6 +6025,7 @@ impl TerminalAttestationKind {
 		match self {
 			Self::Quiesce => "quiesce",
 			Self::Hangup => "hangup",
+			Self::SealedBlocked => "sealed_blocked",
 		}
 	}
 }
@@ -6233,11 +6312,12 @@ impl Command for AttestCommand {
 	}
 }
 
-/// Atomically close admission and exit if the bound quiescence attempt passes.
+/// Require explicit strict or attested completeness; close admission and retire, retaining strict sealed failures for retry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QuiesceAndExitCommand {
 	#[serde(rename = "operationId")]
 	pub operation_id: String,
+	pub completeness: QuiesceRequestCompleteness,
 	pub attempt: f64,
 	pub epoch: f64,
 	#[serde(rename = "instanceId")]

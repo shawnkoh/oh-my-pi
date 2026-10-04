@@ -8,6 +8,7 @@ import {
 	type AgentToolContext,
 	type AgentToolResult,
 	type AgentToolUpdateCallback,
+	inheritAssistantMessageIdentity,
 	isNonBlankContext,
 	joinAdditionalContext,
 } from "@oh-my-pi/pi-agent-core";
@@ -35,6 +36,7 @@ import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import { type Theme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { AsyncJobSnapshot } from "../../session/agent-session";
+import { ExtensionActivityLedger } from "../../session/activity-ledger";
 import { EXTERNAL_DELIVERY_CAPABILITY } from "../../session/external-delivery";
 import { SESSION_CAPABILITIES } from "../../session/quiescence";
 import { MAIN_AGENT_ID } from "../../registry/agent-registry";
@@ -449,6 +451,7 @@ export async function emitSessionShutdownEvent(extensionRunner: ExtensionRunner 
 	} finally {
 		extensionRunner.disposeFileFallbacks();
 		extensionRunner.clearManagedTimers();
+		extensionRunner.disposeWorkReporting();
 	}
 }
 
@@ -718,6 +721,22 @@ export class ExtensionRunner {
 			options?.onUpdate as never,
 			options?.callerContext ?? resolved.makeContext(),
 		)) as AgentToolResult<TDetails>;
+	}
+
+	readonly #workActivity = new ExtensionActivityLedger(() => this.workCompletenessReasons());
+
+	get outstandingWork(): number {
+		return this.#workActivity.count;
+	}
+
+	workCompletenessReasons(): string[] {
+		return this.getLoadedExtensions()
+			.filter(extension => extension.workReporting !== "complete")
+			.map(extension => `extension_work_reporting_unknown:${extension.label ?? extension.path}`);
+	}
+
+	disposeWorkReporting(): void {
+		this.#workActivity.dispose();
 	}
 
 	constructor(
@@ -1400,6 +1419,7 @@ export class ExtensionRunner {
 		const getModel = model ? () => model : this.#getModel;
 		const runEphemeralTurn = this.#runEphemeralTurnFn;
 		return {
+			holdWork: reason => this.#workActivity.hold(reason),
 			ui: this.#uiContext,
 			mode: this.#mode,
 			getContextUsage: () => this.#getContextUsageFn(),
@@ -2048,6 +2068,9 @@ export class ExtensionRunner {
 		let currentMessages: AgentMessage[];
 		try {
 			currentMessages = structuredClone(messages);
+			for (let index = 0; index < currentMessages.length; index++) {
+				inheritAssistantMessageIdentity(messages[index]!, currentMessages[index]!);
+			}
 		} catch {
 			// Messages may contain non-cloneable objects (e.g. in ToolResultMessage.details
 			// or ProviderPayload). Fall back to a shallow array clone — extensions should
@@ -2100,6 +2123,7 @@ export class ExtensionRunner {
 			clearContextHistoryIndex(message);
 			if (historyMessage) clearContextHistoryIndex(historyMessage);
 			if (!unchanged) markPerCallContextMessage(message);
+			else if (historyMessage) inheritAssistantMessageIdentity(historyMessage, message);
 		}
 		for (const message of messages) clearContextHistoryIndex(message);
 		// An aborted handler is skipped and its input kept unchanged. Never hand that

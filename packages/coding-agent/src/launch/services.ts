@@ -272,7 +272,7 @@ export async function startService(
 	} catch (error) {
 		// Aborted, timed out, failed in transit or answered unexpectedly: the broker may still
 		// have started the service, and its pid was never reported.
-		registry?.markIncomplete("a service start ended without reporting its process");
+		registry?.markIncomplete("a service start ended without reporting its process", "service-identity-unknown");
 		throw error;
 	} finally {
 		if (pendingId) registry?.end(pendingId, "settled");
@@ -314,7 +314,8 @@ function recordServiceProcess(
 	if (!registry) return;
 	if (daemon.pid !== undefined) {
 		// Without the broker the record would read as ended while the broker relaunches it.
-		if (host.brokerPid === undefined) registry.markIncomplete("a service's daemon broker could not be identified");
+		if (host.brokerPid === undefined)
+			registry.markIncomplete("a service's daemon broker could not be identified", "service-identity-unknown");
 		registry.registerProcess({
 			kind: "service",
 			jobId: `service:${daemon.id}:${daemon.startedAt}`,
@@ -326,7 +327,7 @@ function recordServiceProcess(
 			daemon: { id: daemon.id, meta: host.meta },
 		});
 	} else if (!TERMINAL_STATES[daemon.state]) {
-		registry.markIncomplete("service started without a reported pid");
+		registry.markIncomplete("service started without a reported pid", "service-identity-unknown");
 	}
 }
 
@@ -361,7 +362,7 @@ export async function modeService(
 		if (result.op !== "mode") throw new Error("Unexpected daemon mode response");
 	} catch (error) {
 		// A mode change can restart the service under a new pid that was never reported.
-		registry?.markIncomplete("a service mode change ended without reporting its process");
+		registry?.markIncomplete("a service mode change ended without reporting its process", "service-identity-unknown");
 		throw error;
 	}
 	// Switching to or from `detached` restarts the service: record the new process, keeping

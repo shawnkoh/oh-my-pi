@@ -501,6 +501,8 @@ export interface ExtensionAgentIdentity {
 }
 
 export interface ExtensionContext {
+	/** Report background work until it truly settles, including after cancellation. */
+	holdWork(reason: string): { release(): void };
 	/** UI methods for user interaction */
 	ui: ExtensionUIContext;
 	/** Current run mode. Use `"tui"` to guard terminal-only UI such as custom components. */
@@ -534,7 +536,7 @@ export interface ExtensionContext {
 	/** Gracefully shutdown and exit. */
 	shutdown(): void;
 	/**
-	 * Protocol capabilities this host implements (`quiesce-exit/1`, `owned-jobs/1`).
+	 * Protocol capabilities this host implements (`quiesce-exit/2`, `owned-jobs/1`).
 	 * Empty when the host cannot quiesce and exit.
 	 */
 	capabilities: readonly string[];
@@ -1386,6 +1388,8 @@ export type ExtensionServiceTier<Family extends ServiceTierFamily> = Family exte
  * Methods retain their extension binding when destructured or passed as callbacks.
  */
 export interface ExtensionAPI {
+	/** Declare that all background activity is reported through ctx.holdWork(). */
+	workReporting?: "complete";
 	// =========================================================================
 	// Module Access
 	// =========================================================================
@@ -1993,6 +1997,7 @@ export interface Extension {
 	path: string;
 	resolvedPath: string;
 	label?: string;
+	workReporting?: "complete";
 	handlers: Map<string, HandlerFn[]>;
 	tools: Map<string, RegisteredTool<any, any>>;
 	toolRegistrationListeners?: Set<ToolRegistrationListener>;
