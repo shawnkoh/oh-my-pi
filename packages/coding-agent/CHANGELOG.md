@@ -27,6 +27,12 @@
 - Interrupting a turn while a tool approval is pending now closes the dialog (RPC hosts receive `cancel`), and an approval answered after the call was aborted no longer runs the tool
 - Count host-dispatched extension hooks, including `session_start`, until their actual handler work settles; an extension cannot pass quiescence from inside its own startup hook.
 - Advance the owning session's activity epoch when host-dispatched extension work starts, so a completed hook cannot leave an older exit attestation valid. Commands, shortcuts, file fallbacks and managed timer callbacks also advance the epoch and remain counted until settlement.
+- RPC goal continuations reserve quiescence work, wait for host input hooks and turn setup, and re-arm after a host abort only on accepted host input or explicit goal create/resume. Persistence-driven sibling moves preserve goal and reply attribution without treating real session switches as continuity.
+- External deliveries stay behind earlier prompts, count once while queued or accepted-but-unsettled, and are rejected after quiescence or hang-up. Input hooks may await their own deliveries, including in plan mode or after an abort; provider turns, turn tails and non-input observers never inherit that exemption.
+- Failed session transitions reconnect and resume retained deliveries under upstream's existing failure semantics; disconnected sessions never wake deliveries, and parked steers survive rollback or transcript-preserving forks.
+- Ordered input remains counted after `abort_and_prompt` acknowledges. Prediction and feedback after quiescence use only an already-open daemon connection.
+- Service ownership follows the hosting broker across restart backoff and replacement PIDs using split daemon metadata; per-service lifecycle serialization prevents stale requests, overlapping relaunches and shutdown races.
+- Throwing shell `onStart` probes no longer strand run records. Failed teardown releases the process-wide parked-agent revival refusal.
 
 ### Changed
 

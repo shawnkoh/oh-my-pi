@@ -43,7 +43,10 @@ type RunSegment = ReadonlyArray<{ id: string; role: string; text?: string }>;
 
 /** Session surface the reporter reads: settle state plus the persisted branch. */
 export type RpcPromptResultSession = RpcSettleSession & {
-	readonly sessionManager: Pick<AgentSession["sessionManager"], "getLeafId" | "getBranch" | "getSessionId">;
+	readonly sessionManager: Pick<
+		AgentSession["sessionManager"],
+		"getLeafId" | "getBranch" | "getSessionId" | "continuesSession"
+	>;
 };
 
 interface OpenPrompt {
@@ -227,13 +230,14 @@ export class RpcPromptResults {
 
 	/**
 	 * Snapshot, at the yield, of the message entries the run persisted: those
-	 * after its start leaf on the current branch of the same session. A session
-	 * switch or a branch that no longer holds the start leaf yields nothing.
+	 * after its start leaf on the current branch of the same session (a sibling
+	 * move keeps the transcript under a new id, so it still counts as the same).
+	 * A session switch or a branch that no longer holds the start leaf yields nothing.
 	 */
 	#segment(): RunSegment | undefined {
 		const start = this.#runStart;
 		const manager = this.#session.sessionManager;
-		if (!start || manager.getSessionId() !== start.sessionId) return undefined;
+		if (!start || !manager.continuesSession(start.sessionId)) return undefined;
 		const branch = manager.getBranch();
 		const from = start.leaf === null ? 0 : branch.findIndex(entry => entry.id === start.leaf) + 1;
 		if (from === 0 && start.leaf !== null) return undefined;

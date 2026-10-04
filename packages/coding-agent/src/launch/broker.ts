@@ -17,6 +17,7 @@ import {
 	DAEMON_META_FILE,
 	DAEMON_SPEC_FILE,
 	daemonBrokerEndpoint,
+	daemonRecordDir,
 	readStoredDaemonRecord,
 	writeDaemonScopeMeta,
 } from "./paths";
@@ -100,6 +101,21 @@ interface ManagedDaemon {
 	outputOffset: number;
 	readyPattern?: RegExp;
 	restartTimer?: NodeJS.Timeout;
+	/**
+	 * True while a `restart` request (or a switch to detached) stops this daemon to launch it
+	 * again. Its metadata then publishes `restarting` rather than the stop's terminal state:
+	 * out-of-process readers (the owned-job registry) must not see the service as ended
+	 * while the broker is about to relaunch it. Lifecycle requests on one daemon never
+	 * overlap (see `lifecycle`), so one relaunch at a time sets and clears it.
+	 */
+	relaunching?: boolean;
+	/**
+	 * The tail of this daemon's lifecycle requests (`stop`, `restart`, `mode`): each runs
+	 * after the previous one settled, in arrival order. Overlapping requests otherwise stop a
+	 * process another request just launched (losing its `restarting` overlay), lose a stop,
+	 * or launch twice and orphan the first child.
+	 */
+	lifecycle: Promise<void>;
 	consecutiveFailures: number;
 	completionCapable: boolean;
 	pendingCompletions: DaemonCompletionNotification[];
@@ -487,6 +503,9 @@ class DaemonBroker {
 		clearTimeout(this.#idleTimer);
 		this.#idleTimer = undefined;
 		for (const record of this.#records.values()) {
+			// Let a lifecycle request already running on the record finish first (queued ones
+			// are refused now): stopping the record under it races its own stop.
+			await record.lifecycle;
 			const detached = record.spec.detached && !record.stopRequested && record.snapshot.pid !== undefined;
 			if (!detached && !terminalState(record.snapshot.state)) await this.#stopRecord(record, 2_000);
 			// The detached daemon outlives this broker and the next one recovers it from
@@ -663,13 +682,17 @@ class DaemonBroker {
 				return this.#send(operation);
 			case "stop": {
 				const record = this.#record(operation.name);
-				await this.#stopRecord(record, operation.timeoutMs);
+				await this.#serialized(record, () => this.#stopRecord(record, operation.timeoutMs));
 				return { op: "stop", daemon: record.snapshot };
 			}
-			case "restart":
-				return this.#restart(operation.name);
-			case "mode":
-				return this.#mode(operation);
+			case "restart": {
+				const record = this.#record(operation.name);
+				return this.#serialized(record, () => this.#restart(record));
+			}
+			case "mode": {
+				const record = this.#record(operation.name);
+				return this.#serialized(record, () => this.#mode(record, operation));
+			}
 			case "describe": {
 				const record = this.#record(operation.name);
 				await this.#refreshDetached(record);
@@ -694,70 +717,30 @@ class DaemonBroker {
 		) {
 			throw new Error('Windows batch files require application "cmd.exe" with the batch path after "/c"');
 		}
+		if (this.#shuttingDown) throw new Error("Daemon broker is shutting down");
 		if (this.#startingNames.has(spec.name)) {
 			throw new Error(`Daemon ${spec.name} is already starting`);
 		}
 		this.#startingNames.add(spec.name);
 		let record: ManagedDaemon;
+		let launchGate: PromiseWithResolvers<void>;
 		try {
 			const existing = this.#records.get(spec.name);
-			if (existing) await this.#refreshDetached(existing);
-			if (existing && !terminalState(existing.snapshot.state)) {
-				if (!replace) throw new Error(`Daemon ${spec.name} is already ${existing.snapshot.state}`);
-				await this.#stopRecord(existing, 2_000);
-				if (!terminalState(existing.snapshot.state)) throw new Error(`Daemon ${spec.name} did not stop`);
-			}
-			if (existing && existing.pendingCompletions.length > 0 && !replace) {
-				throw new Error(`Daemon ${spec.name} has unacknowledged completion notifications`);
-			}
-			// The replaced generation's log writer must finish before its files are discarded.
-			await existing?.log?.close();
-			if (spec.ready?.log) {
-				try {
-					new RegExp(spec.ready.log, "u");
-				} catch (error) {
-					throw new Error(`Invalid readiness regex: ${error instanceof Error ? error.message : String(error)}`);
-				}
-			}
-			const stat = await fs.stat(spec.cwd);
-			if (!stat.isDirectory()) throw new Error(`Daemon cwd is not a directory: ${spec.cwd}`);
-			const dir = path.join(this.#runtimeDir, "daemons", spec.name);
-			const now = Date.now();
-			record = {
-				spec,
-				snapshot: {
-					name: spec.name,
-					id: crypto.randomUUID(),
-					state: "starting",
-					createdAt: now,
-					startedAt: now,
-					restartCount: 0,
-					outputBytes: 0,
-					owner,
-					persist: spec.persist,
-					detached: spec.detached,
-				},
-				dir,
-				log: await DaemonLog.create(dir),
-				generation: 0,
-				stopRequested: false,
-				logReady: !spec.ready?.log,
-				portReady: spec.ready?.port === undefined,
-				readinessBuffer: "",
-				outputOffset: 0,
-				readyPattern: spec.ready?.log ? new RegExp(spec.ready.log, "u") : undefined,
-				consecutiveFailures: 0,
-				persistQueue: Promise.resolve(),
-				completionCapable: owner !== undefined && this.#completionSubscriptions.has(owner),
-				completionSubscriptionId: owner === undefined ? undefined : this.#completionSubscriptions.get(owner),
-				pendingCompletions: replace ? (existing?.pendingCompletions ?? []) : [],
-			};
-			syncReadyPending(record);
-			this.#records.set(spec.name, record);
+			// A start takes its turn on the existing record like any lifecycle request: what is
+			// queued on it runs first, and what is queued after this finds it replaced
+			// (#serialized) instead of relaunching a record the broker no longer tracks.
+			({ record, launchGate } = existing
+				? await this.#serialized(existing, () => this.#replace(spec, owner, replace, existing))
+				: await this.#replace(spec, owner, replace, undefined));
 		} finally {
 			this.#startingNames.delete(spec.name);
 		}
-		await this.#launch(record);
+		// The new record's own lifecycle requests wait until its first launch is done.
+		try {
+			await this.#launch(record);
+		} finally {
+			launchGate.resolve();
+		}
 		let readyTimedOut = false;
 		if (spec.ready && !terminalState(record.snapshot.state)) {
 			// Wake on the sticky readyAt marker or any terminal state, not the live
@@ -774,6 +757,82 @@ class DaemonBroker {
 		}
 		await record.persistQueue;
 		return { op: "start", daemon: record.snapshot, readyTimedOut };
+	}
+
+	/**
+	 * Stop `existing` (when `replace` allows) and install a new record for `spec` in its place.
+	 * The new record's lifecycle is held by `launchGate` until {@link #start} launched it.
+	 */
+	async #replace(
+		spec: DaemonSpec,
+		owner: string | undefined,
+		replace: boolean,
+		existing: ManagedDaemon | undefined,
+	): Promise<{ record: ManagedDaemon; launchGate: PromiseWithResolvers<void> }> {
+		if (existing) await this.#refreshDetached(existing);
+		if (existing && !terminalState(existing.snapshot.state)) {
+			if (!replace) throw new Error(`Daemon ${spec.name} is already ${existing.snapshot.state}`);
+			await this.#stopRecord(existing, 2_000);
+			if (!terminalState(existing.snapshot.state)) throw new Error(`Daemon ${spec.name} did not stop`);
+		}
+		if (existing && existing.pendingCompletions.length > 0 && !replace) {
+			throw new Error(`Daemon ${spec.name} has unacknowledged completion notifications`);
+		}
+		// The replaced generation's log writer must finish before its files are discarded.
+		await existing?.log?.close();
+		if (spec.ready?.log) {
+			try {
+				new RegExp(spec.ready.log, "u");
+			} catch (error) {
+				throw new Error(`Invalid readiness regex: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		}
+		const stat = await fs.stat(spec.cwd);
+		if (!stat.isDirectory()) throw new Error(`Daemon cwd is not a directory: ${spec.cwd}`);
+		const dir = daemonRecordDir(this.#runtimeDir, spec.name);
+		const now = Date.now();
+		const launchGate = Promise.withResolvers<void>();
+		const record: ManagedDaemon = {
+			spec,
+			snapshot: {
+				name: spec.name,
+				id: crypto.randomUUID(),
+				state: "starting",
+				createdAt: now,
+				startedAt: now,
+				restartCount: 0,
+				outputBytes: 0,
+				owner,
+				persist: spec.persist,
+				detached: spec.detached,
+			},
+			dir,
+			log: await DaemonLog.create(dir),
+			generation: 0,
+			stopRequested: false,
+			logReady: !spec.ready?.log,
+			portReady: spec.ready?.port === undefined,
+			readinessBuffer: "",
+			outputOffset: 0,
+			readyPattern: spec.ready?.log ? new RegExp(spec.ready.log, "u") : undefined,
+			consecutiveFailures: 0,
+			persistQueue: Promise.resolve(),
+			lifecycle: launchGate.promise,
+			completionCapable: owner !== undefined && this.#completionSubscriptions.has(owner),
+			completionSubscriptionId: owner === undefined ? undefined : this.#completionSubscriptions.get(owner),
+			pendingCompletions: replace ? (existing?.pendingCompletions ?? []) : [],
+		};
+		syncReadyPending(record);
+		// Shutdown may have begun during the awaits above. Its pass over the records never
+		// visits a record installed under a key it already passed (or after it finished), so
+		// nothing would ever stop this one: refuse instead. No await between this check and
+		// the install.
+		if (this.#shuttingDown) {
+			await record.log?.close();
+			throw new Error("Daemon broker is shutting down");
+		}
+		this.#records.set(spec.name, record);
+		return { record, launchGate };
 	}
 
 	async #launch(record: ManagedDaemon): Promise<void> {
@@ -1277,24 +1336,53 @@ class DaemonBroker {
 		if (!settled && record.pty) record.pty.kill();
 	}
 
-	async #restart(name: string): Promise<DaemonRpcResult> {
-		const record = this.#record(name);
-		await this.#stopRecord(record, 2_000);
-		await record.log?.close();
-		record.log = await DaemonLog.open(record.dir);
-		record.stopRequested = false;
-		// Settled history does not need subscription writes, but a new generation
-		// must persist the owner's current capability for crash recovery.
-		const owner = record.snapshot.owner;
-		record.completionCapable = owner !== undefined && this.#completionSubscriptions.has(owner);
-		record.completionSubscriptionId = owner === undefined ? undefined : this.#completionSubscriptions.get(owner);
-		await this.#launch(record);
+	/**
+	 * Run one lifecycle request on `record` (`stop`, `restart`, `mode`, or a `start` that
+	 * takes its name) once every earlier one has settled. A request queued behind a `start`
+	 * that replaced the daemon fails rather than act on the retired record, whose process
+	 * would no longer be tracked; so does one whose turn comes once the broker is shutting
+	 * down, which must not launch anything.
+	 */
+	#serialized<T>(record: ManagedDaemon, run: () => Promise<T>): Promise<T> {
+		const result = record.lifecycle.then(() => {
+			if (this.#records.get(record.snapshot.name) !== record) {
+				throw new Error(`Daemon ${record.snapshot.name} was replaced`);
+			}
+			if (this.#shuttingDown) throw new Error("Daemon broker is shutting down");
+			return run();
+		});
+		record.lifecycle = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		return result;
+	}
+
+	/** Stop and relaunch `record`. Callers serialize it ({@link #serialized}). */
+	async #restart(record: ManagedDaemon): Promise<DaemonRpcResult> {
+		record.relaunching = true;
+		try {
+			await this.#stopRecord(record, 2_000);
+			await record.log?.close();
+			record.log = await DaemonLog.open(record.dir);
+			record.stopRequested = false;
+			// Settled history does not need subscription writes, but a new generation
+			// must persist the owner's current capability for crash recovery.
+			const owner = record.snapshot.owner;
+			record.completionCapable = owner !== undefined && this.#completionSubscriptions.has(owner);
+			record.completionSubscriptionId = owner === undefined ? undefined : this.#completionSubscriptions.get(owner);
+			await this.#launch(record);
+		} finally {
+			record.relaunching = false;
+			// A relaunch that failed (or a stop that ended the broker's run of it) is ended now.
+			if (terminalState(record.snapshot.state)) this.#persist(record);
+		}
 		await record.persistQueue;
 		return { op: "restart", daemon: record.snapshot };
 	}
 
-	async #mode(operation: Extract<DaemonOperation, { op: "mode" }>): Promise<DaemonRpcResult> {
-		const record = this.#record(operation.name);
+	/** Change `record`'s mode. Callers serialize it ({@link #serialized}). */
+	async #mode(record: ManagedDaemon, operation: Extract<DaemonOperation, { op: "mode" }>): Promise<DaemonRpcResult> {
 		await this.#refreshDetached(record);
 		if (terminalState(record.snapshot.state) || record.snapshot.state === "stopping") {
 			throw new Error(`Daemon ${operation.name} is ${record.snapshot.state}`);
@@ -1302,7 +1390,7 @@ class DaemonBroker {
 		if (operation.mode === "detached") {
 			if (!record.spec.detached) {
 				record.spec = { ...record.spec, detached: true, pty: false, persist: true };
-				await this.#restart(operation.name);
+				await this.#restart(record);
 			}
 		} else {
 			if (record.spec.detached && operation.mode === "session") {
@@ -1336,8 +1424,10 @@ class DaemonBroker {
 	}
 
 	#serializeMetadata(record: ManagedDaemon): string {
+		// A daemon stopped by a restart request is published as `restarting`, never as ended.
+		const relaunching = record.relaunching === true && terminalState(record.snapshot.state);
 		return JSON.stringify({
-			daemon: { ...record.snapshot },
+			daemon: relaunching ? { ...record.snapshot, state: "restarting" } : { ...record.snapshot },
 			completionEvents: record.completionCapable,
 			completionSubscriptionId: record.completionSubscriptionId,
 			completionPending: record.pendingCompletions.length > 0,
@@ -1447,6 +1537,7 @@ class DaemonBroker {
 					// Legacy files are rewritten once into the split layout.
 					persistedSpec: legacyLayout ? undefined : JSON.stringify(storedSpec),
 					persistedMeta: legacyLayout ? undefined : JSON.stringify(decoded),
+					lifecycle: Promise.resolve(),
 					completionCapable: "completionEvents" in decoded && decoded.completionEvents === true,
 					completionSubscriptionId:
 						"completionSubscriptionId" in decoded && typeof decoded.completionSubscriptionId === "string"

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `Agent.setRunScope(scope)` wraps the start of every run (`prompt` and `continue`), so a host can start runs outside its own async context
+
 ## [18.6.0] - 2026-10-03
 
 ### Fixed
