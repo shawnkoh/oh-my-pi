@@ -40,7 +40,7 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 	},
 	{
 		name: "quiesce_and_exit",
-		doc: "Atomically close admission and exit if the bound quiescence attempt passes.",
+		doc: "Require explicit strict or attested completeness; close admission and retire, retaining strict sealed failures for retry.",
 		params: "QuiesceRequest",
 		result: "QuiesceResult",
 	},

@@ -314,7 +314,8 @@ function recordServiceProcess(
 	if (!registry) return;
 	if (daemon.pid !== undefined) {
 		// Without the broker the record would read as ended while the broker relaunches it.
-		if (host.brokerPid === undefined) registry.markIncomplete("a service's daemon broker could not be identified", "service-identity-unknown");
+		if (host.brokerPid === undefined)
+			registry.markIncomplete("a service's daemon broker could not be identified", "service-identity-unknown");
 		registry.registerProcess({
 			kind: "service",
 			jobId: `service:${daemon.id}:${daemon.startedAt}`,

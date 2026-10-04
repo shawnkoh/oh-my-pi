@@ -22,7 +22,7 @@
 			},
 			{
 				"name": "quiesce_and_exit",
-				"doc": "Atomically close admission and exit if the bound quiescence attempt passes.",
+				"doc": "Require explicit strict or attested completeness; close admission and retire, retaining strict sealed failures for retry.",
 				"params": "QuiesceRequest",
 				"result": "QuiesceResult",
 				"nullable": false,
@@ -2345,6 +2345,9 @@
 					],
 					"type": "string"
 				},
+				"sealed": {
+					"type": "boolean"
+				},
 				"registry": {
 					"$ref": "#/$defs/OwnedJobRegistryState"
 				},
@@ -2362,6 +2365,7 @@
 				"invocation",
 				"counts",
 				"admission",
+				"sealed",
 				"registry",
 				"observedAt"
 			]
@@ -2370,6 +2374,13 @@
 			"type": "object",
 			"properties": {
 				"operationId": {
+					"type": "string"
+				},
+				"completeness": {
+					"enum": [
+						"strict",
+						"attested"
+					],
 					"type": "string"
 				},
 				"attempt": {
@@ -2390,6 +2401,7 @@
 			},
 			"required": [
 				"operationId",
+				"completeness",
 				"attempt",
 				"epoch",
 				"instanceId",
@@ -2407,6 +2419,7 @@
 				"deadline_expired",
 				"epoch_mismatch",
 				"work_active",
+				"completeness_unknown",
 				"attestation_unavailable"
 			],
 			"type": "string"
@@ -2420,7 +2433,8 @@
 				"kind": {
 					"enum": [
 						"quiesce",
-						"hangup"
+						"hangup",
+						"sealed_blocked"
 					],
 					"type": "string"
 				},
@@ -2493,6 +2507,50 @@
 				"writtenAt"
 			]
 		},
+		"CensusProcess": {
+			"type": "object",
+			"properties": {
+				"pid": {
+					"type": "number"
+				},
+				"comm": {
+					"type": "string"
+				},
+				"ppid": {
+					"type": "number"
+				}
+			},
+			"required": [
+				"pid",
+				"comm",
+				"ppid"
+			]
+		},
+		"CensusResult": {
+			"type": "object",
+			"properties": {
+				"complete": {
+					"type": "boolean"
+				},
+				"work": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/CensusProcess"
+					}
+				},
+				"reasons": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
+				}
+			},
+			"required": [
+				"complete",
+				"work",
+				"reasons"
+			]
+		},
 		"QuiesceSnapshot": {
 			"type": "object",
 			"properties": {
@@ -2504,12 +2562,115 @@
 				},
 				"observedAt": {
 					"type": "string"
+				},
+				"registry": {
+					"$ref": "#/$defs/OwnedJobRegistryState"
+				},
+				"census": {
+					"$ref": "#/$defs/CensusResult"
+				},
+				"completenessReasons": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
 				}
 			},
 			"required": [
 				"epoch",
 				"counts",
 				"observedAt"
+			]
+		},
+		"SealedQuiesceSnapshot": {
+			"type": "object",
+			"properties": {
+				"epoch": {
+					"type": "number"
+				},
+				"counts": {
+					"$ref": "#/$defs/WorkCounts"
+				},
+				"observedAt": {
+					"type": "string"
+				},
+				"registry": {
+					"$ref": "#/$defs/OwnedJobRegistryState"
+				},
+				"census": {
+					"anyOf": [
+						{
+							"$ref": "#/$defs/CensusResult"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"completenessReasons": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
+				}
+			},
+			"required": [
+				"epoch",
+				"counts",
+				"observedAt",
+				"registry",
+				"census",
+				"completenessReasons"
+			]
+		},
+		"QuiesceProgress": {
+			"type": "object",
+			"properties": {
+				"finalized": {
+					"type": "boolean"
+				},
+				"bound": {
+					"type": "boolean"
+				},
+				"attested": {
+					"type": "boolean"
+				}
+			},
+			"required": [
+				"finalized",
+				"bound",
+				"attested"
+			]
+		},
+		"QuiesceSealedBlockedResult": {
+			"type": "object",
+			"properties": {
+				"status": {
+					"const": "sealed_blocked"
+				},
+				"operationId": {
+					"type": "string"
+				},
+				"attempt": {
+					"type": "number"
+				},
+				"reason": {
+					"type": "string"
+				},
+				"snapshot": {
+					"$ref": "#/$defs/SealedQuiesceSnapshot"
+				},
+				"progress": {
+					"$ref": "#/$defs/QuiesceProgress"
+				}
+			},
+			"required": [
+				"status",
+				"operationId",
+				"attempt",
+				"reason",
+				"snapshot",
+				"progress"
 			]
 		},
 		"QuiescedResult": {
@@ -2607,6 +2768,9 @@
 				},
 				{
 					"$ref": "#/$defs/QuiesceUnattestedResult"
+				},
+				{
+					"$ref": "#/$defs/QuiesceSealedBlockedResult"
 				}
 			]
 		},
@@ -4609,7 +4773,7 @@
 			"required": [
 				"type"
 			],
-			"description": "First frame after startup; capabilities include quiesce-exit/1 and owned-jobs/1. Transport fields are absent on servers without protocol v2."
+			"description": "First frame after startup; capabilities include quiesce-exit/2 and owned-jobs/1. Transport fields are absent on servers without protocol v2."
 		},
 		"DeliveryAcceptedEvent": {
 			"type": "object",

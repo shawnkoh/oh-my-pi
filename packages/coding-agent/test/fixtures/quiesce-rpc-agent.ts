@@ -100,20 +100,11 @@ if (process.env.QUIESCE_FIXTURE_PENDING === "1") {
 // Files release the provider-independent live controller at exact lifecycle boundaries.
 const createLiveSession: RpcLiveSessionFactory = ({ callbacks }) => {
 	let muted = false;
-	const waitFor = (name: string) =>
-		new Promise<void>(resolve => {
-			const file = path.join(process.cwd(), name);
-			const watcher = fs.watch(process.cwd(), () => {
-				if (fs.existsSync(file)) {
-					watcher.close();
-					resolve();
-				}
-			});
-			if (fs.existsSync(file)) {
-				watcher.close();
-				resolve();
-			}
-		});
+	const waitFor = async (name: string) => {
+		const file = path.join(process.cwd(), name);
+		// Poll the explicit release file rather than depend on filesystem notifications.
+		while (!fs.existsSync(file)) await Bun.sleep(10);
+	};
 	return {
 		get muted() {
 			return muted;

@@ -942,7 +942,10 @@ export class AgentSession implements SettingsScope {
 	#extensionRunner: ExtensionRunner | undefined = undefined;
 	#getEvalPreludes: (() => readonly EvalPreludeDefinition[]) | undefined;
 	#reconcileBrowserMcpFilter: AgentSessionConfig["reconcileBrowserMcpFilter"];
-	#censusConfig: Pick<AgentSessionConfig, "a13Identity" | "a13Instance" | "a13Extinct" | "namespaceCensus" | "idleInfrastructure">;
+	#censusConfig: Pick<
+		AgentSessionConfig,
+		"a13Identity" | "a13Instance" | "a13Extinct" | "namespaceCensus" | "idleInfrastructure"
+	>;
 	#lastCensus: CensusResult | undefined;
 	#lastCompletenessReasons: string[] | undefined;
 	#skillDescriptions: SkillDescriptionCatalog;
@@ -3560,7 +3563,12 @@ export class AgentSession implements SettingsScope {
 			const epoch = this.#activityEpoch;
 			counts = this.getWorkCounts(strict);
 			const completeness = strict ? this.#strictCompleteness() : undefined;
-			if (strict) counts.detachedJobs += this.#lastCensus?.work.length ?? 0;
+			if (strict) {
+				const fresh = this.#countWork(false, true);
+				for (const key of Object.keys(counts) as (keyof WorkCounts)[])
+					counts[key] = Math.max(counts[key], fresh[key]);
+				counts.detachedJobs += this.#lastCensus?.work.length ?? 0;
+			}
 			const sessionFile = this.sessionManager.getSessionFile();
 			let reason: QuiesceRefusalReason | undefined;
 			if (Date.now() >= request.deadline) reason = "deadline_expired";
@@ -3665,6 +3673,9 @@ export class AgentSession implements SettingsScope {
 			}
 			counts = this.getWorkCounts(true);
 			const completeness = this.#strictCompleteness();
+			const fresh = this.#countWork(false, true);
+			for (const key of Object.keys(counts) as (keyof WorkCounts)[]) counts[key] = Math.max(counts[key], fresh[key]);
+			if (Date.now() >= request.deadline) throw new Error("deadline_expired");
 			counts.detachedJobs += this.#lastCensus?.work.length ?? 0;
 			if (hasOutstandingWork(counts)) throw new Error("work_active");
 			if (this.#activityEpoch !== state.epoch) throw new Error("epoch_mismatch");
@@ -3803,9 +3814,7 @@ export class AgentSession implements SettingsScope {
 		const complete = registryComplete && this.#censusConfig.a13Instance !== undefined;
 		const reasons = registryComplete ? [] : ["registry_incomplete"];
 		if (!this.#censusConfig.a13Instance) reasons.push("instance_identity_missing");
-		const result = this.#ledgerCompleteness(
-			this.#censusCompleteness({ complete, reasons }),
-		);
+		const result = this.#ledgerCompleteness(this.#censusCompleteness({ complete, reasons }));
 		this.#lastCompletenessReasons = result.reasons;
 		return result;
 	}
@@ -3814,19 +3823,21 @@ export class AgentSession implements SettingsScope {
 		const records = this.ownedJobRegistry?.openJobs() ?? [];
 		this.#lastCensus = (this.#censusConfig.namespaceCensus ?? namespaceCensus)({
 			identity: this.#censusConfig.a13Identity,
-			idleInfrastructure: this.#censusConfig.idleInfrastructure ?? (() => this.getIdleSafeServerProcesses()),
+			idleInfrastructure: () => [
+				...(this.ownedJobRegistry?.idleHelpers() ?? []),
+				...(this.#censusConfig.idleInfrastructure?.() ?? this.getIdleSafeServerProcesses()),
+			],
+			ledgerSnapshot: () =>
+				JSON.stringify({
+					counts: this.#countWork(false, true),
+					reasons: ExtensionActivityLedger.completenessReasons().sort(),
+				}),
 			registered: records
 				.filter(record => !record.inProcess)
 				.map(record => ({
 					pid: record.pid,
 					startId: record.startId,
 					kind: record.kind,
-					supervisesLiveService: records.some(
-						service =>
-							service.kind === "service" &&
-							service.broker?.pid === record.pid &&
-							service.broker.startId === record.startId,
-					),
 				})),
 		});
 		return {

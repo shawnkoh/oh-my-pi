@@ -708,17 +708,24 @@ read-only snapshot, then asks the process to exit only if nothing changed:
    the census. With admission closed, the census checks the proc mount for hidepid,
    boot ID, and every numeric PID's `stat`, raw NUL-delimited `cmdline`, and status
    `Uid` line; it never reads `environ`. Read failures, malformed fields, duplicate
-   PIDs, and unconfirmed disappearance are unknown. Zombies are gone.
+   PIDs, and unconfirmed disappearance are unknown. Dead-state processes remain work;
+   a dead boundary or canonical process invalidates the census.
+   Each pass snapshots ledger counts and completeness reasons before and after.
+   A change restarts stability checking within the same three-pass, 90-second budget;
+   exhaustion reports `completeness_unknown` with `census-ledger-unstable`.
+   Registry records never authorize internal-helper exclusion: only identities held
+   in memory by this invocation can do so.
 
    Only the exact boundary (PID 1, recorded start, `openshell-sandb`), owner-recorded
    canonical process (with `sleep infinity` argv corroboration), engine, exact
    registered processes, idle internal helpers supervising no registered live service,
-   and exact identities from the injected idle-infrastructure provider are excluded
-   from additional work. The provider defaults to empty. Registered processes are
+   and exact identities from the idle-infrastructure provider are excluded from
+   additional work. The engine combines invocation-local helper identities with
+   contracted idle-safe servers (none configured by default). Registered processes are
    already counted; unmatched processes, including ppid-0 processes, are work.
    Such work increases `detachedJobs` for the strict decision and refuses with
    `work_active`. Two consecutive passes must agree on `(pid,start)` and classification,
-   with at most three comparisons before `census-unstable`. This does not make the
+   within at most three passes and 90 seconds before `census-unstable`. This does not make the
    census atomic against privileged out-of-band launches; managed launch admission
    must remain closed at the owner.
    - Pass → `data: { status: "quiesced", operationId, attempt, attestation, path }`.

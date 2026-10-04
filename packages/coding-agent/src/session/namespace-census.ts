@@ -16,7 +16,6 @@ export interface CensusRegistration {
 	pid: number;
 	startId: string | null;
 	kind: string;
-	supervisesLiveService?: boolean;
 }
 export interface CensusOptions {
 	identity?: CensusIdentity;
@@ -25,6 +24,8 @@ export interface CensusOptions {
 	enginePid?: number;
 	registered?: readonly CensusRegistration[];
 	idleInfrastructure?: () => readonly { pid: number; start: string; label: string }[];
+	/** Counts and completeness reasons, sampled around every pass under the same budget. */
+	ledgerSnapshot?: () => string;
 	/** Filesystem seam for deterministic race and read-error tests. */
 	io?: { read(file: string): Buffer; list(root: string): string[] };
 }
@@ -175,12 +176,7 @@ export function namespaceCensus(options: CensusOptions): CensusResult {
 						const records =
 							options.registered?.filter(record => record.pid === pid && record.startId === proc.start) ?? [];
 						if (records.some(record => record.kind !== "internal")) classification = "registered";
-						else if (records.some(record => record.kind === "internal" && record.supervisesLiveService === false))
-							classification = "internal";
-						else if (
-							records.length === 0 &&
-							idle.some(server => server.pid === pid && server.start === proc.start)
-						)
+						else if (idle.some(server => server.pid === pid && server.start === proc.start))
 							classification = "idle-infrastructure";
 					}
 					members.push(`${pid}:${proc.start}:${classification}`);
@@ -195,14 +191,24 @@ export function namespaceCensus(options: CensusOptions): CensusResult {
 			if (!boundary || !canonical) throw new Error("required-identity-missing");
 			return { signature: members.sort().join("\n"), work, settled: [...end].every(pid => pids.includes(pid)) };
 		};
-		let previous = pass();
-		for (let round = 0; round < 3; round++) {
+		const deadline = Date.now() + 90_000;
+		let previous: { signature: string; work: CensusResult["work"]; settled: boolean } | undefined;
+		let ledgerUnstable = false;
+		for (let round = 0; round < 3 && Date.now() < deadline; round++) {
+			const before = options.ledgerSnapshot?.();
 			const current = pass();
-			if (previous.settled && current.settled && previous.signature === current.signature)
+			const after = options.ledgerSnapshot?.();
+			if (before !== after) {
+				ledgerUnstable = true;
+				previous = undefined;
+				continue;
+			}
+			if (Date.now() >= deadline) break;
+			if (previous?.settled && current.settled && previous.signature === current.signature)
 				return { complete: true, work: current.work, reasons: [] };
 			previous = current;
 		}
-		return unknown("census-unstable");
+		return unknown(ledgerUnstable ? "census-ledger-unstable" : "census-unstable");
 	} catch (error) {
 		return unknown(`census-${String(error)}`);
 	}

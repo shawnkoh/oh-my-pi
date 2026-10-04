@@ -741,6 +741,8 @@ export class OwnedJobRegistry {
 	readonly #options: OwnedJobRegistryOptions;
 	/** Open jobs keyed by job id (ids are unique within one invocation). */
 	readonly #open = new Map<string, OpenJob>();
+	/** Invocation-local helper identities; never populated by registry replay or takeover. */
+	readonly #helpers = new Map<number, { pid: number; start: string; label: string }>();
 	/** Files whose `invocation` header for this invocation was written successfully. */
 	readonly #headered = new Set<string>();
 	readonly #incompleteReasons: IncompleteReason[] = [];
@@ -864,6 +866,9 @@ export class OwnedJobRegistry {
 			if (identity.state === "gone") return undefined;
 			startId = identity.startId ?? null;
 			startTime ??= identity.startTime ?? null;
+		}
+		if (input.kind === "internal" && startId !== null) {
+			this.#helpers.set(input.pid, { pid: input.pid, start: startId, label: input.command });
 		}
 		const jobId = input.jobId ?? `${input.kind}:${input.pid}:${startId ?? "unknown"}`;
 		if (this.#open.has(jobId)) return jobId;
@@ -1167,6 +1172,19 @@ export class OwnedJobRegistry {
 	/** Open records (both in-process and OS processes), for diagnostics and tests. */
 	openJobs(): OwnedJobStartRecord[] {
 		return Array.from(this.#open.values(), open => open.record);
+	}
+
+	/** Exclusion authority comes only from helpers registered by this running invocation. */
+	idleHelpers(): readonly { pid: number; start: string; label: string }[] {
+		return [...this.#helpers.values()].filter(
+			helper =>
+				![...this.#open.values()].some(
+					({ record }) =>
+						record.kind === "service" &&
+						record.broker?.pid === helper.pid &&
+						record.broker.startId === helper.start,
+				),
+		);
 	}
 
 	/** Stop liveness polling. Open records stay open on disk: they may outlive this process. */

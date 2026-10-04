@@ -10,6 +10,8 @@ import {
 	type CensusOptions,
 } from "../src/session/namespace-census";
 import { parseArgs } from "../src/cli/args";
+import { ExtensionActivityLedger, ServerActivityLedger, outstandingServerWork } from "../src/session/activity-ledger";
+import { OwnedJobRegistry } from "../src/session/owned-job-registry";
 
 const identity = {
 	v: 1 as const,
@@ -86,17 +88,106 @@ test("registered identities are counted once; internal helpers require exact idl
 	f.add(7);
 	f.options.registered = [
 		{ pid: 4, startId: "40", kind: "process" },
-		{ pid: 5, startId: "50", kind: "internal", supervisesLiveService: false },
-		{ pid: 6, startId: "60", kind: "internal", supervisesLiveService: true },
-		{ pid: 7, startId: "71", kind: "internal", supervisesLiveService: false },
+		{ pid: 5, startId: "50", kind: "internal" },
+		{ pid: 6, startId: "60", kind: "internal" },
+		{ pid: 7, startId: "71", kind: "internal" },
 	];
 	expect(
 		namespaceCensus(f.options)
 			.work.map(p => p.pid)
 			.sort(),
-	).toEqual([6, 7]);
+	).toEqual([5, 6, 7]);
 	f.options.idleInfrastructure = () => [{ pid: 7, start: "70", label: "audited" }];
-	expect(namespaceCensus(f.options).work.map(p => p.pid)).toEqual([6]);
+	expect(
+		namespaceCensus(f.options)
+			.work.map(p => p.pid)
+			.sort(),
+	).toEqual([5, 6]);
+});
+
+test("forged internal registry records cannot exclude a live process", () => {
+	const f = fixture();
+	f.add(process.pid, "live-test-process", 1, "40");
+	const options = {
+		getSessionFile: () => path.join(f.root, "session.jsonl"),
+		getSessionId: () => "test",
+		pollIntervalMs: 0,
+	};
+	const writer = new OwnedJobRegistry(options);
+	writer.registerProcess({ kind: "process", pid: process.pid, startId: "40", command: "live-test-process" });
+	const file = writer.path!;
+	writer.close();
+	const records = fs
+		.readFileSync(file, "utf8")
+		.trim()
+		.split("\n")
+		.map(line => JSON.parse(line));
+	for (const record of records) if (record.type === "start") record.kind = "internal";
+	fs.writeFileSync(file, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+	const reader = new OwnedJobRegistry(options);
+	try {
+		reader.ensureHeader();
+		f.options.registered = reader.openJobs();
+		f.options.idleInfrastructure = () => reader.idleHelpers();
+		expect(namespaceCensus(f.options).work).toContainEqual({ pid: process.pid, comm: "live-test-process", ppid: 1 });
+	} finally {
+		reader.close();
+	}
+});
+
+test.each(["mcp", "lsp"] as const)("a %s server request arriving mid-census consumes another pass", kind => {
+	const f = fixture();
+	const server = new ServerActivityLedger(kind, "census-test");
+	const before = outstandingServerWork();
+	let hold: { release(): void } | undefined;
+	let passes = 0;
+	f.options.ledgerSnapshot = () => JSON.stringify({ count: outstandingServerWork(), reasons: [] });
+	f.options.io = {
+		list: root => fs.readdirSync(root),
+		read: file => {
+			if (file.endsWith("self/mountinfo") && ++passes === 2) hold = server.hold();
+			return fs.readFileSync(file);
+		},
+	};
+	try {
+		expect(namespaceCensus(f.options)).toEqual({ complete: false, work: [], reasons: ["census-ledger-unstable"] });
+		expect(passes).toBe(3);
+		expect(outstandingServerWork()).toBe(before + 1);
+	} finally {
+		hold?.release();
+	}
+});
+
+test("extension holds changing mid-census cannot establish stability", () => {
+	const f = fixture();
+	const ledger = new ExtensionActivityLedger();
+	let hold: { release(): void } | undefined;
+	let passes = 0;
+	f.options.ledgerSnapshot = () =>
+		JSON.stringify({
+			count: ExtensionActivityLedger.outstandingWork(),
+			reasons: ExtensionActivityLedger.completenessReasons(),
+		});
+	f.options.io = {
+		list: root => fs.readdirSync(root),
+		read: file => {
+			if (file.endsWith("self/mountinfo")) {
+				passes++;
+				if (hold) {
+					hold.release();
+					hold = undefined;
+				} else hold = ledger.hold("background");
+			}
+			return fs.readFileSync(file);
+		},
+	};
+	try {
+		expect(namespaceCensus(f.options)).toEqual({ complete: false, work: [], reasons: ["census-ledger-unstable"] });
+		expect(passes).toBe(3);
+	} finally {
+		hold?.release();
+		ledger.dispose();
+	}
 });
 test("hidden mounts, malformed metadata, missing identity and canonical mismatch fail closed", () => {
 	const f = fixture();

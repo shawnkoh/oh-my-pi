@@ -27,7 +27,8 @@
 - Hosts that schedule goal continuations can reserve them on the session (`reserveGoalContinuation()`), so a pending continuation counts as work and none is scheduled once the session is exiting
 - The owned-job registry records the daemon broker and text-prediction helpers it starts as `internal` jobs that never count as work
 - After a passed quiesce, `set_ask_dialog`, `predict_word` and `predict_word_feedback` still answer while `cancel_subagent` and `steer_subagent` are refused, and no parked subagent is revived; queued read-only commands never count as outstanding input, a cancelled background job counts until it has stopped, and a turn boundary held by an advisor sync catch-up wait counts while updates held back by the review cadence do not. When another process owns the session file and the exit moves the transcript to a sibling, the terminal attestation, its digest and the registry name that sibling
-- The quiescence census includes RPC live voice sessions throughout connecting, active and closing; admission closure rejects live controls and `fork`. Every RPC command has an explicit admission classification, while upstream's busy-fork guard remains intact. Generated TypeScript, JSON Schema, Python, Rust and Go contracts expose the unchanged `quiesce-exit/1` requests and response variants.
+- The quiescence census includes RPC live voice sessions throughout connecting, active and closing; admission closure rejects live controls and `fork`. Every RPC command has an explicit admission classification, while upstream's busy-fork guard remains intact. Generated TypeScript, JSON Schema, Python, Rust and Go contracts expose `quiesce-exit/2`, including explicit completeness, sealed retirement and diagnostic snapshots.
+- Strict census stability compares ledger counts and completeness reasons around each pass, bounded to three passes and 90 seconds. Internal-helper exclusions use invocation-local identities, never registry records.
 
 ### Fixed
 
