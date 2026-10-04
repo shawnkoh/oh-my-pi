@@ -153,6 +153,44 @@ describe.skipIf(process.platform === "win32")("owned-job registry", () => {
 		expect(retainedShellWorkCount()).toBe(retainedBefore);
 	});
 
+	it.each([0, 1, undefined])(
+		"accounts for cancelled background jobs (%s) without a post-settle native call",
+		async liveBackgroundJobs => {
+			const nativeResult = Promise.withResolvers<natives.ShellRunResult>();
+			const dispatched = Promise.withResolvers<void>();
+			const runSpy = vi.spyOn(natives.Shell.prototype, "run").mockImplementation(() => {
+				dispatched.resolve();
+				return nativeResult.promise;
+			});
+			const abortSpy = vi.spyOn(natives.Shell.prototype, "abort").mockResolvedValue();
+			const countSpy = vi.spyOn(natives.Shell.prototype, "liveBackgroundJobCount").mockResolvedValue(0);
+			const controller = new AbortController();
+			try {
+				const run = executeBash("sleep 10", { cwd: tempDir.path(), signal: controller.signal });
+				await dispatched.promise;
+				controller.abort();
+				expect((await run).cancelled).toBe(true);
+				nativeResult.resolve({
+					cancelled: true,
+					timedOut: false,
+					liveBackgroundJobs,
+					spawnedProcesses: [],
+					spawnedComplete: true,
+				});
+				await eventually(
+					() => !registry.openJobs().some(record => record.kind === "shell-run"),
+					"cancelled run settlement",
+				);
+				expect(registry.complete).toBe(liveBackgroundJobs === 0);
+				expect(countSpy).not.toHaveBeenCalled();
+			} finally {
+				runSpy.mockRestore();
+				abortSpy.mockRestore();
+				countSpy.mockRestore();
+			}
+		},
+	);
+
 	it("keeps a retained-shell record open while a background job can still start processes", async () => {
 		// The job forks its long-lived child only after the run returned: no survivor report sees it.
 		const result = await executeBash("{ /bin/sleep 0.3; /bin/sleep 4; } >/dev/null 2>&1 & echo started", {

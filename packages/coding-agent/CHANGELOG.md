@@ -32,6 +32,7 @@
 
 ### Fixed
 
+- Cancelled and timed-out shell runs report background jobs in their native result, avoiding a post-settlement native call that could crash Bun during teardown while preserving strict ownership accounting.
 - Interrupting a turn while a tool approval is pending now closes the dialog (RPC hosts receive `cancel`), and an approval answered after the call was aborted no longer runs the tool
 - Literal RPC prompts (`literal: true`) are acknowledged only once admitted, like other prompts, so an immediate `promote_queued_message` observes a queued literal prompt
 - Host-dispatched extension work (hooks including `session_start`, commands, shortcuts, file fallbacks and managed timer callbacks) advances the owning session's activity epoch when it starts and counts until it settles, so a completed hook cannot leave an older exit attestation valid and an extension cannot pass quiescence from inside its own startup hook

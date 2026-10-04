@@ -149,22 +149,25 @@ pub struct MinimizerResult {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ShellRunResult {
-	pub exit_code:         Option<i32>,
-	pub cancelled:         bool,
-	pub timed_out:         bool,
-	pub minimized:         Option<MinimizerResult>,
-	pub working_dir:       Option<String>,
+	pub exit_code:            Option<i32>,
+	pub cancelled:            bool,
+	pub timed_out:            bool,
+	pub minimized:            Option<MinimizerResult>,
+	pub working_dir:          Option<String>,
+	/// Live background jobs at settlement; None if the session could not be
+	/// counted.
+	pub live_background_jobs: Option<u32>,
 	/// Processes this run launched that were still alive when it resolved
 	/// (identity-pinned), including the real process of reparented launches
 	/// such as `nohup cmd &` and leftover members of process groups the run's
 	/// spawns created. Present on every result, possibly empty. A run that
 	/// fails with an error carries no list: its leftovers are unknown.
 	#[serde(default)]
-	pub spawned_processes: Vec<process::SpawnedProcess>,
+	pub spawned_processes:    Vec<process::SpawnedProcess>,
 	/// False when the run may have left a process `spawned_processes` does not
 	/// name; see [`process::Survivors::complete`].
 	#[serde(default)]
-	pub spawned_complete:  bool,
+	pub spawned_complete:     bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -297,16 +300,14 @@ impl Shell {
 	/// kill-on-drop).
 	pub async fn live_background_job_count(&self) -> u32 {
 		let mut guard = self.session.lock().await;
-		let Some(core) = guard.as_mut() else {
-			return 0;
-		};
-		let jobs = core.shell.jobs_mut();
-		// Fail closed: a poll error leaves the job table in an unknown state, so
-		// report 0 (drop the shell) rather than pin a retained session forever on
-		// stale `representative_pid()` entries.
-		if jobs.poll().is_err() {
-			return 0;
-		}
+		count_live_background_jobs(guard.as_mut()).unwrap_or(0)
+	}
+}
+
+fn count_live_background_jobs(core: Option<&mut ShellSessionCore>) -> Option<u32> {
+	let jobs = core?.shell.jobs_mut();
+	jobs.poll().ok()?;
+	Some(
 		u32::try_from(
 			jobs
 				.jobs
@@ -314,8 +315,8 @@ impl Shell {
 				.filter(|job| job.representative_pid().is_some() || job.has_internal_task())
 				.count(),
 		)
-		.unwrap_or(u32::MAX)
-	}
+		.unwrap_or(u32::MAX),
+	)
 }
 
 pub async fn execute_shell(
@@ -458,9 +459,13 @@ async fn run_shell_session(
 			// Use try_lock to avoid deadlocking if another task holds the session.
 			// If we can't acquire the lock, the session will be cleaned up when the
 			// holding task finishes.
-			if let Ok(mut guard) = session.try_lock() {
+			let live_background_jobs = if let Ok(mut guard) = session.try_lock() {
+				let count = count_live_background_jobs(guard.as_mut());
 				*guard = None;
-			}
+				count
+			} else {
+				None
+			};
 			let _ = process_cancel_bridge.await;
 			let survivors = spawn_registry.survivors();
 			return Ok(ShellRunResult {
@@ -469,6 +474,7 @@ async fn run_shell_session(
 				timed_out:         matches!(reason, AbortReason::Timeout),
 				minimized:         None,
 				working_dir:       None,
+				live_background_jobs,
 				spawned_processes: survivors.processes,
 				spawned_complete:  survivors.complete,
 			});
@@ -481,8 +487,10 @@ async fn run_shell_session(
 	abort_state.clear().await;
 
 	let keepalive = res.as_ref().is_ok_and(|(exec, ..)| session_keepalive(exec));
+	let mut guard = session.lock().await;
+	let live_background_jobs = count_live_background_jobs(guard.as_mut());
 	if !keepalive {
-		*session.lock().await = None;
+		*guard = None;
 	}
 	let (exec, minimized, working_dir) = res?;
 	let survivors = spawn_registry.survivors();
@@ -492,6 +500,7 @@ async fn run_shell_session(
 		timed_out: false,
 		working_dir,
 		minimized,
+		live_background_jobs,
 		spawned_processes: survivors.processes,
 		spawned_complete: survivors.complete,
 	})
@@ -524,7 +533,11 @@ async fn run_shell_oneshot(
 				Some(tokio_cancel.clone()),
 			)
 			.await?;
-			run_shell_command(&mut session, &run_config, on_chunk, tokio_cancel, spawn_registry).await
+			let result =
+				run_shell_command(&mut session, &run_config, on_chunk, tokio_cancel, spawn_registry)
+					.await;
+			let count = count_live_background_jobs(Some(&mut session));
+			result.map(|result| (result, count))
 		}
 	});
 
@@ -537,6 +550,8 @@ async fn run_shell_oneshot(
 				task.abort();
 				let _ = task.await;
 			}
+			let live_background_jobs = graceful.ok().and_then(|result| result.ok())
+				.and_then(|result| result.ok()).and_then(|(_, count)| count);
 			let _ = process_cancel_bridge.await;
 			let survivors = spawn_registry.survivors();
 			return Ok(ShellExecuteResult {
@@ -545,6 +560,7 @@ async fn run_shell_oneshot(
 				timed_out:         matches!(reason, AbortReason::Timeout),
 				minimized:         None,
 				working_dir:       None,
+				live_background_jobs,
 				spawned_processes: survivors.processes,
 				spawned_complete:  survivors.complete,
 			});
@@ -555,7 +571,7 @@ async fn run_shell_oneshot(
 	let _ = process_cancel_bridge.await;
 	let res = run_result
 		.unwrap_or_else(|err| Err(Error::msg(format!("Shell execution task failed: {err}"))));
-	let (exec, minimized, working_dir) = res?;
+	let ((exec, minimized, working_dir), live_background_jobs) = res?;
 	let survivors = spawn_registry.survivors();
 	Ok(ShellExecuteResult {
 		exit_code: Some(exit_code(&exec)),
@@ -563,6 +579,7 @@ async fn run_shell_oneshot(
 		timed_out: false,
 		working_dir,
 		minimized,
+		live_background_jobs,
 		spawned_processes: survivors.processes,
 		spawned_complete: survivors.complete,
 	})
@@ -595,8 +612,16 @@ async fn run_shell_oneshot_streams(
 				Some(tokio_cancel.clone()),
 			)
 			.await?;
-			run_shell_command_streams(&mut session, &run_config, streams, tokio_cancel, spawn_registry)
-				.await
+			let result = run_shell_command_streams(
+				&mut session,
+				&run_config,
+				streams,
+				tokio_cancel,
+				spawn_registry,
+			)
+			.await;
+			let count = count_live_background_jobs(Some(&mut session));
+			result.map(|result| (result, count))
 		}
 	});
 
@@ -609,6 +634,8 @@ async fn run_shell_oneshot_streams(
 				task.abort();
 				let _ = task.await;
 			}
+			let live_background_jobs = graceful.ok().and_then(|result| result.ok())
+				.and_then(|result| result.ok()).and_then(|(_, count)| count);
 			let _ = process_cancel_bridge.await;
 			let survivors = spawn_registry.survivors();
 			return Ok(ShellExecuteResult {
@@ -617,6 +644,7 @@ async fn run_shell_oneshot_streams(
 				timed_out: matches!(reason, AbortReason::Timeout),
 				minimized: None,
 				working_dir: None,
+				live_background_jobs,
 				spawned_processes: survivors.processes,
 				spawned_complete: survivors.complete,
 			});
@@ -627,7 +655,7 @@ async fn run_shell_oneshot_streams(
 	let _ = process_cancel_bridge.await;
 	let res = run_result
 		.unwrap_or_else(|err| Err(Error::msg(format!("Shell execution task failed: {err}"))));
-	let (exec, working_dir) = res?;
+	let ((exec, working_dir), live_background_jobs) = res?;
 	let survivors = spawn_registry.survivors();
 	Ok(ShellExecuteResult {
 		exit_code: Some(exit_code(&exec)),
@@ -635,6 +663,7 @@ async fn run_shell_oneshot_streams(
 		timed_out: false,
 		working_dir,
 		minimized: None,
+		live_background_jobs,
 		spawned_processes: survivors.processes,
 		spawned_complete: survivors.complete,
 	})
@@ -6061,7 +6090,7 @@ replace = [{ pattern = "hello", replacement = "HI" }]
 		assert_eq!(shell.live_background_job_count().await, 0);
 
 		// A foreground-only command leaves nothing in the background.
-		shell
+		let result = shell
 			.run(
 				ShellRunOptions { command: "true".into(), ..Default::default() },
 				None,
@@ -6069,10 +6098,11 @@ replace = [{ pattern = "hello", replacement = "HI" }]
 			)
 			.await
 			.expect("run true");
+		assert_eq!(result.live_background_jobs, Some(0));
 		assert_eq!(shell.live_background_job_count().await, 0);
 
 		// An external background process is tracked while it runs.
-		shell
+		let result = shell
 			.run(
 				ShellRunOptions { command: "sh -c 'sleep 30' &".into(), ..Default::default() },
 				None,
@@ -6080,11 +6110,12 @@ replace = [{ pattern = "hello", replacement = "HI" }]
 			)
 			.await
 			.expect("run sleep");
+		assert_eq!(result.live_background_jobs, Some(1));
 		assert_eq!(shell.live_background_job_count().await, 1);
 
 		// An in-process job that has not started its external process yet is tracked
 		// too.
-		shell
+		let result = shell
 			.run(
 				ShellRunOptions {
 					command: "{ sleep 30; sh -c 'sleep 30'; } &".into(),
@@ -6095,10 +6126,36 @@ replace = [{ pattern = "hello", replacement = "HI" }]
 			)
 			.await
 			.expect("run brace group");
+		assert_eq!(result.live_background_jobs, Some(2));
 		assert_eq!(shell.live_background_job_count().await, 2);
 
 		// Dropping the shell at scope end reaps the children via kill-on-drop.
 		shell.abort().await;
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn timed_out_run_reports_background_jobs_before_reset() {
+		let _guard = shell_test_lock().lock().await;
+		assert_eq!(super::count_live_background_jobs(None), None);
+		let shell = Shell::new(None);
+		shell
+			.run(
+				ShellRunOptions { command: "true".into(), ..Default::default() },
+				None,
+				CancelToken::default(),
+			)
+			.await
+			.expect("materialize session");
+		let result = shell
+			.run(
+				ShellRunOptions { command: "sleep 30".into(), ..Default::default() },
+				None,
+				CancelToken::new(Some(50)),
+			)
+			.await
+			.expect("timed-out run");
+		assert!(result.timed_out);
+		assert_eq!(result.live_background_jobs, Some(0));
 	}
 
 	/// `Shell::pids` reports the in-flight run's live external children without

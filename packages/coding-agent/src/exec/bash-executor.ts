@@ -228,17 +228,11 @@ const QUARANTINE_CLEANUP_TIMEOUT_MS = 30_000;
  * `retained-shell` record, until they exit. A cancelled or timed-out run tears its Shell
  * down instead; background jobs still live then are untracked from here on.
  */
-async function trackBackgroundJobs(
-	shell: Shell,
-	result: ShellRunResult,
-	context: { command: string; cwd: string },
-): Promise<void> {
+function trackBackgroundJobs(shell: Shell, result: ShellRunResult, context: { command: string; cwd: string }): void {
 	if (backgroundShells.has(shell)) return;
 	const registry = OwnedJobRegistry.instance();
-	let live: number;
-	try {
-		live = await shell.liveBackgroundJobCount();
-	} catch {
+	const live = result.liveBackgroundJobs;
+	if (live === undefined) {
 		registry?.markIncomplete("shell background jobs could not be counted", "bash-background-uncounted");
 		return;
 	}
@@ -789,9 +783,9 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		};
 		void runPromise
 			.then(
-				async result => {
+				result => {
 					registry?.registerShellSurvivors(result, registryContext);
-					await trackBackgroundJobs(executionShell, result, registryContext);
+					trackBackgroundJobs(executionShell, result, registryContext);
 				},
 				() => {
 					registry?.markIncomplete(
