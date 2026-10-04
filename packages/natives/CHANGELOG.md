@@ -21,6 +21,12 @@
 ### Fixed
 
 - Fixed Ctrl+V on Windows sometimes pasting text with a few characters replaced by unrelated glyphs (for example `https://` turning into `՞ttp缀難//`); clipboard reads and writes no longer run at the same time ([#14144](https://github.com/can1357/oh-my-pi/pull/14144) by [@H4vC](https://github.com/H4vC))
+### Fixed
+
+- Fixed `spawnedComplete` being `false` for every shell run that started an external command in OpenShell sandboxes, whose seccomp filter denies every process-group signal: where group signals are refused outright, whether such a command's process group is gone is now read from the process table (two empty listings in a row); elsewhere a refused group signal still means the group has a member, and only "no such process" from a group signal ever ends a group
+- Fixed `pkill` reporting "signalling pid N failed" for every process where `pidfd_open` is unavailable (OpenShell sandboxes); it now signals by pid after re-checking that the pid still names the selected process
+- Fixed `spawnedComplete` being `false` for every shell run that left a process alive on Linux where `pidfd_open` is unavailable, such as OpenShell sandboxes whose seccomp filter fails it with `ENOSYS`: processes are now identified by their `/proc` start time there, are reported with their `startId`, and can still be signalled
+- Fixed `Shell.run` hanging forever with its command's process left a zombie on Linux where `pidfd_open` is unavailable (OpenShell sandboxes), once the host had spawned a subprocess of its own; waiting now retries reaping every 100 ms
 
 ## [18.4.10] - 2026-10-02
 
