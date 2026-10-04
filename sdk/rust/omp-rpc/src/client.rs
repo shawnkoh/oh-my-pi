@@ -826,6 +826,7 @@ impl Client {
 				supported_protocol_versions: None,
 				max_frame_bytes:             None,
 				max_reassembled_frame_bytes: None,
+				capabilities:               Vec::new(),
 			},
 			shared,
 			child,

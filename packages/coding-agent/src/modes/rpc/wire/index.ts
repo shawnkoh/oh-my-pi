@@ -63,6 +63,10 @@ const notificationDefs = {
 	RpcNotification: doc(
 		[
 			"ReadyEvent",
+			"DeliveryAcceptedEvent",
+			"DeliverySettledEvent",
+			"DeliveryDiscardedEvent",
+			"DeliveryCancelledEvent",
 			"PromptResultEvent",
 			"SessionSettledEvent",
 			"ExtensionError",
@@ -164,7 +168,7 @@ export function buildRpcWireBundle(): RpcWireBundle {
 		...frameDefs,
 		...notificationDefs,
 	};
-	const open = new Set([...Object.keys(messageDefs), "SelectOptionDetail"]);
+	const open = new Set([...Object.keys(messageDefs), "SelectOptionDetail", "DeliveryRecord", "DeliveryOptions"]);
 	const commands = collectCommands(defs);
 	const exported = type.scope(defs).export() as Record<string, { toJsonSchema(): Record<string, unknown> }>;
 

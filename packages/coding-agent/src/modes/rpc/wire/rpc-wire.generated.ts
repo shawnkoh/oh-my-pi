@@ -453,6 +453,30 @@ export interface GoalResult {
 	state: GoalModeState | null;
 }
 
+export type DeliveryMode = "aside" | "steer";
+
+export interface DeliveryOptions {
+	mode: DeliveryMode;
+	quiet?: true;
+	wakeAfterInterrupt?: true;
+	wakeInPlanMode?: true;
+}
+
+export interface DeliveryRecord {
+	customType: string;
+	content: MessageContent;
+	/** Requires a valid `omp.llm` user projection and `omp.llm.source` for admission. */
+	details: Record<string, unknown>;
+	display?: boolean;
+	attribution?: Attribution;
+}
+
+export interface ExternalDeliveryListing {
+	deliveryId: string;
+	state: "queued" | "accepted";
+	mode: DeliveryMode;
+}
+
 export interface SessionState {
 	sessionId: string;
 	model?: ModelInfo;
@@ -476,6 +500,8 @@ export interface SessionState {
 	isSettled?: boolean;
 	queuedMessages?: QueuedMessagesState;
 	todoPhases?: TodoPhase[];
+	capabilities?: string[];
+	externalDeliveries?: ExternalDeliveryListing[];
 	/** System prompt sections, for session dumps. */
 	systemPrompt?: string[];
 	dumpTools?: ToolDescriptor[];
@@ -909,6 +935,36 @@ export interface ReadyEvent {
 	supportedProtocolVersions?: number[];
 	maxFrameBytes?: number;
 	maxReassembledFrameBytes?: number;
+	capabilities?: string[];
+}
+
+export interface DeliveryAcceptedEvent {
+	type: "delivery_accepted";
+	deliveryId: string;
+	at: number;
+	mode: DeliveryMode;
+	mechanism: "wake" | "aside" | "steer-boundary";
+}
+
+export interface DeliverySettledEvent {
+	type: "delivery_settled";
+	deliveryId: string;
+	outcome: "quiet" | "text" | "refused" | "error" | "aborted";
+	included: boolean;
+	requests: number;
+	sole: boolean;
+	interactive: boolean;
+}
+
+export interface DeliveryDiscardedEvent {
+	type: "delivery_discarded";
+	deliveryId: string;
+	reason: string;
+}
+
+export interface DeliveryCancelledEvent {
+	type: "delivery_cancelled";
+	deliveryId: string;
 }
 
 export type PromptStatus = "completed" | "aborted" | "error";
@@ -1313,6 +1369,10 @@ export interface RpcResponse {
 	id?: string;
 	/** Command result on success; its shape is the command's `result`. */
 	data?: unknown;
+	/** Engine-minted delivery id on a successful deliver response; also in data. */
+	deliveryId?: string;
+	/** Pre-acceptance cancellation result on cancel_delivery; also in data. */
+	cancelled?: boolean;
 	/** Failure message when `success` is false. */
 	error?: string;
 	/** Machine-readable failure reason, when one applies. */
@@ -1339,7 +1399,7 @@ export interface HostUriSchemeDefinition {
 }
 
 /** Unsolicited outbound frame (everything except responses and host tool/URI requests), discriminated by `type`. */
-export type RpcNotification = ReadyEvent | PromptResultEvent | SessionSettledEvent | ExtensionError | ExtensionUiRequest | AvailableCommandsUpdateEvent | SubagentLifecycleEvent | SubagentProgressEvent | SubagentEvent | LivePhaseEvent | LiveLevelsEvent | LiveTranscriptEvent | LiveEndEvent | CommandOutputEvent | SessionInfoUpdateEvent | ConfigUpdateEvent | RpcFrameErrorEvent | RpcAgentEvent;
+export type RpcNotification = ReadyEvent | DeliveryAcceptedEvent | DeliverySettledEvent | DeliveryDiscardedEvent | DeliveryCancelledEvent | PromptResultEvent | SessionSettledEvent | ExtensionError | ExtensionUiRequest | AvailableCommandsUpdateEvent | SubagentLifecycleEvent | SubagentProgressEvent | SubagentEvent | LivePhaseEvent | LiveLevelsEvent | LiveTranscriptEvent | LiveEndEvent | CommandOutputEvent | SessionInfoUpdateEvent | ConfigUpdateEvent | RpcFrameErrorEvent | RpcAgentEvent;
 
 /** Any frame the server writes to stdout (after reassembling `rpc_chunk` sequences), discriminated by `type`. */
 export type RpcServerFrame = RpcResponse | RpcHostRequest | RpcNotification;
@@ -1369,6 +1429,23 @@ export interface FollowUpParams {
 	message: string;
 	/** Images attached to the message. */
 	images?: ImageContent[];
+}
+
+export interface DeliverParams {
+	record: DeliveryRecord;
+	options: DeliveryOptions;
+}
+
+export interface DeliverResult {
+	deliveryId: string;
+}
+
+export interface CancelDeliveryParams {
+	deliveryId: string;
+}
+
+export interface CancelDeliveryResult {
+	cancelled: boolean;
 }
 
 export interface RemoveQueuedMessageParams {
@@ -1634,6 +1711,8 @@ export interface RpcWireCommands {
 	prompt: { params: PromptParams; result: PromptAck };
 	steer: { params: SteerParams; result: undefined };
 	follow_up: { params: FollowUpParams; result: undefined };
+	deliver: { params: DeliverParams; result: DeliverResult };
+	cancel_delivery: { params: CancelDeliveryParams; result: CancelDeliveryResult };
 	remove_queued_message: { params: RemoveQueuedMessageParams; result: RemoveQueuedMessageResult };
 	promote_queued_message: { params: PromoteQueuedMessageParams; result: PromoteQueuedMessageResult };
 	abort: { params: undefined; result: undefined };

@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- External delivery (`external-delivery/1`): RPC hosts can hand the session a record authored by another actor with `deliver` (`mode: "aside" | "steer"`) and withdraw it with `cancel_delivery`; the engine reports `delivery_accepted`, `delivery_settled`, `delivery_discarded` and `delivery_cancelled` receipts, lists held records in `get_state.externalDeliveries`, and advertises the capability in `ready.capabilities` and `get_state.capabilities`. Extensions get the same surface as `ExtensionAPI.deliverMessage` with `ExtensionAPI.capabilities`. Records declare their provider view in `details["omp.llm"]` and are rejected without one; delivery-owned evaluations may complete quietly (see `docs/rpc.md#external-delivery`).
+
+### Fixed
+
+- Preserved queued external steer deliveries while a session transition is held, including whole-session forks; admission resumes when the hold clears.
+- Corrected generated RPC delivery records to require `customType`, `content`, and object-valued `details`, matching the existing runtime contract.
+
 ## [18.6.0] - 2026-10-03
 
 ### Added
