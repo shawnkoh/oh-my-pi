@@ -462,15 +462,14 @@ export interface DeliveryOptions {
 	wakeInPlanMode?: true;
 }
 
-export interface DeliveryRecordObject {
-	customType?: string;
-	content?: MessageContent;
+export interface DeliveryRecord {
+	customType: string;
+	content: MessageContent;
+	/** Requires a valid `omp.llm` user projection and `omp.llm.source` for admission. */
+	details: Record<string, unknown>;
 	display?: boolean;
-	details?: unknown;
 	attribution?: Attribution;
 }
-
-export type DeliveryRecord = string | DeliveryRecordObject;
 
 export interface ExternalDeliveryListing {
 	deliveryId: string;

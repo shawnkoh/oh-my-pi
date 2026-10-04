@@ -2432,7 +2432,7 @@
 			],
 			"x-open": true
 		},
-		"DeliveryRecordObject": {
+		"DeliveryRecord": {
 			"type": "object",
 			"properties": {
 				"customType": {
@@ -2441,25 +2441,25 @@
 				"content": {
 					"$ref": "#/$defs/MessageContent"
 				},
+				"details": {
+					"type": "object",
+					"properties": {},
+					"additionalProperties": {},
+					"description": "Requires a valid `omp.llm` user projection and `omp.llm.source` for admission."
+				},
 				"display": {
 					"type": "boolean"
 				},
-				"details": {},
 				"attribution": {
 					"$ref": "#/$defs/Attribution"
 				}
 			},
+			"required": [
+				"customType",
+				"content",
+				"details"
+			],
 			"x-open": true
-		},
-		"DeliveryRecord": {
-			"anyOf": [
-				{
-					"type": "string"
-				},
-				{
-					"$ref": "#/$defs/DeliveryRecordObject"
-				}
-			]
 		},
 		"ExternalDeliveryListing": {
 			"type": "object",

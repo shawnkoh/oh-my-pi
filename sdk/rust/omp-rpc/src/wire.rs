@@ -3032,17 +3032,18 @@ impl<'de> Deserialize<'de> for DeliveryOptions {
 /// Open record: declared fields are decoded leniently (a value that does not fit stays
 /// in `extra`) and every other key is kept in `extra`.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct DeliveryRecordObject {
+pub struct DeliveryRecord {
 	pub custom_type: Option<String>,
 	pub content: Option<MessageContent>,
+	/// Requires a valid `omp.llm` user projection and `omp.llm.source` for admission.
+	pub details: Option<Map<String, Value>>,
 	pub display: Option<bool>,
-	pub details: Option<Value>,
 	pub attribution: Option<Attribution>,
 	/// Every key not decoded into a declared field.
 	pub extra: Map<String, Value>,
 }
 
-impl Serialize for DeliveryRecordObject {
+impl Serialize for DeliveryRecord {
 	fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
 		let mut map = serializer.serialize_map(None)?;
 		if let Some(value) = &self.custom_type {
@@ -3051,11 +3052,11 @@ impl Serialize for DeliveryRecordObject {
 		if let Some(value) = &self.content {
 			map.serialize_entry("content", value)?;
 		}
-		if let Some(value) = &self.display {
-			map.serialize_entry("display", value)?;
-		}
 		if let Some(value) = &self.details {
 			map.serialize_entry("details", value)?;
+		}
+		if let Some(value) = &self.display {
+			map.serialize_entry("display", value)?;
 		}
 		if let Some(value) = &self.attribution {
 			map.serialize_entry("attribution", value)?;
@@ -3064,8 +3065,8 @@ impl Serialize for DeliveryRecordObject {
 			match key.as_str() {
 				"customType" if self.custom_type.is_some() => continue,
 				"content" if self.content.is_some() => continue,
-				"display" if self.display.is_some() => continue,
 				"details" if self.details.is_some() => continue,
+				"display" if self.display.is_some() => continue,
 				"attribution" if self.attribution.is_some() => continue,
 				_ => {}
 			}
@@ -3075,26 +3076,18 @@ impl Serialize for DeliveryRecordObject {
 	}
 }
 
-impl<'de> Deserialize<'de> for DeliveryRecordObject {
+impl<'de> Deserialize<'de> for DeliveryRecord {
 	fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
 		let mut extra = Map::<String, Value>::deserialize(deserializer)?;
 		Ok(Self {
 			custom_type: take(&mut extra, "customType"),
 			content: take(&mut extra, "content"),
-			display: take(&mut extra, "display"),
 			details: take(&mut extra, "details"),
+			display: take(&mut extra, "display"),
 			attribution: take(&mut extra, "attribution"),
 			extra,
 		})
 	}
-}
-
-/// Untagged union: the first variant that decodes wins.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum DeliveryRecord {
-	String(String),
-	DeliveryRecordObject(DeliveryRecordObject),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

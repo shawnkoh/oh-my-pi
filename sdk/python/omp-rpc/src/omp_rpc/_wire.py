@@ -493,11 +493,12 @@ class DeliveryOptions(TypedDict):
     wakeInPlanMode: NotRequired[Literal[True]]
 
 
-class DeliveryRecordObject(TypedDict):
-    customType: NotRequired[str]
-    content: NotRequired[MessageContent]
+class DeliveryRecord(TypedDict):
+    customType: str
+    content: MessageContent
+    details: JsonObject
+    """Requires a valid `omp.llm` user projection and `omp.llm.source` for admission."""
     display: NotRequired[bool]
-    details: NotRequired[JsonValue]
     attribution: NotRequired[Attribution]
 
 
@@ -1559,9 +1560,6 @@ MessageContent: TypeAlias = str | list[UserContent]
 """Message content: plain text or content blocks."""
 
 
-DeliveryRecord: TypeAlias = str | DeliveryRecordObject
-
-
 parse_text_content = cast("Decoder[TextContent]", open_record("type", frozenset({"text"})))
 """Decodes a `TextContent` open record: checks the discriminator and keeps every key."""
 
@@ -1702,8 +1700,8 @@ parse_delivery_options = cast("Decoder[DeliveryOptions]", open_record(None, None
 """Decodes a `DeliveryOptions` open record: checks the discriminator and keeps every key."""
 
 
-parse_delivery_record_object = cast("Decoder[DeliveryRecordObject]", open_record(None, None))
-"""Decodes a `DeliveryRecordObject` open record: checks the discriminator and keeps every key."""
+parse_delivery_record = cast("Decoder[DeliveryRecord]", open_record(None, None))
+"""Decodes a `DeliveryRecord` open record: checks the discriminator and keeps every key."""
 
 
 parse_select_option_detail = cast("Decoder[SelectOptionDetail]", open_record(None, None))
@@ -3653,7 +3651,6 @@ __all__ = [
     "DeliveryMode",
     "DeliveryOptions",
     "DeliveryRecord",
-    "DeliveryRecordObject",
     "DeliverySettledEvent",
     "DeveloperMessage",
     "EditorUiRequest",
@@ -3833,7 +3830,7 @@ __all__ = [
     "parse_delivery_cancelled_event",
     "parse_delivery_discarded_event",
     "parse_delivery_options",
-    "parse_delivery_record_object",
+    "parse_delivery_record",
     "parse_delivery_settled_event",
     "parse_developer_message",
     "parse_editor_ui_request",

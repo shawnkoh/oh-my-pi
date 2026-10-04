@@ -1192,7 +1192,10 @@ export class AgentSession implements SettingsScope {
 			// autonomous turn. Convergence to ask/resolve stays user-driven. Owned
 			// external records never fold (they enter context only through their
 			// own admission): `wakeInPlanMode` wakes, otherwise they stay queued.
-			const { wake, held, rest } = this.#splitOwnedStrandedRecords(records, owner => owner.options.wakeInPlanMode);
+			const { wake, held, rest } = this.#splitOwnedStrandedRecords(
+				records,
+				owner => owner.mode === "steer" || owner.options.wakeInPlanMode,
+			);
 			this.#foldStrandedIrcAsidesIntoContext(rest);
 			this.#irc.queueAside(held);
 			if (wake.length > 0) this.#wakeForIrc(wake);
@@ -1207,7 +1210,7 @@ export class AgentSession implements SettingsScope {
 			// user-driven until the next deliberate prompt. The interrupt latch stays set.
 			const { wake, held, rest } = this.#splitOwnedStrandedRecords(
 				records,
-				owner => owner.options.wakeAfterInterrupt,
+				owner => owner.mode === "steer" || owner.options.wakeAfterInterrupt,
 			);
 			const fold: AgentMessage[] = [];
 			for (const record of rest) {
@@ -1223,7 +1226,7 @@ export class AgentSession implements SettingsScope {
 	}
 
 	/** Partitions stranded records into owned records that may wake (`wake`), owned records that
-	 *  must stay queued (`held`; a `steer` always wakes since it demands action) and the rest. */
+	 *  must stay queued (`held`) and the rest. The caller decides whether steers may wake. */
 	#splitOwnedStrandedRecords(
 		records: AgentMessage[],
 		mayWake: (owner: ExternalDeliveryOwner) => boolean | undefined,
@@ -1234,7 +1237,7 @@ export class AgentSession implements SettingsScope {
 		for (const record of records) {
 			const owner = this.#externalDeliveries.ownerOf(record);
 			if (!owner) rest.push(record);
-			else if (owner.mode === "steer" || mayWake(owner) === true) wake.push(record);
+			else if (mayWake(owner) === true) wake.push(record);
 			else held.push(record);
 		}
 		return { wake, held, rest };

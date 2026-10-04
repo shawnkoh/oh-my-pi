@@ -884,9 +884,10 @@ exactly whether and how the model saw it. Extensions get the same surface as
 (a `ReadonlySet<string>`) for negotiation; `deliverMessage` throws when the
 capability is absent.
 
-The record is a custom message payload (`customType`, `content`, `display`,
-`details`, optional `attribution`). `content` is the display form and never
-reaches a provider. The provider view MUST be declared in `details`:
+The RPC record must be an object with `customType`, `content`, and an
+object-valued `details`; `display` and `attribution` are optional. Strings and
+empty objects are not RPC delivery records. `content` is the display form and
+never reaches a provider. The provider view MUST be declared in `details`:
 
 ```json
 {
@@ -915,12 +916,15 @@ sent as a fallback developer message.
 
 For `aside` only: idle in plan mode holds the record unless `wakeInPlanMode`
 is set; idle after an operator interrupt holds it unless `wakeAfterInterrupt`
-is set (the interrupt latch is not cleared). A `steer` always wakes. A record
+is set (the interrupt latch is not cleared). A `steer` wakes once transition
+holds clear, without requiring either flag. A record
 delivered while a prompt is waiting on manual-compaction cleanup or setting up
 its turn, or while a session transition is open, is held and folds into or
 follows that turn rather than racing it; a prompt that only runs an extension
 command does not hold it. Pressing Esc in the interactive UI parks a queued
 `steer` instead of dropping it; it wakes as soon as the abort settles.
+Both modes remain queued during a held `session_before_switch` hook on a
+whole-session fork and resume admission after the fork completes.
 
 Receipts, one event each, all carrying `deliveryId`:
 

@@ -168,7 +168,7 @@ export function buildRpcWireBundle(): RpcWireBundle {
 		...frameDefs,
 		...notificationDefs,
 	};
-	const open = new Set([...Object.keys(messageDefs), "SelectOptionDetail", "DeliveryRecordObject", "DeliveryOptions"]);
+	const open = new Set([...Object.keys(messageDefs), "SelectOptionDetail", "DeliveryRecord", "DeliveryOptions"]);
 	const commands = collectCommands(defs);
 	const exported = type.scope(defs).export() as Record<string, { toJsonSchema(): Record<string, unknown> }>;
 

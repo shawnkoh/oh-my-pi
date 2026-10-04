@@ -830,18 +830,72 @@ describe("external delivery (session)", () => {
 			// Reach the stop boundary with the transition still open.
 			slow.release();
 			await first.settled;
-			// Without the hold this spins defer → requeue → drain at the boundary; the
-			// deferral counter would climb while the hook is pending.
-			const deferrals = (second as unknown as { deferrals?: number }).deferrals;
+			// No additional provider work is admitted while the transition holds.
 			for (let i = 0; i < 25; i++) await setImmediate();
 			expect(second.state()).toBe("queued");
+			expect(s.listExternalDeliveries()).toEqual([{ deliveryId: second.id, state: "queued", mode: "aside" }]);
 			expect(mock.calls).toHaveLength(2);
-			expect((second as unknown as { deferrals?: number }).deferrals).toBe(deferrals);
 			releaseHook.resolve();
 			await switching;
 			const discarded = await second.discarded;
 			expect(discarded.reason).toBe("new-session");
 		});
+
+		it.each(["aside", "steer"] as const)(
+			"requeues an idle %s during a held fork and admits it afterward",
+			async mode => {
+				const hookReached = Promise.withResolvers<void>();
+				const releaseHook = Promise.withResolvers<void>();
+				const sessionManager = SessionManager.create(tempDir.path(), path.join(tempDir.path(), "sessions"));
+				const runtime = new ExtensionRuntime();
+				const extension = await loadExtensionFromFactory(
+					pi => {
+						pi.on("session_before_switch", async () => {
+							hookReached.resolve();
+							await releaseHook.promise;
+						});
+					},
+					tempDir.path(),
+					new EventBus(),
+					runtime,
+					"held-fork-hook",
+				);
+				const extensionRunner = new ExtensionRunner(
+					[extension],
+					runtime,
+					tempDir.path(),
+					sessionManager,
+					new ModelRegistry(authStorage),
+				);
+				const { mock, session: s } = makeSession({ sessionManager, extensionRunner });
+				mock.push({ content: ["seed reply"] });
+				await s.prompt("seed");
+				const forking = s.fork();
+				await hookReached.promise;
+				try {
+					expect(s.isSessionTransitioning).toBe(true);
+					const handle = s.deliverExternalMessage(card("held delivery"), { mode });
+					// Let the deferred wake finish while admission remains held.
+					await s.waitForIdle();
+					expect(handle.state()).toBe("queued");
+					expect(s.listExternalDeliveries()).toEqual([{ deliveryId: handle.id, state: "queued", mode }]);
+					expect(mock.calls).toHaveLength(1);
+					mock.push({ content: ["received delivery"] });
+					releaseHook.resolve();
+					await expect(forking).resolves.toBe(true);
+					await s.waitForIdle();
+					expect(handle.state()).toBe("settled");
+					await expect(handle.accepted).resolves.toMatchObject({ mode });
+					await expect(handle.settled).resolves.toMatchObject({ included: true, requests: 1 });
+					expect(mock.calls).toHaveLength(2);
+					expect(userTexts(mock, 1)).toContain("held delivery");
+					expect(s.listExternalDeliveries()).toEqual([]);
+				} finally {
+					releaseHook.resolve();
+					await forking;
+				}
+			},
+		);
 
 		it("does not wake into an admitted-but-not-started submission; the record folds into that turn", async () => {
 			// The real window: a prompt admitted while a manual /compact is in flight

@@ -72,14 +72,13 @@ export const stateDefs = {
 		"wakeAfterInterrupt?": "true",
 		"wakeInPlanMode?": "true",
 	},
-	DeliveryRecordObject: {
-		"customType?": "string",
-		"content?": "MessageContent",
+	DeliveryRecord: {
+		customType: "string",
+		content: "MessageContent",
 		"display?": "boolean",
-		"details?": "unknown",
+		details: doc(JSON_OBJECT, "Requires a valid `omp.llm` user projection and `omp.llm.source` for admission."),
 		"attribution?": "Attribution",
 	},
-	DeliveryRecord: "string | DeliveryRecordObject",
 	ExternalDeliveryListing: { deliveryId: "string", state: "'queued' | 'accepted'", mode: "DeliveryMode" },
 	SessionState: {
 		"model?": "ModelInfo",

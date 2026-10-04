@@ -2486,28 +2486,29 @@ func (v DeliveryOptionsWakeInPlanMode) MarshalJSON() ([]byte, error) {
 	return []byte("true"), nil
 }
 
-type DeliveryRecordObject struct {
-	CustomType  *string         `json:"customType,omitempty"`
-	Content     *MessageContent `json:"content,omitempty"`
-	Display     *bool           `json:"display,omitempty"`
-	Details     json.RawMessage `json:"details,omitempty"`
-	Attribution *Attribution    `json:"attribution,omitempty"`
+type DeliveryRecord struct {
+	CustomType string         `json:"customType"`
+	Content    MessageContent `json:"content"`
+	// Requires a valid `omp.llm` user projection and `omp.llm.source` for admission.
+	Details     map[string]json.RawMessage `json:"details"`
+	Display     *bool                      `json:"display,omitempty"`
+	Attribution *Attribution               `json:"attribution,omitempty"`
 	// Extra holds undeclared keys and declared keys whose value did not decode (that field stays zero).
 	// Encoding writes them back, over a declared field with the same key.
 	Extra map[string]json.RawMessage `json:"-"`
 }
 
-func (v *DeliveryRecordObject) UnmarshalJSON(data []byte) error {
-	return decodeWith(data, "DeliveryRecordObject", v.decodeFrom)
+func (v *DeliveryRecord) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "DeliveryRecord", v.decodeFrom)
 }
 
-func (v *DeliveryRecordObject) decodeFrom(raw map[string]json.RawMessage) error {
-	var out DeliveryRecordObject
-	d := fieldDecoder{raw: raw, owner: "DeliveryRecordObject", open: true}
-	d.optional("customType", &out.CustomType)
-	d.optional("content", &out.Content)
+func (v *DeliveryRecord) decodeFrom(raw map[string]json.RawMessage) error {
+	var out DeliveryRecord
+	d := fieldDecoder{raw: raw, owner: "DeliveryRecord", open: true}
+	d.required("customType", &out.CustomType)
+	d.required("content", &out.Content)
+	d.required("details", &out.Details)
 	d.optional("display", &out.Display)
-	d.optional("details", &out.Details)
 	d.optional("attribution", &out.Attribution)
 	out.Extra = d.rest()
 	if d.err != nil {
@@ -2517,43 +2518,9 @@ func (v *DeliveryRecordObject) decodeFrom(raw map[string]json.RawMessage) error 
 	return nil
 }
 
-func (v DeliveryRecordObject) MarshalJSON() ([]byte, error) {
-	type plain DeliveryRecordObject
-	return encodeObject(plain(v), "", v.Extra)
-}
-
-// DeliveryRecord holds exactly one of its fields, chosen by the JSON kind of the value.
-type DeliveryRecord struct {
-	String               *string
-	DeliveryRecordObject *DeliveryRecordObject
-}
-
 func (v DeliveryRecord) MarshalJSON() ([]byte, error) {
-	switch {
-	case v.String != nil:
-		return json.Marshal(*v.String)
-	case v.DeliveryRecordObject != nil:
-		return json.Marshal(*v.DeliveryRecordObject)
-	}
-	return nil, emptyUnion("DeliveryRecord")
-}
-
-func (v *DeliveryRecord) UnmarshalJSON(data []byte) error {
-	var out DeliveryRecord
-	var err error
-	switch jsonKind(data) {
-	case '"':
-		err = json.Unmarshal(data, &out.String)
-	case '{':
-		err = json.Unmarshal(data, &out.DeliveryRecordObject)
-	default:
-		return unexpectedKind("DeliveryRecord", data)
-	}
-	if err != nil {
-		return err
-	}
-	*v = out
-	return nil
+	type plain DeliveryRecord
+	return encodeObject(plain(v), "", v.Extra)
 }
 
 type ExternalDeliveryListing struct {
