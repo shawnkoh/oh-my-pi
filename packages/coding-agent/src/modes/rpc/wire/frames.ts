@@ -55,6 +55,9 @@ export const frameDefs = {
 			agentInvoked: "boolean",
 			status: "PromptStatus",
 			"error?": "PromptError",
+			"run?": "number.integer",
+			"promptEntryId?": "string",
+			"replyEntryIds?": "string[]",
 			sessionSettled: doc(
 				"boolean",
 				"Nothing will wake the session again; when false a `session_settled` follows once background work drains.",
@@ -157,6 +160,7 @@ export const frameDefs = {
 		title: "string",
 		options: "string[]",
 		"optionDetails?": "SelectOptionDetail[]",
+		"approval?": "ToolApprovalBinding",
 		"timeout?": "number.integer",
 	},
 	ConfirmUiRequest: {
@@ -184,7 +188,14 @@ export const frameDefs = {
 		"promptStyle?": "boolean",
 	},
 	AskUiRequest: doc(
-		{ type: UI, id: "string", method: "'ask'", questions: "AskQuestion[]", "timeout?": "number.integer" },
+		{
+			type: UI,
+			id: "string",
+			method: "'ask'",
+			questions: "AskQuestion[]",
+			"timeout?": "number.integer",
+			"acceptImages?": "boolean",
+		},
 		"Every question of one `ask` tool call; sent only after `set_ask_dialog` enables it.",
 	),
 	CancelUiRequest: doc(
@@ -228,7 +239,14 @@ export const frameDefs = {
 		"Extension UI request, discriminated by `method`.",
 	),
 	AskAnswer: doc(
-		{ id: "string", selectedOptions: "string[]", "customInput?": "string" },
+		{
+			id: "string",
+			selectedOptions: "string[]",
+			"customInput?": "string",
+			"customInputImages?": "ImageContent[]",
+			"note?": "string",
+			"noteImages?": "ImageContent[]",
+		},
 		"Answer to one `ask` question: exact option labels, plus optional free text.",
 	),
 	ValueUiResponse: doc(
@@ -247,8 +265,12 @@ export const frameDefs = {
 		{ type: "'extension_ui_response'", id: "string", answers: "AskAnswer[]" },
 		"Answers an `ask` request: one `AskAnswer` per question, in question order.",
 	),
+	ChatUiResponse: doc(
+		{ type: "'extension_ui_response'", id: "string", chat: "true" },
+		"Redirects a negotiated rich ask dialog to chat.",
+	),
 	ExtensionUiResponse: doc(
-		"ValueUiResponse | ConfirmUiResponse | CancelUiResponse | AnswersUiResponse",
+		"ValueUiResponse | ConfirmUiResponse | CancelUiResponse | AnswersUiResponse | ChatUiResponse",
 		"Host reply to an extension UI request; variants share `type` and differ by their payload key.",
 	),
 
