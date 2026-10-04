@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { setImmediate } from "node:timers/promises";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { createMockModel, type MockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -39,6 +40,8 @@ import {
 	terminalAttestationPath,
 } from "@oh-my-pi/pi-coding-agent/session/quiescence";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { IndexedSessionStorage, type SessionStorageBackend } from "../src/session/indexed-session-storage";
+import { SessionWriteConflictError } from "../src/session/session-storage";
 import { postmortem, TempDir } from "@oh-my-pi/pi-utils";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
@@ -738,6 +741,91 @@ describe("AgentSession quiesce-and-exit", () => {
 		expect(result).toMatchObject({ status: "refused", reason: "session_mismatch" });
 		expect(s.isAdmissionClosed()).toBe(false);
 		expect(s.quiesceForExit(request(s))).toMatchObject({ status: "quiesced", attempt: 1 });
+	});
+
+	it.each([false, true])("blocks strict retirement until deferred publication settles (failure: %s)", async fails => {
+		const files = new Map<string, string>();
+		let gate: PromiseWithResolvers<void> | undefined;
+		const publishing = Promise.withResolvers<void>();
+		const unsupported = async (): Promise<never> => {
+			throw new Error("Unexpected backend operation");
+		};
+		const backend: SessionStorageBackend = {
+			init: async () => {},
+			loadIndex: async () => [],
+			readFull: async file => files.get(file) ?? null,
+			readSlices: unsupported,
+			writeFull: async (file, body, _mtime, _title, expectedSize) => {
+				if (gate) publishing.resolve();
+				await gate?.promise;
+				const previous = files.get(file);
+				const size = previous === undefined ? null : Buffer.byteLength(previous);
+				if (expectedSize !== undefined && size !== expectedSize) {
+					throw new SessionWriteConflictError(file, expectedSize, size);
+				}
+				files.set(file, body);
+			},
+			append: async (file, line) => {
+				if (gate) publishing.resolve();
+				await gate?.promise;
+				files.set(file, (files.get(file) ?? "") + line);
+			},
+			updateSessionTitle: unsupported,
+			truncate: unsupported,
+			remove: unsupported,
+			move: unsupported,
+		};
+		const storage = new IndexedSessionStorage(backend);
+		await storage.initialize();
+		const parts = sessionParts();
+		parts.sessionManager = SessionManager.create(tempDir.path(), path.join(tempDir.path(), "sessions"), storage);
+		const s = createSession({ ...parts, census: { complete: true, work: [], reasons: [] } });
+		vi.spyOn(s.ownedJobRegistry!, "scanAndCount").mockReturnValue({
+			scan: { supported: true, sound: true, scanned: 1, discovered: 0, opaque: [] },
+			live: 0,
+		});
+		await s.prompt("materialize the transcript");
+		await parts.sessionManager.ensureOnDisk();
+		await parts.sessionManager.flush();
+		gate = Promise.withResolvers<void>();
+		const failure = new Error("backend publication failed");
+		const req = request(s, { completeness: "strict" });
+		try {
+			expect(s.quiesceForExit(req)).toMatchObject({
+				status: "sealed_blocked",
+				progress: { finalized: false, bound: false, attested: false },
+			});
+			await publishing.promise;
+			expect(s.quiesceForExit({ ...req, attempt: 2 })).toMatchObject({
+				status: "sealed_blocked",
+				progress: { finalized: false },
+			});
+			if (fails) gate.reject(failure);
+			else gate.resolve();
+			await storage.drain().catch(() => {});
+			// Let the manager's confirmation/readback continuation finish.
+			await setImmediate();
+			if (fails) {
+				expect(s.quiesceForExit({ ...req, attempt: 3 })).toMatchObject({
+					status: "sealed_blocked",
+					progress: { finalized: false },
+				});
+				expect(() => parts.sessionManager.flushSync()).toThrow(failure);
+			} else {
+				const result = s.quiesceForExit({ ...req, attempt: 3 });
+				expect(result.status).toBe("quiesced");
+				const body = files.get(s.sessionFile!)!;
+				expect(readAttestation(s).session).toMatchObject({
+					size: Buffer.byteLength(body),
+					sha256: new Bun.CryptoHasher("sha256").update(body).digest("hex"),
+				});
+				expect(body.split("\n").filter(line => line.includes('"session_exit"'))).toHaveLength(1);
+			}
+		} finally {
+			gate.resolve();
+			gate = undefined;
+			await storage.drain().catch(() => {});
+		}
 	});
 
 	it.each([false, true])(

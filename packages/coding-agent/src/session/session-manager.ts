@@ -827,6 +827,9 @@ export class SessionManager {
 	 * nothing (rvEW).
 	 */
 	#deferredPublishGen = 0;
+	/** Strict retirement confirms deferred storage once, retaining failures under the seal. */
+	#strictPublicationStarted = false;
+	#strictPublicationDigest: TranscriptDigest | undefined;
 	/** Lazy gate crossed (ensureOnDisk / loaded file): every entry must persist from now on. */
 	#forceFileCreation = false;
 	/**
@@ -2842,16 +2845,45 @@ export class SessionManager {
 	 * than append another. Ordinary finalization and mid-life recovery are unchanged.
 	 */
 	recoverFinalizationForExit(): TranscriptDigest | null {
+		if (this.#persist && this.#sessionFile && this.#storage.defersSyncPublish) {
+			if (this.#entriesReleased) throw new Error("Cannot recover a released session transcript.");
+			this.#draftOnlySessionCleanupArmed = false;
+			this.seal();
+			if (this.#diskFailure) throw this.#diskFailure;
+			if (this.#strictPublicationDigest) return this.#strictPublicationDigest;
+			if (!this.#strictPublicationStarted) {
+				this.#strictPublicationStarted = true;
+				void this.#confirmStrictPublication(this.#sessionFile).catch(error => this.#noteDiskFailure(error));
+			}
+			throw new Error("Deferred transcript publication is not yet confirmed.");
+		}
 		if (!this.#released) return this.finalizeForExit();
 		if (this.#entriesReleased) throw new Error("Cannot recover a released session transcript.");
 		if (this.#diskFailure) {
-			// A deferred publish cannot be confirmed by this synchronous exit path.
-			// Keep the failure latched rather than attest to an unconfirmed rewrite.
-			if (this.#storage.defersSyncPublish) throw this.#diskFailure;
 			this.#rewriteSynchronously(true);
 			if (this.#diskFailure) throw this.#diskFailure;
 		}
 		return this.finalizeForExit();
+	}
+
+	/** Drain pre-seal writes, then publish any retained entries they did not include. */
+	async #confirmStrictPublication(file: string): Promise<void> {
+		await this.#diskTail;
+		await this.#closeWriterHandle();
+		await this.#storage.drain();
+		if (this.#diskFailure) throw this.#diskFailure;
+		const body = this.#fileBody();
+		// Entries can carry post-append metadata; publish the sealed authoritative
+		// journal rather than equating a drained append queue with that journal.
+		await this.#storage.writeTextAtomic(file, body, { expectedSize: this.#expectedDiskSize });
+		if (this.#diskFailure) throw this.#diskFailure;
+		this.#recordFullRewrite(body);
+		this.#fileIsCurrent = true;
+		this.#rewriteRequired = false;
+		this.#strictPublicationDigest = {
+			size: Buffer.byteLength(body, "utf8"),
+			sha256: new Bun.CryptoHasher("sha256").update(body).digest("hex"),
+		};
 	}
 
 	/**

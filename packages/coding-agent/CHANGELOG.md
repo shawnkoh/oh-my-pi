@@ -32,6 +32,8 @@
 
 ### Fixed
 
+- Strict retirement on deferred storage stays `sealed_blocked` with `finalized: false` until authoritative transcript publication is confirmed. A newer sealed retry then uses its size and SHA-256; publication failures remain latched. Attested retirement is unchanged.
+- LSP deadline regression fixtures now model process exit and settle simulated activity during cleanup, preserving explicit-timeout and caller-abort assertions.
 - Literal RPC prompts (`literal: true`) are acknowledged only once admitted, like other prompts, so an immediate `promote_queued_message` observes a queued literal prompt
 - Interrupting a turn while a tool approval is pending now closes the dialog (RPC hosts receive `cancel`), and an approval answered after the call was aborted no longer runs the tool
 - Count host-dispatched extension hooks, including `session_start`, until their actual handler work settles; an extension cannot pass quiescence from inside its own startup hook.
