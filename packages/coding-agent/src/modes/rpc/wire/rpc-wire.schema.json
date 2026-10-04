@@ -10,6 +10,28 @@
 		"inbound": "RpcInbound",
 		"commands": [
 			{
+				"name": "attest",
+				"doc": "Snapshot identity, activity epoch, work census and owned-job registry soundness.",
+				"params": "AttestParams",
+				"result": "WorkAttestation",
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
+				"name": "quiesce_and_exit",
+				"doc": "Atomically close admission and exit if the bound quiescence attempt passes.",
+				"params": "QuiesceRequest",
+				"result": "QuiesceResult",
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
 				"name": "negotiate_protocol",
 				"doc": "Switch the connection to a protocol version advertised by `ready`.",
 				"params": "NegotiateProtocolParams",
@@ -2089,6 +2111,505 @@
 			],
 			"description": "Model descriptor: the client-relevant subset of the server's model record."
 		},
+		"WorkCounts": {
+			"type": "object",
+			"properties": {
+				"streaming": {
+					"type": "number"
+				},
+				"queuedInput": {
+					"type": "number"
+				},
+				"asyncJobs": {
+					"type": "number"
+				},
+				"subagents": {
+					"type": "number"
+				},
+				"retainedJobs": {
+					"type": "number"
+				},
+				"detachedJobs": {
+					"type": "number"
+				},
+				"compacting": {
+					"type": "number"
+				},
+				"handoff": {
+					"type": "number"
+				},
+				"goalContinuationScheduled": {
+					"type": "number"
+				},
+				"scheduledTurns": {
+					"type": "number"
+				}
+			},
+			"required": [
+				"streaming",
+				"queuedInput",
+				"asyncJobs",
+				"subagents",
+				"retainedJobs",
+				"detachedJobs",
+				"compacting",
+				"handoff",
+				"goalContinuationScheduled",
+				"scheduledTurns"
+			]
+		},
+		"InvocationIdentity": {
+			"type": "object",
+			"properties": {
+				"pid": {
+					"type": "number"
+				},
+				"startId": {
+					"anyOf": [
+						{
+							"type": "string"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"startTime": {
+					"anyOf": [
+						{
+							"type": "number"
+						},
+						{
+							"type": "null"
+						}
+					]
+				}
+			},
+			"required": [
+				"pid",
+				"startId",
+				"startTime"
+			]
+		},
+		"AttestedSessionIdentity": {
+			"type": "object",
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"file": {
+					"anyOf": [
+						{
+							"type": "string"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"size": {
+					"anyOf": [
+						{
+							"type": "number"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"sha256": {
+					"anyOf": [
+						{
+							"type": "string"
+						},
+						{
+							"type": "null"
+						}
+					]
+				}
+			},
+			"required": [
+				"id",
+				"file"
+			]
+		},
+		"OpaqueOwnedProcess": {
+			"type": "object",
+			"properties": {
+				"pid": {
+					"type": "number"
+				},
+				"command": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"pid",
+				"command"
+			]
+		},
+		"OwnerScanSummary": {
+			"type": "object",
+			"properties": {
+				"supported": {
+					"type": "boolean"
+				},
+				"sound": {
+					"type": "boolean"
+				},
+				"scanned": {
+					"type": "number"
+				},
+				"discovered": {
+					"type": "number"
+				},
+				"opaque": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/OpaqueOwnedProcess"
+					}
+				}
+			},
+			"required": [
+				"supported",
+				"sound",
+				"scanned",
+				"discovered",
+				"opaque"
+			]
+		},
+		"OwnedJobRegistryState": {
+			"type": "object",
+			"properties": {
+				"path": {
+					"anyOf": [
+						{
+							"type": "string"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"complete": {
+					"type": "boolean"
+				},
+				"ownerScan": {
+					"anyOf": [
+						{
+							"$ref": "#/$defs/OwnerScanSummary"
+						},
+						{
+							"type": "null"
+						}
+					]
+				}
+			},
+			"required": [
+				"path",
+				"complete",
+				"ownerScan"
+			]
+		},
+		"WorkAttestation": {
+			"type": "object",
+			"properties": {
+				"version": {
+					"const": 1
+				},
+				"operationId": {
+					"type": "string"
+				},
+				"nonce": {
+					"type": "string"
+				},
+				"epoch": {
+					"type": "number"
+				},
+				"instanceId": {
+					"type": "string"
+				},
+				"session": {
+					"$ref": "#/$defs/AttestedSessionIdentity"
+				},
+				"invocation": {
+					"$ref": "#/$defs/InvocationIdentity"
+				},
+				"counts": {
+					"$ref": "#/$defs/WorkCounts"
+				},
+				"admission": {
+					"enum": [
+						"open",
+						"closed"
+					],
+					"type": "string"
+				},
+				"registry": {
+					"$ref": "#/$defs/OwnedJobRegistryState"
+				},
+				"observedAt": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"version",
+				"operationId",
+				"nonce",
+				"epoch",
+				"instanceId",
+				"session",
+				"invocation",
+				"counts",
+				"admission",
+				"registry",
+				"observedAt"
+			]
+		},
+		"QuiesceRequest": {
+			"type": "object",
+			"properties": {
+				"operationId": {
+					"type": "string"
+				},
+				"attempt": {
+					"type": "number"
+				},
+				"epoch": {
+					"type": "number"
+				},
+				"instanceId": {
+					"type": "string"
+				},
+				"sessionId": {
+					"type": "string"
+				},
+				"deadline": {
+					"type": "number"
+				}
+			},
+			"required": [
+				"operationId",
+				"attempt",
+				"epoch",
+				"instanceId",
+				"sessionId",
+				"deadline"
+			]
+		},
+		"QuiesceRefusalReason": {
+			"enum": [
+				"invalid_request",
+				"invocation_mismatch",
+				"session_mismatch",
+				"stale_attempt",
+				"admission_closed",
+				"deadline_expired",
+				"epoch_mismatch",
+				"work_active",
+				"attestation_unavailable"
+			],
+			"type": "string"
+		},
+		"TerminalAttestation": {
+			"type": "object",
+			"properties": {
+				"version": {
+					"const": 1
+				},
+				"kind": {
+					"enum": [
+						"quiesce",
+						"hangup"
+					],
+					"type": "string"
+				},
+				"session": {
+					"$ref": "#/$defs/AttestedSessionIdentity"
+				},
+				"invocation": {
+					"$ref": "#/$defs/InvocationIdentity"
+				},
+				"instanceId": {
+					"type": "string"
+				},
+				"epoch": {
+					"type": "number"
+				},
+				"counts": {
+					"$ref": "#/$defs/WorkCounts"
+				},
+				"interrupted": {
+					"type": "boolean"
+				},
+				"registryComplete": {
+					"type": "boolean"
+				},
+				"registryPath": {
+					"anyOf": [
+						{
+							"type": "string"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"ownerScan": {
+					"anyOf": [
+						{
+							"$ref": "#/$defs/OwnerScanSummary"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"writtenAt": {
+					"type": "string"
+				},
+				"operationId": {
+					"type": "string"
+				},
+				"attempt": {
+					"type": "number"
+				},
+				"signal": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"version",
+				"kind",
+				"session",
+				"invocation",
+				"instanceId",
+				"epoch",
+				"counts",
+				"interrupted",
+				"registryComplete",
+				"registryPath",
+				"ownerScan",
+				"writtenAt"
+			]
+		},
+		"QuiesceSnapshot": {
+			"type": "object",
+			"properties": {
+				"epoch": {
+					"type": "number"
+				},
+				"counts": {
+					"$ref": "#/$defs/WorkCounts"
+				},
+				"observedAt": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"epoch",
+				"counts",
+				"observedAt"
+			]
+		},
+		"QuiescedResult": {
+			"type": "object",
+			"properties": {
+				"status": {
+					"const": "quiesced"
+				},
+				"operationId": {
+					"type": "string"
+				},
+				"attempt": {
+					"type": "number"
+				},
+				"attestation": {
+					"$ref": "#/$defs/TerminalAttestation"
+				},
+				"path": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"status",
+				"operationId",
+				"attempt",
+				"attestation",
+				"path"
+			]
+		},
+		"QuiesceRefusedResult": {
+			"type": "object",
+			"properties": {
+				"status": {
+					"const": "refused"
+				},
+				"operationId": {
+					"type": "string"
+				},
+				"attempt": {
+					"type": "number"
+				},
+				"reason": {
+					"$ref": "#/$defs/QuiesceRefusalReason"
+				},
+				"snapshot": {
+					"$ref": "#/$defs/QuiesceSnapshot"
+				}
+			},
+			"required": [
+				"status",
+				"operationId",
+				"attempt",
+				"reason",
+				"snapshot"
+			]
+		},
+		"QuiesceUnattestedResult": {
+			"type": "object",
+			"properties": {
+				"status": {
+					"const": "exit_unattested"
+				},
+				"operationId": {
+					"type": "string"
+				},
+				"attempt": {
+					"type": "number"
+				},
+				"reason": {
+					"const": "attestation_unavailable"
+				},
+				"error": {
+					"type": "string"
+				},
+				"snapshot": {
+					"$ref": "#/$defs/QuiesceSnapshot"
+				}
+			},
+			"required": [
+				"status",
+				"operationId",
+				"attempt",
+				"reason",
+				"error",
+				"snapshot"
+			]
+		},
+		"QuiesceResult": {
+			"anyOf": [
+				{
+					"$ref": "#/$defs/QuiescedResult"
+				},
+				{
+					"$ref": "#/$defs/QuiesceRefusedResult"
+				},
+				{
+					"$ref": "#/$defs/QuiesceUnattestedResult"
+				}
+			]
+		},
 		"ToolApprovalBinding": {
 			"type": "object",
 			"properties": {
@@ -4088,7 +4609,7 @@
 			"required": [
 				"type"
 			],
-			"description": "First frame after startup; transport fields are absent on servers without protocol v2."
+			"description": "First frame after startup; capabilities include quiesce-exit/1 and owned-jobs/1. Transport fields are absent on servers without protocol v2."
 		},
 		"DeliveryAcceptedEvent": {
 			"type": "object",
@@ -5706,6 +6227,21 @@
 				}
 			],
 			"description": "Any frame the server writes to stdout (after reassembling `rpc_chunk` sequences), discriminated by `type`."
+		},
+		"AttestParams": {
+			"type": "object",
+			"properties": {
+				"operationId": {
+					"type": "string"
+				},
+				"nonce": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"operationId",
+				"nonce"
+			]
 		},
 		"NegotiateProtocolParams": {
 			"type": "object",

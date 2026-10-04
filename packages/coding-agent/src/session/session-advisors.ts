@@ -941,6 +941,17 @@ export class SessionAdvisors {
 		await Promise.allSettled(this.#pendingAdvisorCardEvents);
 	}
 
+	/**
+	 * Advisor work that can still change the session: card events persisting and reviews
+	 * queued or running. A primary sync catch-up wait is already counted as streaming.
+	 * Deltas held back by review cadence are not work until a later boundary schedules a review.
+	 */
+	pendingWork(): number {
+		let pending = this.#pendingAdvisorCardEvents.size;
+		for (const advisor of this.#advisors) pending += advisor.runtime.pendingWork;
+		return pending;
+	}
+
 	// Advisor runtime lifecycle
 	// -------------------------------------------------------------------------
 	#advisorImmuneTurnLimit(): number {

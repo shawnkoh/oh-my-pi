@@ -281,7 +281,7 @@ func (d *fieldDecoder) defaulted(key string, dst any, fallback string) {
 	d.decode(key, value, dst)
 }
 
-// constant checks a constant member (a discriminator); want is a string or bool.
+// constant checks a constant member; want is a string, bool, or JSON number (float64).
 func (d *fieldDecoder) constant(key string, want any) {
 	value, ok := d.take(key)
 	if d.err != nil {

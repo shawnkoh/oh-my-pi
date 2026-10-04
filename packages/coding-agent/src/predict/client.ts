@@ -17,6 +17,7 @@ import { getAgentDir, logger, ptree, VERSION } from "@oh-my-pi/pi-utils";
 import { daemonClientForGlobal } from "../launch/client";
 import { describeQuietly, stopQuietly, waitReady } from "../launch/ensure";
 import { resolveWorkerSpawnCmd, SMOKE_TEST_TIMEOUT_MS, workerEnvFromParent } from "../subprocess/worker-client";
+import { OwnedJobRegistry } from "../session/owned-job-registry";
 import { connectJsonlSocket, LineParser, writeJsonLine } from "../tiny/jsonl-socket";
 import { prefetchSmolLmWeights } from "./smollm-weights";
 import {
@@ -161,7 +162,7 @@ async function ensureDaemon(agentDir: string): Promise<DaemonConnection> {
 			continue;
 		}
 		try {
-			await broker.request({
+			const started = await broker.request({
 				op: "start",
 				spec: {
 					name,
@@ -176,6 +177,15 @@ async function ensureDaemon(agentDir: string): Promise<DaemonConnection> {
 					detached: false,
 				},
 			});
+			// A shared engine helper, not Thread work: recorded so a consumer can identify it.
+			if (started.op === "start" && started.daemon.pid !== undefined) {
+				OwnedJobRegistry.instance()?.registerProcess({
+					kind: "internal",
+					pid: started.daemon.pid,
+					command: TEXT_PREDICT_WORKER_ARG,
+					cwd: spawn.cwd ?? broker.projectDir,
+				});
+			}
 		} catch (error) {
 			// Lost a cross-process start race; the next round adopts the winner.
 			logger.debug("text-predict: daemon start contention", { name, error: String(error) });

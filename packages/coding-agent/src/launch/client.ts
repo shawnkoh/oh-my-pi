@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getGlobalDaemonRuntimeDir, isEexist, isEnoent, logger, postmortem } from "@oh-my-pi/pi-utils";
 import { resolveWorkerSpawnCmd, workerEnvFromParent } from "../subprocess/worker-client";
+import { OWNER_MARKER_ENV, OwnedJobRegistry } from "../session/owned-job-registry";
 import { canonicalProjectDir, daemonBrokerEndpoint, daemonRuntimeDir } from "./paths";
 import {
 	DAEMON_BROKER_WORKER_ARG,
@@ -322,15 +323,26 @@ class SocketDaemonClient implements DaemonBrokerClient {
 			[DAEMON_RUNTIME_DIR_ENV]: this.#runtimeDir,
 		};
 		if (this.#idleGraceMs !== undefined) overlay[DAEMON_IDLE_GRACE_ENV] = String(this.#idleGraceMs);
+		const env = workerEnvFromParent(overlay);
+		// The broker is shared by every agent process in its scope and outlives any one of them:
+		// it must not carry an owner marker an enclosing agent handed to this process.
+		delete env[OWNER_MARKER_ENV];
 		const child = Bun.spawn(spawn.cmd, {
 			cwd: spawn.cwd,
-			env: workerEnvFromParent(overlay),
+			env,
 			stdin: "ignore",
 			stdout: "ignore",
 			stderr: "ignore",
 			...BROKER_SPAWN_OPTIONS,
 		});
 		child.unref();
+		// A shared engine helper, not Thread work: recorded so a consumer can identify it.
+		OwnedJobRegistry.instance()?.registerProcess({
+			kind: "internal",
+			pid: child.pid,
+			command: DAEMON_BROKER_WORKER_ARG,
+			cwd: spawn.cwd ?? null,
+		});
 	}
 
 	#bindSocket(socket: net.Socket): void {

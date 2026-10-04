@@ -33,6 +33,18 @@ const IMAGES = doc("ImageContent[]", "Images attached to the message.");
 
 export const rpcCommands: readonly RpcCommandSpec[] = [
 	{
+		name: "attest",
+		doc: "Snapshot identity, activity epoch, work census and owned-job registry soundness.",
+		params: { operationId: "string", nonce: "string" },
+		result: "WorkAttestation",
+	},
+	{
+		name: "quiesce_and_exit",
+		doc: "Atomically close admission and exit if the bound quiescence attempt passes.",
+		params: "QuiesceRequest",
+		result: "QuiesceResult",
+	},
+	{
 		name: "negotiate_protocol",
 		doc: "Switch the connection to a protocol version advertised by `ready`.",
 		params: { protocolVersion: "number.integer" },
