@@ -1,9 +1,16 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
 import * as path from "node:path";
 import { isRecord, readJsonl, TempDir } from "@oh-my-pi/pi-utils";
+import * as launchClient from "@oh-my-pi/pi-coding-agent/launch/client";
 import { selectRpcEntries } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-compat";
 import { RpcWordPredictor } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
-import type { TextPrediction } from "@oh-my-pi/pi-coding-agent/predict/client";
+import {
+	closeTextPrediction,
+	hasTextPredictionConnection,
+	requestTextPrediction,
+	type TextPrediction,
+} from "@oh-my-pi/pi-coding-agent/predict/client";
+import * as smollmWeights from "@oh-my-pi/pi-coding-agent/predict/smollm-weights";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import type { SessionEntry, SessionTreeNode } from "@oh-my-pi/pi-coding-agent/session/session-entries";
@@ -209,7 +216,7 @@ describe("RpcWordPredictor", () => {
 			return answer("er");
 		});
 		expect(await predictor.predict("ngram", draft, draft.length)).toBe("er");
-		expect(calls).toEqual([["ngram", "Check it\nthe ", "weath"]]);
+		expect(calls).toEqual([["ngram", "Check it\nthe ", "weath", { connectedOnly: false }]]);
 	});
 
 	test("never asks the engine mid-line or when completion is off", async () => {
@@ -244,6 +251,51 @@ describe("RpcWordPredictor", () => {
 		expect(await a).toBe("hat");
 		expect(await c).toBe("wea!");
 		expect(prefixes).toEqual(["w", "wea"]);
+	});
+
+	test("asks for connection-only answers once the session is exiting, read as each request starts", async () => {
+		let exiting = false;
+		const first = Promise.withResolvers<TextPrediction>();
+		const options: unknown[] = [];
+		const predictor = new RpcWordPredictor(
+			async (_engine, _before, _prefix, requestOptions) => {
+				options.push(requestOptions);
+				return options.length === 1 ? first.promise : answer(null);
+			},
+			() => exiting,
+		);
+		const running = predictor.predict("ngram", "w", 1);
+		// Queued while input is still admitted, started after the session decided to exit.
+		const queued = predictor.predict("ngram", "we", 2);
+		exiting = true;
+		first.resolve(answer("hat"));
+		expect(await running).toBe("hat");
+		expect(await queued).toBeNull();
+		expect(options).toEqual([{ connectedOnly: false }, { connectedOnly: true }]);
+	});
+});
+
+describe("requestTextPrediction connection-only", () => {
+	test("answers no suggestion without starting the broker, the daemon or a weights download", async () => {
+		const broker = vi.spyOn(launchClient, "daemonClientForGlobal").mockRejectedValue(new Error("broker started"));
+		const prefetch = vi.spyOn(smollmWeights, "prefetchSmolLmWeights").mockImplementation(() => {});
+		try {
+			expect(hasTextPredictionConnection()).toBe(false);
+			expect(await requestTextPrediction("smollm", "the ", "weath", { connectedOnly: true })).toEqual({
+				engine: "smollm",
+				suggestion: null,
+			});
+			expect(broker).not.toHaveBeenCalled();
+			expect(prefetch).not.toHaveBeenCalled();
+			// The same request without the flag starts both, so the spies do intercept them.
+			await expect(requestTextPrediction("smollm", "the ", "weath")).rejects.toThrow("broker started");
+			expect(broker).toHaveBeenCalledTimes(1);
+			expect(prefetch).toHaveBeenCalledTimes(1);
+		} finally {
+			// Drops the client and its retry back-off.
+			closeTextPrediction();
+			vi.restoreAllMocks();
+		}
 	});
 });
 

@@ -687,6 +687,8 @@ interface SessionManagerStateSnapshot {
 	cwd: string;
 	sessionDir: string;
 	sessionId: string;
+	/** Sibling-move lineage ({@link SessionManager.continuesSession}); a restore puts it back. */
+	siblingLineage: string[];
 	sessionName: string | undefined;
 	titleSource: SessionTitleSource | undefined;
 	sessionFile: string | undefined;
@@ -901,6 +903,11 @@ export class SessionManager {
 	#persistenceNoticeCallbacks = new Set<(notice: SessionPersistenceNotice) => void>();
 	/** Every notice raised so far, replayed to each later subscriber. */
 	#persistenceNotices: SessionPersistenceNotice[] = [];
+	/**
+	 * Ids the current session continues through sibling moves ({@link SessionPersistenceNotice}),
+	 * oldest first. Any other id change ({@link #adoptSessionId}) starts a new lineage.
+	 */
+	#siblingLineage: string[] = [];
 	/**
 	 * This process's ownership claim on the session it last wrote (file storage
 	 * only), keyed by session id so every path to the journal meets it.
@@ -1158,6 +1165,7 @@ export class SessionManager {
 		const from = this.#sessionFile as string;
 		const previousSessionId = this.#sessionId;
 		const timestamp = nowIso();
+		this.#siblingLineage.push(previousSessionId);
 		this.#sessionId = mintSessionId();
 		const to = path.join(path.dirname(from), `${fileSafeTimestamp(timestamp)}_${this.#sessionId}.jsonl`);
 		this.#header = {
@@ -1848,7 +1856,7 @@ export class SessionManager {
 			this.#sessionDir = path.resolve(options.sessionDir);
 			this.#storage.ensureDirSync(this.#sessionDir);
 		}
-		this.#sessionId = mintSessionId();
+		this.#adoptSessionId(mintSessionId());
 		this.#sessionName = undefined;
 		this.#titleSource = undefined;
 		this.#titleUpdatedAt = "";
@@ -1905,7 +1913,7 @@ export class SessionManager {
 	#applyEntries(header: SessionHeader, entries: SessionEntry[]): void {
 		this.#header = header;
 		this.#entries = entries;
-		this.#sessionId = header.id;
+		this.#adoptSessionId(header.id);
 		this.#sessionName = header.title;
 		this.#titleSource = header.titleSource;
 		this.#titleUpdatedAt = header.timestamp;
@@ -2053,6 +2061,7 @@ export class SessionManager {
 			cwd: this.#cwd,
 			sessionDir: this.#sessionDir,
 			sessionId: this.#sessionId,
+			siblingLineage: [...this.#siblingLineage],
 			sessionName: this.#sessionName,
 			titleSource: this.#titleSource,
 			titleUpdatedAt: this.#titleUpdatedAt,
@@ -2108,6 +2117,8 @@ export class SessionManager {
 		this.#draftOnlySessionCleanupArmed = snapshot.draftOnlySessionCleanupArmed;
 		this.#fallbackRuntimeOnly = snapshot.fallbackRuntimeOnly;
 		this.#applyEntries(snapshot.header, [...snapshot.entries]);
+		// After #applyEntries: its id adoption resets the lineage on an id change.
+		this.#siblingLineage = [...snapshot.siblingLineage];
 		this.#additionalDirectories = snapshot.header.additionalDirectories ?? [];
 		this.#sessionName = snapshot.sessionName;
 
@@ -2289,7 +2300,7 @@ export class SessionManager {
 		this.#reconcileSessionDirForFallback();
 
 		const timestamp = nowIso();
-		this.#sessionId = mintSessionId();
+		this.#adoptSessionId(mintSessionId());
 		this.#sessionFile = path.join(this.#sessionDir, `${fileSafeTimestamp(timestamp)}_${this.#sessionId}.jsonl`);
 		this.#expectedDiskSize = null;
 		this.#header = {
@@ -3044,6 +3055,21 @@ export class SessionManager {
 		return this.#sessionId;
 	}
 
+	/**
+	 * True when the current session is `sessionId`, or continues it through sibling moves
+	 * only: a move to a fresh file after a write conflict (see {@link SessionPersistenceNotice})
+	 * mints a new id for the same transcript. A fork, branch, new or opened session never does.
+	 */
+	continuesSession(sessionId: string): boolean {
+		return sessionId === this.#sessionId || this.#siblingLineage.includes(sessionId);
+	}
+
+	/** Every id change except a sibling move: a different id ends the sibling lineage. */
+	#adoptSessionId(sessionId: string): void {
+		if (sessionId !== this.#sessionId) this.#siblingLineage = [];
+		this.#sessionId = sessionId;
+	}
+
 	getSessionFile(): string | undefined {
 		return this.#sessionFile;
 	}
@@ -3790,7 +3816,7 @@ export class SessionManager {
 
 		this.#header = header;
 		this.#entries = [...entriesToKeep, ...labels];
-		this.#sessionId = newSessionId;
+		this.#adoptSessionId(newSessionId);
 		this.#sessionName = header.title;
 		this.#titleSource = header.titleSource;
 		this.#titleUpdatedAt = timestamp;
