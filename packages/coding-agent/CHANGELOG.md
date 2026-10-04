@@ -26,6 +26,7 @@
 - Literal RPC prompts (`literal: true`) are acknowledged only once admitted, like other prompts, so an immediate `promote_queued_message` observes a queued literal prompt
 - Interrupting a turn while a tool approval is pending now closes the dialog (RPC hosts receive `cancel`), and an approval answered after the call was aborted no longer runs the tool
 - Count host-dispatched extension hooks, including `session_start`, until their actual handler work settles; an extension cannot pass quiescence from inside its own startup hook.
+- Advance the owning session's activity epoch when host-dispatched extension work starts, so a completed hook cannot leave an older exit attestation valid. Commands, shortcuts, file fallbacks and managed timer callbacks also advance the epoch and remain counted until settlement.
 
 ### Changed
 

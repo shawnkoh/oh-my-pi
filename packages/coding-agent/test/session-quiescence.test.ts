@@ -188,6 +188,64 @@ describe("AgentSession quiesce-and-exit", () => {
 		expect(await exited.promise).toBe(0);
 	});
 
+	it("invalidates an attestation when a host-dispatched handler starts and then settles", async () => {
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const s = await createSessionWithExtension(pi => {
+			pi.on("session_start", async () => {
+				started.resolve();
+				await release.promise;
+			});
+		});
+		const oldRequest = request(s);
+		const dispatched = s.extensionRunner!.emit({ type: "session_start" });
+		try {
+			await started.promise;
+			expect(s.getWorkCounts().scheduledTurns).toBe(1);
+		} finally {
+			release.resolve();
+			await dispatched;
+		}
+		expect(s.getWorkCounts().scheduledTurns).toBe(0);
+		expect(s.quiesceForExit(oldRequest)).toMatchObject({ status: "refused", reason: "epoch_mismatch" });
+		expect(s.quiesceForExit(request(s, { attempt: 2 }))).toMatchObject({ status: "quiesced" });
+	});
+
+	it.each(["scoped callback", "managed timer"] as const)(
+		"counts a host %s until settlement and invalidates the old attestation",
+		async kind => {
+			const s = await createSessionWithExtension(() => {});
+			const runner = s.extensionRunner!;
+			const started = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const handler = () => {
+				started.resolve();
+				return release.promise;
+			};
+			const oldRequest = request(s);
+			if (kind === "managed timer") vi.useFakeTimers();
+			const dispatched =
+				kind === "scoped callback" ? runner.runScoped(handler) : runner.createContext().setTimeout(handler, 0);
+			try {
+				if (kind === "managed timer") vi.advanceTimersByTime(0);
+				await started.promise;
+				expect(s.getWorkCounts().scheduledTurns).toBe(1);
+				expect(s.quiesceForExit(request(s))).toMatchObject({ status: "refused", reason: "work_active" });
+			} finally {
+				release.resolve();
+				await release.promise;
+				if (dispatched instanceof Promise) await dispatched;
+				if (kind === "managed timer") vi.useRealTimers();
+			}
+			expect(s.getWorkCounts().scheduledTurns).toBe(0);
+			expect(s.quiesceForExit({ ...oldRequest, attempt: 2 })).toMatchObject({
+				status: "refused",
+				reason: "epoch_mismatch",
+			});
+			expect(s.quiesceForExit(request(s, { attempt: 3 }))).toMatchObject({ status: "quiesced" });
+		},
+	);
+
 	it("keeps parked subagents parked after a passed quiesce", async () => {
 		const s = createSession();
 		const registry = AgentRegistry.global();

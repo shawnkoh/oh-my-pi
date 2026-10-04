@@ -512,10 +512,12 @@ export class ExtensionRunner {
 	#attestFn?: ExtensionContextActions["attest"];
 	#quiesceAndExitFn?: ExtensionContextActions["quiesceAndExit"];
 	#activeHandlers = 0;
+	/** Bound by the owning session before any host dispatch. */
+	onActivity?: () => void;
 
 	/** Includes host-dispatched hooks and timed-out handlers until their actual work settles. */
 	get activeHandlers(): number {
-		return this.#activeHandlers;
+		return this.#activeHandlers + this.#managedTimers.activeCallbacks;
 	}
 	#ephemeralTurnBlocker = new AsyncLocalStorage<string | undefined>();
 	#getAsyncJobSnapshotFn: () => AsyncJobSnapshot | null = () => null;
@@ -563,8 +565,9 @@ export class ExtensionRunner {
 	 * whole session (issue #5664). Handles are `unref`'d and every outstanding
 	 * timer is cleared on session teardown via {@link clearManagedTimers}.
 	 */
-	#managedTimers = new ManagedTimers((event, error, stack) =>
-		this.emitError({ extensionPath: "<timer>", event, error, stack }),
+	#managedTimers = new ManagedTimers(
+		(event, error, stack) => this.emitError({ extensionPath: "<timer>", event, error, stack }),
+		() => this.onActivity?.(),
 	);
 	/**
 	 * Disposers for the trampolines installed via {@link addFileWriteFallback} and
@@ -879,7 +882,7 @@ export class ExtensionRunner {
 						const ctx = this.createContext();
 						for (const handler of ext.fileWriteFallbackHandlers) {
 							try {
-								if (await handler(req, ctx)) return true;
+								if (await this.runScoped(() => handler(req, ctx))) return true;
 							} catch (error) {
 								logger.warn("Extension file write fallback handler threw; trying next handler", {
 									extension: ext.path,
@@ -898,7 +901,7 @@ export class ExtensionRunner {
 						const ctx = this.createContext();
 						for (const handler of ext.fileDeleteFallbackHandlers) {
 							try {
-								if (await handler(req, ctx)) return true;
+								if (await this.runScoped(() => handler(req, ctx))) return true;
 							} catch (error) {
 								logger.warn("Extension file delete fallback handler threw; trying next handler", {
 									extension: ext.path,
@@ -1349,7 +1352,22 @@ export class ExtensionRunner {
 	 * invoked directly by their controllers and route through here instead.
 	 */
 	runScoped<T>(fn: () => T): T {
-		return withActiveSettings(this.settings, fn);
+		this.onActivity?.();
+		this.#activeHandlers++;
+		let result: T;
+		try {
+			result = withActiveSettings(this.settings, fn);
+		} catch (error) {
+			this.#activeHandlers--;
+			throw error;
+		}
+		if (result instanceof Promise) {
+			return result.finally(() => {
+				this.#activeHandlers--;
+			}) as T;
+		}
+		this.#activeHandlers--;
+		return result;
 	}
 
 	/**
@@ -1537,6 +1555,7 @@ export class ExtensionRunner {
 				raceHandlerWithTimeout(
 					async (handlerSignal, budget) => {
 						this.#activeHandlers++;
+						this.onActivity?.();
 						try {
 							registrationScope.signal = handlerSignal;
 							let result: R | undefined;

@@ -1790,6 +1790,7 @@ export class AgentSession implements SettingsScope {
 		this.#promptTemplates = config.promptTemplates ?? [];
 		this.#slashCommands = config.slashCommands ?? [];
 		this.#extensionRunner = config.extensionRunner;
+		if (this.#extensionRunner) this.#extensionRunner.onActivity = () => this.noteActivity();
 		this.#cacheWarmer = config.cacheWarmer;
 		if (config.cacheWarmer) {
 			const warmer = config.cacheWarmer;
@@ -3243,6 +3244,7 @@ export class AgentSession implements SettingsScope {
 			(this.#ttsr.resumeGate ? 1 : 0) +
 			this.#inFlightEventHandlers.size +
 			(this.#extensionRunner?.activeHandlers ?? 0) +
+			(this.#fallbackExtensionTimers?.activeCallbacks ?? 0) +
 			this.#pendingMessageEndPersistence.size +
 			this.#advisors.pendingWork() +
 			(this.#cacheWarmer?.refreshing ? 1 : 0) +
@@ -8716,8 +8718,9 @@ export class AgentSession implements SettingsScope {
 
 	/** Lazily create the runner-less command-context timer registry (#5664). */
 	#fallbackTimers(): ManagedTimers {
-		this.#fallbackExtensionTimers ??= new ManagedTimers((event, error) =>
-			logger.warn("Extension timer callback threw", { event, error }),
+		this.#fallbackExtensionTimers ??= new ManagedTimers(
+			(event, error) => logger.warn("Extension timer callback threw", { event, error }),
+			() => this.noteActivity(),
 		);
 		return this.#fallbackExtensionTimers;
 	}

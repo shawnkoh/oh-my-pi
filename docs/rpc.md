@@ -568,8 +568,11 @@ read-only snapshot, then asks the process to exit only if nothing changed:
    request, and the RPC live bridge while connecting, active or closing. Updates the
    advisor review cadence holds back for a later review are not work. `streaming`
    includes side-channel (ephemeral) turns and primary advisor sync catch-up waits. `epoch`
-   increases whenever input is admitted or work starts. `instanceId` is random per
-   session object and process. `detachedJobs` counts live owned processes, including
+   increases whenever input is admitted or work starts, including host-dispatched
+   extension hooks, commands, shortcuts, file fallbacks and managed timer callbacks.
+   These callbacks remain counted until their actual work settles, even if a hook
+   times out; completion does not make a pre-dispatch attestation valid again.
+   `instanceId` is random per session object and process. `detachedJobs` counts live owned processes, including
    ones found by the owner-marker scan below; `registry.complete` is false unless that
    scan was `sound` and the session is persisted.
 2. `quiesce_and_exit` `{ operationId, attempt, epoch, instanceId, sessionId, deadline }`,
