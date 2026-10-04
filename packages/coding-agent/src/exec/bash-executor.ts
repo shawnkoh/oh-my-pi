@@ -229,7 +229,6 @@ const QUARANTINE_CLEANUP_TIMEOUT_MS = 30_000;
  * down instead; background jobs still live then are untracked from here on.
  */
 function trackBackgroundJobs(shell: Shell, result: ShellRunResult, context: { command: string; cwd: string }): void {
-	if (backgroundShells.has(shell)) return;
 	const registry = OwnedJobRegistry.instance();
 	const live = result.liveBackgroundJobs;
 	if (live === undefined) {
@@ -241,6 +240,7 @@ function trackBackgroundJobs(shell: Shell, result: ShellRunResult, context: { co
 		registry?.markIncomplete("a cancelled shell run left background jobs running", "bash-background-uncounted");
 		return;
 	}
+	if (backgroundShells.has(shell)) return;
 	const jobId = registry?.registerInProcessJob({
 		jobId: `retained-shell:${++shellRunSequence}`,
 		kind: "retained-shell",

@@ -191,6 +191,30 @@ describe.skipIf(process.platform === "win32")("owned-job registry", () => {
 		},
 	);
 
+	it.each([
+		{ liveBackgroundJobs: undefined, cancelled: false, timedOut: false },
+		{ liveBackgroundJobs: 1, cancelled: true, timedOut: false },
+		{ liveBackgroundJobs: 1, cancelled: false, timedOut: true },
+	])("fails closed when a retained shell is reused with %j", async result => {
+		const sessionKey = `retained-reuse-${Date.now()}`;
+		await executeBash("{ sleep 1; } >/dev/null 2>&1 &", { cwd: tempDir.path(), sessionKey });
+		expect(registry.openJobs().filter(record => record.kind === "retained-shell")).toHaveLength(1);
+		expect(registry.complete).toBe(true);
+		const runSpy = vi.spyOn(natives.Shell.prototype, "run").mockResolvedValue({
+			...result,
+			spawnedProcesses: [],
+			spawnedComplete: true,
+		});
+		try {
+			await executeBash("true", { cwd: tempDir.path(), sessionKey });
+			expect(registry.complete).toBe(false);
+			expect(registry.openJobs().filter(record => record.kind === "retained-shell")).toHaveLength(1);
+		} finally {
+			runSpy.mockRestore();
+			releaseShellSessions(sessionKey);
+		}
+	});
+
 	it("keeps a retained-shell record open while a background job can still start processes", async () => {
 		// The job forks its long-lived child only after the run returned: no survivor report sees it.
 		const result = await executeBash("{ /bin/sleep 0.3; /bin/sleep 4; } >/dev/null 2>&1 & echo started", {

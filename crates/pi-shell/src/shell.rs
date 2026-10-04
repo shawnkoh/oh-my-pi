@@ -442,7 +442,18 @@ async fn run_shell_session(
 				),
 			};
 			abort_state.set(at).await;
-			run_shell_command(session, &run_config, on_chunk, tokio_cancel, spawn_registry).await
+			let result =
+				run_shell_command(session, &run_config, on_chunk, tokio_cancel.clone(), spawn_registry)
+					.await;
+			let live_background_jobs = count_live_background_jobs(session_guard.as_mut());
+			let keepalive = !tokio_cancel.is_cancelled()
+				&& result
+					.as_ref()
+					.is_ok_and(|(exec, ..)| session_keepalive(exec));
+			if !keepalive {
+				*session_guard = None;
+			}
+			result.map(|result| (result, live_background_jobs))
 		}
 	});
 
@@ -456,15 +467,20 @@ async fn run_shell_session(
 				let _ = run_task.await;
 			}
 			abort_state.clear().await;
-			// Use try_lock to avoid deadlocking if another task holds the session.
-			// If we can't acquire the lock, the session will be cleaned up when the
-			// holding task finishes.
-			let live_background_jobs = if let Ok(mut guard) = session.try_lock() {
-				let count = count_live_background_jobs(guard.as_mut());
-				*guard = None;
-				count
-			} else {
-				None
+			// A graceful run captured its own snapshot before releasing the session.
+			// Only forced cancellation needs a nonblocking fallback.
+			let live_background_jobs = match graceful {
+				Ok(Ok(Ok((_, count)))) => count,
+				Ok(_) => None,
+				Err(_) => {
+					if let Ok(mut guard) = session.try_lock() {
+						let count = count_live_background_jobs(guard.as_mut());
+						*guard = None;
+						count
+					} else {
+						None
+					}
+				},
 			};
 			let _ = process_cancel_bridge.await;
 			let survivors = spawn_registry.survivors();
@@ -486,13 +502,7 @@ async fn run_shell_session(
 	let _ = process_cancel_bridge.await;
 	abort_state.clear().await;
 
-	let keepalive = res.as_ref().is_ok_and(|(exec, ..)| session_keepalive(exec));
-	let mut guard = session.lock().await;
-	let live_background_jobs = count_live_background_jobs(guard.as_mut());
-	if !keepalive {
-		*guard = None;
-	}
-	let (exec, minimized, working_dir) = res?;
+	let ((exec, minimized, working_dir), live_background_jobs) = res?;
 	let survivors = spawn_registry.survivors();
 	Ok(ShellRunResult {
 		exit_code: Some(exit_code(&exec)),
