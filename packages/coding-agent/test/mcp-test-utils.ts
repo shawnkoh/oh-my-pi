@@ -1,4 +1,5 @@
 import type { MCPServerCapabilities, MCPServerConnection, MCPTransport } from "@oh-my-pi/pi-coding-agent/mcp/types";
+import { ServerActivityLedger } from "../src/session/activity-ledger";
 
 export function createMockTransport(
 	responses: Map<string, unknown[]>,
@@ -6,6 +7,7 @@ export function createMockTransport(
 ): MCPTransport {
 	const callCounts = new Map<string, number>();
 	return {
+		activity: new ServerActivityLedger("mcp", "test"),
 		connected: true,
 		async request<T>(method: string, params?: Record<string, unknown>): Promise<T> {
 			onRequest?.(method, params);

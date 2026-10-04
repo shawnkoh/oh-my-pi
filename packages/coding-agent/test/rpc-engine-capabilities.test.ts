@@ -32,7 +32,7 @@ describe("RPC engine capabilities", () => {
 			"tool-approval-binding/1",
 			"reply-attribution/1",
 			"external-delivery/1",
-			"quiesce-exit/1",
+			"quiesce-exit/2",
 			"owned-jobs/1",
 		]);
 		const state = await client.getState();

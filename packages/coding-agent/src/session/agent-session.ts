@@ -14,6 +14,13 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
+import {
+	ExtensionActivityLedger,
+	holdExtensionWork,
+	idleSafeServerProcesses,
+	outstandingServerWork,
+} from "./activity-ledger";
+import { cfgStrictIdleIdleSafeServers } from "./settings";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -289,6 +296,7 @@ import type {
 	SteerOptions,
 	UsageFallbackConfirmer,
 } from "./agent-session-types";
+import { namespaceCensus, type CensusResult } from "./namespace-census";
 import { writeArtifact } from "./artifacts";
 import { renderAttachmentSourceNotice } from "./attachment-source-notice";
 import { formatArtifactErrorNotice, type OutputMeta, stripOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
@@ -418,7 +426,12 @@ import {
 	SessionMaintenance,
 	type SessionMaintenanceHost,
 } from "./session-maintenance";
-import { cleanupEmptyMoveSession, copySessionArtifacts, type SessionManager } from "./session-manager";
+import {
+	cleanupEmptyMoveSession,
+	copySessionArtifacts,
+	type SessionManager,
+	type TranscriptDigest,
+} from "./session-manager";
 import { SessionMemory, type SessionMemoryHost } from "./session-memory";
 import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
@@ -929,6 +942,12 @@ export class AgentSession implements SettingsScope {
 	#extensionRunner: ExtensionRunner | undefined = undefined;
 	#getEvalPreludes: (() => readonly EvalPreludeDefinition[]) | undefined;
 	#reconcileBrowserMcpFilter: AgentSessionConfig["reconcileBrowserMcpFilter"];
+	#censusConfig: Pick<
+		AgentSessionConfig,
+		"a13Identity" | "a13Instance" | "a13Extinct" | "namespaceCensus" | "idleInfrastructure"
+	>;
+	#lastCensus: CensusResult | undefined;
+	#lastCompletenessReasons: string[] | undefined;
 	#skillDescriptions: SkillDescriptionCatalog;
 	#promptSkillsSource: readonly Skill[] | undefined;
 	#promptSkills: readonly Skill[] = [];
@@ -1035,6 +1054,14 @@ export class AgentSession implements SettingsScope {
 	/** Random per-object id binding quiesce requests to the attestation they were built from. */
 	readonly #instanceId = crypto.randomUUID();
 	#terminalAttestation: TerminalAttestation | undefined;
+	#strictSeal:
+		| {
+				epoch: number;
+				progress: { finalized: boolean; bound: boolean; attested: boolean };
+				transcript: TranscriptDigest | null;
+				blocked: boolean;
+		  }
+		| undefined;
 	/** Lifts this session's refusal of subagent revivals, set once it decided to exit. */
 	#releaseRevivalRefusal: (() => void) | undefined;
 	/** Owned-job registry this session created (root sessions that own the async job manager). */
@@ -1681,6 +1708,13 @@ export class AgentSession implements SettingsScope {
 	readonly tokenRate: TokenRateMeter;
 
 	constructor(config: AgentSessionConfig) {
+		this.#censusConfig = {
+			a13Identity: config.a13Identity,
+			a13Instance: config.a13Instance,
+			a13Extinct: config.a13Extinct,
+			namespaceCensus: config.namespaceCensus,
+			idleInfrastructure: config.idleInfrastructure,
+		};
 		this.agent = config.agent;
 		this.tokenRate = new TokenRateMeter(text => this.agent.tokenizer.countTokens(text));
 		this.#reseedTokenRate();
@@ -1855,6 +1889,12 @@ export class AgentSession implements SettingsScope {
 		this.#promptTemplates = config.promptTemplates ?? [];
 		this.#slashCommands = config.slashCommands ?? [];
 		this.#extensionRunner = config.extensionRunner;
+		this.registerWorkSource({ kind: "scheduledTurns", strictOnly: true, count: outstandingServerWork });
+		this.registerWorkSource({
+			kind: "scheduledTurns",
+			strictOnly: true,
+			count: ExtensionActivityLedger.outstandingWork,
+		});
 		if (this.#extensionRunner) {
 			this.#extensionRunner.onActivity = () => this.noteActivity();
 			this.#extensionRunner.eventScope = dispatch => this.#hostInputHookScope.exit(dispatch);
@@ -3315,9 +3355,13 @@ export class AgentSession implements SettingsScope {
 		return this.#terminalAttestation;
 	}
 
+	get isSealedBlocked(): boolean {
+		return this.#strictSeal?.blocked === true;
+	}
+
 	/** Synchronously count all outstanding work. Never awaits; safe to call with admission closed. */
-	getWorkCounts(): WorkCounts {
-		return this.#countWork(true);
+	getWorkCounts(strict = false): WorkCounts {
+		return this.#countWork(true, strict);
 	}
 
 	/**
@@ -3325,7 +3369,7 @@ export class AgentSession implements SettingsScope {
 	 * found processes); without it, `detachedJobs` counts only processes already recorded —
 	 * enough for answers that decide nothing (malformed, stale or foreign requests).
 	 */
-	#countWork(scan: boolean): WorkCounts {
+	#countWork(scan: boolean, strict = false): WorkCounts {
 		const counts = emptyWorkCounts();
 		counts.streaming = this.isStreaming || this.isBashRunning || this.isEvalRunning ? 1 : 0;
 		counts.queuedInput =
@@ -3387,7 +3431,9 @@ export class AgentSession implements SettingsScope {
 			(this.#sessionTransitionDepth > 0 ? 1 : 0);
 		counts.goalContinuationScheduled = this.#goalContinuationReservations;
 		this.#hostInputHookScope.exit(() => {
-			for (const source of this.#workSources) counts[source.kind] += Math.max(0, source.count());
+			for (const source of this.#workSources) {
+				if (!source.strictOnly || strict) counts[source.kind] += Math.max(0, source.count());
+			}
 		});
 		return counts;
 	}
@@ -3395,11 +3441,11 @@ export class AgentSession implements SettingsScope {
 	/** Read-only snapshot of outstanding work, echoing the caller's operation id and nonce. */
 	attest(operationId: string, nonce: string): WorkAttestation {
 		const registry = this.ownedJobRegistry;
-		registry?.ensureHeader();
+		if (!this.#strictSeal) registry?.ensureHeader();
 		// Count first: the owner-marker scan inside may record (and so move the epoch past) a
 		// process nobody tracked yet. The attested epoch must include that registration.
 		const counts = this.getWorkCounts();
-		const epoch = this.#activityEpoch;
+		const epoch = this.#strictSeal?.epoch ?? this.#activityEpoch;
 		return {
 			version: WORK_ATTESTATION_VERSION,
 			operationId,
@@ -3410,6 +3456,7 @@ export class AgentSession implements SettingsScope {
 			invocation: currentInvocation(),
 			counts,
 			admission: this.#admissionClosedBy ? "closed" : "open",
+			sealed: this.#strictSeal !== undefined,
 			registry: {
 				path: registry?.path ?? null,
 				complete: this.#registryComplete(registry),
@@ -3428,13 +3475,15 @@ export class AgentSession implements SettingsScope {
 	 * not reached. On success it durably writes the terminal attestation next to the session
 	 * file and leaves admission closed; the host must then exit. On refusal it reopens
 	 * admission exactly as before and changes nothing else — no work is cancelled. If the
-	 * attestation cannot be written after the transcript was made final, the answer is
-	 * `exit_unattested`: the host exits anyway and consumers fall back to the registry.
+	 * attestation cannot be written after the transcript was made final, attested policy
+	 * returns `exit_unattested`; strict policy stays alive as `sealed_blocked` for retirement.
 	 * Each `(operationId, attempt)` of this session is evaluated once: repeating it returns
 	 * the original answer unchanged, and an older attempt is refused. Malformed requests and
 	 * requests for another session object or session never use up an attempt.
 	 */
 	quiesceForExit(request: QuiesceRequest): QuiesceResult {
+		this.#lastCensus = undefined;
+		this.#lastCompletenessReasons = undefined;
 		const { operationId, attempt } = request;
 		const refuse = (reason: QuiesceRefusalReason, counts?: WorkCounts): QuiesceResult => ({
 			status: "refused",
@@ -3445,11 +3494,23 @@ export class AgentSession implements SettingsScope {
 				epoch: this.#activityEpoch,
 				counts: counts ?? this.#safeCounts(),
 				observedAt: new Date().toISOString(),
+				...(request.completeness === "strict" && (reason === "completeness_unknown" || reason === "work_active")
+					? {
+							census: this.#lastCensus,
+							completenessReasons: this.#lastCompletenessReasons,
+							registry: {
+								path: this.ownedJobRegistry?.path ?? null,
+								complete: this.#registryComplete(this.ownedJobRegistry),
+								ownerScan: this.#lastOwnerScan,
+							},
+						}
+					: {}),
 			},
 		});
 		if (
 			typeof operationId !== "string" ||
 			operationId.length === 0 ||
+			(request.completeness !== "strict" && request.completeness !== "attested") ||
 			!Number.isSafeInteger(attempt) ||
 			attempt < 0 ||
 			!Number.isSafeInteger(request.epoch) ||
@@ -3484,6 +3545,11 @@ export class AgentSession implements SettingsScope {
 		refuse: (reason: QuiesceRefusalReason, counts?: WorkCounts) => QuiesceResult,
 	): QuiesceResult {
 		const { operationId, attempt } = request;
+		if (this.isSealedBlocked && !this.#isDisposed && request.completeness === "strict") {
+			if (Date.now() >= request.deadline) return refuse("deadline_expired");
+			if (request.epoch !== this.#strictSeal!.epoch) return refuse("epoch_mismatch");
+			return this.#retireStrictSeal(request);
+		}
 		if (this.#admissionClosedBy || this.#isDisposed) return refuse("admission_closed");
 
 		// Close admission before looking at anything. Nothing below awaits, so no input can
@@ -3492,13 +3558,24 @@ export class AgentSession implements SettingsScope {
 		let sealed = false;
 		let counts: WorkCounts | undefined;
 		try {
+			const strict = request.completeness === "strict";
+			if (strict) this.ownedJobRegistry?.ensureHeader();
 			const epoch = this.#activityEpoch;
-			counts = this.getWorkCounts();
+			counts = this.getWorkCounts(strict);
+			const completeness = strict ? this.#strictCompleteness() : undefined;
+			if (strict) {
+				const fresh = this.#countWork(false, true);
+				for (const key of Object.keys(counts) as (keyof WorkCounts)[])
+					counts[key] = Math.max(counts[key], fresh[key]);
+				counts.detachedJobs += this.#lastCensus?.work.length ?? 0;
+			}
 			const sessionFile = this.sessionManager.getSessionFile();
 			let reason: QuiesceRefusalReason | undefined;
 			if (Date.now() >= request.deadline) reason = "deadline_expired";
 			else if (epoch !== request.epoch) reason = "epoch_mismatch";
 			else if (hasOutstandingWork(counts)) reason = "work_active";
+			else if (strict && this.#activityEpoch !== request.epoch) reason = "epoch_mismatch";
+			else if (strict && !completeness?.complete) reason = "completeness_unknown";
 			else if (!sessionFile) reason = "attestation_unavailable";
 			if (reason || !sessionFile) {
 				this.#admissionClosedBy = undefined;
@@ -3512,6 +3589,15 @@ export class AgentSession implements SettingsScope {
 			assertAttestationWritable(terminalAttestationPath(sessionFile));
 			this.#recordSessionExit("quiesce");
 			sealed = true;
+			if (strict) {
+				this.#strictSeal = {
+					epoch,
+					progress: { finalized: false, bound: false, attested: false },
+					transcript: null,
+					blocked: true,
+				};
+				return this.#retireStrictSeal(request);
+			}
 			// The process exits from here on: a parked subagent must stay parked.
 			this.#releaseRevivalRefusal ??= AgentLifecycleManager.global().refuseRevivals("the session is exiting");
 			// An armed warm would still pay for a provider call after the decision.
@@ -3563,6 +3649,106 @@ export class AgentSession implements SettingsScope {
 					counts: counts ?? this.#safeCounts(),
 					observedAt: new Date().toISOString(),
 				},
+			};
+		}
+	}
+
+	/** Resume only incomplete preparation; every attempt re-evaluates the final binding. */
+	#retireStrictSeal(request: QuiesceRequest): QuiesceResult {
+		const state = this.#strictSeal!;
+		const { operationId, attempt } = request;
+		let counts = this.#safeCounts();
+		try {
+			this.#releaseRevivalRefusal ??= AgentLifecycleManager.global().refuseRevivals("the session is sealed");
+			this.#cacheWarmer?.cancel();
+			if (!state.progress.finalized) {
+				state.transcript = this.sessionManager.recoverFinalizationForExit();
+				state.progress.finalized = true;
+			}
+			const registry = this.ownedJobRegistry;
+			if (!state.progress.bound) {
+				if (!registry) throw new Error("registry_unavailable");
+				registry.ensureHeader();
+				state.progress.bound = true;
+			}
+			counts = this.getWorkCounts(true);
+			const completeness = this.#strictCompleteness();
+			const fresh = this.#countWork(false, true);
+			for (const key of Object.keys(counts) as (keyof WorkCounts)[]) counts[key] = Math.max(counts[key], fresh[key]);
+			if (Date.now() >= request.deadline) throw new Error("deadline_expired");
+			counts.detachedJobs += this.#lastCensus?.work.length ?? 0;
+			if (hasOutstandingWork(counts)) throw new Error("work_active");
+			if (this.#activityEpoch !== state.epoch) throw new Error("epoch_mismatch");
+			if (!completeness.complete) throw new Error("completeness_unknown");
+			const session = this.#sessionIdentity();
+			if (!session.file) throw new Error("attestation_unavailable");
+			const attestation: TerminalAttestation = {
+				version: TERMINAL_ATTESTATION_VERSION,
+				kind: "quiesce",
+				operationId,
+				attempt,
+				session: { ...session, size: state.transcript?.size ?? null, sha256: state.transcript?.sha256 ?? null },
+				invocation: currentInvocation(),
+				instanceId: this.#instanceId,
+				epoch: state.epoch,
+				counts,
+				interrupted: false,
+				registryComplete: this.#registryComplete(registry),
+				registryPath: registry?.path ?? null,
+				ownerScan: this.#lastOwnerScan,
+				writtenAt: new Date().toISOString(),
+			};
+			const file = terminalAttestationPath(session.file);
+			writeTerminalAttestationSync(file, attestation);
+			state.progress.attested = true;
+			this.#terminalAttestation = attestation;
+			state.blocked = false;
+			return { status: "quiesced", operationId, attempt, attestation, path: file };
+		} catch (error) {
+			state.blocked = true;
+			this.sessionManager.seal();
+			const registry = this.ownedJobRegistry;
+			const terminal: TerminalAttestation = {
+				version: TERMINAL_ATTESTATION_VERSION,
+				kind: "sealed_blocked",
+				operationId,
+				attempt,
+				session: this.#sessionIdentity(),
+				invocation: currentInvocation(),
+				instanceId: this.#instanceId,
+				epoch: state.epoch,
+				counts,
+				interrupted: true,
+				registryComplete: this.#registryComplete(registry),
+				registryPath: registry?.path ?? null,
+				ownerScan: this.#lastOwnerScan,
+				writtenAt: new Date().toISOString(),
+			};
+			this.#terminalAttestation = terminal;
+			try {
+				if (terminal.session.file)
+					writeTerminalAttestationSync(terminalAttestationPath(terminal.session.file), terminal);
+			} catch (writeError) {
+				logger.error("Could not publish sealed-blocked attestation", { error: String(writeError) });
+			}
+			return {
+				status: "sealed_blocked",
+				operationId,
+				attempt,
+				reason: String(error),
+				snapshot: {
+					epoch: state.epoch,
+					counts,
+					observedAt: new Date().toISOString(),
+					census: this.#lastCensus ?? null,
+					completenessReasons: this.#lastCompletenessReasons ?? [],
+					registry: {
+						path: registry?.path ?? null,
+						complete: this.#registryComplete(registry),
+						ownerScan: this.#lastOwnerScan,
+					},
+				},
+				progress: { ...state.progress },
 			};
 		}
 	}
@@ -3622,6 +3808,54 @@ export class AgentSession implements SettingsScope {
 		);
 	}
 
+	/** Single strict gate for registry coverage and future completeness inputs. */
+	#strictCompleteness(): { complete: boolean; reasons: string[] } {
+		const registryComplete = this.#registryComplete(this.ownedJobRegistry);
+		const complete = registryComplete && this.#censusConfig.a13Instance !== undefined;
+		const reasons = registryComplete ? [] : ["registry_incomplete"];
+		if (!this.#censusConfig.a13Instance) reasons.push("instance_identity_missing");
+		const result = this.#ledgerCompleteness(this.#censusCompleteness({ complete, reasons }));
+		this.#lastCompletenessReasons = result.reasons;
+		return result;
+	}
+
+	#censusCompleteness(base: { complete: boolean; reasons: string[] }): { complete: boolean; reasons: string[] } {
+		const records = this.ownedJobRegistry?.openJobs() ?? [];
+		this.#lastCensus = (this.#censusConfig.namespaceCensus ?? namespaceCensus)({
+			identity: this.#censusConfig.a13Identity,
+			idleInfrastructure: () => [
+				...(this.ownedJobRegistry?.idleHelpers() ?? []),
+				...(this.#censusConfig.idleInfrastructure?.() ?? this.getIdleSafeServerProcesses()),
+			],
+			ledgerSnapshot: () =>
+				JSON.stringify({
+					counts: this.#countWork(false, true),
+					reasons: ExtensionActivityLedger.completenessReasons().sort(),
+				}),
+			registered: records
+				.filter(record => !record.inProcess)
+				.map(record => ({
+					pid: record.pid,
+					startId: record.startId,
+					kind: record.kind,
+				})),
+		});
+		return {
+			complete: base.complete && this.#lastCensus.complete,
+			reasons: [...base.reasons, ...this.#lastCensus.reasons],
+		};
+	}
+
+	#ledgerCompleteness(state: { complete: boolean; reasons: string[] }): { complete: boolean; reasons: string[] } {
+		const reasons = ExtensionActivityLedger.completenessReasons();
+		return { complete: state.complete && reasons.length === 0, reasons: [...state.reasons, ...reasons] };
+	}
+
+	/** Exact idleSafe identities for the strict namespace census; never used by attested retirement. */
+	getIdleSafeServerProcesses() {
+		return idleSafeServerProcesses(cfgStrictIdleIdleSafeServers.get(this.settings));
+	}
+
 	/**
 	 * After teardown has closed the transcript, add its final size and SHA-256 to a `hangup`
 	 * attestation (the work counts keep their pre-teardown values). Best effort: a process
@@ -3667,6 +3901,8 @@ export class AgentSession implements SettingsScope {
 
 	#initOwnedJobRegistry(manager: AsyncJobManager): void {
 		const registry = new OwnedJobRegistry({
+			currentInstance: this.#censusConfig.a13Instance,
+			extinct: this.#censusConfig.a13Extinct,
 			getSessionFile: () => this.sessionManager.getSessionFile(),
 			getSessionId: () => this.sessionManager.getSessionId(),
 			onRegister: () => {
@@ -3709,7 +3945,7 @@ export class AgentSession implements SettingsScope {
 			try {
 				retireTerminalAttestationSync(sessionFile);
 			} catch (error) {
-				registry.markIncomplete("a stale terminal attestation could not be retired");
+				registry.markIncomplete("a stale terminal attestation could not be retired", "attestation-retire-failed");
 				logger.warn("Failed to retire a stale terminal attestation", { sessionFile, error: String(error) });
 			}
 		}
@@ -8806,6 +9042,7 @@ export class AgentSession implements SettingsScope {
 		}
 
 		return {
+			holdWork: holdExtensionWork,
 			ui: noOpUIContext,
 			mode: "print",
 			hasUI: false,
@@ -11630,7 +11867,7 @@ export class AgentSession implements SettingsScope {
 		const refused = this.#refuseInput("python");
 		if (refused) return refused;
 		// Kernel code can start processes the owned-job registry never sees.
-		this.ownedJobRegistry?.markIncomplete("eval code can start untracked processes");
+		this.ownedJobRegistry?.markIncomplete("eval code can start untracked processes", "eval-untracked");
 		return this.#eval.executePython(code, onChunk, options);
 	}
 

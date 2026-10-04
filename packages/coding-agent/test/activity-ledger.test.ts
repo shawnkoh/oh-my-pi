@@ -1,0 +1,293 @@
+import { describe, expect, it } from "bun:test";
+import { pathToFileURL } from "node:url";
+import * as path from "node:path";
+import { getLspActivity, sendRequest, startMessageReader } from "../src/lsp/client";
+import type { LspClient } from "../src/lsp/types";
+import { StdioTransport } from "../src/mcp/transports/stdio";
+import { ExtensionActivityLedger, idleSafeServerProcesses, ServerActivityLedger } from "../src/session/activity-ledger";
+import { TempDir } from "@oh-my-pi/pi-utils";
+
+// Real subprocess I/O and process-exit callbacks cannot be advanced with fake timers.
+async function until(predicate: () => boolean): Promise<void> {
+	const deadline = Date.now() + 3000;
+	while (!predicate()) {
+		if (Date.now() > deadline) throw new Error("ledger did not reach expected state");
+		await Bun.sleep(5);
+	}
+}
+
+// Every frame must leave request 1 unsettled: malformed shapes or a different request id.
+const nonSettlingReplies: unknown[] = [
+	{ jsonrpc: "2.0", id: 1 },
+	{ jsonrpc: "1.0", id: 1, result: null },
+	{ jsonrpc: "2.0", id: 1, error: null },
+	{ jsonrpc: "2.0", id: 1, error: { code: "bad", message: "bad" } },
+	{ jsonrpc: "2.0", id: 1, error: { code: -1 } },
+	{ jsonrpc: "2.0", id: 1, result: null, error: { code: -1, message: "bad" } },
+	{ jsonrpc: "2.0", id: "1", result: null },
+	{ jsonrpc: "2.0", id: 2, result: null },
+	null,
+	42,
+];
+
+describe("strict outstanding-activity ledger", () => {
+	it.each(["result", "error", "exit"])("keeps cancelled MCP work until %s", async outcome => {
+		const transport = new StdioTransport({
+			command: process.execPath,
+			args: [
+				"-e",
+				`
+				const readline = require('node:readline');
+				let pending;
+				readline.createInterface({input:process.stdin}).on('line', line => {
+					const msg = JSON.parse(line);
+					if (msg.method === 'wait') pending = msg.id;
+					if (msg.method === 'frame') {
+						console.log(JSON.stringify(msg.params.frame));
+						console.log(JSON.stringify({jsonrpc:'2.0', method:'frame-read'}));
+					}
+					if (msg.method === 'settle') {
+						if (${JSON.stringify(outcome)} === 'exit') process.exit(0);
+						console.log(JSON.stringify({jsonrpc:'2.0', id:pending,
+							...(${JSON.stringify(outcome)} === 'error' ? {error:{code:-1,message:'failed'}} : {result:{done:true}})}));
+					}
+				});
+			`,
+			],
+			timeout: 0,
+		});
+		await transport.connect();
+		try {
+			const abort = new AbortController();
+			const request = transport.request("wait", {}, { signal: abort.signal });
+			expect(transport.activity.count).toBe(1);
+			abort.abort(new Error("cancelled by caller"));
+			await expect(request).rejects.toThrow("cancelled by caller");
+			expect(transport.activity.count).toBe(1);
+			for (const frame of nonSettlingReplies) {
+				const read = Promise.withResolvers<void>();
+				transport.onNotification = method => {
+					if (method === "frame-read") read.resolve();
+				};
+				await transport.notify("frame", { frame });
+				await read.promise;
+				expect(transport.activity.count).toBe(1);
+			}
+			await transport.notify("settle");
+			await until(() => transport.activity.count === 0);
+		} finally {
+			await transport.close();
+		}
+	});
+
+	it.each(["result", "error"])("counts LSP cancellation until a valid late %s reply", async outcome => {
+		const fixture = lspFixture();
+		const reader = startMessageReader(fixture.client);
+		try {
+			const abort = new AbortController();
+			const request = sendRequest(fixture.client, "textDocument/hover", {}, abort.signal);
+			await fixture.written.promise;
+			await fixture.client.writeQueue;
+			expect(getLspActivity(fixture.client).count).toBe(1);
+			abort.abort(new Error("cancelled"));
+			await expect(request).rejects.toThrow("cancelled");
+			expect(fixture.client.pendingRequests.size).toBe(0);
+			expect(getLspActivity(fixture.client).count).toBe(1);
+			for (const frame of nonSettlingReplies) {
+				const version = fixture.client.diagnosticsVersion;
+				fixture.receive(frame);
+				fixture.receive({
+					jsonrpc: "2.0",
+					method: "textDocument/publishDiagnostics",
+					params: { uri: "file:///ledger-marker", diagnostics: [] },
+				});
+				await until(() => fixture.client.diagnosticsVersion > version);
+				expect(getLspActivity(fixture.client).count).toBe(1);
+			}
+			fixture.receive({
+				jsonrpc: "2.0",
+				id: 1,
+				...(outcome === "error" ? { error: { code: -32800, message: "cancelled" } } : { result: null }),
+			});
+			await until(() => getLspActivity(fixture.client).count === 0);
+		} finally {
+			fixture.close();
+			await reader;
+		}
+	});
+
+	it.each([false, true])(
+		"settles cancelled LSP work on process death, not mux disconnect (shared=%s)",
+		async shared => {
+			const fixture = lspFixture(false, shared);
+			const abort = new AbortController();
+			const request = sendRequest(fixture.client, "textDocument/hover", {}, abort.signal);
+			const ledger = getLspActivity(fixture.client);
+			try {
+				await fixture.client.writeQueue;
+				abort.abort(new Error("cancelled"));
+				await expect(request).rejects.toThrow("cancelled");
+				fixture.close();
+				await fixture.client.proc.exited;
+				expect(ledger.count).toBe(shared ? 1 : 0);
+			} finally {
+				fixture.close();
+				// The test's simulated shared server is now stopped too, not just its link.
+				ledger.processExited();
+			}
+		},
+	);
+
+	it("keeps server-initiated applyEdit counted through its response write", async () => {
+		const temp = TempDir.createSync("@omp-ledger-");
+		const fixture = lspFixture(true);
+		const reader = startMessageReader(fixture.client);
+		try {
+			const file = path.join(temp.path(), "edited.txt");
+			await Bun.write(file, "before\n");
+			fixture.receive({
+				jsonrpc: "2.0",
+				id: 91,
+				method: "workspace/applyEdit",
+				params: {
+					edit: {
+						changes: {
+							[pathToFileURL(file).href]: [
+								{
+									range: { start: { line: 0, character: 0 }, end: { line: 0, character: 6 } },
+									newText: "after",
+								},
+							],
+						},
+					},
+				},
+			});
+			await fixture.written.promise;
+			expect(await Bun.file(file).text()).toBe("after\n");
+			expect(getLspActivity(fixture.client).count).toBe(1);
+			fixture.release.resolve();
+			await until(() => getLspActivity(fixture.client).count === 0);
+		} finally {
+			fixture.close();
+			await reader;
+			temp.removeSync();
+		}
+	});
+
+	it("never excludes uncontracted or unknown process identities", () => {
+		const server = new ServerActivityLedger("mcp", "unknown-test-server");
+		server.bindProcess(2147483647);
+		expect(server.idleSafeIdentity([server.name])).toBeUndefined();
+		expect(idleSafeServerProcesses([])).toEqual([]);
+		server.processExited();
+	});
+
+	it("keeps disposed extension uncertainty and holds without retaining released ledgers", () => {
+		ExtensionActivityLedger.resetForTests();
+		try {
+			const refs: WeakRef<ExtensionActivityLedger>[] = [];
+			for (let i = 0; i < 200; i++) {
+				const ledger = new ExtensionActivityLedger(() => ["extension_work_reporting_unknown:same-child"]);
+				refs.push(new WeakRef(ledger));
+				ledger.dispose();
+			}
+			const held = new ExtensionActivityLedger();
+			const hold = held.hold("background");
+			held.dispose();
+			expect(ExtensionActivityLedger.outstandingWork()).toBe(1);
+			hold.release();
+			expect(ExtensionActivityLedger.outstandingWork()).toBe(0);
+			expect(ExtensionActivityLedger.completenessReasons()).toEqual(["extension_work_reporting_unknown:same-child"]);
+			// Bun's GC scans the stack conservatively, so a few may survive; before the fix all 200 were retained.
+			Bun.gc(true);
+			expect(refs.filter(ref => ref.deref() !== undefined).length).toBeLessThan(refs.length / 2);
+		} finally {
+			ExtensionActivityLedger.resetForTests();
+		}
+	});
+
+	it.skipIf(process.platform !== "linux")("only excludes a contracted live process with a zero ledger", () => {
+		const server = new ServerActivityLedger("mcp", "idle-safe-test");
+		server.bindProcess(process.pid);
+		try {
+			expect(server.idleSafeIdentity([])).toBeUndefined();
+			const identity = server.idleSafeIdentity([server.name]);
+			expect(identity).toMatchObject({ pid: process.pid, label: "mcp:idle-safe-test" });
+			expect(identity?.start).toMatch(/^\d+$/);
+			server.sent(1);
+			expect(server.idleSafeIdentity([server.name])).toBeUndefined();
+			server.replied(1);
+			const hold = server.hold();
+			expect(server.idleSafeIdentity([server.name])).toBeUndefined();
+			hold.release();
+			expect(server.idleSafeIdentity([server.name])).toEqual(identity);
+		} finally {
+			server.processExited();
+		}
+	});
+});
+
+function lspFixture(blockWrite = false, sharedMux = false) {
+	let controller!: ReadableStreamDefaultController<Uint8Array>;
+	const exited = Promise.withResolvers<number>();
+	const release = Promise.withResolvers<void>();
+	const written = Promise.withResolvers<void>();
+	let closed = false;
+	const close = () => {
+		if (closed) return;
+		closed = true;
+		release.resolve();
+		controller.close();
+		exited.resolve(0);
+	};
+	const client: LspClient = {
+		name: "ledger-lsp",
+		cwd: process.cwd(),
+		config: { command: "ledger-lsp", fileTypes: [".txt"], rootMarkers: [] },
+		proc: {
+			sharedMux,
+			exited: exited.promise,
+			exitCode: null,
+			stdin: {
+				write: chunk => {
+					written.resolve();
+					return typeof chunk === "string" ? Buffer.byteLength(chunk) : chunk.byteLength;
+				},
+				flush: async () => {
+					if (blockWrite) await release.promise;
+					return 0;
+				},
+			},
+			stdout: new ReadableStream({
+				start: stream => {
+					controller = stream;
+				},
+			}),
+			peekStderr: () => "",
+			kill: close,
+		},
+		requestId: 0,
+		diagnostics: new Map(),
+		diagnosticsVersion: 0,
+		openFiles: new Map(),
+		pendingRequests: new Map(),
+		messageBuffer: new Uint8Array(),
+		isReading: false,
+		status: "ready",
+		lastActivity: Date.now(),
+		writeQueue: Promise.resolve(),
+		activeProgressTokens: new Set(),
+		projectLoaded: Promise.resolve(),
+		resolveProjectLoaded: () => {},
+	};
+	return {
+		client,
+		close,
+		written,
+		release,
+		receive: (message: unknown) => {
+			const body = JSON.stringify(message);
+			controller.enqueue(Buffer.from(`Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`));
+		},
+	};
+}

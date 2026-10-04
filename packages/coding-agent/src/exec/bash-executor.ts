@@ -228,25 +228,19 @@ const QUARANTINE_CLEANUP_TIMEOUT_MS = 30_000;
  * `retained-shell` record, until they exit. A cancelled or timed-out run tears its Shell
  * down instead; background jobs still live then are untracked from here on.
  */
-async function trackBackgroundJobs(
-	shell: Shell,
-	result: ShellRunResult,
-	context: { command: string; cwd: string },
-): Promise<void> {
-	if (backgroundShells.has(shell)) return;
+function trackBackgroundJobs(shell: Shell, result: ShellRunResult, context: { command: string; cwd: string }): void {
 	const registry = OwnedJobRegistry.instance();
-	let live: number;
-	try {
-		live = await shell.liveBackgroundJobCount();
-	} catch {
-		registry?.markIncomplete("shell background jobs could not be counted");
+	const live = result.liveBackgroundJobs;
+	if (live === undefined) {
+		registry?.markIncomplete("shell background jobs could not be counted", "bash-background-uncounted");
 		return;
 	}
 	if (live <= 0) return;
 	if (result.cancelled || result.timedOut) {
-		registry?.markIncomplete("a cancelled shell run left background jobs running");
+		registry?.markIncomplete("a cancelled shell run left background jobs running", "bash-background-uncounted");
 		return;
 	}
+	if (backgroundShells.has(shell)) return;
 	const jobId = registry?.registerInProcessJob({
 		jobId: `retained-shell:${++shellRunSequence}`,
 		kind: "retained-shell",
@@ -265,7 +259,7 @@ async function trackBackgroundJobs(
 			},
 			() => {
 				// The shell can no longer be asked, so its jobs can no longer be vouched for.
-				registry?.markIncomplete("shell background jobs could not be counted");
+				registry?.markIncomplete("shell background jobs could not be counted", "bash-background-uncounted");
 				release();
 			},
 		);
@@ -789,17 +783,20 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		};
 		void runPromise
 			.then(
-				async result => {
+				result => {
 					registry?.registerShellSurvivors(result, registryContext);
-					await trackBackgroundJobs(executionShell, result, registryContext);
+					trackBackgroundJobs(executionShell, result, registryContext);
 				},
 				() => {
-					registry?.markIncomplete("a shell run failed without reporting its spawned processes");
+					registry?.markIncomplete(
+						"a shell run failed without reporting its spawned processes",
+						"bash-background-uncounted",
+					);
 				},
 			)
 			.finally(settleRun)
 			.catch(error => {
-				registry?.markIncomplete("shell run survivors could not be recorded");
+				registry?.markIncomplete("shell run survivors could not be recorded", "bash-background-uncounted");
 				logger.warn("Recording shell run survivors failed", { error: String(error) });
 			});
 		// After the run is tracked: a throwing probe must not leave the run record open.

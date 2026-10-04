@@ -7,6 +7,7 @@
  */
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { isRecord, logger, postmortem, readSseEvents, readSseJson, untilAborted } from "@oh-my-pi/pi-utils";
+import { ServerActivityLedger } from "../../session/activity-ledger";
 import type {
 	JsonRpcError,
 	JsonRpcMessage,
@@ -82,6 +83,7 @@ export function resolveSSEConnectTimeoutMs(configTimeout?: number): number {
  * Uses POST for requests, supports SSE responses.
  */
 export class HttpTransport implements MCPTransport {
+	readonly activity = new ServerActivityLedger("mcp", "http");
 	#connected = false;
 	#sessionId: string | null = null;
 	#sseConnection: AbortController | null = null;
@@ -386,9 +388,13 @@ export class HttpTransport implements MCPTransport {
 			for (const m of message) this.#dispatchSSEMessage(m);
 			return;
 		}
+		if ("id" in message && ("result" in message || "error" in message)) {
+			this.activity.replied(message.id);
+		}
 		// Server-to-client request: has both method and id
 		if ("method" in message && "id" in message && message.id != null) {
-			void this.#handleServerRequest(message as JsonRpcRequest);
+			const hold = this.activity.hold();
+			void this.#handleServerRequest(message as JsonRpcRequest).finally(() => hold.release());
 			return;
 		}
 		// Notification: has method but no id
@@ -479,6 +485,7 @@ export class HttpTransport implements MCPTransport {
 		let traceId: string | undefined;
 
 		try {
+			if (!operation.signal?.aborted) this.activity.sent(id);
 			const response = await this.#fetch(
 				{ method: "POST", body: JSON.stringify(body), signal: operation.signal },
 				generated,
@@ -529,6 +536,7 @@ export class HttpTransport implements MCPTransport {
 			if (!isRecord(result) || result.jsonrpc !== "2.0" || (!("result" in result) && !("error" in result))) {
 				throw new SyntaxError("Malformed JSON-RPC response");
 			}
+			if (result.id === id) this.activity.replied(id);
 			if (result.error !== undefined) {
 				if (
 					!isRecord(result.error) ||
@@ -618,6 +626,7 @@ export class HttpTransport implements MCPTransport {
 									("result" in message || "error" in message)
 								) {
 									captured = true;
+									this.activity.replied(expectedId);
 									releaseCaller?.();
 									releaseCaller = undefined;
 									operation.clear();

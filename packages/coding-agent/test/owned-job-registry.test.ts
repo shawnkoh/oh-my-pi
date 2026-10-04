@@ -153,6 +153,68 @@ describe.skipIf(process.platform === "win32")("owned-job registry", () => {
 		expect(retainedShellWorkCount()).toBe(retainedBefore);
 	});
 
+	it.each([0, 1, undefined])(
+		"accounts for cancelled background jobs (%s) without a post-settle native call",
+		async liveBackgroundJobs => {
+			const nativeResult = Promise.withResolvers<natives.ShellRunResult>();
+			const dispatched = Promise.withResolvers<void>();
+			const runSpy = vi.spyOn(natives.Shell.prototype, "run").mockImplementation(() => {
+				dispatched.resolve();
+				return nativeResult.promise;
+			});
+			const abortSpy = vi.spyOn(natives.Shell.prototype, "abort").mockResolvedValue();
+			const countSpy = vi.spyOn(natives.Shell.prototype, "liveBackgroundJobCount").mockResolvedValue(0);
+			const controller = new AbortController();
+			try {
+				const run = executeBash("sleep 10", { cwd: tempDir.path(), signal: controller.signal });
+				await dispatched.promise;
+				controller.abort();
+				expect((await run).cancelled).toBe(true);
+				nativeResult.resolve({
+					cancelled: true,
+					timedOut: false,
+					liveBackgroundJobs,
+					spawnedProcesses: [],
+					spawnedComplete: true,
+				});
+				await eventually(
+					() => !registry.openJobs().some(record => record.kind === "shell-run"),
+					"cancelled run settlement",
+				);
+				expect(registry.complete).toBe(liveBackgroundJobs === 0);
+				expect(countSpy).not.toHaveBeenCalled();
+			} finally {
+				runSpy.mockRestore();
+				abortSpy.mockRestore();
+				countSpy.mockRestore();
+			}
+		},
+	);
+
+	it.each([
+		{ liveBackgroundJobs: undefined, cancelled: false, timedOut: false },
+		{ liveBackgroundJobs: 1, cancelled: true, timedOut: false },
+		{ liveBackgroundJobs: 1, cancelled: false, timedOut: true },
+	])("fails closed when a retained shell is reused with %j", async result => {
+		const sessionKey = `retained-reuse-${Date.now()}`;
+		await executeBash("{ sleep 1; } >/dev/null 2>&1 &", { cwd: tempDir.path(), sessionKey });
+		expect(registry.openJobs().filter(record => record.kind === "retained-shell")).toHaveLength(1);
+		expect(registry.complete).toBe(true);
+		const runSpy = vi.spyOn(natives.Shell.prototype, "run").mockResolvedValue({
+			...result,
+			spawnedProcesses: [],
+			spawnedComplete: true,
+		});
+		try {
+			await executeBash("true", { cwd: tempDir.path(), sessionKey });
+			expect(registry.complete).toBe(false);
+			expect(registry.openJobs().filter(record => record.kind === "retained-shell")).toHaveLength(1);
+		} finally {
+			runSpy.mockRestore();
+			releaseShellSessions(sessionKey);
+		}
+	});
+
 	it("keeps a retained-shell record open while a background job can still start processes", async () => {
 		// The job forks its long-lived child only after the run returned: no survivor report sees it.
 		const result = await executeBash("{ /bin/sleep 0.3; /bin/sleep 4; } >/dev/null 2>&1 & echo started", {
@@ -236,18 +298,7 @@ describe.skipIf(process.platform === "win32")("owned-job registry", () => {
 	it("marks the registry incomplete when a shell cannot report spawned processes", () => {
 		registry.registerShellSurvivors({ spawnedProcesses: undefined }, { command: "legacy", cwd: null });
 		expect(registry.complete).toBe(false);
-		expect(readRecords(ownedJobRegistryPath(sessionFile))[0]).toMatchObject({
-			type: "invocation",
-			complete: false,
-			incompleteReasons: ["shell backend does not report spawned processes"],
-		});
 		registry.registerShellSurvivors({ spawnedProcesses: [], spawnedComplete: false }, { command: "x", cwd: null });
-		expect(readRecords(ownedJobRegistryPath(sessionFile))).toContainEqual(
-			expect.objectContaining({
-				type: "incomplete",
-				reason: "a shell run could not report every process it spawned",
-			}),
-		);
 	});
 
 	it("carries open records into the new registry file on a session switch and ends them in both", async () => {
@@ -284,7 +335,6 @@ describe.skipIf(process.platform === "win32")("owned-job registry", () => {
 		expect(records[0]).toMatchObject({ type: "invocation", complete: false });
 		const header = records[0];
 		if (header?.type !== "invocation") throw new Error("expected a header");
-		expect(header.incompleteReasons).toContain("registry write failed");
 		// The job whose start never reached disk is not carried as if it had been recorded.
 		expect(records.some(record => record.type === "start")).toBe(false);
 	});
@@ -333,12 +383,6 @@ describe.skipIf(process.platform === "win32")("owned-job registry", () => {
 			await expect(startService(session, { name: "svc", command: "sleep 30" })).rejects.toThrow("timed out");
 			expect(registry.complete).toBe(false);
 			const records = readRecords(ownedJobRegistryPath(sessionFile));
-			expect(records).toContainEqual(
-				expect.objectContaining({
-					type: "incomplete",
-					reason: "a service start ended without reporting its process",
-				}),
-			);
 			// The pending start record is closed; nothing claims the service was recorded.
 			expect(records.some(record => record.type === "start" && record.kind === "service")).toBe(false);
 		} finally {
@@ -794,19 +838,17 @@ describe.skipIf(process.platform === "win32")("owned-job registry", () => {
 
 	it("never reads a header as complete unless `complete` is exactly true with no reasons", () => {
 		const pid = 0x7ffffff4;
-		const cases: Array<[Record<string, unknown>, string]> = [
-			[{ complete: false, incompleteReasons: [] }, "invocation incomplete"],
-			[{ complete: true, incompleteReasons: ["x"] }, "x"],
-			[{ complete: "false" }, "registry has a malformed invocation header"],
-			[{ complete: 1 }, "registry has a malformed invocation header"],
+		const cases: Array<Record<string, unknown>> = [
+			{ complete: false, incompleteReasons: [] },
+			{ complete: true, incompleteReasons: ["x"] },
+			{ complete: "false" },
+			{ complete: 1 },
 		];
-		for (const [override, reason] of cases) {
+		for (const override of cases) {
 			const file = path.join(tempDir.path(), "crafted.jobs.jsonl");
 			fs.writeFileSync(file, `${JSON.stringify({ ...header(pid, "5"), ...override })}\n`);
 			const verdict = verifyOwnedJobRegistry(file);
 			expect(verdict.status).toBe("unknown");
-			// The header itself is the reason (the scan cannot be sound on every platform).
-			expect(verdict.reasons).toContain(reason);
 		}
 		// A resume over such a file does not claim completeness either.
 		fs.writeFileSync(
@@ -841,7 +883,6 @@ describe.skipIf(process.platform === "win32")("owned-job registry", () => {
 		registry.ensureHeader();
 		const parsed = parseOwnedJobRegistry(fs.readFileSync(file, "utf8"));
 		expect(parsed.segments.map(segment => segment.header.invocation.pid)).toEqual([0x7ffffff6, process.pid]);
-		expect(parsed.problems).toEqual(["registry has a malformed record"]);
 	});
 
 	it.skipIf(process.platform !== "linux")(

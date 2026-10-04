@@ -5,6 +5,7 @@ import * as path from "node:path";
 import * as mcpClient from "@oh-my-pi/pi-coding-agent/mcp/client";
 import * as mcpConfigWriter from "@oh-my-pi/pi-coding-agent/mcp/config-writer";
 import { MCPCommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/mcp-command-controller";
+import { ServerActivityLedger } from "../src/session/activity-ledger";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { getConfigRootDir, getProjectDir, removeWithRetries, setAgentDir, setProjectDir } from "@oh-my-pi/pi-utils";
@@ -82,6 +83,7 @@ describe("interactive /mcp test", () => {
 	it("tests a discovered server and keeps its advertised Esc cancellation grace", async () => {
 		vi.useFakeTimers();
 		const transport = {
+			activity: new ServerActivityLedger("mcp", "github"),
 			connected: true,
 			request: vi.fn(),
 			notify: vi.fn(),
@@ -210,6 +212,7 @@ describe("interactive /mcp test", () => {
 
 	it("treats an abort landing during manager sync as a completed test", async () => {
 		const transport = {
+			activity: new ServerActivityLedger("mcp", "github"),
 			connected: true,
 			request: vi.fn(),
 			notify: vi.fn(),

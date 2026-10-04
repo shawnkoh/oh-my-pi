@@ -83,6 +83,15 @@ describe("SessionManager persistence latch on drain-only failures", () => {
 		expect(observed).toEqual([backend.failure]);
 	});
 
+	it("keeps a deferred publication failure latched during sealed exit recovery", async () => {
+		const { backend, storage, manager } = await createManagerWithFailingPublish();
+		storage.writeTextSync("/sessions/headless.jsonl", '{"type":"session"}\n');
+		await expect(manager.flush()).rejects.toBe(backend.failure);
+		manager.seal();
+		expect(() => manager.recoverFinalizationForExit()).toThrow(backend.failure);
+		expect(() => manager.flushSync()).toThrow(backend.failure);
+	});
+
 	it("latches a flush() drain failure and notifies observers before rejecting", async () => {
 		const { backend, storage, manager } = await createManagerWithFailingPublish();
 
