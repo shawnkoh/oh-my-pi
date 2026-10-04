@@ -102,6 +102,7 @@ import {
 	ASIDE_MESSAGE_COMMIT,
 	ASIDE_MESSAGE_DEFER,
 	ASIDE_MESSAGE_DISCARD,
+	inheritAssistantMessageIdentity,
 	isOwnedAsideMessage,
 	isSoftToolRequirement,
 	markEngineInjected,
@@ -416,7 +417,7 @@ function snapshotAssistantContentBlock(block: AssistantContentBlock): AssistantC
 }
 
 function snapshotAssistantMessage(message: AssistantMessage): AssistantMessage {
-	return {
+	return inheritAssistantMessageIdentity(message, {
 		...message,
 		content: message.content.map(snapshotAssistantContentBlock),
 		usage: {
@@ -425,7 +426,7 @@ function snapshotAssistantMessage(message: AssistantMessage): AssistantMessage {
 		},
 		disabledFeatures: message.disabledFeatures ? [...message.disabledFeatures] : undefined,
 		toolCallAbortMessages: message.toolCallAbortMessages ? { ...message.toolCallAbortMessages } : undefined,
-	};
+	});
 }
 
 /**
@@ -474,7 +475,7 @@ function snapshotAssistantMessageIncremental(
 			content[openIndex] = snapshotAssistantContentBlock(liveContent[openIndex]!);
 		}
 	}
-	return {
+	return inheritAssistantMessageIdentity(live, {
 		...live,
 		content,
 		usage: {
@@ -483,7 +484,7 @@ function snapshotAssistantMessageIncremental(
 		},
 		disabledFeatures: live.disabledFeatures ? [...live.disabledFeatures] : undefined,
 		toolCallAbortMessages: live.toolCallAbortMessages ? { ...live.toolCallAbortMessages } : undefined,
-	};
+	});
 }
 
 /**
@@ -917,7 +918,9 @@ export function normalizeMessagesForProvider(
 			return message;
 		}
 		const filtered = message.content.filter(block => block.type !== "thinking");
-		return filtered.length === message.content.length ? message : { ...message, content: filtered };
+		return filtered.length === message.content.length
+			? message
+			: inheritAssistantMessageIdentity(message, { ...message, content: filtered });
 	});
 }
 
@@ -2663,7 +2666,7 @@ function retainCompletedToolCalls(
 		return keep;
 	});
 	if (!droppedIncompleteToolCall) return message;
-	return {
+	return inheritAssistantMessageIdentity(message, {
 		...message,
 		content,
 		stopDetails:
@@ -2674,7 +2677,7 @@ function retainCompletedToolCalls(
 						category: message.stopDetails?.type ?? null,
 						explanation: message.stopDetails?.explanation ?? message.errorMessage ?? null,
 					},
-	};
+	});
 }
 
 function recoverTransientErrorToolTurn(
@@ -2707,7 +2710,7 @@ function recoverTransientErrorToolTurn(
 		!AIError.isTransientStreamParseError(message.stopDetails?.explanation)
 	)
 		return message;
-	return {
+	return inheritAssistantMessageIdentity(message, {
 		...message,
 		stopReason: "toolUse",
 		stopDetails:
@@ -2721,7 +2724,7 @@ function recoverTransientErrorToolTurn(
 		errorMessage: undefined,
 		errorId: undefined,
 		errorStatus: undefined,
-	};
+	});
 }
 
 function emitDiscardedHarmonyPartial(
@@ -2732,7 +2735,9 @@ function emitDiscardedHarmonyPartial(
 	if (!partialMessage) return;
 	stream.push({
 		type: "message_end",
-		message: snapshotAssistantMessage({ ...partialMessage, stopReason: "error", errorMessage }),
+		message: snapshotAssistantMessage(
+			inheritAssistantMessageIdentity(partialMessage, { ...partialMessage, stopReason: "error", errorMessage }),
+		),
 	});
 }
 
@@ -2797,7 +2802,12 @@ function emitAbortedAssistantMessage(
 			? AIError.create(AIError.Flag.Abort)
 			: AIError.classify(requestSignal?.reason) || undefined;
 	const base: AssistantMessage = partialMessage
-		? { ...partialMessage, stopReason: "aborted", errorMessage, errorId }
+		? inheritAssistantMessageIdentity(partialMessage, {
+				...partialMessage,
+				stopReason: "aborted",
+				errorMessage,
+				errorId,
+			})
 		: {
 				role: "assistant",
 				content: [],

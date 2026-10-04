@@ -32,6 +32,7 @@
 
 ### Fixed
 
+- Fixed distinct assistant replies being lost from session history when they share a timestamp and content. Repeated handling remains idempotent across core snapshots, reloaded display copies and reparented answers; retries survive atomic rollback that retains a concurrent leaf, without changing context-extension equality or assistant prompt-cache eligibility.
 - Cancelled and timed-out shell runs report background jobs in their native result, avoiding a post-settlement native call that could crash Bun during teardown while preserving strict ownership accounting.
 - Interrupting a turn while a tool approval is pending now closes the dialog (RPC hosts receive `cancel`), and an approval answered after the call was aborted no longer runs the tool
 - Literal RPC prompts (`literal: true`) are acknowledged only once admitted, like other prompts, so an immediate `promote_queued_message` observes a queued literal prompt
