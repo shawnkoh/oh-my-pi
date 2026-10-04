@@ -2955,6 +2955,156 @@ pub struct GoalResult {
 	pub state: Option<GoalModeState>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DeliveryMode {
+	#[serde(rename = "aside")]
+	Aside,
+	#[serde(rename = "steer")]
+	Steer,
+}
+
+impl DeliveryMode {
+	/// Wire value.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Aside => "aside",
+			Self::Steer => "steer",
+		}
+	}
+}
+
+///
+/// Open record: declared fields are decoded leniently (a value that does not fit stays
+/// in `extra`) and every other key is kept in `extra`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DeliveryOptions {
+	pub mode: Option<DeliveryMode>,
+	pub quiet: Option<LitTrue>,
+	pub wake_after_interrupt: Option<LitTrue>,
+	pub wake_in_plan_mode: Option<LitTrue>,
+	/// Every key not decoded into a declared field.
+	pub extra: Map<String, Value>,
+}
+
+impl Serialize for DeliveryOptions {
+	fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		let mut map = serializer.serialize_map(None)?;
+		if let Some(value) = &self.mode {
+			map.serialize_entry("mode", value)?;
+		}
+		if let Some(value) = &self.quiet {
+			map.serialize_entry("quiet", value)?;
+		}
+		if let Some(value) = &self.wake_after_interrupt {
+			map.serialize_entry("wakeAfterInterrupt", value)?;
+		}
+		if let Some(value) = &self.wake_in_plan_mode {
+			map.serialize_entry("wakeInPlanMode", value)?;
+		}
+		for (key, value) in &self.extra {
+			match key.as_str() {
+				"mode" if self.mode.is_some() => continue,
+				"quiet" if self.quiet.is_some() => continue,
+				"wakeAfterInterrupt" if self.wake_after_interrupt.is_some() => continue,
+				"wakeInPlanMode" if self.wake_in_plan_mode.is_some() => continue,
+				_ => {}
+			}
+			map.serialize_entry(key, value)?;
+		}
+		map.end()
+	}
+}
+
+impl<'de> Deserialize<'de> for DeliveryOptions {
+	fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+		let mut extra = Map::<String, Value>::deserialize(deserializer)?;
+		Ok(Self {
+			mode: take(&mut extra, "mode"),
+			quiet: take(&mut extra, "quiet"),
+			wake_after_interrupt: take(&mut extra, "wakeAfterInterrupt"),
+			wake_in_plan_mode: take(&mut extra, "wakeInPlanMode"),
+			extra,
+		})
+	}
+}
+
+///
+/// Open record: declared fields are decoded leniently (a value that does not fit stays
+/// in `extra`) and every other key is kept in `extra`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DeliveryRecordObject {
+	pub custom_type: Option<String>,
+	pub content: Option<MessageContent>,
+	pub display: Option<bool>,
+	pub details: Option<Value>,
+	pub attribution: Option<Attribution>,
+	/// Every key not decoded into a declared field.
+	pub extra: Map<String, Value>,
+}
+
+impl Serialize for DeliveryRecordObject {
+	fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		let mut map = serializer.serialize_map(None)?;
+		if let Some(value) = &self.custom_type {
+			map.serialize_entry("customType", value)?;
+		}
+		if let Some(value) = &self.content {
+			map.serialize_entry("content", value)?;
+		}
+		if let Some(value) = &self.display {
+			map.serialize_entry("display", value)?;
+		}
+		if let Some(value) = &self.details {
+			map.serialize_entry("details", value)?;
+		}
+		if let Some(value) = &self.attribution {
+			map.serialize_entry("attribution", value)?;
+		}
+		for (key, value) in &self.extra {
+			match key.as_str() {
+				"customType" if self.custom_type.is_some() => continue,
+				"content" if self.content.is_some() => continue,
+				"display" if self.display.is_some() => continue,
+				"details" if self.details.is_some() => continue,
+				"attribution" if self.attribution.is_some() => continue,
+				_ => {}
+			}
+			map.serialize_entry(key, value)?;
+		}
+		map.end()
+	}
+}
+
+impl<'de> Deserialize<'de> for DeliveryRecordObject {
+	fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+		let mut extra = Map::<String, Value>::deserialize(deserializer)?;
+		Ok(Self {
+			custom_type: take(&mut extra, "customType"),
+			content: take(&mut extra, "content"),
+			display: take(&mut extra, "display"),
+			details: take(&mut extra, "details"),
+			attribution: take(&mut extra, "attribution"),
+			extra,
+		})
+	}
+}
+
+/// Untagged union: the first variant that decodes wins.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DeliveryRecord {
+	String(String),
+	DeliveryRecordObject(DeliveryRecordObject),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExternalDeliveryListing {
+	#[serde(rename = "deliveryId")]
+	pub delivery_id: String,
+	pub state: ExternalDeliveryListingState,
+	pub mode: DeliveryMode,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionState {
 	#[serde(rename = "sessionId")]
@@ -2999,6 +3149,10 @@ pub struct SessionState {
 	pub queued_messages: QueuedMessagesState,
 	#[serde(rename = "todoPhases", default = "default_session_state_todo_phases")]
 	pub todo_phases: Vec<TodoPhase>,
+	#[serde(default = "default_session_state_capabilities")]
+	pub capabilities: Vec<String>,
+	#[serde(rename = "externalDeliveries", default = "default_session_state_external_deliveries")]
+	pub external_deliveries: Vec<ExternalDeliveryListing>,
 	/// System prompt sections, for session dumps.
 	#[serde(rename = "systemPrompt", default = "default_session_state_system_prompt", deserialize_with = "scalar_or_array")]
 	pub system_prompt: Vec<String>,
@@ -3795,6 +3949,41 @@ pub struct ReadyEvent {
 	pub max_frame_bytes: Option<i64>,
 	#[serde(rename = "maxReassembledFrameBytes", default, skip_serializing_if = "Option::is_none")]
 	pub max_reassembled_frame_bytes: Option<i64>,
+	#[serde(default = "default_ready_event_capabilities")]
+	pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeliveryAcceptedEvent {
+	#[serde(rename = "deliveryId")]
+	pub delivery_id: String,
+	pub at: f64,
+	pub mode: DeliveryMode,
+	pub mechanism: DeliveryAcceptedEventMechanism,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeliverySettledEvent {
+	#[serde(rename = "deliveryId")]
+	pub delivery_id: String,
+	pub outcome: DeliverySettledEventOutcome,
+	pub included: bool,
+	pub requests: f64,
+	pub sole: bool,
+	pub interactive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeliveryDiscardedEvent {
+	#[serde(rename = "deliveryId")]
+	pub delivery_id: String,
+	pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeliveryCancelledEvent {
+	#[serde(rename = "deliveryId")]
+	pub delivery_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -4605,6 +4794,12 @@ pub struct RpcResponse {
 	/// Command result on success; its shape is the command's `result`.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub data: Option<Value>,
+	/// Engine-minted delivery id on a successful deliver response; also in data.
+	#[serde(rename = "deliveryId", default, skip_serializing_if = "Option::is_none")]
+	pub delivery_id: Option<String>,
+	/// Pre-acceptance cancellation result on cancel_delivery; also in data.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub cancelled: Option<bool>,
 	/// Failure message when `success` is false.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub error: Option<String>,
@@ -4662,6 +4857,10 @@ pub struct HostUriSchemeDefinition {
 pub enum RpcNotification {
 	/// First frame after startup; transport fields are absent on servers without protocol v2.
 	Ready(ReadyEvent),
+	DeliveryAccepted(DeliveryAcceptedEvent),
+	DeliverySettled(DeliverySettledEvent),
+	DeliveryDiscarded(DeliveryDiscardedEvent),
+	DeliveryCancelled(DeliveryCancelledEvent),
 	/// Terminal outcome of one accepted `prompt` / `abort_and_prompt`, keyed by request `id`.
 	PromptResult(PromptResultEvent),
 	/// The session went quiet: the last run yielded and no background work can wake it.
@@ -4703,6 +4902,10 @@ impl RpcNotification {
 	pub fn from_value(value: Value) -> Result<Self, serde_json::Error> {
 		let decode: fn(Value) -> Result<Self, serde_json::Error> = match value.get("type").and_then(Value::as_str) {
 			Some("ready") => |value| serde_json::from_value(value).map(Self::Ready),
+			Some("delivery_accepted") => |value| serde_json::from_value(value).map(Self::DeliveryAccepted),
+			Some("delivery_settled") => |value| serde_json::from_value(value).map(Self::DeliverySettled),
+			Some("delivery_discarded") => |value| serde_json::from_value(value).map(Self::DeliveryDiscarded),
+			Some("delivery_cancelled") => |value| serde_json::from_value(value).map(Self::DeliveryCancelled),
 			Some("prompt_result") => |value| serde_json::from_value(value).map(Self::PromptResult),
 			Some("session_settled") => |value| serde_json::from_value(value).map(Self::SessionSettled),
 			Some("extension_error") => |value| serde_json::from_value(value).map(Self::ExtensionError),
@@ -4730,6 +4933,10 @@ impl Serialize for RpcNotification {
 	fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
 		match self {
 			Self::Ready(member) => serialize_tagged(member, &[("type", "ready")], serializer),
+			Self::DeliveryAccepted(member) => serialize_tagged(member, &[("type", "delivery_accepted")], serializer),
+			Self::DeliverySettled(member) => serialize_tagged(member, &[("type", "delivery_settled")], serializer),
+			Self::DeliveryDiscarded(member) => serialize_tagged(member, &[("type", "delivery_discarded")], serializer),
+			Self::DeliveryCancelled(member) => serialize_tagged(member, &[("type", "delivery_cancelled")], serializer),
 			Self::PromptResult(member) => serialize_tagged(member, &[("type", "prompt_result")], serializer),
 			Self::SessionSettled(member) => serialize_tagged(member, &[("type", "session_settled")], serializer),
 			Self::ExtensionError(member) => serialize_tagged(member, &[("type", "extension_error")], serializer),
@@ -4777,7 +4984,7 @@ impl RpcServerFrame {
 		let decode: fn(Value) -> Result<Self, serde_json::Error> = match value.get("type").and_then(Value::as_str) {
 			Some("response") => |value| serde_json::from_value(value).map(Self::Response),
 			Some("host_tool_call" | "host_tool_cancel" | "host_uri_request" | "host_uri_cancel") => |value| serde_json::from_value(value).map(Self::RpcHostRequest),
-			Some("ready" | "prompt_result" | "session_settled" | "extension_error" | "extension_ui_request" | "available_commands_update" | "subagent_lifecycle" | "subagent_progress" | "subagent_event" | "live_phase" | "live_levels" | "live_transcript" | "live_end" | "command_output" | "session_info_update" | "config_update" | "rpc_frame_error" | "agent_start" | "agent_end" | "turn_start" | "turn_end" | "message_start" | "message_update" | "message_end" | "tool_execution_start" | "tool_execution_update" | "tool_stream_update" | "tool_execution_end" | "auto_compaction_start" | "auto_compaction_end" | "auto_retry_start" | "auto_retry_end" | "cache_warming_start" | "cache_warming_end" | "retry_fallback_applied" | "retry_fallback_succeeded" | "model_changed" | "config_warnings_changed" | "advisor_cost_changed" | "advisor_yielded" | "ttsr_triggered" | "todo_reminder" | "todo_auto_clear" | "irc_message" | "notice" | "thinking_level_changed" | "goal_updated" | "queue_update") => |value| serde_json::from_value(value).map(Self::RpcNotification),
+			Some("ready" | "delivery_accepted" | "delivery_settled" | "delivery_discarded" | "delivery_cancelled" | "prompt_result" | "session_settled" | "extension_error" | "extension_ui_request" | "available_commands_update" | "subagent_lifecycle" | "subagent_progress" | "subagent_event" | "live_phase" | "live_levels" | "live_transcript" | "live_end" | "command_output" | "session_info_update" | "config_update" | "rpc_frame_error" | "agent_start" | "agent_end" | "turn_start" | "turn_end" | "message_start" | "message_update" | "message_end" | "tool_execution_start" | "tool_execution_update" | "tool_stream_update" | "tool_execution_end" | "auto_compaction_start" | "auto_compaction_end" | "auto_retry_start" | "auto_retry_end" | "cache_warming_start" | "cache_warming_end" | "retry_fallback_applied" | "retry_fallback_succeeded" | "model_changed" | "config_warnings_changed" | "advisor_cost_changed" | "advisor_yielded" | "ttsr_triggered" | "todo_reminder" | "todo_auto_clear" | "irc_message" | "notice" | "thinking_level_changed" | "goal_updated" | "queue_update") => |value| serde_json::from_value(value).map(Self::RpcNotification),
 			_ => |value| Ok(Self::Unknown(value)),
 		};
 		decode(value)
@@ -4837,6 +5044,29 @@ pub struct FollowUpParams {
 	/// Images attached to the message.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub images: Option<Vec<ImageContent>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeliverParams {
+	pub record: DeliveryRecord,
+	pub options: DeliveryOptions,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeliverResult {
+	#[serde(rename = "deliveryId")]
+	pub delivery_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CancelDeliveryParams {
+	#[serde(rename = "deliveryId")]
+	pub delivery_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CancelDeliveryResult {
+	pub cancelled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5436,6 +5666,72 @@ impl<'de> Deserialize<'de> for LitTrue {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ExternalDeliveryListingState {
+	#[serde(rename = "queued")]
+	Queued,
+	#[serde(rename = "accepted")]
+	Accepted,
+}
+
+impl ExternalDeliveryListingState {
+	/// Wire value.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Queued => "queued",
+			Self::Accepted => "accepted",
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DeliveryAcceptedEventMechanism {
+	#[serde(rename = "wake")]
+	Wake,
+	#[serde(rename = "aside")]
+	Aside,
+	#[serde(rename = "steer-boundary")]
+	SteerBoundary,
+}
+
+impl DeliveryAcceptedEventMechanism {
+	/// Wire value.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Wake => "wake",
+			Self::Aside => "aside",
+			Self::SteerBoundary => "steer-boundary",
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DeliverySettledEventOutcome {
+	#[serde(rename = "quiet")]
+	Quiet,
+	#[serde(rename = "text")]
+	Text,
+	#[serde(rename = "refused")]
+	Refused,
+	#[serde(rename = "error")]
+	Error,
+	#[serde(rename = "aborted")]
+	Aborted,
+}
+
+impl DeliverySettledEventOutcome {
+	/// Wire value.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Quiet => "quiet",
+			Self::Text => "text",
+			Self::Refused => "refused",
+			Self::Error => "error",
+			Self::Aborted => "aborted",
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum HostUriResultContentType {
 	#[serde(rename = "text/markdown")]
 	TextMarkdown,
@@ -5516,6 +5812,14 @@ fn default_session_state_todo_phases() -> Vec<TodoPhase> {
 	serde_json::from_str("[]").expect("valid wire default")
 }
 
+fn default_session_state_capabilities() -> Vec<String> {
+	serde_json::from_str("[]").expect("valid wire default")
+}
+
+fn default_session_state_external_deliveries() -> Vec<ExternalDeliveryListing> {
+	serde_json::from_str("[]").expect("valid wire default")
+}
+
 fn default_session_state_system_prompt() -> Vec<String> {
 	serde_json::from_str("[]").expect("valid wire default")
 }
@@ -5533,6 +5837,10 @@ fn default_token_usage_reasoning() -> i64 {
 }
 
 fn default_auto_retry_end_event_retry_errors() -> Vec<Map<String, Value>> {
+	serde_json::from_str("[]").expect("valid wire default")
+}
+
+fn default_ready_event_capabilities() -> Vec<String> {
 	serde_json::from_str("[]").expect("valid wire default")
 }
 
@@ -5618,6 +5926,40 @@ impl Command for FollowUpCommand {
 	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
 		let _ = data;
 		Ok(())
+	}
+}
+
+/// Deliver an externally authored record with owned admission and settlement receipts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeliverCommand {
+	pub record: DeliveryRecord,
+	pub options: DeliveryOptions,
+}
+
+impl Command for DeliverCommand {
+	const NAME: &'static str = "deliver";
+	const TIMEOUT_MS: Option<u64> = None;
+	type Output = DeliverResult;
+
+	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
+		serde_json::from_value::<DeliverResult>(data.unwrap_or_else(|| Value::Object(Map::new())))
+	}
+}
+
+/// Cancel a delivery only while it remains queued.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CancelDeliveryCommand {
+	#[serde(rename = "deliveryId")]
+	pub delivery_id: String,
+}
+
+impl Command for CancelDeliveryCommand {
+	const NAME: &'static str = "cancel_delivery";
+	const TIMEOUT_MS: Option<u64> = None;
+	type Output = CancelDeliveryResult;
+
+	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
+		serde_json::from_value::<CancelDeliveryResult>(data.unwrap_or_else(|| Value::Object(Map::new())))
 	}
 }
 

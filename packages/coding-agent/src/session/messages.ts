@@ -950,6 +950,11 @@ function customMessageContentToLlmContent(content: CustomMessage["content"]): (T
 	return typeof content === "string" ? [{ type: "text", text: content }] : content;
 }
 
+/** Whether a custom record declares a provider projection (see `convertMessageToLlm` in agent-core). */
+function hasLlmProjection(details: unknown): boolean {
+	return isRecord(details) && "omp.llm" in details;
+}
+
 function convertImageBearingCustomMessage(message: CustomMessage | HookMessage): Message[] | undefined {
 	if (!isCustomMessageContent(message.content)) return undefined;
 	if (typeof message.content === "string") return undefined;
@@ -1112,14 +1117,17 @@ function convertOne(m: AgentMessage, interruptedNext: boolean): Message[] {
 					},
 				];
 			}
-			const split = convertImageBearingCustomMessage(m);
+			// A record carrying an owner projection (`details["omp.llm"]`) reaches the
+			// provider only through the core projection: its `content` is a display
+			// header and must never be split into provider parts.
+			const split = hasLlmProjection(m.details) ? undefined : convertImageBearingCustomMessage(m);
 			if (split) return split;
 			const converted = convertMessageToLlm(m);
 			return converted ? [converted] : [];
 		}
 		case "hookMessage": {
 			if (!isCustomMessageContent(m.content)) return [];
-			const split = convertImageBearingCustomMessage(m);
+			const split = hasLlmProjection(m.details) ? undefined : convertImageBearingCustomMessage(m);
 			if (split) return split;
 			const converted = convertMessageToLlm(m);
 			return converted ? [converted] : [];

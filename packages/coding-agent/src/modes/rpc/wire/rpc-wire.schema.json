@@ -54,6 +54,28 @@
 				"clientOmit": []
 			},
 			{
+				"name": "deliver",
+				"doc": "Deliver an externally authored record with owned admission and settlement receipts.",
+				"params": "DeliverParams",
+				"result": "DeliverResult",
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
+				"name": "cancel_delivery",
+				"doc": "Cancel a delivery only while it remains queued.",
+				"params": "CancelDeliveryParams",
+				"result": "CancelDeliveryResult",
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
 				"name": "remove_queued_message",
 				"doc": "Remove one pending queued message by its queue-chip text.",
 				"params": "RemoveQueuedMessageParams",
@@ -2382,6 +2404,86 @@
 			],
 			"description": "Outcome of every `goal` op; both fields are null when the session has no goal."
 		},
+		"DeliveryMode": {
+			"enum": [
+				"aside",
+				"steer"
+			],
+			"type": "string"
+		},
+		"DeliveryOptions": {
+			"type": "object",
+			"properties": {
+				"mode": {
+					"$ref": "#/$defs/DeliveryMode"
+				},
+				"quiet": {
+					"const": true
+				},
+				"wakeAfterInterrupt": {
+					"const": true
+				},
+				"wakeInPlanMode": {
+					"const": true
+				}
+			},
+			"required": [
+				"mode"
+			],
+			"x-open": true
+		},
+		"DeliveryRecordObject": {
+			"type": "object",
+			"properties": {
+				"customType": {
+					"type": "string"
+				},
+				"content": {
+					"$ref": "#/$defs/MessageContent"
+				},
+				"display": {
+					"type": "boolean"
+				},
+				"details": {},
+				"attribution": {
+					"$ref": "#/$defs/Attribution"
+				}
+			},
+			"x-open": true
+		},
+		"DeliveryRecord": {
+			"anyOf": [
+				{
+					"type": "string"
+				},
+				{
+					"$ref": "#/$defs/DeliveryRecordObject"
+				}
+			]
+		},
+		"ExternalDeliveryListing": {
+			"type": "object",
+			"properties": {
+				"deliveryId": {
+					"type": "string"
+				},
+				"state": {
+					"enum": [
+						"queued",
+						"accepted"
+					],
+					"type": "string"
+				},
+				"mode": {
+					"$ref": "#/$defs/DeliveryMode"
+				}
+			},
+			"required": [
+				"deliveryId",
+				"state",
+				"mode"
+			]
+		},
 		"SessionState": {
 			"type": "object",
 			"properties": {
@@ -2472,6 +2574,20 @@
 					"type": "array",
 					"items": {
 						"$ref": "#/$defs/TodoPhase"
+					},
+					"default": []
+				},
+				"capabilities": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"default": []
+				},
+				"externalDeliveries": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/ExternalDeliveryListing"
 					},
 					"default": []
 				},
@@ -3939,12 +4055,127 @@
 				},
 				"maxReassembledFrameBytes": {
 					"type": "integer"
+				},
+				"capabilities": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"default": []
 				}
 			},
 			"required": [
 				"type"
 			],
 			"description": "First frame after startup; transport fields are absent on servers without protocol v2."
+		},
+		"DeliveryAcceptedEvent": {
+			"type": "object",
+			"properties": {
+				"type": {
+					"const": "delivery_accepted"
+				},
+				"deliveryId": {
+					"type": "string"
+				},
+				"at": {
+					"type": "number"
+				},
+				"mode": {
+					"$ref": "#/$defs/DeliveryMode"
+				},
+				"mechanism": {
+					"enum": [
+						"wake",
+						"aside",
+						"steer-boundary"
+					],
+					"type": "string"
+				}
+			},
+			"required": [
+				"type",
+				"deliveryId",
+				"at",
+				"mode",
+				"mechanism"
+			]
+		},
+		"DeliverySettledEvent": {
+			"type": "object",
+			"properties": {
+				"type": {
+					"const": "delivery_settled"
+				},
+				"deliveryId": {
+					"type": "string"
+				},
+				"outcome": {
+					"enum": [
+						"quiet",
+						"text",
+						"refused",
+						"error",
+						"aborted"
+					],
+					"type": "string"
+				},
+				"included": {
+					"type": "boolean"
+				},
+				"requests": {
+					"type": "number"
+				},
+				"sole": {
+					"type": "boolean"
+				},
+				"interactive": {
+					"type": "boolean"
+				}
+			},
+			"required": [
+				"type",
+				"deliveryId",
+				"outcome",
+				"included",
+				"requests",
+				"sole",
+				"interactive"
+			]
+		},
+		"DeliveryDiscardedEvent": {
+			"type": "object",
+			"properties": {
+				"type": {
+					"const": "delivery_discarded"
+				},
+				"deliveryId": {
+					"type": "string"
+				},
+				"reason": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"type",
+				"deliveryId",
+				"reason"
+			]
+		},
+		"DeliveryCancelledEvent": {
+			"type": "object",
+			"properties": {
+				"type": {
+					"const": "delivery_cancelled"
+				},
+				"deliveryId": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"type",
+				"deliveryId"
+			]
 		},
 		"PromptStatus": {
 			"enum": [
@@ -5230,6 +5461,14 @@
 				"data": {
 					"description": "Command result on success; its shape is the command's `result`."
 				},
+				"deliveryId": {
+					"type": "string",
+					"description": "Engine-minted delivery id on a successful deliver response; also in data."
+				},
+				"cancelled": {
+					"type": "boolean",
+					"description": "Pre-acceptance cancellation result on cancel_delivery; also in data."
+				},
 				"error": {
 					"type": "string",
 					"description": "Failure message when `success` is false."
@@ -5310,6 +5549,18 @@
 			"anyOf": [
 				{
 					"$ref": "#/$defs/ReadyEvent"
+				},
+				{
+					"$ref": "#/$defs/DeliveryAcceptedEvent"
+				},
+				{
+					"$ref": "#/$defs/DeliverySettledEvent"
+				},
+				{
+					"$ref": "#/$defs/DeliveryDiscardedEvent"
+				},
+				{
+					"$ref": "#/$defs/DeliveryCancelledEvent"
 				},
 				{
 					"$ref": "#/$defs/PromptResultEvent"
@@ -5456,6 +5707,54 @@
 			},
 			"required": [
 				"message"
+			]
+		},
+		"DeliverParams": {
+			"type": "object",
+			"properties": {
+				"record": {
+					"$ref": "#/$defs/DeliveryRecord"
+				},
+				"options": {
+					"$ref": "#/$defs/DeliveryOptions"
+				}
+			},
+			"required": [
+				"record",
+				"options"
+			]
+		},
+		"DeliverResult": {
+			"type": "object",
+			"properties": {
+				"deliveryId": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"deliveryId"
+			]
+		},
+		"CancelDeliveryParams": {
+			"type": "object",
+			"properties": {
+				"deliveryId": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"deliveryId"
+			]
+		},
+		"CancelDeliveryResult": {
+			"type": "object",
+			"properties": {
+				"cancelled": {
+					"type": "boolean"
+				}
+			},
+			"required": [
+				"cancelled"
 			]
 		},
 		"RemoveQueuedMessageParams": {

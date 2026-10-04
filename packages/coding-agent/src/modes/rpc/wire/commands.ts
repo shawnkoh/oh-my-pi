@@ -48,6 +48,18 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 	{ name: "steer", doc: "Queue a steering message.", params: { message: "string", "images?": IMAGES } },
 	{ name: "follow_up", doc: "Queue a follow-up message.", params: { message: "string", "images?": IMAGES } },
 	{
+		name: "deliver",
+		doc: "Deliver an externally authored record with owned admission and settlement receipts.",
+		params: { record: "DeliveryRecord", options: "DeliveryOptions" },
+		result: { deliveryId: "string" },
+	},
+	{
+		name: "cancel_delivery",
+		doc: "Cancel a delivery only while it remains queued.",
+		params: { deliveryId: "string" },
+		result: { cancelled: "boolean" },
+	},
+	{
 		name: "remove_queued_message",
 		doc: "Remove one pending queued message by its queue-chip text.",
 		params: { message: "string", queue: "QueuedMessageQueue" },
