@@ -9,6 +9,26 @@ import (
 	"time"
 )
 
+func TestDeliveryQuietLiteral(t *testing.T) {
+	for _, input := range []string{"false", "null", " null ", `"true"`, "1"} {
+		var quiet DeliveryOptionsQuiet
+		if err := json.Unmarshal([]byte(input), &quiet); err == nil {
+			t.Fatalf("accepted invalid quiet flag %s", input)
+		}
+	}
+	var quiet DeliveryOptionsQuiet
+	if err := json.Unmarshal([]byte("true"), &quiet); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(quiet)
+	if err != nil || string(encoded) != "true" {
+		t.Fatalf("quiet round trip: %s %v", encoded, err)
+	}
+	if _, err := json.Marshal(DeliveryOptionsQuiet(false)); err == nil {
+		t.Fatal("encoded false for a true-only delivery option")
+	}
+}
+
 func decodeFrame(t *testing.T, line string) RpcServerFrameVariant {
 	t.Helper()
 	var frame RpcServerFrame
