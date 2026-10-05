@@ -421,12 +421,14 @@ export interface WorkAttestation {
 	invocation: InvocationIdentity;
 	counts: WorkCounts;
 	admission: "open" | "closed";
+	sealed: boolean;
 	registry: OwnedJobRegistryState;
 	observedAt: string;
 }
 
 export interface QuiesceRequest {
 	operationId: string;
+	completeness: "strict" | "attested";
 	attempt: number;
 	epoch: number;
 	instanceId: string;
@@ -434,11 +436,11 @@ export interface QuiesceRequest {
 	deadline: number;
 }
 
-export type QuiesceRefusalReason = "invalid_request" | "invocation_mismatch" | "session_mismatch" | "stale_attempt" | "admission_closed" | "deadline_expired" | "epoch_mismatch" | "work_active" | "attestation_unavailable";
+export type QuiesceRefusalReason = "invalid_request" | "invocation_mismatch" | "session_mismatch" | "stale_attempt" | "admission_closed" | "deadline_expired" | "epoch_mismatch" | "work_active" | "completeness_unknown" | "attestation_unavailable";
 
 export interface TerminalAttestation {
 	version: 1;
-	kind: "quiesce" | "hangup";
+	kind: "quiesce" | "hangup" | "sealed_blocked";
 	session: AttestedSessionIdentity;
 	invocation: InvocationIdentity;
 	instanceId: string;
@@ -454,10 +456,49 @@ export interface TerminalAttestation {
 	signal?: string;
 }
 
+export interface CensusProcess {
+	pid: number;
+	comm: string;
+	ppid: number;
+}
+
+export interface CensusResult {
+	complete: boolean;
+	work: CensusProcess[];
+	reasons: string[];
+}
+
 export interface QuiesceSnapshot {
 	epoch: number;
 	counts: WorkCounts;
 	observedAt: string;
+	registry?: OwnedJobRegistryState;
+	census?: CensusResult;
+	completenessReasons?: string[];
+}
+
+export interface SealedQuiesceSnapshot {
+	epoch: number;
+	counts: WorkCounts;
+	observedAt: string;
+	registry: OwnedJobRegistryState;
+	census: CensusResult | null;
+	completenessReasons: string[];
+}
+
+export interface QuiesceProgress {
+	finalized: boolean;
+	bound: boolean;
+	attested: boolean;
+}
+
+export interface QuiesceSealedBlockedResult {
+	status: "sealed_blocked";
+	operationId: string;
+	attempt: number;
+	reason: string;
+	snapshot: SealedQuiesceSnapshot;
+	progress: QuiesceProgress;
 }
 
 export interface QuiescedResult {
@@ -485,7 +526,7 @@ export interface QuiesceUnattestedResult {
 	snapshot: QuiesceSnapshot;
 }
 
-export type QuiesceResult = QuiescedResult | QuiesceRefusedResult | QuiesceUnattestedResult;
+export type QuiesceResult = QuiescedResult | QuiesceRefusedResult | QuiesceUnattestedResult | QuiesceSealedBlockedResult;
 
 /** Exact call and evaluated arguments decided by a tool-approval select. */
 export interface ToolApprovalBinding {
@@ -1057,7 +1098,7 @@ export interface QueueUpdateEvent {
 /** A session event, discriminated by `type`; `set_event_filter` selects which are sent. */
 export type RpcAgentEvent = AgentStartEvent | AgentEndEvent | TurnStartEvent | TurnEndEvent | MessageStartEvent | MessageUpdateEvent | MessageEndEvent | ToolExecutionStartEvent | ToolExecutionUpdateEvent | ToolStreamUpdateEvent | ToolExecutionEndEvent | AutoCompactionStartEvent | AutoCompactionEndEvent | AutoRetryStartEvent | AutoRetryEndEvent | CacheWarmingStartEvent | CacheWarmingEndEvent | RetryFallbackAppliedEvent | RetryFallbackSucceededEvent | ModelChangedEvent | ConfigWarningsChangedEvent | AdvisorCostChangedEvent | AdvisorYieldedEvent | TtsrTriggeredEvent | TodoReminderEvent | TodoAutoClearEvent | IrcMessageEvent | NoticeEvent | ThinkingLevelChangedEvent | GoalUpdatedEvent | QueueUpdateEvent;
 
-/** First frame after startup; capabilities include quiesce-exit/1 and owned-jobs/1. Transport fields are absent on servers without protocol v2. */
+/** First frame after startup; capabilities include quiesce-exit/2 and owned-jobs/1. Transport fields are absent on servers without protocol v2. */
 export interface ReadyEvent {
 	type: "ready";
 	protocolVersion?: number;

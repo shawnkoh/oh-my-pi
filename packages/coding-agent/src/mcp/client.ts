@@ -162,6 +162,7 @@ export async function connectToServer(
 
 	const connect = async (): Promise<MCPServerConnection> => {
 		transport = await createTransport(config);
+		transport.activity.name = name;
 		if (options?.onNotification) {
 			transport.onNotification = options.onNotification;
 		}

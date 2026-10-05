@@ -63,6 +63,9 @@ if (process.env.QUIESCE_FIXTURE_INPUT_HOOK === "1") {
 }
 const session = new AgentSession({
 	agent,
+	a13Instance: { sandboxId: "rpc-fixture", generation: "1", startKey: "boot:10" },
+	a13Extinct: [],
+	namespaceCensus: () => ({ complete: true, work: [], reasons: [] }),
 	sessionManager,
 	settings: Settings.isolated({
 		"compaction.enabled": false,
@@ -72,6 +75,11 @@ const session = new AgentSession({
 	ownedAsyncJobManager: new AsyncJobManager({ maxRunningJobs: 4 }),
 	agentId: "Main",
 	extensionRunner,
+});
+// Deterministic namespace/owner observations; real host processes are outside this fixture.
+spyOn(session.ownedJobRegistry!, "scanAndCount").mockReturnValue({
+	scan: { supported: true, sound: true, scanned: 1, discovered: 0, opaque: [] },
+	live: 0,
 });
 if (process.env.QUIESCE_FIXTURE_PREDICT === "1") {
 	spyOn(predictClient, "requestTextPrediction").mockImplementation(async (_method, _before, _prefix, options) => {
@@ -92,20 +100,11 @@ if (process.env.QUIESCE_FIXTURE_PENDING === "1") {
 // Files release the provider-independent live controller at exact lifecycle boundaries.
 const createLiveSession: RpcLiveSessionFactory = ({ callbacks }) => {
 	let muted = false;
-	const waitFor = (name: string) =>
-		new Promise<void>(resolve => {
-			const file = path.join(process.cwd(), name);
-			const watcher = fs.watch(process.cwd(), () => {
-				if (fs.existsSync(file)) {
-					watcher.close();
-					resolve();
-				}
-			});
-			if (fs.existsSync(file)) {
-				watcher.close();
-				resolve();
-			}
-		});
+	const waitFor = async (name: string) => {
+		const file = path.join(process.cwd(), name);
+		// Poll the explicit release file rather than depend on filesystem notifications.
+		while (!fs.existsSync(file)) await Bun.sleep(10);
+	};
 	return {
 		get muted() {
 			return muted;

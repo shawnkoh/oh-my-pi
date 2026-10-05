@@ -1,3 +1,4 @@
+import { ServerActivityLedger } from "../src/session/activity-ledger";
 import { beforeAll, describe, expect, it } from "bun:test";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { TSchema } from "@oh-my-pi/pi-ai";
@@ -30,6 +31,7 @@ async function getRequiredTheme() {
 
 function makeConnection(): MCPServerConnection {
 	const transport: MCPTransport = {
+		activity: new ServerActivityLedger("mcp", "test"),
 		connected: true,
 		request<T = unknown>(): Promise<T> {
 			return Promise.reject(new Error("transport is not used by renderer tests"));

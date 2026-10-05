@@ -17,7 +17,7 @@ export const frameDefs = {
 			"maxReassembledFrameBytes?": "number.integer",
 			capabilities: absentAs("string[]", []),
 		},
-		"First frame after startup; capabilities include quiesce-exit/1 and owned-jobs/1. Transport fields are absent on servers without protocol v2.",
+		"First frame after startup; capabilities include quiesce-exit/2 and owned-jobs/1. Transport fields are absent on servers without protocol v2.",
 	),
 	DeliveryAcceptedEvent: {
 		type: "'delivery_accepted'",

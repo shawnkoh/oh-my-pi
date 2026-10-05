@@ -14,6 +14,7 @@ try {
  * CLI entry point — registers all commands explicitly and delegates to the
  * lightweight CLI runner from pi-utils.
  */
+import { writeSync } from "node:fs";
 import type * as WorkerThreads from "node:worker_threads";
 import type { MessagePort } from "node:worker_threads";
 import type { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
@@ -29,6 +30,8 @@ import {
 } from "@oh-my-pi/pi-utils/dirs";
 
 import { declareWorkerHostEntry, installWorkerInbox, isWorkerHostSelector } from "@oh-my-pi/pi-utils/worker-host";
+import { parseLaunchIdentityArgs, parseInstanceArgs } from "./cli/flag-tables";
+import { checkStartupIdentity, type StartupIdentityOptions } from "./session/namespace-census";
 import { extractProfileFlags } from "./cli/profile-bootstrap";
 import {
 	BLOB_BROKER_WORKER_ARG,
@@ -481,7 +484,27 @@ async function runTinyWorker(): Promise<void> {
 let runningCommand: string | undefined;
 
 /** Run the CLI with the given argv (no `process.argv` prefix). */
-export async function runCli(argv: string[]): Promise<void> {
+export async function runCli(argv: string[], startupIdentity?: StartupIdentityOptions): Promise<void> {
+	// Scan raw argv, including flags after `--` or consumed by another option:
+	// this owner-supplied identity must gate every possible early-output path.
+	let identity;
+	try {
+		identity = parseLaunchIdentityArgs(argv);
+		parseInstanceArgs(argv);
+	} catch (error) {
+		// Static import would load the agent .env before profile bootstrap.
+		// Only the terminating usage-error path may load this graph this early.
+		const { reportCliUsageError } = await import("./cli/args");
+		if (!reportCliUsageError(error)) throw error;
+		process.exitCode = 2;
+		return;
+	}
+	const identityError = checkStartupIdentity(identity, startupIdentity);
+	if (identityError) {
+		writeSync(2, `${identityError}\n`);
+		process.exitCode = 3;
+		return;
+	}
 	let resolvedArgv = argv;
 	try {
 		const extracted = extractProfileFlags(resolvedArgv);

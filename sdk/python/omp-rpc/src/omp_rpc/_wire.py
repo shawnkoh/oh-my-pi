@@ -63,8 +63,8 @@ _CONFIGURED_THINKING_LEVEL_VALUES: Final[frozenset[str]] = frozenset({"auto", "i
 _decode_configured_thinking_level = cast("Decoder[ConfiguredThinkingLevel]", literal(_CONFIGURED_THINKING_LEVEL_VALUES))
 
 
-QuiesceRefusalReason: TypeAlias = Literal["invalid_request", "invocation_mismatch", "session_mismatch", "stale_attempt", "admission_closed", "deadline_expired", "epoch_mismatch", "work_active", "attestation_unavailable"]
-_QUIESCE_REFUSAL_REASON_VALUES: Final[frozenset[str]] = frozenset({"invalid_request", "invocation_mismatch", "session_mismatch", "stale_attempt", "admission_closed", "deadline_expired", "epoch_mismatch", "work_active", "attestation_unavailable"})
+QuiesceRefusalReason: TypeAlias = Literal["invalid_request", "invocation_mismatch", "session_mismatch", "stale_attempt", "admission_closed", "deadline_expired", "epoch_mismatch", "work_active", "completeness_unknown", "attestation_unavailable"]
+_QUIESCE_REFUSAL_REASON_VALUES: Final[frozenset[str]] = frozenset({"invalid_request", "invocation_mismatch", "session_mismatch", "stale_attempt", "admission_closed", "deadline_expired", "epoch_mismatch", "work_active", "completeness_unknown", "attestation_unavailable"})
 _decode_quiesce_refusal_reason = cast("Decoder[QuiesceRefusalReason]", literal(_QUIESCE_REFUSAL_REASON_VALUES))
 
 
@@ -623,6 +623,7 @@ class WorkAttestation:
     invocation: InvocationIdentity
     counts: WorkCounts
     admission: Literal["open", "closed"]
+    sealed: bool
     registry: OwnedJobRegistryState
     observed_at: str
 
@@ -630,7 +631,7 @@ class WorkAttestation:
 @dataclass(slots=True, frozen=True, kw_only=True)
 class TerminalAttestation:
     version: Literal[1] = 1
-    kind: Literal["quiesce", "hangup"]
+    kind: Literal["quiesce", "hangup", "sealed_blocked"]
     session: AttestedSessionIdentity
     invocation: InvocationIdentity
     instance_id: str
@@ -647,10 +648,54 @@ class TerminalAttestation:
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
+class CensusProcess:
+    pid: float
+    comm: str
+    ppid: float
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class CensusResult:
+    complete: bool
+    work: tuple[CensusProcess, ...]
+    reasons: tuple[str, ...]
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
 class QuiesceSnapshot:
     epoch: float
     counts: WorkCounts
     observed_at: str
+    registry: OwnedJobRegistryState | None = None
+    census: CensusResult | None = None
+    completeness_reasons: tuple[str, ...] | None = None
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class SealedQuiesceSnapshot:
+    epoch: float
+    counts: WorkCounts
+    observed_at: str
+    registry: OwnedJobRegistryState
+    census: CensusResult | None
+    completeness_reasons: tuple[str, ...]
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class QuiesceProgress:
+    finalized: bool
+    bound: bool
+    attested: bool
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class QuiesceSealedBlockedResult:
+    status: Literal["sealed_blocked"] = "sealed_blocked"
+    operation_id: str
+    attempt: float
+    reason: str
+    snapshot: SealedQuiesceSnapshot
+    progress: QuiesceProgress
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -1261,7 +1306,7 @@ class QueueUpdateEvent:
 
 @dataclass(slots=True, frozen=True, kw_only=True)
 class ReadyEvent:
-    """First frame after startup; capabilities include quiesce-exit/1 and owned-jobs/1. Transport fields are absent on servers without protocol v2."""
+    """First frame after startup; capabilities include quiesce-exit/2 and owned-jobs/1. Transport fields are absent on servers without protocol v2."""
     type: Literal["ready"] = "ready"
     protocol_version: int | None = None
     supported_protocol_versions: tuple[int, ...] | None = None
@@ -1699,7 +1744,7 @@ AssistantMessageEvent: TypeAlias = AssistantStartEvent | AssistantTextStartEvent
 """Streaming update for one assistant message, discriminated by `type`."""
 
 
-QuiesceResult: TypeAlias = QuiescedResult | QuiesceRefusedResult | QuiesceUnattestedResult
+QuiesceResult: TypeAlias = QuiescedResult | QuiesceRefusedResult | QuiesceUnattestedResult | QuiesceSealedBlockedResult
 
 
 RpcAgentEvent: TypeAlias = AgentStartEvent | AgentEndEvent | TurnStartEvent | TurnEndEvent | MessageStartEvent | MessageUpdateEvent | MessageEndEvent | ToolExecutionStartEvent | ToolExecutionUpdateEvent | ToolStreamUpdateEvent | ToolExecutionEndEvent | AutoCompactionStartEvent | AutoCompactionEndEvent | AutoRetryStartEvent | AutoRetryEndEvent | CacheWarmingStartEvent | CacheWarmingEndEvent | RetryFallbackAppliedEvent | RetryFallbackSucceededEvent | ModelChangedEvent | ConfigWarningsChangedEvent | AdvisorCostChangedEvent | AdvisorYieldedEvent | TtsrTriggeredEvent | TodoReminderEvent | TodoAutoClearEvent | IrcMessageEvent | NoticeEvent | ThinkingLevelChangedEvent | GoalUpdatedEvent | QueueUpdateEvent
@@ -2002,6 +2047,7 @@ def parse_work_attestation(value: object, path: str = "WorkAttestation") -> Work
         invocation=required(payload, "invocation", parse_invocation_identity, path),
         counts=required(payload, "counts", parse_work_counts, path),
         admission=required(payload, "admission", cast('Decoder[Literal["open", "closed"]]', literal(frozenset({"open", "closed"}))), path),
+        sealed=required(payload, "sealed", decode_bool, path),
         registry=required(payload, "registry", parse_owned_job_registry_state, path),
         observed_at=required(payload, "observedAt", decode_str, path),
     )
@@ -2011,7 +2057,7 @@ def parse_terminal_attestation(value: object, path: str = "TerminalAttestation")
     payload = expect_object(value, path)
     required(payload, "version", cast('Decoder[Literal[1]]', literal_number(1)), path)
     return TerminalAttestation(
-        kind=required(payload, "kind", cast('Decoder[Literal["quiesce", "hangup"]]', literal(frozenset({"quiesce", "hangup"}))), path),
+        kind=required(payload, "kind", cast('Decoder[Literal["quiesce", "hangup", "sealed_blocked"]]', literal(frozenset({"quiesce", "hangup", "sealed_blocked"}))), path),
         session=required(payload, "session", parse_attested_session_identity, path),
         invocation=required(payload, "invocation", parse_invocation_identity, path),
         instance_id=required(payload, "instanceId", decode_str, path),
@@ -2028,12 +2074,66 @@ def parse_terminal_attestation(value: object, path: str = "TerminalAttestation")
     )
 
 
+def parse_census_process(value: object, path: str = "CensusProcess") -> CensusProcess:
+    payload = expect_object(value, path)
+    return CensusProcess(
+        pid=required(payload, "pid", decode_float, path),
+        comm=required(payload, "comm", decode_str, path),
+        ppid=required(payload, "ppid", decode_float, path),
+    )
+
+
+def parse_census_result(value: object, path: str = "CensusResult") -> CensusResult:
+    payload = expect_object(value, path)
+    return CensusResult(
+        complete=required(payload, "complete", decode_bool, path),
+        work=required(payload, "work", array(parse_census_process), path),
+        reasons=required(payload, "reasons", array(decode_str), path),
+    )
+
+
 def parse_quiesce_snapshot(value: object, path: str = "QuiesceSnapshot") -> QuiesceSnapshot:
     payload = expect_object(value, path)
     return QuiesceSnapshot(
         epoch=required(payload, "epoch", decode_float, path),
         counts=required(payload, "counts", parse_work_counts, path),
         observed_at=required(payload, "observedAt", decode_str, path),
+        registry=optional(payload, "registry", parse_owned_job_registry_state, path),
+        census=optional(payload, "census", parse_census_result, path),
+        completeness_reasons=optional(payload, "completenessReasons", array(decode_str), path),
+    )
+
+
+def parse_sealed_quiesce_snapshot(value: object, path: str = "SealedQuiesceSnapshot") -> SealedQuiesceSnapshot:
+    payload = expect_object(value, path)
+    return SealedQuiesceSnapshot(
+        epoch=required(payload, "epoch", decode_float, path),
+        counts=required(payload, "counts", parse_work_counts, path),
+        observed_at=required(payload, "observedAt", decode_str, path),
+        registry=required(payload, "registry", parse_owned_job_registry_state, path),
+        census=required(payload, "census", nullable(parse_census_result), path),
+        completeness_reasons=required(payload, "completenessReasons", array(decode_str), path),
+    )
+
+
+def parse_quiesce_progress(value: object, path: str = "QuiesceProgress") -> QuiesceProgress:
+    payload = expect_object(value, path)
+    return QuiesceProgress(
+        finalized=required(payload, "finalized", decode_bool, path),
+        bound=required(payload, "bound", decode_bool, path),
+        attested=required(payload, "attested", decode_bool, path),
+    )
+
+
+def parse_quiesce_sealed_blocked_result(value: object, path: str = "QuiesceSealedBlockedResult") -> QuiesceSealedBlockedResult:
+    payload = expect_object(value, path)
+    required(payload, "status", cast('Decoder[Literal["sealed_blocked"]]', literal(frozenset({"sealed_blocked"}))), path)
+    return QuiesceSealedBlockedResult(
+        operation_id=required(payload, "operationId", decode_str, path),
+        attempt=required(payload, "attempt", decode_float, path),
+        reason=required(payload, "reason", decode_str, path),
+        snapshot=required(payload, "snapshot", parse_sealed_quiesce_snapshot, path),
+        progress=required(payload, "progress", parse_quiesce_progress, path),
     )
 
 
@@ -3257,6 +3357,7 @@ _QUIESCE_RESULT_CASES: Final[dict[str, Decoder[QuiesceResult]]] = {
         "quiesced": parse_quiesced_result,
         "refused": parse_quiesce_refused_result,
         "exit_unattested": parse_quiesce_unattested_result,
+        "sealed_blocked": parse_quiesce_sealed_blocked_result,
 }
 
 
@@ -3369,10 +3470,11 @@ class WireClient:
         params["nonce"] = nonce
         return parse_work_attestation(self._command("attest", params), "attest")
 
-    def quiesce_and_exit(self, operation_id: str, attempt: float, epoch: float, instance_id: str, session_id: str, deadline: float) -> QuiesceResult:
-        """Atomically close admission and exit if the bound quiescence attempt passes."""
+    def quiesce_and_exit(self, operation_id: str, completeness: Literal["strict", "attested"], attempt: float, epoch: float, instance_id: str, session_id: str, deadline: float) -> QuiesceResult:
+        """Require explicit strict or attested completeness; close admission and retire, retaining strict sealed failures for retry."""
         params: dict[str, object] = {}
         params["operationId"] = operation_id
+        params["completeness"] = completeness
         params["attempt"] = attempt
         params["epoch"] = epoch
         params["instanceId"] = instance_id
@@ -3738,7 +3840,7 @@ class WireClient:
         self._command("predict_word_feedback", params)
 
     def on_ready(self, listener: Callable[[ReadyEvent], None]) -> Callable[[], None]:
-        """Subscribe to `ready`: First frame after startup; capabilities include quiesce-exit/1 and owned-jobs/1. Transport fields are absent on servers without protocol v2."""
+        """Subscribe to `ready`: First frame after startup; capabilities include quiesce-exit/2 and owned-jobs/1. Transport fields are absent on servers without protocol v2."""
         return self._listen("ready", listener)
 
     def on_delivery_accepted(self, listener: Callable[[DeliveryAcceptedEvent], None]) -> Callable[[], None]:
@@ -3997,6 +4099,8 @@ __all__ = [
     "CancelDeliveryResult",
     "CancelUiRequest",
     "CancellationResult",
+    "CensusProcess",
+    "CensusResult",
     "CommandOutputEvent",
     "CompactionResult",
     "CompactionSummaryMessage",
@@ -4076,9 +4180,11 @@ __all__ = [
     "QueueUpdateEvent",
     "QueuedMessageQueue",
     "QueuedMessagesState",
+    "QuiesceProgress",
     "QuiesceRefusalReason",
     "QuiesceRefusedResult",
     "QuiesceResult",
+    "QuiesceSealedBlockedResult",
     "QuiesceSnapshot",
     "QuiesceUnattestedResult",
     "QuiescedResult",
@@ -4090,6 +4196,7 @@ __all__ = [
     "RpcAgentEvent",
     "RpcFrameErrorEvent",
     "RpcNotification",
+    "SealedQuiesceSnapshot",
     "SelectOptionDetail",
     "SelectUiRequest",
     "SessionCredits",
@@ -4195,6 +4302,8 @@ __all__ = [
     "parse_cancel_delivery_result",
     "parse_cancel_ui_request",
     "parse_cancellation_result",
+    "parse_census_process",
+    "parse_census_result",
     "parse_command_output_event",
     "parse_compaction_result",
     "parse_compaction_summary_message",
@@ -4260,8 +4369,10 @@ __all__ = [
     "parse_python_execution_message",
     "parse_queue_update_event",
     "parse_queued_messages_state",
+    "parse_quiesce_progress",
     "parse_quiesce_refused_result",
     "parse_quiesce_result",
+    "parse_quiesce_sealed_blocked_result",
     "parse_quiesce_snapshot",
     "parse_quiesce_unattested_result",
     "parse_quiesced_result",
@@ -4272,6 +4383,7 @@ __all__ = [
     "parse_retry_fallback_succeeded_event",
     "parse_rpc_agent_event",
     "parse_rpc_frame_error_event",
+    "parse_sealed_quiesce_snapshot",
     "parse_select_option_detail",
     "parse_select_ui_request",
     "parse_session_credits",

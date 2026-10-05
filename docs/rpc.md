@@ -46,7 +46,7 @@ The initial ready frame uses protocol v1 and advertises the opt-in lossless tran
   "supportedProtocolVersions": [1, 2],
   "maxFrameBytes": 1048576,
   "maxReassembledFrameBytes": 67108864,
-  "capabilities": ["literal-input/1", "tool-approval-binding/1", "reply-attribution/1", "external-delivery/1", "quiesce-exit/1", "owned-jobs/1", "rich-ask/2"]
+  "capabilities": ["literal-input/1", "tool-approval-binding/1", "reply-attribution/1", "external-delivery/1", "quiesce-exit/2", "owned-jobs/1", "rich-ask/2"]
 }
 ```
 
@@ -168,7 +168,7 @@ With `literal: true` (capability `literal-input/1`) input hooks run first with s
 ### Quiescence
 
 - `{ id?, type: "attest", operationId: string, nonce: string }`
-- `{ id?, type: "quiesce_and_exit", operationId: string, attempt: number, epoch: number, instanceId: string, sessionId: string, deadline: number }`
+- `{ id?, type: "quiesce_and_exit", operationId: string, attempt: number, completeness: "strict" | "attested", epoch: number, instanceId: string, sessionId: string, deadline: number }`
 
 Both run on receipt, ahead of any queued command; see [Quiesce and exit](#quiesce-and-exit).
 
@@ -537,7 +537,15 @@ is re-armed.
     "contextWindow": 200000,
     "percent": 0.55
   },
-  "goal": null
+  "goal": null,
+  "capabilities": [
+    "literal-input/1",
+    "tool-approval-binding/1",
+    "reply-attribution/1",
+    "external-delivery/1",
+    "quiesce-exit/2",
+    "owned-jobs/1"
+  ]
 }
 ```
 
@@ -615,7 +623,7 @@ When the agent completes the goal, the goal tool is removed again and
 ### Quiesce and exit
 
 A client must check `ready.capabilities` (or `get_state.capabilities`) for
-`quiesce-exit/1` before sending `attest` or `quiesce_and_exit`, and for
+`quiesce-exit/2` before sending `attest` or `quiesce_and_exit`, and for
 `owned-jobs/1` before relying on the owned-job registry file.
 
 A supervisor that wants the agent to exit without interrupting work first takes a
@@ -623,7 +631,7 @@ read-only snapshot, then asks the process to exit only if nothing changed:
 
 1. `attest` → `data`: `{ version: 1, operationId, nonce, epoch, instanceId,
    session: { id, file }, invocation: { pid, startId, startTime }, counts,
-   admission: "open" | "closed", registry: { path, complete, ownerScan }, observedAt }`.
+   admission: "open" | "closed", sealed: boolean, registry: { path, complete, ownerScan }, observedAt }`.
    `counts` has `streaming`, `queuedInput`, `asyncJobs`, `subagents`, `retainedJobs`,
    `detachedJobs`, `compacting`, `handoff`, `goalContinuationScheduled`,
    `scheduledTurns`; any non-zero value means work is outstanding. `queuedInput`
@@ -651,7 +659,7 @@ read-only snapshot, then asks the process to exit only if nothing changed:
    `instanceId` is random per session object and process. `detachedJobs` counts live owned processes, including
    ones found by the owner-marker scan below; `registry.complete` is false unless that
    scan was `sound` and the session is persisted.
-2. `quiesce_and_exit` `{ operationId, attempt, epoch, instanceId, sessionId, deadline }`,
+2. `quiesce_and_exit` `{ operationId, attempt, completeness, epoch, instanceId, sessionId, deadline }`,
    with `epoch`, `instanceId` and `sessionId` (`session.id`) copied from the attestation
    the decision is based on. `deadline` is Unix epoch milliseconds compared against the
    agent host's clock (`Date.now()` in the agent process); a supervisor on another host
@@ -660,6 +668,66 @@ read-only snapshot, then asks the process to exit only if nothing changed:
    match, all counts zero, `epoch` unchanged and the deadline not reached — all without
    yielding, so no input can interleave. A session switch (`new_session`,
    `switch_session`, `open_session`, `branch` or `fork` to another session) also advances `epoch`.
+   `completeness` is required: `"attested"` preserves the counts-only decision
+   (deadline → pre-scan epoch → work active → session file), without a completeness
+   check. `"strict"` ensures the registry header before counting with admission closed,
+   then checks deadline → pre-scan epoch → work active → live epoch after counting →
+   registry completeness → session file. A scan that registers work which exits before
+   counting finishes therefore refuses strict retirement with `epoch_mismatch`.
+   Strict also performs the Linux namespace census and checks the outstanding-activity
+   ledger described below. Only attested retirement retains the prior post-seal exit behaviour.
+   There is no legacy capability alias or default policy.
+
+   **Strict namespace census (Linux).** The owner must supply a single launch argv
+   element `--a13-identity=<json>` with exactly this schema:
+   `{"v":1,"boot":"12345678-1234-1234-1234-123456789abc","pid1Start":"123","canonical":{"pid":2,"start":"456"}}`.
+   Boot is a lowercase UUID, starts are decimal tick strings, and the canonical PID
+   is a safe integer greater than 1. Malformed, repeated, or split-form flags exit
+   with status 2 and no stdout at the CLI entry, before help, version, license,
+   profile alias installation, or worker/command dispatch. The reserved flag is
+   validated wherever it occurs in argv, including after `--`. This is launch
+   identity, not a setting or a guest-discovered substitute for the owner's record.
+
+   On Linux, supplying the flag also verifies the launch identity before any
+   stdout, including CLI help/version and RPC `ready`. The engine reads the trimmed
+   `/proc/sys/kernel/random/boot_id` and field 22 of `/proc/1/stat`, parsed after
+   the last `)`. Unreadable or malformed values produce exactly one stderr line,
+   `juiz.a13-identity-unreadable`; either value differing from the owner record
+   produces `juiz.a13-identity-mismatch`. Both failures exit with status 3 and no
+   stdout, so the owner must not adopt the engine. This startup check applies
+   to every session mode, independent of retirement policy; it is skipped without
+   the flag or on non-Linux platforms.
+
+   Strict sandbox launches also pass the paired `--a13-instance=<json I>` and
+   `--a13-extinct=<json [I,...]>` flags described under **A′ extinction fencing**
+   below. Without an instance, strict completeness is UNKNOWN with
+   `instance_identity_missing`; attested retirement keeps its existing decision.
+
+   Without identity strict refuses with `census-identity-missing`; non-Linux
+   platforms report `census-unsupported-platform`. Attested retirement does not run
+   the census. With admission closed, the census checks the proc mount for hidepid,
+   boot ID, and every numeric PID's `stat`, raw NUL-delimited `cmdline`, and status
+   `Uid` line; it never reads `environ`. Read failures, malformed fields, duplicate
+   PIDs, and unconfirmed disappearance are unknown. Dead-state processes remain work;
+   a dead boundary or canonical process invalidates the census.
+   Each pass snapshots ledger counts and completeness reasons before and after.
+   A change restarts stability checking within the same three-pass, 90-second budget;
+   exhaustion reports `completeness_unknown` with `census-ledger-unstable`.
+   Registry records never authorize internal-helper exclusion: only identities held
+   in memory by this invocation can do so.
+
+   Only the exact boundary (PID 1, recorded start, `openshell-sandb`), owner-recorded
+   canonical process (with `sleep infinity` argv corroboration), engine, exact
+   registered processes, idle internal helpers supervising no registered live service,
+   and exact identities from the idle-infrastructure provider are excluded from
+   additional work. The engine combines invocation-local helper identities with
+   contracted idle-safe servers (none configured by default). Registered processes are
+   already counted; unmatched processes, including ppid-0 processes, are work.
+   Such work increases `detachedJobs` for the strict decision and refuses with
+   `work_active`. Two consecutive passes must agree on `(pid,start)` and classification,
+   within at most three passes and 90 seconds before `census-unstable`. This does not make the
+   census atomic against privileged out-of-band launches; managed launch admission
+   must remain closed at the owner.
    - Pass → `data: { status: "quiesced", operationId, attempt, attestation, path }`.
      Before the attestation is written the transcript is made final (the exit record
      is appended, flushed and the file sealed), and `attestation.session` carries its
@@ -686,18 +754,56 @@ read-only snapshot, then asks the process to exit only if nothing changed:
      connection the process already holds: without one, `predict_word` answers
      `suffix: null` and feedback is dropped, so neither starts the daemon, its broker
      or a model download after the pass.
-   - Exit without attestation → `data: { status: "exit_unattested", operationId,
+   - Strict commit point: after recording the exit, finalize the transcript, bind the
+     registry to the final file, then take fresh strict counts, census and ledger
+     coverage and recheck the live epoch and final-binding registry completeness.
+     Only after that final evaluation passes is the success attestation published.
+   - Strict post-seal failure → `data: { status: "sealed_blocked", operationId,
+     attempt, reason, snapshot: { epoch, counts, observedAt, census,
+     completenessReasons, registry }, progress: { finalized, bound, attested } }`.
+     Any failure in finalization, binding, final evaluation or publication leaves
+     admission closed and the transcript sealed. The process does not dispose or
+     schedule an exit; stdin EOF keeps it alive. Publication of a terminal
+     `kind: "sealed_blocked"` record is attempted even if a success record was
+     already published; failure to invalidate that record still does not permit exit.
+     `attest` remains available with `admission: "closed"`, `sealed: true` and the
+     sealed decision epoch.
+     A newer strict attempt on the same session object resumes incomplete
+     finalization/binding without appending another exit, then repeats final evaluation
+     and publication. Identity, deadline and epoch checks still apply; duplicate
+     attempts replay the memoized result and older attempts return `stale_attempt`.
+     A transient synchronous exit-record write failure is recovered by persisting the retained
+     authoritative transcript, including its existing exit record, while keeping the
+     seal in place. The persistence error clears only after a successful write;
+     another storage failure leaves `finalized: false` and `sealed_blocked`.
+     Deferred-storage finalization drains prior writes and confirms publication of the
+     sealed authoritative transcript before computing its digest. While publication
+     is pending, strict attempts return `sealed_blocked` with `finalized: false`.
+     A newer attempt can proceed once publication succeeds; a publication failure
+     remains latched and retries stay blocked. Attested finalization is unchanged.
+     Attested requests and unrelated admission closures return `admission_closed`.
+     Rejected retries never reopen admission. Recovery requires the existing RPC
+     channel; no reattachment transport or automatic replacement is provided.
+   - Attested exit without attestation → `data: { status: "exit_unattested", operationId,
      attempt, reason: "attestation_unavailable", error, snapshot }`. The session was
      idle and its transcript was made final, but the attestation could not be written.
      The process exits anyway, with code 1; there is no terminal attestation for this
      exit, so the consumer decides from the registry (`verifyOwnedJobRegistry`).
    - Refusal → `data: { status: "refused", operationId, attempt, reason, snapshot:
-     { epoch, counts, observedAt } }`. Admission is reopened and nothing is cancelled.
+     { epoch, counts, observedAt } }`. An evaluated pre-seal refusal reopens its own admission closure; nothing is cancelled.
      `reason` is one of `work_active`, `epoch_mismatch`, `deadline_expired`,
      `invocation_mismatch` (the `instanceId` belongs to another session object or
      process), `session_mismatch` (the session was switched since the attestation),
      `stale_attempt`, `admission_closed`, `invalid_request`, `attestation_unavailable`
      (no session file, or the attestation directory is not writable).
+     Strict also returns `completeness_unknown` when registry coverage, the namespace
+     census or extension ledger coverage is incomplete. Strict `work_active` and
+     `completeness_unknown` refusals include `snapshot.registry: { path, complete, ownerScan }`,
+     `snapshot.census: { complete, work: [{ pid, comm, ppid }], reasons }` and
+     `snapshot.completenessReasons` (including
+     `extension_work_reporting_unknown:<extension label or path>`), captured with admission
+     closed. Missing or unknown `completeness` is
+     `invalid_request` before admission closes and does not consume an attempt.
 
 Each `(operationId, attempt)` is evaluated once: repeating it returns the original
 answer unchanged (so a retry after a lost response learns whether it passed), and a
@@ -710,6 +816,32 @@ Every RPC command has an explicit admission classification. Once admission close
 `live_start`, `live_mute`, `live_stop` and `fork` are refused with `admission_closed`.
 Before closure, upstream's busy-fork refusal still applies; a successful fork invalidates
 attestations bound to the previous session identity.
+
+#### Strict outstanding-activity ledger
+
+Only strict retirement includes these sources in `scheduledTurns`:
+
+- MCP requests sent without a JSON-RPC result/error, across stdio, Streamable HTTP and legacy SSE.
+  Cancellation, timeout and transport loss do **not** settle a request. A late reply or observed
+  local server process exit does. Closing a remote transport does not prove remote work stopped.
+- LSP client requests, including cancelled/timed-out requests removed from the caller promise map,
+  and queued/in-flight server-initiated requests such as `workspace/applyEdit`.
+  MCP stdio and LSP settle only on a valid JSON-RPC 2.0 response with the matching id and exactly
+  one of `result` or a well-formed `error`. ID-only and malformed frames leave work unsettled.
+- Extension `ctx.holdWork(reason)` holds, aggregated across all runners in the engine, including
+  main and child sessions. Task completion, parking and runner/session disposal do not release
+  holds; only an explicit `release()` settles them. Every loaded extension must declare
+  `pi.workReporting = "complete"`; otherwise strict completeness is unknown, with the extension
+  named in the refusal. Disposing an undeclared runner preserves its completeness uncertainty.
+  Existing tool, subagent, goal-continuation and delivery counts are reused.
+
+Live MCP/LSP processes are work by default. `strictIdle.idleSafeServers` (default `[]`) asserts an
+audited lifecycle/admission contract; it is not a general process allowlist. The census integration
+can call `session.getIdleSafeServerProcesses()` for `{ pid, start, label }` identities of contracted
+servers with zero ledger items. `start` is Linux `/proc/<pid>/stat` field 22, captured at spawn and
+rechecked; unknown identities, disconnected readers and broker-shared LSP links are never provided.
+The lower-level provider is `idleSafeServerProcesses(names)` in `session/activity-ledger.ts`.
+This ledger does not detect unregistered external jobs or unrelated remote services.
 
 Extensions (`ctx.quiesceAndExit`) cannot quiesce from inside their own command or event
 handler: the running handler is outstanding work, so the answer is `work_active`.
@@ -738,7 +870,8 @@ the consumer last observed through `attest` (or `get_state`).
 
 **Decide from both.** A clean terminal attestation is necessary, not sufficient: after
 observing that the process exited, a consumer must also run
-`verifyOwnedJobRegistry(path, { expectedInvocation })` with that invocation and treat
+`verifyOwnedJobRegistry(path, { expectedInvocation, currentInstance, extinct })` with the
+owner-recorded invocation, instance and persisted launch extinction list, and treat
 the session as clear only if the attestation is clean **and** the verdict is `clear`.
 The attestation describes what this invocation could see when it decided; the registry
 check also covers what happened afterwards or elsewhere (another invocation writing the
@@ -755,8 +888,11 @@ false` when some process may be untracked; `writer`, a random id of the registry
 `groupMember?`, `discovered?`, `carriedFrom?`, `adoptedFrom?`; `service` records also
 `broker?` and `daemon?`, below), `end` records, and
 `incomplete` records; `start`, `end` and `incomplete` records carry `invocationPid` and
-the `writer` of their header (records written before `writer` existed have none). A
-record belongs to the latest preceding header whose invocation has its `invocationPid`
+the `writer` of their header (records written before `writer` existed have none).
+The exception is `end` with `reason:"extinct"`, whose historical routing and authorization
+are specified below. Header reasons and `incomplete.reason` are now
+`{category, text, issuer}` records; legacy strings have null provenance and cannot be fenced.
+An ordinary record belongs to the latest preceding header whose invocation has its `invocationPid`
 and, when the record has a `writer`, the same `writer` — so two session objects in one
 process writing the same file never end or hide each other's jobs; job ids restart per
 header. `startId` is an opaque,
@@ -790,13 +926,15 @@ read of a file from its start:
   live process in `detachedJobs`, so no quiesce passes while it can still start work;
 - their owner tokens go into `inheritedOwnerMarkers` and are scanned from then on,
   counting unexaminable processes started since the earliest of those invocations; a
-  token stops being copied into new headers only when its invocation is gone, no open
+  token in a launch without `--a13-instance` stops being copied into new headers only when its invocation is gone, no open
   record was adopted from that invocation, and two consecutive scans that could examine
   every candidate process — tracked or not — found none carrying it, with no counted
   process exiting between those scans and their counts (the header that issued it still
   names it, so consumers keep scanning it). Two scans that each miss a carrier that
   forks and exits during its own scan could still drop a token whose child lives; only
   this invocation's later headers and attestations lose it;
+  With an instance binding, inherited tokens instead remain until owner-authorized
+  extinction, and unfenced inherited markers keep completeness UNKNOWN;
 - their incomplete state — a header that is not exactly `complete: true` with no reasons
   (every header, including a writer's repeated one), an `incomplete` record, an
   in-process job still open once its invocation is gone, an unparseable line — makes
@@ -939,13 +1077,14 @@ answer stays `unknown` until it exits. One that started before the agent, or run
 another uid, has no effect.
 
 **Consumer rule after the agent exited** (`verifyOwnedJobRegistry(path, {
-expectedInvocation })` in `@oh-my-pi/pi-coding-agent/session/owned-job-registry`
-implements it):
+expectedInvocation, currentInstance, extinct })` in
+`@oh-my-pi/pi-coding-agent/session/owned-job-registry` implements it).
+Apply the A′ historical fence below first; the following rules apply to everything retained:
 1. Attribute each record to the latest preceding header with its `invocationPid` and,
    when the record has a `writer`, the same `writer`. At best `unknown` for: a malformed
    line; an unknown record type; a header whose fields do not have the types above
    (`invocation.pid` an integer, `invocation.startId` a decimal string or null,
-   `sessionId` a string, `complete` a boolean, `incompleteReasons` strings, `writer` a
+   `sessionId` a string, `complete` a boolean, `incompleteReasons` an array of reason records (legacy strings are never fenceable), `writer` a
    string, `ownerMarker` and every `inheritedOwnerMarkers` entry with string
    `token`/`env` and a decimal-string or null `startId`); a start record without a string
    `jobId` and `kind`, an integer `pid`, a boolean `inProcess` and a decimal-string or
@@ -973,6 +1112,80 @@ implements it):
    since the earliest of those invocations, a scan that reports hidden processes, or no
    scan on the platform → at best `unknown`.
 6. Otherwise `clear`.
+
+#### A′ extinction fencing
+
+Launch inputs are reserved single argv elements, with JSON but no shell quote characters:
+
+```text
+--a13-instance={"sandboxId":"S","generation":"123","startKey":"boot:pid1Start"}
+--a13-extinct=[{"sandboxId":"S","generation":"122","startKey":"boot:oldPid1Start"}]
+```
+
+Both flags must appear exactly once, or both must be absent. Malformed, split,
+duplicate, unpaired, or out-of-bounds inputs exit 2 before startup (including `--help`).
+Instance objects have exactly the three required fields `sandboxId`, `generation`,
+and `startKey`; missing or unknown keys are rejected. Sandbox ID and start key are strings of at most 128 UTF-8
+bytes. Generation is a canonical decimal string (`0` or a nonzero digit followed by
+digits), at most 20 digits and at most `18446744073709551615`. Each serialized instance
+is at most 512 bytes; the extinct JSON is at most 40 KiB and 64 entries. Duplicate
+`(sandboxId,generation)` entries are rejected, even with different start keys.
+Start key is required corroboration, not independent authority; fencing requires
+exact equality of all three fields. The current header must exactly match the
+supplied instance; a header without `startKey` yields UNKNOWN.
+
+The owner selects only its own reset-eligible causal fresh-Stop records for this
+Thread's sandbox, highest generation first, capped at 64. It persists the exact list
+with the launch and reuses that list for post-exit verification. Omitted generations
+remain unfenced. Registry content, including `extinctFenced`, never adds authority.
+Without the pair, there is no instance binding or fence; strict retirement refuses
+the missing instance, while attested retirement remains unchanged.
+
+New invocation headers carry `instance`. Inherited markers have
+`{token,startId,issuer}`, and header `incompleteReasons` and `incomplete.reason` use
+`{category,text,issuer}`. Adopted start records retain `issuer` and the original
+`adoptedFrom` across later takeovers. Missing, malformed or conflicting provenance,
+including an instance without `startKey`, is null and never fenceable. Dedupe includes issuer, plus marker token, reason
+category/text, or open job ID/original invocation respectively. Corroboration is
+retained in dedupe so conflicting keys are not lost. Another invocation claiming
+the current instance yields `issuer-conflict` and UNKNOWN.
+
+Only historical entries with an owner-listed issuer and one of these categories
+are fenceable: `owner-marker`, `pty-untracked`, `debug-untracked`, `eval-untracked`,
+`bash-background-uncounted`, `service-identity-unknown`, `scan-unsound`,
+`foreign-invocation-unobservable`, `open-record-unended`, `shell-backend-unreported`.
+Fresh failures, unknown categories, file integrity (`registry-io`,
+`attestation-retire-failed`), identity/parse failures and all other categories stay.
+Fenced markers no longer participate in scan tokens or the opaque baseline.
+`extinctFenced: [{issuer,category,count}]` on a new header is audit information only.
+
+Open jobs require a persisted historical end:
+
+```json
+{"type":"end","reason":"extinct","invocationPid":123,"writer":"original-writer","jobId":"job","targetStartId":"456","issuer":{"sandboxId":"S","generation":"122","startKey":"boot:oldPid1Start"}}
+```
+
+Before ordinary record attribution, find **all** headers matching the original PID,
+exact non-null `targetStartId`, and exact writer (including absence on both sides).
+Exactly one segment and one open matching job are required. Its issuer must match
+the end's issuer and the owner's extinct list, and must not be the current instance.
+Only then remove the job. Otherwise ignore the end, keep the job, and emit
+non-fenceable `parse-extinct-target`. A later duplicate header also invalidates the
+target. Ordinary ends retain latest-header attribution. Adopted ordinary ends carry
+the original `adoptedFrom` and `issuer` to distinguish colliding job IDs.
+
+**Trust boundary (option A):** historical registry provenance and categories are
+trusted as written by the engine; hostile guest rewriting is outside the A′
+guarantee. Fencing clears stale local bookkeeping only. The independent engine and
+owner censuses, which never consult the registry, decide local cessation. Fencing
+never settles activity or waits, authorizes replacement, or clears strict custody;
+a registry `clear` verdict alone proves none of those.
+
+**Shared TS/Go vectors:** `packages/coding-agent/test/fixtures/a13-extinction.json`
+contains the schema cases, complete category table and concrete JSONL record arrays.
+For each registry case, use its `options`, inject the top-level `observations`, and
+compare `openBySegment`, parser `problemCategories`, and verifier `status`.
+The Go mirror must consume the same fixture bytes, not independently copied cases.
 
 ### `set_fast_mode` payload
 
@@ -1897,7 +2110,7 @@ Failures are `success: false` with string `error`.
 - Malformed JSONL / parse-loop exceptions emit a `parse` error response and continue reading subsequent lines.
 - Empty `set_session_name` is rejected (`Session name cannot be empty`).
 - Extension UI responses and valid host-tool/host-URI updates/results with unknown `id` are ignored. These side-channel frames do not receive command response frames.
-- Normal termination occurs on stdin close, extension-triggered shutdown, or a passed `quiesce_and_exit`. Output/spool failures and unrecovered session-persistence failures are fatal.
+- Normal termination occurs on stdin close, extension-triggered shutdown, or a passed `quiesce_and_exit`, except that strict `sealed_blocked` prevents disposal and controlled exit (including stdin EOF). Output/spool failures and unrecovered session-persistence failures are fatal.
 - Session-persistence errors emit an unfiltered `{ type: "notice", level: "error", message, source: "session-persistence" }` frame and a stderr mirror. A recovered failure can still shut down normally; a failure still latched during disposal exits with code `1` after draining stdout.
 
 ## Compact Command Flows

@@ -1,5 +1,6 @@
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { logger, postmortem, readSseEvents } from "@oh-my-pi/pi-utils";
+import { ServerActivityLedger } from "../../session/activity-ledger";
 import type {
 	JsonRpcError,
 	JsonRpcMessage,
@@ -37,6 +38,7 @@ export class LegacySseConnectionTimeoutError extends Error {
 
 /** Legacy MCP HTTP+SSE transport from protocol revision 2024-11-05. */
 export class LegacySseTransport implements MCPTransport {
+	readonly activity = new ServerActivityLedger("mcp", "sse");
 	#connected = false;
 	#endpointUrl: string | null = null;
 	#sseConnection: AbortController | null = null;
@@ -194,6 +196,7 @@ export class LegacySseTransport implements MCPTransport {
 
 	#dispatchMessage(message: JsonRpcMessage): void {
 		if ("id" in message && ("result" in message || "error" in message)) {
+			this.activity.replied(message.id);
 			const pending = this.#pending.get(message.id);
 			if (pending) {
 				this.#pending.delete(message.id);
@@ -209,7 +212,8 @@ export class LegacySseTransport implements MCPTransport {
 			}
 		}
 		if ("method" in message && "id" in message && message.id != null) {
-			void this.#handleServerRequest(message as JsonRpcRequest);
+			const hold = this.activity.hold();
+			void this.#handleServerRequest(message as JsonRpcRequest).finally(() => hold.release());
 			return;
 		}
 		if ("method" in message && !("id" in message)) {
@@ -266,6 +270,7 @@ export class LegacySseTransport implements MCPTransport {
 		this.#pending.set(id, pending);
 
 		try {
+			if (!operation.signal?.aborted) this.activity.sent(id);
 			const response = await this.#postJson(body, operation.signal);
 			if (!response.ok) {
 				const text = await response.text();

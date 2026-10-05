@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { setImmediate } from "node:timers/promises";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { createMockModel, type MockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -15,6 +16,8 @@ import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-in
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { ExtensionActivityLedger, ServerActivityLedger } from "@oh-my-pi/pi-coding-agent/session/activity-ledger";
+import * as activityLedger from "@oh-my-pi/pi-coding-agent/session/activity-ledger";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import type { DeliveryHandle } from "@oh-my-pi/pi-coding-agent/session/external-delivery";
 import type { CustomMessagePayload } from "@oh-my-pi/pi-coding-agent/session/messages";
@@ -37,11 +40,14 @@ import {
 	terminalAttestationPath,
 } from "@oh-my-pi/pi-coding-agent/session/quiescence";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { IndexedSessionStorage, type SessionStorageBackend } from "../src/session/indexed-session-storage";
+import { SessionWriteConflictError } from "../src/session/session-storage";
 import { postmortem, TempDir } from "@oh-my-pi/pi-utils";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import type { DaemonCompletionNotification } from "@oh-my-pi/pi-coding-agent/launch/protocol";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
+import type { CensusResult } from "../src/session/namespace-census";
 
 const SESSION_MANAGER_MODULE = path.join(import.meta.dir, "../src/session/session-manager.ts");
 
@@ -55,12 +61,15 @@ describe("AgentSession quiesce-and-exit", () => {
 	let providerGate: PromiseWithResolvers<void> | undefined;
 
 	beforeEach(() => {
+		ExtensionActivityLedger.resetForTests();
 		tempDir = TempDir.createSync("@omp-quiesce-");
 		authStorage = createInMemoryAuthStorage();
 		authStorage.keys.setRuntime("anthropic", "test-key");
 		providerGate = undefined;
 		// Retained shells are process-global; other suites' background jobs must not leak in.
 		vi.spyOn(bashExecutor, "retainedShellWorkCount").mockReturnValue(0);
+		// Other transport suites deliberately leave cancelled remote work unsettled.
+		vi.spyOn(activityLedger, "outstandingServerWork").mockReturnValue(0);
 	});
 
 	afterEach(async () => {
@@ -68,6 +77,7 @@ describe("AgentSession quiesce-and-exit", () => {
 		const current = session;
 		session = undefined;
 		if (current) await current.dispose();
+		ExtensionActivityLedger.resetForTests();
 		authStorage.close();
 		AsyncJobManager.resetForTests();
 		vi.restoreAllMocks();
@@ -78,6 +88,8 @@ describe("AgentSession quiesce-and-exit", () => {
 		sessionManager: SessionManager;
 		modelRegistry: ModelRegistry;
 		extensionRunner?: ExtensionRunner;
+		census?: CensusResult;
+		instance?: boolean;
 	}
 
 	function sessionParts(): SessionParts {
@@ -87,7 +99,7 @@ describe("AgentSession quiesce-and-exit", () => {
 		};
 	}
 
-	function createSession(parts: SessionParts = sessionParts()): AgentSession {
+	function createSession(parts: SessionParts = sessionParts(), agentId = "Main"): AgentSession {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("expected bundled model");
 		mock = createMockModel({
@@ -104,20 +116,28 @@ describe("AgentSession quiesce-and-exit", () => {
 		manager = new AsyncJobManager({ maxRunningJobs: 4 });
 		session = new AgentSession({
 			agent,
+			a13Instance:
+				parts.instance === false ? undefined : { sandboxId: "test-sandbox", generation: "1", startKey: "boot:10" },
+			a13Extinct: parts.instance === false ? undefined : [],
+			namespaceCensus: parts.census ? () => parts.census! : undefined,
 			sessionManager: parts.sessionManager,
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: parts.modelRegistry,
 			ownedAsyncJobManager: manager,
-			agentId: "Main",
+			agentId,
 			...(parts.extensionRunner ? { extensionRunner: parts.extensionRunner } : {}),
 		});
 		return session;
 	}
 
-	async function createSessionWithExtension(factory: ExtensionFactory): Promise<AgentSession> {
+	async function createSessionWithExtension(
+		factory: ExtensionFactory,
+		agentId = "Main",
+		label = "quiesce",
+	): Promise<AgentSession> {
 		const parts = sessionParts();
 		const runtime = new ExtensionRuntime();
-		const extension = await loadExtensionFromFactory(factory, tempDir.path(), new EventBus(), runtime, "quiesce");
+		const extension = await loadExtensionFromFactory(factory, tempDir.path(), new EventBus(), runtime, label);
 		parts.extensionRunner = new ExtensionRunner(
 			[extension],
 			runtime,
@@ -125,14 +145,42 @@ describe("AgentSession quiesce-and-exit", () => {
 			parts.sessionManager,
 			parts.modelRegistry,
 		);
-		return createSession(parts);
+		return createSession(parts, agentId);
 	}
+
+	it("strict census work refuses without changing attested retirement", () => {
+		const census: CensusResult = { complete: true, work: [{ pid: 999, comm: "unowned", ppid: 0 }], reasons: [] };
+		const s = createSession({ ...sessionParts(), census });
+		const result = s.quiesceForExit(request(s, { completeness: "strict" }));
+		expect(result.status).toBe("refused");
+		if (result.status !== "refused") throw new Error("expected refusal");
+		expect(result.reason).toBe("work_active");
+		expect(result.snapshot.counts.detachedJobs).toBe(1);
+		expect(result.snapshot.census).toEqual(census);
+		expect(
+			s.quiesceForExit(request(s, { operationId: "attested-after-census", completeness: "attested" })).status,
+		).toBe("quiesced");
+	});
+
+	it("missing instance refuses strict retirement but leaves attested retirement unchanged", () => {
+		const s = createSession({
+			...sessionParts(),
+			instance: false,
+			census: { complete: true, work: [], reasons: [] },
+		});
+		const strict = s.quiesceForExit(request(s, { completeness: "strict" }));
+		expect(strict).toMatchObject({ status: "refused", reason: "completeness_unknown" });
+		if (strict.status !== "refused") throw new Error("expected refusal");
+		expect(strict.snapshot.completenessReasons).toContain("instance_identity_missing");
+		expect(s.quiesceForExit(request(s, { operationId: "attested" })).status).toBe("quiesced");
+	});
 
 	/** A quiesce request built from a fresh attestation (its epoch, instance id and session). */
 	function request(s: AgentSession, overrides: Partial<QuiesceRequest> = {}): QuiesceRequest {
 		const attested = s.attest("op-1", "nonce");
 		return {
 			operationId: "op-1",
+			completeness: "attested",
 			attempt: 1,
 			epoch: attested.epoch,
 			instanceId: attested.instanceId,
@@ -141,6 +189,130 @@ describe("AgentSession quiesce-and-exit", () => {
 			...overrides,
 		};
 	}
+
+	it("refuses unsettled server activity only under strict retirement", () => {
+		const server = new ServerActivityLedger("mcp", "session-ledger-test");
+		server.sent(1);
+		vi.spyOn(activityLedger, "outstandingServerWork").mockImplementation(() => server.count);
+		const s = createSession();
+		try {
+			const strict = s.quiesceForExit(request(s, { completeness: "strict" }));
+			expect(strict.status === "refused" && strict.reason).toBe("work_active");
+			if (strict.status === "refused") expect(strict.snapshot.counts.scheduledTurns).toBe(1);
+			expect(s.quiesceForExit(request(s, { attempt: 2 })).status).toBe("quiesced");
+		} finally {
+			server.processExited();
+		}
+	});
+
+	it("names an undeclared extension in strict refusal, without changing attested retirement", async () => {
+		const s = await createSessionWithExtension(() => {});
+		const strict = s.quiesceForExit(request(s, { completeness: "strict" }));
+		expect(strict.status).toBe("refused");
+		if (strict.status !== "refused") throw new Error("expected refusal");
+		expect(strict.reason).toBe("completeness_unknown");
+		expect(strict.snapshot.completenessReasons).toContain("extension_work_reporting_unknown:quiesce");
+		expect(s.quiesceForExit(request(s, { attempt: 2 })).status).toBe("quiesced");
+	});
+
+	it("counts extension holds only under strict and releases them idempotently", async () => {
+		const parts = sessionParts();
+		const runtime = new ExtensionRuntime();
+		const extension = await loadExtensionFromFactory(
+			api => {
+				api.workReporting = "complete";
+			},
+			tempDir.path(),
+			new EventBus(),
+			runtime,
+			"reporting",
+		);
+		const runner = new ExtensionRunner(
+			[extension],
+			runtime,
+			tempDir.path(),
+			parts.sessionManager,
+			parts.modelRegistry,
+		);
+		parts.extensionRunner = runner;
+		const s = createSession(parts);
+		const first = runner.createContext().holdWork("background request");
+		const second = runner.createContext().holdWork("another request");
+		expect(runner.workCompletenessReasons()).toEqual([]);
+		expect(s.getWorkCounts(true).scheduledTurns).toBe(2);
+		expect(s.getWorkCounts().scheduledTurns).toBe(0);
+		const refusal = s.quiesceForExit(request(s, { completeness: "strict" }));
+		expect(refusal.status === "refused" && refusal.reason).toBe("work_active");
+		first.release();
+		first.release();
+		expect(s.getWorkCounts(true).scheduledTurns).toBe(1);
+		second.release();
+		expect(s.getWorkCounts(true).scheduledTurns).toBe(0);
+		extension.workReporting = undefined;
+		runner.setSuspendedExtensions(() => true);
+		const suspended = s.quiesceForExit(request(s, { attempt: 2, completeness: "strict" }));
+		expect(suspended.status === "refused" && suspended.reason).toBe("completeness_unknown");
+		if (suspended.status === "refused") {
+			expect(suspended.snapshot.completenessReasons).toContain("extension_work_reporting_unknown:reporting");
+		}
+		expect(s.quiesceForExit(request(s, { attempt: 3 })).status).toBe("quiesced");
+	});
+
+	it("keeps a completed child's hold visible to main through parking and disposal", async () => {
+		let hold: { release(): void } | undefined;
+		const child = await createSessionWithExtension(
+			api => {
+				api.workReporting = "complete";
+				api.on("agent_end", (_event, ctx) => {
+					hold = ctx.holdWork("child background effects");
+				});
+			},
+			"0-Child",
+			"child",
+		);
+		const main = await createSessionWithExtension(api => {
+			api.workReporting = "complete";
+		});
+		try {
+			await child.prompt("complete the child task");
+			expect(child.isStreaming).toBe(false);
+			expect(hold).toBeDefined();
+			for (const parked of [false, true]) {
+				if (parked) await child.dispose();
+				const refusal = main.quiesceForExit(request(main, { completeness: "strict", attempt: parked ? 2 : 1 }));
+				expect(refusal.status === "refused" && refusal.reason).toBe("work_active");
+				expect(main.getWorkCounts(true).scheduledTurns).toBe(1);
+				expect(main.getWorkCounts().scheduledTurns).toBe(0);
+			}
+			hold!.release();
+			hold!.release();
+			expect(main.getWorkCounts(true).scheduledTurns).toBe(0);
+		} finally {
+			hold?.release();
+			await child.dispose();
+		}
+	});
+
+	it("names a child-only undeclared extension in main strict completeness, even after disposal", async () => {
+		const child = await createSessionWithExtension(() => {}, "0-Child", "child-only");
+		const main = await createSessionWithExtension(api => {
+			api.workReporting = "complete";
+		});
+		try {
+			for (const disposed of [false, true]) {
+				if (disposed) await child.dispose();
+				const refusal = main.quiesceForExit(request(main, { completeness: "strict", attempt: disposed ? 2 : 1 }));
+				expect(refusal.status === "refused" && refusal.reason).toBe("completeness_unknown");
+				if (refusal.status === "refused") {
+					expect(refusal.snapshot.completenessReasons).toContain("extension_work_reporting_unknown:child-only");
+					expect(refusal.snapshot.completenessReasons).not.toContain("extension_work_reporting_unknown:quiesce");
+				}
+			}
+			expect(main.quiesceForExit(request(main, { attempt: 3 })).status).toBe("quiesced");
+		} finally {
+			await child.dispose();
+		}
+	});
 
 	function readAttestation(s: AgentSession): TerminalAttestation {
 		return JSON.parse(fs.readFileSync(terminalAttestationPath(s.sessionFile!), "utf8")) as TerminalAttestation;
@@ -161,7 +333,7 @@ describe("AgentSession quiesce-and-exit", () => {
 		const s = await createSessionWithExtension(pi => {
 			pi.on("session_start", (_event, ctx) => {
 				context = ctx;
-				if (!ctx.capabilities.includes("quiesce-exit/1")) return;
+				if (!ctx.capabilities.includes("quiesce-exit/2")) return;
 				const attested = ctx.attest("op-1", "extension");
 				expect(attested.nonce).toBe("extension");
 				const result = ctx.quiesceAndExit(request(s));
@@ -183,7 +355,7 @@ describe("AgentSession quiesce-and-exit", () => {
 		const exited = Promise.withResolvers<number>();
 		await initializeExtensions(s, { ...hooks, mode: "rpc", onQuiesced: exited.resolve });
 		expect(errors).toEqual([]);
-		expect(context?.capabilities).toEqual(["quiesce-exit/1", "owned-jobs/1"]);
+		expect(context?.capabilities).toEqual(["quiesce-exit/2", "owned-jobs/1"]);
 		expect(refusals).toEqual(["refused"]);
 		expect(s.isAdmissionClosed()).toBe(false);
 		expect(context!.quiesceAndExit(request(s, { attempt: 2 })).status).toBe("quiesced");
@@ -260,6 +432,65 @@ describe("AgentSession quiesce-and-exit", () => {
 		} finally {
 			registry.unregister(id, ref);
 		}
+	});
+
+	it.each([undefined, null, "", "unknown", 1])(
+		"rejects completeness %j without consuming the attempt",
+		completeness => {
+			const s = createSession();
+			const valid = request(s);
+			const invalid = { ...valid, completeness } as unknown as QuiesceRequest;
+			if (completeness === undefined) delete (invalid as Partial<QuiesceRequest>).completeness;
+			expect(s.quiesceForExit(invalid)).toMatchObject({ status: "refused", reason: "invalid_request" });
+			expect(s.isAdmissionClosed()).toBe(false);
+			expect(s.quiesceForExit(valid)).toMatchObject({ status: "quiesced", attempt: valid.attempt });
+		},
+	);
+
+	it("refuses incomplete registry coverage only for strict retirement and memoizes the refusal", () => {
+		const s = createSession();
+		const registry = s.ownedJobRegistry!;
+		registry.beginPtyRun({ command: "finished PTY", cwd: tempDir.path() })();
+		const strict = request(s, { completeness: "strict" });
+		const result = s.quiesceForExit(strict);
+		expect(result).toMatchObject({
+			status: "refused",
+			reason: "completeness_unknown",
+			snapshot: { registry: { path: registry.path, complete: false } },
+		});
+		expect(s.isAdmissionClosed()).toBe(false);
+		expect(fs.existsSync(terminalAttestationPath(s.sessionFile!))).toBe(false);
+		expect(s.quiesceForExit({ ...strict, completeness: "attested" })).toBe(result);
+		expect(s.quiesceForExit(request(s, { attempt: 2 }))).toMatchObject({
+			status: "quiesced",
+			attestation: { registryComplete: false },
+		});
+	});
+
+	it("rechecks the strict epoch when a scan discovers a process that has already exited", () => {
+		const s = createSession();
+		const strict = request(s, { completeness: "strict" });
+		const registry = s.ownedJobRegistry!;
+		const scan = { supported: true, sound: true, scanned: 1, discovered: 1, opaque: [] };
+		vi.spyOn(registry, "scanAndCount").mockImplementationOnce(() => {
+			// Model the race deterministically, using real registration to advance the epoch.
+			const id = registry.registerProcess({
+				kind: "process",
+				pid: process.pid,
+				startId: "test-exited-process",
+				command: "discovered process",
+				discovered: true,
+			})!;
+			registry.end(id, "settled");
+			return { scan, live: 0 };
+		});
+		const result = s.quiesceForExit(strict);
+		expect(result).toMatchObject({ status: "refused", reason: "epoch_mismatch" });
+		if (result.status !== "refused") throw new Error("expected refusal");
+		expect(hasOutstandingWork(result.snapshot.counts)).toBe(false);
+		expect(result.snapshot.epoch).toBeGreaterThan(strict.epoch);
+		expect(result.snapshot.registry).toBeUndefined();
+		expect(s.isAdmissionClosed()).toBe(false);
 	});
 
 	it("exits an idle session with a durable attestation and admits nothing afterwards", async () => {
@@ -511,6 +742,232 @@ describe("AgentSession quiesce-and-exit", () => {
 		expect(s.isAdmissionClosed()).toBe(false);
 		expect(s.quiesceForExit(request(s))).toMatchObject({ status: "quiesced", attempt: 1 });
 	});
+
+	it.each([false, true])("blocks strict retirement until deferred publication settles (failure: %s)", async fails => {
+		const files = new Map<string, string>();
+		let gate: PromiseWithResolvers<void> | undefined;
+		const publishing = Promise.withResolvers<void>();
+		const unsupported = async (): Promise<never> => {
+			throw new Error("Unexpected backend operation");
+		};
+		const backend: SessionStorageBackend = {
+			init: async () => {},
+			loadIndex: async () => [],
+			readFull: async file => files.get(file) ?? null,
+			readSlices: unsupported,
+			writeFull: async (file, body, _mtime, _title, expectedSize) => {
+				if (gate) publishing.resolve();
+				await gate?.promise;
+				const previous = files.get(file);
+				const size = previous === undefined ? null : Buffer.byteLength(previous);
+				if (expectedSize !== undefined && size !== expectedSize) {
+					throw new SessionWriteConflictError(file, expectedSize, size);
+				}
+				files.set(file, body);
+			},
+			append: async (file, line) => {
+				if (gate) publishing.resolve();
+				await gate?.promise;
+				files.set(file, (files.get(file) ?? "") + line);
+			},
+			updateSessionTitle: unsupported,
+			truncate: unsupported,
+			remove: unsupported,
+			move: unsupported,
+		};
+		const storage = new IndexedSessionStorage(backend);
+		await storage.initialize();
+		const parts = sessionParts();
+		parts.sessionManager = SessionManager.create(tempDir.path(), path.join(tempDir.path(), "sessions"), storage);
+		const s = createSession({ ...parts, census: { complete: true, work: [], reasons: [] } });
+		vi.spyOn(s.ownedJobRegistry!, "scanAndCount").mockReturnValue({
+			scan: { supported: true, sound: true, scanned: 1, discovered: 0, opaque: [] },
+			live: 0,
+		});
+		await s.prompt("materialize the transcript");
+		await parts.sessionManager.ensureOnDisk();
+		await parts.sessionManager.flush();
+		gate = Promise.withResolvers<void>();
+		const failure = new Error("backend publication failed");
+		const req = request(s, { completeness: "strict" });
+		try {
+			expect(s.quiesceForExit(req)).toMatchObject({
+				status: "sealed_blocked",
+				progress: { finalized: false, bound: false, attested: false },
+			});
+			await publishing.promise;
+			expect(s.quiesceForExit({ ...req, attempt: 2 })).toMatchObject({
+				status: "sealed_blocked",
+				progress: { finalized: false },
+			});
+			if (fails) gate.reject(failure);
+			else gate.resolve();
+			await storage.drain().catch(() => {});
+			// Let the manager's confirmation/readback continuation finish.
+			await setImmediate();
+			if (fails) {
+				expect(s.quiesceForExit({ ...req, attempt: 3 })).toMatchObject({
+					status: "sealed_blocked",
+					progress: { finalized: false },
+				});
+				expect(() => parts.sessionManager.flushSync()).toThrow(failure);
+			} else {
+				const result = s.quiesceForExit({ ...req, attempt: 3 });
+				expect(result.status).toBe("quiesced");
+				const body = files.get(s.sessionFile!)!;
+				expect(readAttestation(s).session).toMatchObject({
+					size: Buffer.byteLength(body),
+					sha256: new Bun.CryptoHasher("sha256").update(body).digest("hex"),
+				});
+				expect(body.split("\n").filter(line => line.includes('"session_exit"'))).toHaveLength(1);
+			}
+		} finally {
+			gate.resolve();
+			gate = undefined;
+			await storage.drain().catch(() => {});
+		}
+	});
+
+	it.each([false, true])(
+		"recovers a real exit append failure on sealed retry (repeat failure: %s)",
+		async repeatFailure => {
+			const s = createSession({ ...sessionParts(), census: { complete: true, work: [], reasons: [] } });
+			vi.spyOn(s.ownedJobRegistry!, "scanAndCount").mockReturnValue({
+				scan: { supported: true, sound: true, scanned: 1, discovered: 0, opaque: [] },
+				live: 0,
+			});
+			await s.prompt("materialize the transcript");
+			const req = request(s, { completeness: "strict" });
+			const write = fs.writeSync;
+			const failure = new Error("transient ENOSPC");
+			const writer = vi.spyOn(fs, "writeSync").mockImplementation((...args) => {
+				if (String(args[1]).includes('"session_exit"')) throw failure;
+				return Reflect.apply(write, fs, args);
+			});
+			const blocked = s.quiesceForExit(req);
+			expect(blocked).toMatchObject({ status: "sealed_blocked", progress: { finalized: false } });
+			expect(() => s.sessionManager.flushSync()).toThrow(failure);
+			writer.mockRestore();
+			let attempt = 2;
+			if (repeatFailure) {
+				const rename = fs.renameSync;
+				const publish = vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+					if (to === s.sessionFile) throw new Error("storage still unavailable");
+					return rename(from, to);
+				});
+				expect(s.quiesceForExit({ ...req, attempt })).toMatchObject({
+					status: "sealed_blocked",
+					progress: { finalized: false },
+				});
+				expect(() => s.sessionManager.flushSync()).toThrow(failure);
+				publish.mockRestore();
+				attempt++;
+			}
+			expect(s.attest("sealed", "nonce")).toMatchObject({ admission: "closed", sealed: true, epoch: req.epoch });
+			s.sessionManager.appendCustomEntry("must_not_append", {});
+			const passed = s.quiesceForExit({ ...req, attempt });
+			expect(passed.status).toBe("quiesced");
+			expect(() => s.sessionManager.flushSync()).not.toThrow();
+			const entries = fs
+				.readFileSync(s.sessionFile!, "utf8")
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line));
+			expect(entries.filter(entry => entry.customType === "session_exit")).toHaveLength(1);
+			expect(entries.filter(entry => entry.customType === "must_not_append")).toEqual([]);
+			expect(readAttestation(s)).toMatchObject({ kind: "quiesce", attempt });
+			expect(s.attest("still-sealed", "nonce")).toMatchObject({ admission: "closed", sealed: true });
+		},
+	);
+
+	it.each(["finalize", "bind", "counts", "evaluation_throw", "work", "unknown", "publish", "published_then_throw"])(
+		"retains a sealed strict session after %s failure and retires on a newer attempt",
+		async failure => {
+			const census: CensusResult = { complete: true, work: [], reasons: [] };
+			const s = createSession({ ...sessionParts(), census });
+			vi.spyOn(s.ownedJobRegistry!, "scanAndCount").mockReturnValue({
+				scan: { supported: true, sound: true, scanned: 1, discovered: 0, opaque: [] },
+				live: 0,
+			});
+			await s.prompt("materialize the transcript");
+			const req = request(s, { completeness: "strict" });
+			const finalize = s.sessionManager.finalizeForExit.bind(s.sessionManager);
+			const target = terminalAttestationPath(s.sessionFile!);
+			const bind = s.ownedJobRegistry!.ensureHeader.bind(s.ownedJobRegistry);
+			let finalizing = false;
+			let broken = true;
+			s.registerWorkSource({
+				kind: "scheduledTurns",
+				strictOnly: true,
+				count: () => {
+					if (broken && finalizing && failure === "evaluation_throw") throw new Error("count failed");
+					return broken && finalizing && failure === "counts" ? 1 : 0;
+				},
+			});
+			vi.spyOn(s.ownedJobRegistry!, "ensureHeader").mockImplementation(() => {
+				if (broken && finalizing && failure === "bind") throw new Error("bind failed");
+				return bind();
+			});
+			vi.spyOn(s.sessionManager, "finalizeForExit").mockImplementation(() => {
+				finalizing = true;
+				if (broken && failure === "finalize") throw new Error("finalize failed");
+				const digest = finalize();
+				if (broken && failure === "work") census.work = [{ pid: 999, comm: "late", ppid: 0 }];
+				if (broken && failure === "unknown") {
+					census.complete = false;
+					census.reasons = ["late_unknown"];
+				}
+				if (broken && failure === "publish") fs.mkdirSync(path.join(target, "occupied"), { recursive: true });
+				return digest;
+			});
+			const rename = fs.renameSync;
+			vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+				rename(from, to);
+				if (broken && failure === "published_then_throw" && to === target) {
+					broken = false;
+					throw new Error("publication bookkeeping failed");
+				}
+			});
+			const result = s.quiesceForExit(req);
+			expect(result.status).toBe("sealed_blocked");
+			expect(quiesceEndsProcess(result)).toBe(false);
+			expect(s.isSealedBlocked).toBe(true);
+			if (result.status !== "sealed_blocked") throw new Error("expected sealed block");
+			expect(result.progress).toEqual({
+				finalized: failure !== "finalize",
+				bound: failure !== "finalize" && failure !== "bind",
+				attested: false,
+			});
+			expect(s.quiesceForExit({ ...req, operationId: "late", deadline: 0 })).toMatchObject({
+				reason: "deadline_expired",
+			});
+			expect(s.quiesceForExit({ ...req, operationId: "epoch", epoch: req.epoch + 1 })).toMatchObject({
+				reason: "epoch_mismatch",
+			});
+			expect(s.quiesceForExit({ ...req, instanceId: "foreign" })).toMatchObject({ reason: "invocation_mismatch" });
+			expect(s.quiesceForExit({ ...req, sessionId: "foreign" })).toMatchObject({ reason: "session_mismatch" });
+			expect(s.attest("read", "n")).toMatchObject({ admission: "closed", sealed: true, epoch: req.epoch });
+			expect(s.quiesceForExit(req)).toBe(result);
+			expect(s.quiesceForExit({ ...req, attempt: 0 })).toMatchObject({ reason: "stale_attempt" });
+			expect(s.quiesceForExit({ ...req, operationId: "attested", completeness: "attested" })).toMatchObject({
+				reason: "admission_closed",
+			});
+			if (failure !== "publish") expect(readAttestation(s).kind).toBe("sealed_blocked");
+			const sealedBytes = fs.readFileSync(s.sessionFile!, "utf8");
+			s.sessionManager.appendCustomEntry("must_not_append", {});
+			expect(fs.readFileSync(s.sessionFile!, "utf8")).toBe(sealedBytes);
+			broken = false;
+			census.complete = true;
+			census.work = [];
+			census.reasons = [];
+			if (failure === "publish") fs.rmSync(target, { recursive: true });
+			const passed = s.quiesceForExit({ ...req, attempt: 2 });
+			expect(passed.status).toBe("quiesced");
+			expect(quiesceEndsProcess(passed)).toBe(true);
+			expect(readAttestation(s)).toMatchObject({ kind: "quiesce", attempt: 2 });
+			expect(fs.readFileSync(s.sessionFile!, "utf8")).toBe(sealedBytes);
+		},
+	);
 
 	it("exits unattested instead of wedging when the attestation cannot be written after the seal", async () => {
 		const s = createSession();
@@ -1041,6 +1498,7 @@ describe("AgentSession quiesce with an advisor", () => {
 		const attested = s.attest("op-1", "nonce");
 		return {
 			operationId: "op-1",
+			completeness: "attested",
 			attempt: 1,
 			epoch: attested.epoch,
 			instanceId: attested.instanceId,

@@ -1,3 +1,4 @@
+import { ServerActivityLedger } from "../src/session/activity-ledger";
 import { describe, expect, it } from "bun:test";
 import {
 	listResources,
@@ -146,6 +147,7 @@ describe("serverSupportsResourceSubscriptions", () => {
 describe("subscribeToResources", () => {
 	it("does not throw when one subscription fails", async () => {
 		const transport: MCPTransport = {
+			activity: new ServerActivityLedger("mcp", "test"),
 			connected: true,
 			async request<T>(_method: string, params?: Record<string, unknown>): Promise<T> {
 				if (params?.uri === "fail://x") throw new Error("boom");
@@ -162,6 +164,7 @@ describe("subscribeToResources", () => {
 describe("unsubscribeFromResources", () => {
 	it("does not throw when one unsubscription fails", async () => {
 		const transport: MCPTransport = {
+			activity: new ServerActivityLedger("mcp", "test"),
 			connected: true,
 			async request<T>(_method: string, params?: Record<string, unknown>): Promise<T> {
 				if (params?.uri === "fail://x") throw new Error("boom");

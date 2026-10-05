@@ -46,6 +46,36 @@ function killReported(pids: Iterable<number>) {
 }
 
 describe.skipIf(process.platform === "win32")("Shell spawnedProcesses", () => {
+	it("settles each queued run with its own background snapshot", async () => {
+		const shell = new Shell({});
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "shell-queued-"));
+		const release = path.join(dir, "release");
+		const started = Promise.withResolvers<void>();
+		// Gate on output, not submission order: native tasks may start in either order.
+		const first = shell.run(
+			{ command: `printf ready; while [ ! -e '${release}' ]; do sleep 0.01; done; true` },
+			(err, chunk) => {
+				if (!err && chunk.includes("ready")) started.resolve();
+			},
+		);
+		await started.promise;
+		let secondSettled = false;
+		const second = shell.run({ command: "sleep 1; { sleep 3; } >/dev/null 2>&1 &" }).then(result => {
+			secondSettled = true;
+			return result;
+		});
+		await fs.writeFile(release, "");
+		try {
+			const result = await first;
+			expect(result.liveBackgroundJobs).toBe(0);
+			expect(secondSettled).toBe(false);
+			expect((await second).liveBackgroundJobs).toBe(1);
+		} finally {
+			await second;
+			await shell.run({ command: "wait" });
+		}
+	});
+
 	it("reports the live reparented grandchild of `nohup cmd &` with its identity", async () => {
 		const { result, bang } = await runWithBang("nohup /bin/sleep 7411 >/dev/null 2>&1 & printf 'bang=%s\\n' \"$!\"");
 		const reparented = (result.spawnedProcesses ?? []).filter(entry => entry.reparented);

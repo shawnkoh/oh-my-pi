@@ -1,3 +1,4 @@
+import { ServerActivityLedger } from "../src/session/activity-ledger";
 import { expect, test, vi } from "bun:test";
 import type { CustomToolContext } from "../src/extensibility/custom-tools/types";
 import { MCPManager } from "../src/mcp/manager";
@@ -13,6 +14,7 @@ function createFakeConnection() {
 	let isRequestCalled = false;
 
 	const transport: MCPTransport = {
+		activity: new ServerActivityLedger("mcp", "test"),
 		async request(_method: string, _params?: Record<string, unknown>, options?: MCPRequestOptions) {
 			isRequestCalled = true;
 			capturedSignal = options?.signal;
