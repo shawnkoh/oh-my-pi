@@ -1074,6 +1074,7 @@ class RpcClient(WireClient):
         *,
         images: Sequence[ImageContent] | None = None,
         streaming_behavior: StreamingBehavior | None = None,
+        literal: bool | None = None,
     ) -> str:
         """Submit a prompt and return its request id once accepted.
 
@@ -1086,11 +1087,13 @@ class RpcClient(WireClient):
             message=message,
             images=cast(JsonValue, list(images)) if images is not None else None,
             streamingBehavior=streaming_behavior,
+            literal=literal,
         )
         return request_id
 
     def abort_and_prompt(
-        self, message: str, *, images: Sequence[ImageContent] | None = None
+        self, message: str, *, images: Sequence[ImageContent] | None = None,
+        literal: bool | None = None,
     ) -> str:
         """Abort the current run and submit a prompt; returns its request id."""
         request_id = self._next_request_id()
@@ -1099,6 +1102,7 @@ class RpcClient(WireClient):
             request_id,
             message=message,
             images=cast(JsonValue, list(images)) if images is not None else None,
+            literal=literal,
         )
         return request_id
 
@@ -1108,6 +1112,7 @@ class RpcClient(WireClient):
         *,
         images: Sequence[ImageContent] | None = None,
         streaming_behavior: StreamingBehavior | None = None,
+        literal: bool | None = None,
         timeout: float | None = None,
     ) -> PromptTurn:
         """Submit a prompt and wait for its own `prompt_result`, i.e. the agent's yield.
@@ -1132,6 +1137,7 @@ class RpcClient(WireClient):
                 message=message,
                 images=cast(JsonValue, list(images)) if images is not None else None,
                 streamingBehavior=streaming_behavior,
+                literal=literal,
             )
             if not agent_invoked:
                 with self._event_condition:

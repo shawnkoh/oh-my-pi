@@ -432,7 +432,7 @@ elif request.method in {"input", "editor"}:
     client.send_ui_value(request.id, "approved")
 ```
 
-After `client.set_ask_dialog(True)`, the agent's `ask` tool sends one `ask`
+After `client.set_ask_dialog(enabled=True)`, the agent's `ask` tool sends one `ask`
 request carrying every question (`request.questions`) instead of one `select`
 per question. Answer with one `AskAnswer` per question, in order; hosts always
 offer free text, sent as `custom_input`:
@@ -450,6 +450,15 @@ if request.method == "ask":
 
 Servers without the command raise `RpcCommandError` from `set_ask_dialog`, so
 keep handling `select` as the fallback.
+
+For engines advertising `rich-ask/2`, call
+`result = client.set_ask_dialog(enabled=True, rich=True)` and inspect
+`result.rich` before sending rich answers. The generated method returns the
+full result (`enabled`, optional `rich`), not an unwrapped boolean.
+Engines advertising `literal-input/1` also accept `literal=True` on
+`prompt`, `prompt_and_wait`, `steer`, `follow_up` and `abort_and_prompt`.
+Input hooks still run; command dispatch, templates and model mentions are
+bypassed for the resulting literal text.
 
 For non-interactive scripts, you can install a default headless policy instead of
 handling every request manually:

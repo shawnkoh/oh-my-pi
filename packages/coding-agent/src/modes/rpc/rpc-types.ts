@@ -16,6 +16,7 @@ import type {
 	DeliverySettlement,
 	ExternalDeliveryListing,
 } from "../../session/external-delivery";
+import { EXTERNAL_DELIVERY_CAPABILITY } from "../../session/external-delivery";
 import type { CustomMessagePayload } from "../../session/messages";
 import type { CacheWarmingMode } from "../../session/cache-warmer";
 import type { FileEntry, SessionEntry, SessionTreeNode } from "../../session/session-entries";
@@ -39,14 +40,23 @@ export type RpcCommand =
 	// Protocol
 	| { id?: string; type: "negotiate_protocol"; protocolVersion: number }
 
-	// Prompting
-	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
-	| { id?: string; type: "steer"; message: string; images?: ImageContent[] }
-	| { id?: string; type: "follow_up"; message: string; images?: ImageContent[] }
+	// Prompting. `literal: true` delivers `message` verbatim as the user's text:
+	// no slash/skill/builtin/extension/custom command dispatch, template or
+	// model-mention expansion (capability `literal-input/1`).
+	| {
+			id?: string;
+			type: "prompt";
+			message: string;
+			images?: ImageContent[];
+			streamingBehavior?: "steer" | "followUp";
+			literal?: boolean;
+	  }
+	| { id?: string; type: "steer"; message: string; images?: ImageContent[]; literal?: boolean }
+	| { id?: string; type: "follow_up"; message: string; images?: ImageContent[]; literal?: boolean }
 	| { id?: string; type: "remove_queued_message"; message: string; queue: "steering" | "followUp" }
 	| { id?: string; type: "promote_queued_message"; message: string }
 	| { id?: string; type: "abort" }
-	| { id?: string; type: "abort_and_prompt"; message: string; images?: ImageContent[] }
+	| { id?: string; type: "abort_and_prompt"; message: string; images?: ImageContent[]; literal?: boolean }
 	| { id?: string; type: "new_session"; parentSession?: string }
 	| { id?: string; type: "open_session"; sessionDir: string }
 
@@ -64,7 +74,7 @@ export type RpcCommand =
 			objective?: string;
 			token_budget?: number;
 	  }
-	| { id?: string; type: "set_ask_dialog"; enabled: boolean }
+	| { id?: string; type: "set_ask_dialog"; enabled: boolean; rich?: boolean }
 	| { id?: string; type: "get_available_commands" }
 	| { id?: string; type: "get_entries"; since?: string }
 	| { id?: string; type: "get_tree" }
@@ -233,7 +243,30 @@ export interface RpcPromptResultFrame {
 	 * When false, a {@link RpcSessionSettledFrame} follows once that work is done.
 	 */
 	sessionSettled: boolean;
+	/**
+	 * Engine-local ordinal of the run whose yield answered this prompt (capability
+	 * `reply-attribution/1`). A run spans retries and continuations up to its
+	 * yield. Prompts reported with the same `run` were answered together, e.g. a
+	 * follow-up folded into a live turn. Absent when no run answered.
+	 */
+	run?: number;
+	/** Session entry id of this prompt's persisted user message, when it could be identified. */
+	promptEntryId?: string;
+	/**
+	 * Session entry ids of the assistant messages that followed this prompt's
+	 * user message up to the next user message, in order; the last is the reply.
+	 * Empty when the prompt's message could not be identified: a non-literal
+	 * prompt in a run that delivered several messages, identical literal texts
+	 * answered together, or a session or branch change during the run. Any
+	 * persisted user message (including host steers and extension messages),
+	 * external delivery or goal-mode context
+	 * ends the preceding reply.
+	 */
+	replyEntryIds?: string[];
 }
+
+/** Ready-frame capability: `prompt_result` carries `run`, `promptEntryId` and `replyEntryIds`. */
+export const REPLY_ATTRIBUTION_CAPABILITY = "reply-attribution/1";
 
 /**
  * Emitted when the session goes quiet after agent activity: the last run yielded
@@ -286,15 +319,36 @@ export interface RpcOpenSessionResult {
 	sessionFile?: string;
 }
 
+/** Ready-frame capability: `prompt`/`steer`/`follow_up`/`abort_and_prompt` accept `literal: true`. */
+export const LITERAL_INPUT_CAPABILITY = "literal-input/1";
+
 export interface RpcReadyFrame {
 	type: "ready";
 	protocolVersion: 1;
 	supportedProtocolVersions: [1, 2];
 	maxFrameBytes: number;
 	maxReassembledFrameBytes: number;
-	/** Optional engine capabilities a host may rely on (for example `external-delivery/1`). Absent on older engines. */
+	/** Optional engine capabilities a host may rely on. Absent on older engines. */
 	capabilities: string[];
 }
+
+/** Ready-frame capability: tool-approval selects carry an `approval` binding and interrupts cancel them. */
+export const TOOL_APPROVAL_BINDING_CAPABILITY = "tool-approval-binding/1";
+
+/** Opt-in extension of upstream's ask dialog for notes, images and chat redirects in RPC UI. */
+export const RICH_ASK_CAPABILITY = "rich-ask/2";
+
+/**
+ * Capabilities the engine always supports, one versioned name per feature
+ * (`name/major`). Features that change what a host receives also require the
+ * host to opt in; the entry only says the engine supports them.
+ */
+export const RPC_ENGINE_CAPABILITIES: readonly string[] = [
+	LITERAL_INPUT_CAPABILITY,
+	TOOL_APPROVAL_BINDING_CAPABILITY,
+	REPLY_ATTRIBUTION_CAPABILITY,
+	EXTERNAL_DELIVERY_CAPABILITY,
+];
 
 export interface RpcChunkFrame {
 	type: "rpc_chunk";
@@ -388,7 +442,13 @@ export type RpcResponse =
 			data: { enabled: boolean; active: boolean };
 	  }
 	| { id?: string; type: "response"; command: "goal"; success: true; data: RpcGoalResult }
-	| { id?: string; type: "response"; command: "set_ask_dialog"; success: true; data: { enabled: boolean } }
+	| {
+			id?: string;
+			type: "response";
+			command: "set_ask_dialog";
+			success: true;
+			data: { enabled: boolean; rich?: boolean };
+	  }
 	| {
 			id?: string;
 			type: "response";
@@ -649,6 +709,8 @@ export type RpcExtensionUIRequest =
 			title: string;
 			options: string[];
 			optionDetails?: RpcExtensionUISelectOptionDetail[];
+			/** Tool-approval selects only (capability `tool-approval-binding/1`): the exact call being decided. */
+			approval?: { toolCallId: string; toolName: string; arguments: unknown; reason?: string };
 			timeout?: number;
 	  }
 	| { type: "extension_ui_request"; id: string; method: "confirm"; title: string; message: string; timeout?: number }
@@ -674,6 +736,8 @@ export type RpcExtensionUIRequest =
 			id: string;
 			method: "ask";
 			questions: RpcAskDialogQuestion[];
+			/** Present only when the host opted in to rich-ask/2. */
+			acceptImages?: boolean;
 			timeout?: number;
 	  }
 	| { type: "extension_ui_request"; id: string; method: "cancel"; targetId: string }
@@ -830,8 +894,17 @@ export type RpcExtensionUIResponse =
 	| {
 			type: "extension_ui_response";
 			id: string;
-			answers: Array<{ id: string; selectedOptions: string[]; customInput?: string }>;
-	  };
+			answers: Array<{
+				id: string;
+				selectedOptions: string[];
+				customInput?: string;
+				customInputImages?: ImageContent[];
+				note?: string;
+				noteImages?: ImageContent[];
+			}>;
+	  }
+	/** Rich ask host redirects the tool to chat. */
+	| { type: "extension_ui_response"; id: string; chat: true };
 
 // ============================================================================
 // Helper type for extracting command types

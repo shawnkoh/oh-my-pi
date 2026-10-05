@@ -556,6 +556,15 @@ class ModelInfo:
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
+class ToolApprovalBinding:
+    """Exact call and evaluated arguments decided by a tool-approval select."""
+    tool_call_id: str
+    tool_name: str
+    arguments: JsonValue
+    reason: str | None = None
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
 class TodoItem:
     content: str
     status: TodoStatus
@@ -1189,6 +1198,9 @@ class PromptResultEvent:
     """Nothing will wake the session again; when false a `session_settled` follows once background work drains."""
     id: str | None = None
     error: PromptError | None = None
+    run: int | None = None
+    prompt_entry_id: str | None = None
+    reply_entry_ids: tuple[str, ...] | None = None
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -1356,6 +1368,7 @@ class SelectUiRequest:
     title: str
     options: tuple[str, ...]
     option_details: tuple[SelectOptionDetail, ...] | None = None
+    approval: ToolApprovalBinding | None = None
     timeout: int | None = None
 
 
@@ -1397,6 +1410,7 @@ class AskUiRequest:
     method: Literal["ask"] = "ask"
     questions: tuple[AskQuestion, ...]
     timeout: int | None = None
+    accept_images: bool | None = None
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -1472,12 +1486,14 @@ class ExtensionUiRequest(ExtensionUiRequestMixin):
     title: str | None = None
     options: tuple[str, ...] | None = None
     option_details: tuple[SelectOptionDetail, ...] | None = None
+    approval: ToolApprovalBinding | None = None
     timeout: int | None = None
     message: str | None = None
     placeholder: str | None = None
     prefill: str | None = None
     prompt_style: bool | None = None
     questions: tuple[AskQuestion, ...] | None = None
+    accept_images: bool | None = None
     target_id: str | None = None
     notify_type: NotifyType | None = None
     status_key: str | None = None
@@ -1498,6 +1514,9 @@ class AskAnswer:
     id: str
     selected_options: tuple[str, ...]
     custom_input: str | None = None
+    custom_input_images: tuple[ImageContent, ...] | None = None
+    note: str | None = None
+    note_images: tuple[ImageContent, ...] | None = None
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -1532,6 +1551,12 @@ class DeliverResult:
 @dataclass(slots=True, frozen=True, kw_only=True)
 class CancelDeliveryResult:
     cancelled: bool
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class SetAskDialogResult:
+    enabled: bool
+    rich: bool | None = None
 
 
 UserContent: TypeAlias = TextContent | ImageContent
@@ -1770,6 +1795,16 @@ def parse_model_info(value: object, path: str = "ModelInfo") -> ModelInfo:
         priority=optional(payload, "priority", decode_int, path),
         thinking=optional(payload, "thinking", parse_thinking_config, path),
         compat=optional(payload, "compat", decode_json_object, path),
+    )
+
+
+def parse_tool_approval_binding(value: object, path: str = "ToolApprovalBinding") -> ToolApprovalBinding:
+    payload = expect_object(value, path)
+    return ToolApprovalBinding(
+        tool_call_id=required(payload, "toolCallId", decode_str, path),
+        tool_name=required(payload, "toolName", decode_str, path),
+        arguments=required(payload, "arguments", decode_json, path),
+        reason=optional(payload, "reason", decode_str, path),
     )
 
 
@@ -2510,6 +2545,9 @@ def parse_prompt_result_event(value: object, path: str = "PromptResultEvent") ->
         session_settled=required(payload, "sessionSettled", decode_bool, path),
         id=optional(payload, "id", decode_str, path),
         error=optional(payload, "error", parse_prompt_error, path),
+        run=optional(payload, "run", decode_int, path),
+        prompt_entry_id=optional(payload, "promptEntryId", decode_str, path),
+        reply_entry_ids=optional(payload, "replyEntryIds", array(decode_str), path),
     )
 
 
@@ -2701,6 +2739,7 @@ def parse_select_ui_request(value: object, path: str = "SelectUiRequest") -> Sel
         title=required(payload, "title", decode_str, path),
         options=required(payload, "options", array(decode_str), path),
         option_details=optional(payload, "optionDetails", array(parse_select_option_detail), path),
+        approval=optional(payload, "approval", parse_tool_approval_binding, path),
         timeout=optional(payload, "timeout", decode_int, path),
     )
 
@@ -2749,6 +2788,7 @@ def parse_ask_ui_request(value: object, path: str = "AskUiRequest") -> AskUiRequ
         id=required(payload, "id", decode_str, path),
         questions=required(payload, "questions", array(parse_ask_question), path),
         timeout=optional(payload, "timeout", decode_int, path),
+        accept_images=optional(payload, "acceptImages", decode_bool, path),
     )
 
 
@@ -2837,12 +2877,14 @@ def parse_extension_ui_request(value: object, path: str = "ExtensionUiRequest") 
         title=optional(payload, "title", decode_str, path),
         options=optional(payload, "options", array(decode_str), path),
         option_details=optional(payload, "optionDetails", array(parse_select_option_detail), path),
+        approval=optional(payload, "approval", parse_tool_approval_binding, path),
         timeout=optional(payload, "timeout", decode_int, path),
         message=optional(payload, "message", decode_str, path),
         placeholder=optional(payload, "placeholder", decode_str, path),
         prefill=optional(payload, "prefill", decode_str, path),
         prompt_style=optional(payload, "promptStyle", decode_bool, path),
         questions=optional(payload, "questions", array(parse_ask_question), path),
+        accept_images=optional(payload, "acceptImages", decode_bool, path),
         target_id=optional(payload, "targetId", decode_str, path),
         notify_type=optional(payload, "notifyType", _decode_notify_type, path),
         status_key=optional(payload, "statusKey", decode_str, path),
@@ -2863,6 +2905,9 @@ def parse_ask_answer(value: object, path: str = "AskAnswer") -> AskAnswer:
         id=required(payload, "id", decode_str, path),
         selected_options=required(payload, "selectedOptions", array(decode_str), path),
         custom_input=optional(payload, "customInput", decode_str, path),
+        custom_input_images=optional(payload, "customInputImages", array(parse_image_content), path),
+        note=optional(payload, "note", decode_str, path),
+        note_images=optional(payload, "noteImages", array(parse_image_content), path),
     )
 
 
@@ -2907,6 +2952,14 @@ def parse_cancel_delivery_result(value: object, path: str = "CancelDeliveryResul
     payload = expect_object(value, path)
     return CancelDeliveryResult(
         cancelled=required(payload, "cancelled", decode_bool, path),
+    )
+
+
+def parse_set_ask_dialog_result(value: object, path: str = "SetAskDialogResult") -> SetAskDialogResult:
+    payload = expect_object(value, path)
+    return SetAskDialogResult(
+        enabled=required(payload, "enabled", decode_bool, path),
+        rich=optional(payload, "rich", decode_bool, path),
     )
 
 
@@ -3025,20 +3078,24 @@ class WireClient:
     def _listen(self, frame_type: str, listener: Callable[..., None]) -> Callable[[], None]:
         raise NotImplementedError
 
-    def steer(self, message: str, *, images: Sequence[ImageContent] | None = None) -> None:
+    def steer(self, message: str, *, images: Sequence[ImageContent] | None = None, literal: bool | None = None) -> None:
         """Queue a steering message."""
         params: dict[str, object] = {}
         params["message"] = message
         if images is not None:
             params["images"] = list(images)
+        if literal is not None:
+            params["literal"] = literal
         self._command("steer", params)
 
-    def follow_up(self, message: str, *, images: Sequence[ImageContent] | None = None) -> None:
+    def follow_up(self, message: str, *, images: Sequence[ImageContent] | None = None, literal: bool | None = None) -> None:
         """Queue a follow-up message."""
         params: dict[str, object] = {}
         params["message"] = message
         if images is not None:
             params["images"] = list(images)
+        if literal is not None:
+            params["literal"] = literal
         self._command("follow_up", params)
 
     def deliver(self, record: DeliveryRecord, options: DeliveryOptions) -> DeliverResult:
@@ -3106,11 +3163,13 @@ class WireClient:
             params["token_budget"] = token_budget
         return parse_goal_result(self._command("goal", params), "goal")
 
-    def set_ask_dialog(self, enabled: bool) -> bool:
+    def set_ask_dialog(self, *, enabled: bool, rich: bool | None = None) -> SetAskDialogResult:
         """Opt in to `ask` UI requests; returns the applied setting."""
         params: dict[str, object] = {}
         params["enabled"] = enabled
-        return required(expect_object(self._command("set_ask_dialog", params), "set_ask_dialog"), "enabled", decode_bool, "set_ask_dialog")
+        if rich is not None:
+            params["rich"] = rich
+        return parse_set_ask_dialog_result(self._command("set_ask_dialog", params), "set_ask_dialog")
 
     def get_available_commands(self) -> tuple[AvailableSlashCommand, ...]:
         """List the slash-command catalog."""
@@ -3727,6 +3786,7 @@ __all__ = [
     "SessionState",
     "SessionStats",
     "SessionTree",
+    "SetAskDialogResult",
     "SetEditorTextUiRequest",
     "SetStatusUiRequest",
     "SetTitleUiRequest",
@@ -3759,6 +3819,7 @@ __all__ = [
     "TodoReminderEvent",
     "TodoStatus",
     "TokenUsage",
+    "ToolApprovalBinding",
     "ToolCall",
     "ToolDescriptor",
     "ToolExecutionEndEvent",
@@ -3894,6 +3955,7 @@ __all__ = [
     "parse_session_state",
     "parse_session_stats",
     "parse_session_tree",
+    "parse_set_ask_dialog_result",
     "parse_set_editor_text_ui_request",
     "parse_set_status_ui_request",
     "parse_set_title_ui_request",
@@ -3918,6 +3980,7 @@ __all__ = [
     "parse_todo_phase",
     "parse_todo_reminder_event",
     "parse_token_usage",
+    "parse_tool_approval_binding",
     "parse_tool_call",
     "parse_tool_descriptor",
     "parse_tool_execution_end_event",
