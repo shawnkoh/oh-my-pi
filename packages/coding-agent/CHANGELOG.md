@@ -17,6 +17,9 @@
 ### Fixed
 
 - Fixed an `EPIPE: broken pipe` unhandled rejection crashing the session when a debug adapter, eval kernel, IDA worker, or RPC server exits mid-write (seen on Windows) ([#14196](https://github.com/can1357/oh-my-pi/pull/14196) by [@andrebrait](https://github.com/andrebrait))
+### Added
+
+- Added the default-off `goal.toolDefault` setting, which lets the top-level agent start goal mode itself in ordinary sessions (subagents get `goal` only when their tool list requests it); an explicit `--tools=...,goal` now also exposes the tool while the default stays hidden. The agent cannot start a goal while plan mode is active or paused, and cannot resume a goal you paused — run `/goal resume` ([#13877](https://github.com/can1357/oh-my-pi/pull/13877) by [@shawnkoh](https://github.com/shawnkoh))
 
 ## [18.5.1] - 2026-10-03
 
