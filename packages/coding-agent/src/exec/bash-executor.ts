@@ -12,6 +12,7 @@ import {
 	type ShellFilesystem,
 	type ShellRunResult,
 } from "@oh-my-pi/pi-natives";
+import { logger } from "@oh-my-pi/pi-utils";
 import { $env } from "@oh-my-pi/pi-utils/env";
 import { isCmdShell, isExecutable, type ShellConfig } from "@oh-my-pi/pi-utils/procmgr";
 import { Settings } from "../config/settings";
@@ -25,6 +26,7 @@ import { getOrCreateSnapshot } from "../utils/shell-snapshot";
 import { TerminalGraphicsDecoder } from "../utils/terminal-graphics";
 import { loadDirenvEnv } from "./direnv";
 import { buildNonInteractiveEnv } from "./non-interactive-env";
+import { OwnedJobRegistry, ownerMarkerEnv } from "../session/owned-job-registry";
 
 import {
 	cfgBashDirenv,
@@ -186,15 +188,30 @@ const shellSessionQuarantines = new Map<string, Promise<unknown>>();
 const shellSessionsInUse = new Set<string>();
 
 /**
- * Shells retained past their turn because a background (`nohup`/`&`) job is
- * still running. A per-call `:async:` Shell is normally dropped at teardown,
- * which SIGKILLs its children via kill-on-drop. Keeping the reference alive lets
- * the process survive across turns; the Shell is dropped once its last
- * background job exits (reaped by the poll loop below). Children stay
- * kill-on-drop, so they still die when the harness tears the Shell down on exit.
+ * Shells with a live background (`nohup`/`&`) job after a run settled. A per-call
+ * `:async:` Shell is normally dropped at teardown, which SIGKILLs its children via
+ * kill-on-drop; holding the reference here lets the job survive across turns. The Shell
+ * is released once its last background job exits (reaped by the poll loop below).
+ * Children stay kill-on-drop, so they still die when the harness tears the Shell down on
+ * exit. Each entry holds an open `retained-shell` registry record: a background job can
+ * spawn processes after its run returned (`(sleep 1; cmd) &`, loops), which no survivor
+ * report sees, so a crash while the shell is retained leaves the registry unable to vouch
+ * for them.
  */
-const retainedShells = new Set<Shell>();
+const backgroundShells = new Map<Shell, string | undefined>();
 const RETAIN_REAP_INTERVAL_MS = 5_000;
+/** Native shell runs that have started but not settled (including cancelled runs still unwinding). */
+let unsettledShellRuns = 0;
+let shellRunSequence = 0;
+
+/**
+ * Shell work that outlives the tool call that started it: shells retained for
+ * live background jobs plus native runs that have not settled yet. Counted by
+ * session quiescence checks.
+ */
+export function retainedShellWorkCount(): number {
+	return backgroundShells.size + unsettledShellRuns;
+}
 // Native cancellation may spend two seconds unwinding the shell before its
 // N-API chunk bridge drains. The JS watchdog must not race that teardown.
 const NATIVE_TIMEOUT_FALLBACK_GRACE_MS = 5_000;
@@ -206,27 +223,52 @@ const NATIVE_TIMEOUT_FALLBACK_GRACE_MS = 5_000;
 // (#10308). The backing timer is unref'd so it never keeps the process alive.
 const QUARANTINE_CLEANUP_TIMEOUT_MS = 30_000;
 
-async function retainShellWithLiveBackgroundJobs(shell: Shell): Promise<void> {
+/**
+ * After a run settled: keep a Shell that still has live background jobs, with an open
+ * `retained-shell` record, until they exit. A cancelled or timed-out run tears its Shell
+ * down instead; background jobs still live then are untracked from here on.
+ */
+async function trackBackgroundJobs(
+	shell: Shell,
+	result: ShellRunResult,
+	context: { command: string; cwd: string },
+): Promise<void> {
+	if (backgroundShells.has(shell)) return;
+	const registry = OwnedJobRegistry.instance();
 	let live: number;
 	try {
 		live = await shell.liveBackgroundJobCount();
 	} catch {
+		registry?.markIncomplete("shell background jobs could not be counted");
 		return;
 	}
 	if (live <= 0) return;
-	retainedShells.add(shell);
+	if (result.cancelled || result.timedOut) {
+		registry?.markIncomplete("a cancelled shell run left background jobs running");
+		return;
+	}
+	const jobId = registry?.registerInProcessJob({
+		jobId: `retained-shell:${++shellRunSequence}`,
+		kind: "retained-shell",
+		...context,
+	});
+	backgroundShells.set(shell, jobId);
+	const release = (): void => {
+		clearInterval(interval);
+		backgroundShells.delete(shell);
+		if (jobId) registry?.end(jobId, "settled");
+	};
 	const interval = setInterval(() => {
-		void shell
-			.liveBackgroundJobCount()
-			.then(remaining => {
-				if (remaining > 0) return;
-				clearInterval(interval);
-				retainedShells.delete(shell);
-			})
-			.catch(() => {
-				clearInterval(interval);
-				retainedShells.delete(shell);
-			});
+		void shell.liveBackgroundJobCount().then(
+			remaining => {
+				if (remaining <= 0) release();
+			},
+			() => {
+				// The shell can no longer be asked, so its jobs can no longer be vouched for.
+				registry?.markIncomplete("shell background jobs could not be counted");
+				release();
+			},
+		);
 	}, RETAIN_REAP_INTERVAL_MS);
 	interval.unref?.();
 }
@@ -270,17 +312,17 @@ function quarantineShellSession(
  * Drops every persistent Shell owned by an agent session (keys built with
  * `agentSessionKey` as the {@link BashExecutorOptions.sessionKey}). The map is
  * process-global, so without this each disposed session keeps its native shell
- * for the life of the process. A Shell with live background jobs is retained
- * until they exit, matching the `:async:` teardown; an in-flight run keeps its
- * own reference and drops the Shell when it settles.
+ * for the life of the process. A Shell with live background jobs is already
+ * held, with its open `retained-shell` record, by {@link trackBackgroundJobs}
+ * from the run that left them, until they exit; an in-flight run keeps its own
+ * reference and is tracked the same way when it settles. Releasing therefore
+ * never ends a retained-shell record early.
  */
 export function releaseShellSessions(agentSessionKey: string | undefined): void {
 	if (!agentSessionKey) return;
 	const prefix = `${agentSessionKey}\n`;
-	for (const [key, shell] of shellSessions) {
-		if (!key.startsWith(prefix)) continue;
-		shellSessions.delete(key);
-		if (!shellSessionsInUse.has(key)) void retainShellWithLiveBackgroundJobs(shell);
+	for (const key of shellSessions.keys()) {
+		if (key.startsWith(prefix)) shellSessions.delete(key);
 	}
 }
 
@@ -554,7 +596,9 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 		direnvSetting: virtualCwd ? "off" : cfgBashDirenv.get(settings),
 		commandPrefix: prefix,
 	});
-	const commandEnv = buildNonInteractiveEnv(preflight.env);
+	// Every process the command starts inherits the owner marker, so the owned-job registry
+	// can find it even if it double-forks away from the shell.
+	const commandEnv = { ...buildNonInteractiveEnv(preflight.env), ...ownerMarkerEnv() };
 	const runCdInPersistentShell = options?.useUserShell === true && !prefix && isPersistentShellCdCommand(command);
 	// Never wrap in cmd.exe: it is only the Windows no-bash fallback for spawn
 	// paths, and the embedded brush shell runs the POSIX line better directly.
@@ -609,6 +653,9 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 
 	if (usePty && ptyRequest) {
 		const requestedMs = options?.timeout;
+		// A PTY shell's descendants are not reported back, so the registry can no longer vouch
+		// for every process; the run itself is recorded so a crash mid-run leaves an open record.
+		const endPtyRun = OwnedJobRegistry.instance()?.beginPtyRun({ command, cwd: commandCwd ?? process.cwd() });
 		try {
 			return await executeUserShellPty({
 				shell,
@@ -624,6 +671,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 				dump,
 			});
 		} finally {
+			endPtyRun?.();
 			await sink.dispose();
 		}
 	}
@@ -701,22 +749,60 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	let resetSession = false;
 
 	try {
-		const runPromise = executionShell.run(
-			{
-				command: finalCommand,
-				cwd: commandCwd,
-				env: commandEnv,
-				timeoutMs: nativeTimeoutMs,
-				signal: runAbortController.signal,
-				filesystem: options?.filesystem,
-			},
-			(err, chunk) => {
-				if (!err) {
-					enqueueChunk(chunk);
-				}
-			},
+		// Record the run before it can spawn anything: its external children live
+		// in their own sessions, so a run that never settles (crash) leaves the
+		// registry unable to vouch for them.
+		const registry = OwnedJobRegistry.instance();
+		const registryContext = {
+			command,
+			cwd: commandCwd ?? process.cwd(),
+		};
+		const runJobId = registry?.registerInProcessJob({
+			jobId: `shell-run:${++shellRunSequence}`,
+			kind: "shell-run",
+			...registryContext,
+		});
+		const runPromise = Promise.try(() =>
+			executionShell.run(
+				{
+					command: finalCommand,
+					cwd: commandCwd,
+					env: commandEnv,
+					timeoutMs: nativeTimeoutMs,
+					signal: runAbortController.signal,
+					filesystem: options?.filesystem,
+				},
+				(err, chunk) => {
+					if (!err) {
+						enqueueChunk(chunk);
+					}
+				},
+			),
 		);
 		options?.onStart?.(() => executionShell.pids());
+		// Register processes the run left alive and any retained background jobs, then
+		// close the run record, so no moment exists without an open record. A rejected run
+		// reports no survivors, and an incomplete report may have missed some.
+		unsettledShellRuns++;
+		const settleRun = (): void => {
+			if (runJobId) registry?.end(runJobId, "settled");
+			unsettledShellRuns--;
+		};
+		void runPromise
+			.then(
+				async result => {
+					registry?.registerShellSurvivors(result, registryContext);
+					await trackBackgroundJobs(executionShell, result, registryContext);
+				},
+				() => {
+					registry?.markIncomplete("a shell run failed without reporting its spawned processes");
+				},
+			)
+			.finally(settleRun)
+			.catch(error => {
+				registry?.markIncomplete("shell run survivors could not be recorded");
+				logger.warn("Recording shell run survivors failed", { error: String(error) });
+			});
 
 		const ey = new ExponentialYield();
 		const winner = await ey.race<
@@ -840,15 +926,9 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			if (resetSession || options?.sessionKey?.includes(":async:")) {
 				// `:async:` keys are per-job (jobId is unique), so the Shell would
 				// otherwise stay in the process-global map forever after completion.
+				// Dropping the only reference SIGKILLs `nohup`/`&` children
+				// (kill-on-drop) unless trackBackgroundJobs retained the Shell.
 				shellSessions.delete(sessionKey);
-				// Dropping the only reference to a per-call `:async:` Shell SIGKILLs
-				// any `nohup`/`&` children (kill-on-drop). If the command left a live
-				// background job, retain the Shell so the process survives across
-				// turns; it is reaped once its last job exits and still dies with the
-				// harness. Skip on resetSession (cancel/error) — those tear down.
-				if (!resetSession && shellSession) {
-					await retainShellWithLiveBackgroundJobs(shellSession);
-				}
 			}
 		}
 	}

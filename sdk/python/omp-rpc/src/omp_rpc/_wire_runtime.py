@@ -90,6 +90,17 @@ def literal(values: frozenset[str]) -> Decoder[str]:
     return decode
 
 
+def literal_number(expected: int | float) -> Decoder[float]:
+    """Validate a numeric protocol constant without accepting booleans or strings."""
+    def decode(value: object, path: str) -> float:
+        number = decode_float(value, path)
+        if number != expected:
+            raise ValueError(f"{path} must be {expected}")
+        return number
+
+    return decode
+
+
 def array(item: Decoder[T]) -> Decoder[tuple[T, ...]]:
     def decode(value: object, path: str) -> tuple[T, ...]:
         if not isinstance(value, list):

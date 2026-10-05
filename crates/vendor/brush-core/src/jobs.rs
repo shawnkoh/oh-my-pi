@@ -622,6 +622,12 @@ impl Job {
 		self.tasks.iter().filter(|task| task.is_external()).count()
 	}
 
+	/// Whether this job runs any part in-process (a backgrounded subshell, brace group or
+	/// builtin). Such a part can start external processes long after the job was created.
+	pub fn has_internal_task(&self) -> bool {
+		self.tasks.iter().any(|task| matches!(task, JobTask::Internal(_)))
+	}
+
 	/// Iterates over the external process IDs that make up this job.
 	pub fn process_ids(&self) -> impl Iterator<Item = sys::process::ProcessId> + '_ {
 		self.tasks.iter().filter_map(|task| match task {
