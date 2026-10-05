@@ -679,17 +679,15 @@ export class TtsrCoordinator {
 				const injection = this.#getInjectionContent();
 				if (injection) {
 					const details = { rules: injection.rules.map(rule => rule.name) };
-					this.#host.agent.appendMessage(
-						markEngineInjected({
-							role: "custom",
-							customType: "ttsr-injection",
-							content: injection.content,
-							display: false,
-							details,
-							attribution: "agent",
-							timestamp: Date.now(),
-						}),
-					);
+					this.#host.agent.appendMessage({
+						role: "custom",
+						customType: "ttsr-injection",
+						content: injection.content,
+						display: false,
+						details,
+						attribution: "agent",
+						timestamp: Date.now(),
+					});
 					this.#host.sessionManager.appendCustomMessageEntry(
 						"ttsr-injection",
 						injection.content,

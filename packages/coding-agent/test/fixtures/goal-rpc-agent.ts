@@ -64,22 +64,52 @@ const { session } = await createAgentSession({
 					if (leaf) await ctx.navigateTree(leaf);
 				},
 			});
+			// GOAL_RPC_SCRIPT="abort-resume": the RPC input "goaltest-extension-turn" is handled by
+			// this input hook, which starts the next turn with the extension's own sendUserMessage
+			// (a turn the host did not start).
+			if (Bun.env.GOAL_RPC_SCRIPT === "abort-resume") {
+				pi.on("input", event => {
+					if (event.text !== "goaltest-extension-turn") return;
+					pi.sendUserMessage("pick the goal back up");
+					return { handled: true };
+				});
+			}
 		},
 	],
 });
 // GOAL_RPC_SCRIPT="slow": the first turn stalls long enough for the host to abort it.
+// GOAL_RPC_SCRIPT="abort-resume": as "slow"; the fixture resumes the runtime on the
+// next provider call without a host goal command. The goal tool cannot resume a user pause.
+const slowTurn: MockResponse = {
+	content: [{ type: "toolCall", id: "s1", name: "goal", arguments: { op: "get" } }],
+	delayMs: 10_000,
+};
 const turns: MockResponse[] =
 	Bun.env.GOAL_RPC_SCRIPT === "idle"
 		? []
 		: Bun.env.GOAL_RPC_SCRIPT === "slow"
-			? [{ content: [{ type: "toolCall", id: "s1", name: "goal", arguments: { op: "get" } }], delayMs: 10_000 }]
-			: [
-					{ content: [{ type: "toolCall", id: "t1", name: "goal", arguments: { op: "get" } }] },
-					{ content: ["Step one done."] },
-					{ content: [{ type: "toolCall", id: "t2", name: "goal", arguments: { op: "complete" } }] },
-					{ content: ["Goal complete."] },
-				];
-const mock = createMockModel({ handler: () => turns.shift() ?? { content: ["Nothing left to do."] } });
+			? [slowTurn]
+			: Bun.env.GOAL_RPC_SCRIPT === "abort-resume"
+				? [
+						slowTurn,
+						{ content: [{ type: "toolCall", id: "r1", name: "goal", arguments: { op: "get" } }] },
+						{ content: ["Resumed."] },
+					]
+				: [
+						{ content: [{ type: "toolCall", id: "t1", name: "goal", arguments: { op: "get" } }] },
+						{ content: ["Step one done."] },
+						{ content: [{ type: "toolCall", id: "t2", name: "goal", arguments: { op: "complete" } }] },
+						{ content: ["Goal complete."] },
+					];
+let calls = 0;
+const mock = createMockModel({
+	handler: async () => {
+		if (Bun.env.GOAL_RPC_SCRIPT === "abort-resume" && ++calls === 2) {
+			await session.goalRuntime.resumeGoal();
+		}
+		return turns.shift() ?? { content: ["Nothing left to do."] };
+	},
+});
 session.agent.streamFn = mock.stream;
 if (Bun.env.GOAL_RPC_PLAN === "1") {
 	session.setPlanModeState({ enabled: true, planFilePath: path.join(cwd, "plan.md") });
