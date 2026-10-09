@@ -22,7 +22,15 @@ export class RpcOutputWriter {
 	#failure: Error | undefined;
 	#closing = false;
 	#completion: { promise: Promise<void>; resolve: () => void; reject: (error: Error) => void } | undefined;
-	#deferred: { line: string; deadline: number; complete: (delivered: boolean) => void; timer: NodeJS.Timeout; prepare?: () => string | undefined } | undefined;
+	#deferred:
+		| {
+				line: string;
+				deadline: number;
+				complete: (delivered: boolean) => void;
+				timer: NodeJS.Timeout;
+				prepare?: () => string | undefined;
+		  }
+		| undefined;
 	#deferredTurn: NodeJS.Immediate | undefined;
 
 	constructor(
@@ -52,7 +60,12 @@ export class RpcOutputWriter {
 	 * already accepted by write() take priority; an unsent frame can be discarded.
 	 * Once passed to sink.write, credit remains held until its write callback.
 	 */
-	defer(line: string, deadline: number, complete: (delivered: boolean) => void, prepare?: () => string | undefined): () => void {
+	defer(
+		line: string,
+		deadline: number,
+		complete: (delivered: boolean) => void,
+		prepare?: () => string | undefined,
+	): () => void {
 		if (this.#deferred) throw new Error("RPC deferred output slot occupied");
 		if (this.#failure || this.#closing || deadline <= performance.now()) {
 			complete(false);
@@ -179,8 +192,12 @@ export class RpcOutputWriter {
 			const line = pending.prepare ? pending.prepare() : pending.line;
 			if (line === undefined) pending.complete(false);
 			else {
-				try { this.#write(line, pending.complete); }
-				catch (error) { pending.complete(false); this.#fail(error); }
+				try {
+					this.#write(line, pending.complete);
+				} catch (error) {
+					pending.complete(false);
+					this.#fail(error);
+				}
 			}
 		});
 	}

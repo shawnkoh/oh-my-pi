@@ -3724,7 +3724,8 @@ export class SessionManager {
 	 * discard the view when isCurrent() turns false.
 	 */
 	captureHistoryReadView(): SessionHistoryReadView | undefined {
-		if (this.#atomicEntryBatch || this.#entriesReleased || this.#released || this.#diskFailure || !this.#header) return undefined;
+		if (this.#atomicEntryBatch || this.#entriesReleased || this.#released || this.#diskFailure || !this.#header)
+			return undefined;
 		const revision = this.#historyReadRevision;
 		const sessionId = this.#sessionId;
 		const sessionFile = this.#sessionFile;

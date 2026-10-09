@@ -3628,6 +3628,46 @@ pub struct MessagesPage {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionHistoryEntry {
+	pub index: i64,
+	pub kind: SessionHistoryEntryKind,
+	#[serde(rename = "entryId", default, skip_serializing_if = "Option::is_none")]
+	pub entry_id: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub timestamp: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub attribution: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub text: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub truncated: Option<bool>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub images: Option<i64>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub tools: Option<Vec<String>>,
+	#[serde(rename = "toolName", default, skip_serializing_if = "Option::is_none")]
+	pub tool_name: Option<String>,
+	#[serde(rename = "isError", default, skip_serializing_if = "Option::is_none")]
+	pub is_error: Option<bool>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionHistoryPage {
+	#[serde(rename = "sessionId")]
+	pub session_id: String,
+	#[serde(rename = "sourceKind")]
+	pub source_kind: LitNativeEngine,
+	pub total: i64,
+	#[serde(rename = "omittedLines")]
+	pub omitted_lines: LitV0,
+	#[serde(rename = "leafEntryId")]
+	pub leaf_entry_id: String,
+	pub entries: Vec<SessionHistoryEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SlashCommandInput {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub hint: Option<String>,
@@ -5730,6 +5770,26 @@ pub struct GetMessagesPageParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GetSessionHistoryParams {
+	#[serde(rename = "readId")]
+	pub read_id: String,
+	#[serde(rename = "expectedSessionId")]
+	pub expected_session_id: String,
+	#[serde(rename = "expectedSessionPath")]
+	pub expected_session_path: String,
+	pub before: i64,
+	pub limit: i64,
+	#[serde(rename = "expiresAt")]
+	pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CancelSessionHistoryParams {
+	#[serde(rename = "readId")]
+	pub read_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GetLoginProvidersResult {
 	pub providers: Vec<LoginProvider>,
 }
@@ -6125,6 +6185,72 @@ impl ExternalDeliveryListingState {
 		match self {
 			Self::Queued => "queued",
 			Self::Accepted => "accepted",
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SessionHistoryEntryKind {
+	#[serde(rename = "user")]
+	User,
+	#[serde(rename = "assistant")]
+	Assistant,
+	#[serde(rename = "tool-result")]
+	ToolResult,
+	#[serde(rename = "compaction")]
+	Compaction,
+}
+
+impl SessionHistoryEntryKind {
+	/// Wire value.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::User => "user",
+			Self::Assistant => "assistant",
+			Self::ToolResult => "tool-result",
+			Self::Compaction => "compaction",
+		}
+	}
+}
+
+/// The constant `"native-engine"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct LitNativeEngine;
+
+impl Serialize for LitNativeEngine {
+	fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		serializer.serialize_str("native-engine")
+	}
+}
+
+impl<'de> Deserialize<'de> for LitNativeEngine {
+	fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+		let value = Value::deserialize(deserializer)?;
+		if value.as_str() == Some("native-engine") {
+			Ok(Self)
+		} else {
+			Err(D::Error::custom(format!("expected \"native-engine\", got {value}")))
+		}
+	}
+}
+
+/// The constant `0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct LitV0;
+
+impl Serialize for LitV0 {
+	fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		serializer.serialize_i64(0)
+	}
+}
+
+impl<'de> Deserialize<'de> for LitV0 {
+	fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+		let value = Value::deserialize(deserializer)?;
+		if value.as_i64() == Some(0) {
+			Ok(Self)
+		} else {
+			Err(D::Error::custom(format!("expected 0, got {value}")))
 		}
 	}
 }
@@ -7319,6 +7445,49 @@ impl Command for GetMessagesPageCommand {
 
 	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
 		serde_json::from_value::<MessagesPage>(data.unwrap_or_else(|| Value::Object(Map::new())))
+	}
+}
+
+/// Read a bounded committed native history page from the exact current Session without extending the supplied expiry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GetSessionHistoryCommand {
+	#[serde(rename = "readId")]
+	pub read_id: String,
+	#[serde(rename = "expectedSessionId")]
+	pub expected_session_id: String,
+	#[serde(rename = "expectedSessionPath")]
+	pub expected_session_path: String,
+	pub before: i64,
+	pub limit: i64,
+	#[serde(rename = "expiresAt")]
+	pub expires_at: i64,
+}
+
+impl Command for GetSessionHistoryCommand {
+	const NAME: &'static str = "get_session_history";
+	const TIMEOUT_MS: Option<u64> = Some(5000);
+	type Output = SessionHistoryPage;
+
+	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
+		serde_json::from_value::<SessionHistoryPage>(data.unwrap_or_else(|| Value::Object(Map::new())))
+	}
+}
+
+/// Cancel one ephemeral history read without aborting the agent or terminating its transport.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CancelSessionHistoryCommand {
+	#[serde(rename = "readId")]
+	pub read_id: String,
+}
+
+impl Command for CancelSessionHistoryCommand {
+	const NAME: &'static str = "cancel_session_history";
+	const TIMEOUT_MS: Option<u64> = Some(5000);
+	type Output = ();
+
+	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
+		let _ = data;
+		Ok(())
 	}
 }
 

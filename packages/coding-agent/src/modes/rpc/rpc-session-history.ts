@@ -31,16 +31,25 @@ export interface SessionHistoryPage {
 	leafEntryId: string;
 	entries: SessionHistoryEntry[];
 }
-export type SessionHistoryCode = "session-history-changed" | "session-source-unavailable" | "session-read-busy" |
-	"session-read-expired" | "session-page-too-large" | "invalid-arguments";
+export type SessionHistoryCode =
+	| "session-history-changed"
+	| "session-source-unavailable"
+	| "session-read-busy"
+	| "session-read-expired"
+	| "session-page-too-large"
+	| "invalid-arguments";
 export class SessionHistoryError extends Error {
-	constructor(readonly code: SessionHistoryCode) { super(code); }
+	constructor(readonly code: SessionHistoryCode) {
+		super(code);
+	}
 }
 const TEXT = 16 * 1024;
 const STRUCTURE = 16 * 1024 * 1024;
 const PAGE = 512 * 1024;
 const MAX_ENTRIES = 100_000;
-function refuse(code: SessionHistoryCode): never { throw new SessionHistoryError(code); }
+function refuse(code: SessionHistoryCode): never {
+	throw new SessionHistoryError(code);
+}
 function metadata(value: unknown, max = 1024): string {
 	if (value === undefined || value === null) return "";
 	if (typeof value !== "string") return refuse("session-source-unavailable");
@@ -49,21 +58,45 @@ function metadata(value: unknown, max = 1024): string {
 	return value;
 }
 export function validateSessionHistoryRequest(request: SessionHistoryRequest): void {
-	if (!request || typeof request.readId !== "string" || !request.readId || request.readId.length > 256 ||
-		Buffer.byteLength(request.readId) > 256 || typeof request.expectedSessionId !== "string" ||
-		!request.expectedSessionId || request.expectedSessionId.length > 256 || Buffer.byteLength(request.expectedSessionId) > 256 ||
-		typeof request.expectedSessionPath !== "string" || !request.expectedSessionPath ||
-		request.expectedSessionPath.length > 1024 || Buffer.byteLength(request.expectedSessionPath) > 1024 ||
-		!Number.isSafeInteger(request.before) || request.before < 0 || !Number.isSafeInteger(request.limit) ||
-		request.limit < 1 || request.limit > 100 || !Number.isSafeInteger(request.expiresAt)) refuse("invalid-arguments");
+	if (
+		!request ||
+		typeof request.readId !== "string" ||
+		!request.readId ||
+		request.readId.length > 256 ||
+		Buffer.byteLength(request.readId) > 256 ||
+		typeof request.expectedSessionId !== "string" ||
+		!request.expectedSessionId ||
+		request.expectedSessionId.length > 256 ||
+		Buffer.byteLength(request.expectedSessionId) > 256 ||
+		typeof request.expectedSessionPath !== "string" ||
+		!request.expectedSessionPath ||
+		request.expectedSessionPath.length > 1024 ||
+		Buffer.byteLength(request.expectedSessionPath) > 1024 ||
+		!Number.isSafeInteger(request.before) ||
+		request.before < 0 ||
+		!Number.isSafeInteger(request.limit) ||
+		request.limit < 1 ||
+		request.limit > 100 ||
+		!Number.isSafeInteger(request.expiresAt)
+	)
+		refuse("invalid-arguments");
 }
 function cleanAbsolute(value: string): boolean {
-	return value.startsWith("/") && !value.endsWith("/") && !value.includes("\0") &&
-		!value.includes("\\") && posix.normalize(value) === value;
+	return (
+		value.startsWith("/") &&
+		!value.endsWith("/") &&
+		!value.includes("\0") &&
+		!value.includes("\\") &&
+		posix.normalize(value) === value
+	);
 }
 
 /** No I/O, no context-message reconstruction, and no references retained across a yield. */
-export async function projectSessionHistory(manager: SessionManager, request: SessionHistoryRequest, signal: AbortSignal): Promise<SessionHistoryPage> {
+export async function projectSessionHistory(
+	manager: SessionManager,
+	request: SessionHistoryRequest,
+	signal: AbortSignal,
+): Promise<SessionHistoryPage> {
 	validateSessionHistoryRequest(request);
 	const remaining = request.expiresAt - Date.now();
 	if (remaining <= 0) refuse("session-read-expired");
@@ -74,10 +107,16 @@ export async function projectSessionHistory(manager: SessionManager, request: Se
 	const sessionId = metadata(view.sessionId, 256);
 	const sessionFile = metadata(view.sessionFile);
 	const cwd = metadata(view.cwd);
-	if (sessionId !== request.expectedSessionId || sessionFile !== request.expectedSessionPath ||
-		!cleanAbsolute(sessionFile) || !sessionFile.startsWith("/workspace/sessions/") ||
-		!posix.basename(sessionFile).endsWith(`_${sessionId}.jsonl`) || !cleanAbsolute(cwd) ||
-		(cwd !== "/workspace" && !cwd.startsWith("/workspace/"))) refuse("session-source-unavailable");
+	if (
+		sessionId !== request.expectedSessionId ||
+		sessionFile !== request.expectedSessionPath ||
+		!cleanAbsolute(sessionFile) ||
+		!sessionFile.startsWith("/workspace/sessions/") ||
+		!posix.basename(sessionFile).endsWith(`_${sessionId}.jsonl`) ||
+		!cleanAbsolute(cwd) ||
+		(cwd !== "/workspace" && !cwd.startsWith("/workspace/"))
+	)
+		refuse("session-source-unavailable");
 	if (view.entryCount > MAX_ENTRIES) refuse("session-page-too-large");
 	const budget = new ReadBudget(view, signal, deadline);
 	budget.check();
@@ -115,13 +154,20 @@ export async function projectSessionHistory(manager: SessionManager, request: Se
 	for (let i = 0; i < view.entryCount; i++) {
 		await budget.step();
 		if (!chain.has(i)) continue;
-		if (!await isProjected(view, i, budget)) continue;
+		if (!(await isProjected(view, i, budget))) continue;
 		total++;
 		if (request.before && total >= request.before) continue;
 		if (selected.length === request.limit) selected.shift();
 		selected.push({ position: i, index: total });
 	}
-	const page: SessionHistoryPage = { sessionId, sourceKind: "native-engine", total, omittedLines: 0, leafEntryId: leaf, entries: [] };
+	const page: SessionHistoryPage = {
+		sessionId,
+		sourceKind: "native-engine",
+		total,
+		omittedLines: 0,
+		leafEntryId: leaf,
+		entries: [],
+	};
 	let pageBytes = Buffer.byteLength(JSON.stringify(page));
 	const reserve = (bytes: number) => {
 		pageBytes += bytes;
@@ -132,7 +178,8 @@ export async function projectSessionHistory(manager: SessionManager, request: Se
 		const entry = view.getEntry(item.position);
 		if (!entry) refuse("session-history-changed");
 		const out: SessionHistoryEntry = { index: item.index, kind: "compaction" };
-		const entryId = metadata(entry.id, 256), timestamp = metadata(entry.timestamp);
+		const entryId = metadata(entry.id, 256),
+			timestamp = metadata(entry.timestamp);
 		if (entryId) out.entryId = entryId;
 		if (timestamp) out.timestamp = timestamp;
 		if (entry.type === "message") {
@@ -148,7 +195,8 @@ export async function projectSessionHistory(manager: SessionManager, request: Se
 					const attribution = metadata("attribution" in msg ? msg.attribution : undefined);
 					if (attribution) out.attribution = attribution;
 				} else {
-					const provider = metadata(msg.provider), model = metadata(msg.model);
+					const provider = metadata(msg.provider),
+						model = metadata(msg.model);
 					if (provider && model) out.model = metadata(`${provider}/${model}`);
 				}
 				reserve(Buffer.byteLength(JSON.stringify(out)) + 1);
@@ -171,7 +219,11 @@ class ReadBudget {
 	#bytes = 0;
 	#parts = 0;
 	#inspected = 0;
-	constructor(private view: SessionHistoryReadView, private signal: AbortSignal, private deadline: number) {}
+	constructor(
+		private view: SessionHistoryReadView,
+		private signal: AbortSignal,
+		private deadline: number,
+	) {}
 	check(): void {
 		if (this.signal.aborted || performance.now() >= this.deadline) refuse("session-read-expired");
 		if (!this.view.isCurrent()) refuse("session-history-changed");
@@ -204,15 +256,30 @@ async function isProjected(view: SessionHistoryReadView, position: number, budge
 	for (let i = 0; i < content.length; i++) {
 		await budget.step(0, true);
 		const current = view.getEntry(position);
-		if (!current || current.type !== "message" || !Array.isArray(current.message.content)) refuse("session-history-changed");
+		if (
+			!current ||
+			current.type !== "message" ||
+			(current.message.role !== "user" && current.message.role !== "assistant") ||
+			!Array.isArray(current.message.content)
+		)
+			refuse("session-history-changed");
 		const part = current.message.content[i];
-		if (part && (part.type === "image" || part.type === "toolCall" || (part.type === "text" && part.text.length > 0))) return true;
+		if (part && (part.type === "image" || part.type === "toolCall" || (part.type === "text" && part.text.length > 0)))
+			return true;
 	}
 	return false;
 }
 
-async function projectContent(view: SessionHistoryReadView, position: number, out: SessionHistoryEntry, budget: ReadBudget, reserve: (bytes: number) => void): Promise<void> {
-	let text = "", textBytes = 0, images = 0;
+async function projectContent(
+	view: SessionHistoryReadView,
+	position: number,
+	out: SessionHistoryEntry,
+	budget: ReadBudget,
+	reserve: (bytes: number) => void,
+): Promise<void> {
+	let text = "",
+		textBytes = 0,
+		images = 0;
 	let truncated = false;
 	const append = async (value: string) => {
 		if (truncated) return;
@@ -236,14 +303,21 @@ async function projectContent(view: SessionHistoryReadView, position: number, ou
 		}
 	};
 	const entry = view.getEntry(position);
-	if (!entry || entry.type !== "message") refuse("session-history-changed");
+	if (!entry || entry.type !== "message" || (entry.message.role !== "user" && entry.message.role !== "assistant"))
+		refuse("session-history-changed");
 	if (typeof entry.message.content === "string") await append(entry.message.content);
 	else {
 		const count = entry.message.content.length;
 		for (let i = 0; i < count; i++) {
 			await budget.step(0, true);
 			const current = view.getEntry(position);
-			if (!current || current.type !== "message" || !Array.isArray(current.message.content)) refuse("session-history-changed");
+			if (
+				!current ||
+				current.type !== "message" ||
+				(current.message.role !== "user" && current.message.role !== "assistant") ||
+				!Array.isArray(current.message.content)
+			)
+				refuse("session-history-changed");
 			const part = current.message.content[i];
 			if (!part) continue;
 			if (part.type === "text") await append(part.text);
@@ -257,6 +331,12 @@ async function projectContent(view: SessionHistoryReadView, position: number, ou
 		}
 	}
 	if (text) out.text = text;
-	if (truncated) { reserve(17); out.truncated = true; }
-	if (images) { reserve(20); out.images = images; }
+	if (truncated) {
+		reserve(17);
+		out.truncated = true;
+	}
+	if (images) {
+		reserve(20);
+		out.images = images;
+	}
 }

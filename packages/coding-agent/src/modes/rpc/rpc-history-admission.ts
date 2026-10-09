@@ -1,13 +1,22 @@
 import type { SessionManager } from "../../session/session-manager";
 import { MAX_RPC_FRAME_BYTES } from "./rpc-frame";
-import { projectSessionHistory, validateSessionHistoryRequest, SessionHistoryError, type SessionHistoryRequest } from "./rpc-session-history";
+import {
+	projectSessionHistory,
+	validateSessionHistoryRequest,
+	SessionHistoryError,
+	type SessionHistoryRequest,
+} from "./rpc-session-history";
 import type { RpcCommand, RpcResponse } from "./rpc-types";
 import type { RpcOutputWriter } from "./rpc-output";
 
 type Query = Extract<RpcCommand, { type: "get_session_history" }>;
 const HISTORY_ERRORS: Record<string, true> = {
-	"session-history-changed": true, "session-source-unavailable": true, "session-read-busy": true,
-	"session-read-expired": true, "session-page-too-large": true, "invalid-arguments": true,
+	"session-history-changed": true,
+	"session-source-unavailable": true,
+	"session-read-busy": true,
+	"session-read-expired": true,
+	"session-page-too-large": true,
+	"invalid-arguments": true,
 };
 
 /** Owns the single query credit until computation and its stdout response have both settled. */
@@ -22,18 +31,28 @@ export class RpcHistoryAdmission {
 	) {}
 
 	start(command: Query): void {
-		const id = typeof command.id === "string" && command.id.length <= 256 &&
-			Buffer.byteLength(command.id) <= 256 ? command.id : undefined;
+		const id =
+			typeof command.id === "string" && command.id.length <= 256 && Buffer.byteLength(command.id) <= 256
+				? command.id
+				: undefined;
 		const failure = (code: string): RpcResponse => ({
-			id, type: "response", command: "get_session_history", success: false, error: code, code,
+			id,
+			type: "response",
+			command: "get_session_history",
+			success: false,
+			error: code,
+			code,
 		});
 		const fail = (code: string) => this.respond(failure(code));
 		if (command.id !== undefined && id === undefined) return fail("invalid-arguments");
 		if (this.#active) return fail("session-read-busy");
 		const request: SessionHistoryRequest = {
-			readId: command.readId, expectedSessionId: command.expectedSessionId,
-			expectedSessionPath: command.expectedSessionPath, before: command.before,
-			limit: command.limit, expiresAt: command.expiresAt,
+			readId: command.readId,
+			expectedSessionId: command.expectedSessionId,
+			expectedSessionPath: command.expectedSessionPath,
+			before: command.before,
+			limit: command.limit,
+			expiresAt: command.expiresAt,
 		};
 		try {
 			validateSessionHistoryRequest(request);
@@ -45,17 +64,26 @@ export class RpcHistoryAdmission {
 		if (remaining > 5_000) return fail("invalid-arguments");
 		const deadline = performance.now() + remaining;
 		const view = this.manager.captureHistoryReadView();
-		const active = { readId: request.readId, controller: new AbortController(), discard: undefined as (() => void) | undefined };
+		const active = {
+			readId: request.readId,
+			controller: new AbortController(),
+			discard: undefined as (() => void) | undefined,
+		};
 		this.#active = active;
 		const defer = (line: string, checkRevision: boolean) => {
-			active.discard = this.writer.defer(line, deadline, () => {
-				if (this.#active === active) this.#active = undefined;
-			}, () => {
-				if (active.controller.signal.aborted || performance.now() >= deadline) return undefined;
-				if (checkRevision && !view?.isCurrent())
-					return `${JSON.stringify(failure("session-history-changed"))}\n`;
-				return line;
-			});
+			active.discard = this.writer.defer(
+				line,
+				deadline,
+				() => {
+					if (this.#active === active) this.#active = undefined;
+				},
+				() => {
+					if (active.controller.signal.aborted || performance.now() >= deadline) return undefined;
+					if (checkRevision && !view?.isCurrent())
+						return `${JSON.stringify(failure("session-history-changed"))}\n`;
+					return line;
+				},
+			);
 		};
 		void (async () => {
 			try {
@@ -72,9 +100,14 @@ export class RpcHistoryAdmission {
 				defer(line, true);
 			} catch (cause) {
 				if (!active.controller.signal.aborted) {
-					const code = cause && typeof cause === "object" && "code" in cause &&
-						typeof cause.code === "string" && Object.hasOwn(HISTORY_ERRORS, cause.code)
-						? cause.code : "session-source-unavailable";
+					const code =
+						cause &&
+						typeof cause === "object" &&
+						"code" in cause &&
+						typeof cause.code === "string" &&
+						Object.hasOwn(HISTORY_ERRORS, cause.code)
+							? cause.code
+							: "session-source-unavailable";
 					if (performance.now() < deadline) defer(`${JSON.stringify(failure(code))}\n`, false);
 				}
 			} finally {
@@ -106,10 +139,11 @@ async function encodeHistoryResponse(
 ): Promise<string> {
 	// The projector accounts escaped page bytes before retention; the correlation id
 	// was bounded at admission. Refuse before allocating a complete envelope.
-	if (512 * 1024 + 6 * 256 + 256 > MAX_RPC_FRAME_BYTES)
-		throw new SessionHistoryError("session-page-too-large");
+	if (512 * 1024 + 6 * 256 + 256 > MAX_RPC_FRAME_BYTES) throw new SessionHistoryError("session-page-too-large");
 	const chunks: string[] = [];
-	let bytes = 1, sinceYield = 0, items = 0;
+	let bytes = 1,
+		sinceYield = 0,
+		items = 0;
 	const append = async (chunk: string) => {
 		const size = Buffer.byteLength(chunk);
 		bytes += size;

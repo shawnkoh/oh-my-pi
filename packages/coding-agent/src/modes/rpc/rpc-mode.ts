@@ -389,7 +389,10 @@ export interface RpcInputFrameDeps {
 
 /** Commands answered on receipt, ahead of the serialized command queue. */
 const IMMEDIATE_RPC_COMMANDS: Readonly<Record<string, true>> = {
-	attest: true, quiesce_and_exit: true, get_session_history: true, cancel_session_history: true,
+	attest: true,
+	quiesce_and_exit: true,
+	get_session_history: true,
+	cancel_session_history: true,
 };
 
 /**
@@ -1436,12 +1439,17 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	// stdout froze the whole worker, stdin reader included. An fd write stream
 	// writes from the threadpool and reports backpressure, letting the writer spool.
 	const stdout = process.platform === "win32" ? fs.createWriteStream("", { fd: 1, autoClose: false }) : process.stdout;
-	let history: RpcHistoryAdmission | undefined;
 	const outputWriter = new RpcOutputWriter(stdout, failure => {
-		history?.cancelActive();
+		history.cancelActive();
 		logger.error("RPC output delivery failed", { error: String(failure) });
 		void session.dispose().finally(() => process.exit(1));
 	});
+	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
+		outputWriter.write(frameEncoder.encodeFrames(obj));
+		if (isRecord(obj) && obj.type === "response" && obj.command === "negotiate_protocol" && obj.success === true)
+			frameEncoder.setProtocolVersion(2);
+	};
+	const history = new RpcHistoryAdmission(session.sessionManager, outputWriter, response => output(response));
 	outputWriter.write(
 		frameEncoder.encodeFrames({
 			type: "ready",
@@ -1452,12 +1460,6 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			capabilities,
 		}),
 	);
-	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
-		outputWriter.write(frameEncoder.encodeFrames(obj));
-		if (isRecord(obj) && obj.type === "response" && obj.command === "negotiate_protocol" && obj.success === true)
-			frameEncoder.setProtocolVersion(2);
-	};
-	history = new RpcHistoryAdmission(session.sessionManager, outputWriter, response => output(response));
 	const emitRpcTitles = shouldEmitRpcTitles();
 
 	const success = <T extends RpcCommand["type"]>(
@@ -2852,9 +2854,15 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		deps: dispatchFrameDeps,
 		afterSerialCommand: () => shutdownCoordinator.checkShutdownRequested(),
 		acceptInput: command => {
-			if (command.type === "abort" || command.type === "abort_and_prompt" ||
-				command.type === "new_session" || command.type === "open_session" ||
-				command.type === "switch_session" || command.type === "branch" || command.type === "fork")
+			if (
+				command.type === "abort" ||
+				command.type === "abort_and_prompt" ||
+				command.type === "new_session" ||
+				command.type === "open_session" ||
+				command.type === "switch_session" ||
+				command.type === "branch" ||
+				command.type === "fork"
+			)
 				history?.cancelActive();
 			inputGate.accept(command);
 		},

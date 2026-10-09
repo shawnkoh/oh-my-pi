@@ -331,6 +331,26 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 		params: { "cursor?": "string", "limit?": "number.integer" },
 		result: "MessagesPage",
 	},
+	{
+		name: "get_session_history",
+		doc: "Read a bounded committed native history page from the exact current Session without extending the supplied expiry.",
+		params: {
+			readId: "string",
+			expectedSessionId: "string",
+			expectedSessionPath: "string",
+			before: "number.integer",
+			limit: "number.integer",
+			expiresAt: "number.integer",
+		},
+		result: "SessionHistoryPage",
+		timeoutMs: 5000,
+	},
+	{
+		name: "cancel_session_history",
+		doc: "Cancel one ephemeral history read without aborting the agent or terminating its transport.",
+		params: { readId: "string" },
+		timeoutMs: 5000,
+	},
 
 	{
 		name: "get_login_providers",

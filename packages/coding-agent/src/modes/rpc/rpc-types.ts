@@ -73,7 +73,16 @@ export type RpcCommand =
 
 	// State
 	| { id?: string; type: "get_state" }
-	| { id?: string; type: "get_session_history"; readId: string; expectedSessionId: string; expectedSessionPath: string; before: number; limit: number; expiresAt: number }
+	| {
+			id?: string;
+			type: "get_session_history";
+			readId: string;
+			expectedSessionId: string;
+			expectedSessionPath: string;
+			before: number;
+			limit: number;
+			expiresAt: number;
+	  }
 	| { id?: string; type: "cancel_session_history"; readId: string }
 	| { id?: string; type: "set_fast_mode"; enabled: boolean }
 	| {

@@ -3670,6 +3670,101 @@ func (v *MessagesPage) decodeFrom(raw map[string]json.RawMessage) error {
 	return nil
 }
 
+type SessionHistoryEntry struct {
+	Index       int64                   `json:"index"`
+	Kind        SessionHistoryEntryKind `json:"kind"`
+	EntryID     *string                 `json:"entryId,omitempty"`
+	Timestamp   *string                 `json:"timestamp,omitempty"`
+	Attribution *string                 `json:"attribution,omitempty"`
+	Text        *string                 `json:"text,omitempty"`
+	Truncated   *bool                   `json:"truncated,omitempty"`
+	Images      *int64                  `json:"images,omitempty"`
+	Tools       []string                `json:"tools,omitempty"`
+	ToolName    *string                 `json:"toolName,omitempty"`
+	IsError     *bool                   `json:"isError,omitempty"`
+	Model       *string                 `json:"model,omitempty"`
+}
+
+func (v *SessionHistoryEntry) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "SessionHistoryEntry", v.decodeFrom)
+}
+
+func (v *SessionHistoryEntry) decodeFrom(raw map[string]json.RawMessage) error {
+	var out SessionHistoryEntry
+	d := fieldDecoder{raw: raw, owner: "SessionHistoryEntry"}
+	d.required("index", &out.Index)
+	d.required("kind", &out.Kind)
+	d.optional("entryId", &out.EntryID)
+	d.optional("timestamp", &out.Timestamp)
+	d.optional("attribution", &out.Attribution)
+	d.optional("text", &out.Text)
+	d.optional("truncated", &out.Truncated)
+	d.optional("images", &out.Images)
+	d.optional("tools", &out.Tools)
+	d.optional("toolName", &out.ToolName)
+	d.optional("isError", &out.IsError)
+	d.optional("model", &out.Model)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+type SessionHistoryEntryKind string
+
+const (
+	SessionHistoryEntryKindUser       SessionHistoryEntryKind = "user"
+	SessionHistoryEntryKindAssistant  SessionHistoryEntryKind = "assistant"
+	SessionHistoryEntryKindToolResult SessionHistoryEntryKind = "tool-result"
+	SessionHistoryEntryKindCompaction SessionHistoryEntryKind = "compaction"
+)
+
+func (v *SessionHistoryEntryKind) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "SessionHistoryEntryKind")
+	if err != nil {
+		return err
+	}
+	switch value := SessionHistoryEntryKind(s); value {
+	case SessionHistoryEntryKindUser, SessionHistoryEntryKindAssistant, SessionHistoryEntryKindToolResult, SessionHistoryEntryKindCompaction:
+		*v = value
+		return nil
+	}
+	return unknownValue("SessionHistoryEntryKind", s)
+}
+
+type SessionHistoryPage struct {
+	SessionID   string                `json:"sessionId"`
+	Total       int64                 `json:"total"`
+	LeafEntryID string                `json:"leafEntryId"`
+	Entries     []SessionHistoryEntry `json:"entries"`
+}
+
+func (v *SessionHistoryPage) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "SessionHistoryPage", v.decodeFrom)
+}
+
+func (v *SessionHistoryPage) decodeFrom(raw map[string]json.RawMessage) error {
+	var out SessionHistoryPage
+	d := fieldDecoder{raw: raw, owner: "SessionHistoryPage"}
+	d.required("sessionId", &out.SessionID)
+	d.constant("sourceKind", "native-engine")
+	d.required("total", &out.Total)
+	d.constant("omittedLines", float64(0))
+	d.required("leafEntryId", &out.LeafEntryID)
+	d.required("entries", &out.Entries)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v SessionHistoryPage) MarshalJSON() ([]byte, error) {
+	type plain SessionHistoryPage
+	return encodeObject(plain(v), `"sourceKind":"native-engine","omittedLines":0`, nil)
+}
+
 type SlashCommandInput struct {
 	Hint *string `json:"hint,omitempty"`
 }
@@ -8609,6 +8704,33 @@ func (c Commands) GetMessagesPage(ctx context.Context, p GetMessagesPageCommand)
 	var out MessagesPage
 	err := c.call(ctx, "get_messages_page", p, 0, &out)
 	return out, err
+}
+
+// GetSessionHistoryCommand holds the parameters of "get_session_history".
+type GetSessionHistoryCommand struct {
+	ReadID              string `json:"readId"`
+	ExpectedSessionID   string `json:"expectedSessionId"`
+	ExpectedSessionPath string `json:"expectedSessionPath"`
+	Before              int64  `json:"before"`
+	Limit               int64  `json:"limit"`
+	ExpiresAt           int64  `json:"expiresAt"`
+}
+
+// GetSessionHistory sends "get_session_history": Read a bounded committed native history page from the exact current Session without extending the supplied expiry.
+func (c Commands) GetSessionHistory(ctx context.Context, p GetSessionHistoryCommand) (SessionHistoryPage, error) {
+	var out SessionHistoryPage
+	err := c.call(ctx, "get_session_history", p, 5*time.Second, &out)
+	return out, err
+}
+
+// CancelSessionHistoryCommand holds the parameters of "cancel_session_history".
+type CancelSessionHistoryCommand struct {
+	ReadID string `json:"readId"`
+}
+
+// CancelSessionHistory sends "cancel_session_history": Cancel one ephemeral history read without aborting the agent or terminating its transport.
+func (c Commands) CancelSessionHistory(ctx context.Context, p CancelSessionHistoryCommand) error {
+	return c.call(ctx, "cancel_session_history", p, 5*time.Second, nil)
 }
 
 // GetLoginProviders sends "get_login_providers": List OAuth providers and their authentication status.

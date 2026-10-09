@@ -789,6 +789,30 @@ export interface MessagesPage {
 	nextCursor?: string;
 }
 
+export interface SessionHistoryEntry {
+	index: number;
+	kind: "user" | "assistant" | "tool-result" | "compaction";
+	entryId?: string;
+	timestamp?: string;
+	attribution?: string;
+	text?: string;
+	truncated?: boolean;
+	images?: number;
+	tools?: string[];
+	toolName?: string;
+	isError?: boolean;
+	model?: string;
+}
+
+export interface SessionHistoryPage {
+	sessionId: string;
+	sourceKind: "native-engine";
+	total: number;
+	omittedLines: 0;
+	leafEntryId: string;
+	entries: SessionHistoryEntry[];
+}
+
 export interface SlashCommandInput {
 	hint?: string;
 }
@@ -1873,6 +1897,19 @@ export interface GetMessagesPageParams {
 	limit?: number;
 }
 
+export interface GetSessionHistoryParams {
+	readId: string;
+	expectedSessionId: string;
+	expectedSessionPath: string;
+	before: number;
+	limit: number;
+	expiresAt: number;
+}
+
+export interface CancelSessionHistoryParams {
+	readId: string;
+}
+
 export interface GetLoginProvidersResult {
 	providers: LoginProvider[];
 }
@@ -1963,6 +2000,8 @@ export interface RpcWireCommands {
 	handoff: { params: HandoffParams; result: HandoffResult | null };
 	get_messages: { params: undefined; result: GetMessagesResult };
 	get_messages_page: { params: GetMessagesPageParams; result: MessagesPage };
+	get_session_history: { params: GetSessionHistoryParams; result: SessionHistoryPage };
+	cancel_session_history: { params: CancelSessionHistoryParams; result: undefined };
 	get_login_providers: { params: undefined; result: GetLoginProvidersResult };
 	login: { params: LoginParams; result: LoginResult };
 	predict_word: { params: PredictWordParams; result: PredictWordResult };

@@ -73,11 +73,13 @@ describe("SessionManager committed history read view", () => {
 		expect(beforeCommit.getEntry(0)).toBeUndefined();
 		const afterCommit = manager.captureHistoryReadView()!;
 		expect(afterCommit.entryCount).toBe(2);
-		await expect(manager.appendEntriesAtomically(() => {
-			manager.appendCustomEntry("rolled-back");
-			expect(manager.captureHistoryReadView()).toBeUndefined();
-			throw new Error("abort batch");
-		})).rejects.toThrow("abort batch");
+		await expect(
+			manager.appendEntriesAtomically(() => {
+				manager.appendCustomEntry("rolled-back");
+				expect(manager.captureHistoryReadView()).toBeUndefined();
+				throw new Error("abort batch");
+			}),
+		).rejects.toThrow("abort batch");
 		expect(afterCommit.isCurrent()).toBe(false);
 		const afterRollback = manager.captureHistoryReadView()!;
 		expect(afterRollback.entryCount).toBe(2);
