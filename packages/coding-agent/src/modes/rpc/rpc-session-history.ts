@@ -58,7 +58,8 @@ export function validateSessionHistoryRequest(request: SessionHistoryRequest): v
 		request.limit < 1 || request.limit > 100 || !Number.isSafeInteger(request.expiresAt)) refuse("invalid-arguments");
 }
 function cleanAbsolute(value: string): boolean {
-	return value.startsWith("/") && !value.includes("\0") && !value.includes("\\") && posix.normalize(value) === value;
+	return value.startsWith("/") && !value.endsWith("/") && !value.includes("\0") &&
+		!value.includes("\\") && posix.normalize(value) === value;
 }
 
 /** No I/O, no context-message reconstruction, and no references retained across a yield. */

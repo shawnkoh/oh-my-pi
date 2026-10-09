@@ -51,8 +51,10 @@ describe("bounded native committed session history", () => {
 		for (const override of [{ before: -1 }, { before: 1.5 }, { limit: 101 }, { expiresAt: Date.now() + 60_000 }]) {
 			await expect(projectSessionHistory(manager, request(override), new AbortController().signal)).rejects.toMatchObject({ code: "invalid-arguments" });
 		}
-		const outside = await load([], "/workspace-other");
-		await expect(projectSessionHistory(outside, request(), new AbortController().signal)).rejects.toMatchObject({ code: "session-source-unavailable" });
+		for (const cwd of ["/workspace-other", "/workspace/", "/workspace/./child"]) {
+			const outside = await load([], cwd);
+			await expect(projectSessionHistory(outside, request(), new AbortController().signal)).rejects.toMatchObject({ code: "session-source-unavailable" });
+		}
 		await expect(projectSessionHistory(manager, request({ expiresAt: Date.now() - 1 }), new AbortController().signal)).rejects.toMatchObject({ code: "session-read-expired" });
 	});
 
