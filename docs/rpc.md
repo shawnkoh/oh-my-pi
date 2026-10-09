@@ -46,7 +46,7 @@ The initial ready frame uses protocol v1 and advertises the opt-in lossless tran
   "supportedProtocolVersions": [1, 2],
   "maxFrameBytes": 1048576,
   "maxReassembledFrameBytes": 67108864,
-  "capabilities": ["literal-input/1", "tool-approval-binding/1", "reply-attribution/1", "external-delivery/1", "quiesce-exit/2", "owned-jobs/1", "rich-ask/2"]
+  "capabilities": ["literal-input/1", "tool-approval-binding/1", "reply-attribution/1", "external-delivery/1", "quiesce-exit/2", "owned-jobs/1", "session_history_v1", "rich-ask/2"]
 }
 ```
 
@@ -123,6 +123,66 @@ Important edge behavior from runtime:
 - Malformed JSON and synchronous dispatch failures emit `command: "parse"` without an `id`. Exceptions while handling a recognized command emit a failure with that command's `type` and `id`.
 - Ordinary `prompt` handling acknowledges after the message is admitted (queued, given an idle turn slot, or routed to an extension command), not before native `input` handlers or image preparation finish, and without waiting for the agent run. `abort_and_prompt` first awaits the abort, then acknowledges. A failure before admission is the command's error response. A failure after admission can still emit a later error response with the same `id`.
 - An accepted `prompt` or `abort_and_prompt` completes exactly once: either its success response carries `data.agentInvoked: false` (finished locally), or a later `prompt_result` frame with the same `id` reports how its work ended. `prompt_result` is always written after the response for that `id`.
+
+
+## Native committed session history (`session_history_v1`)
+
+This capability is advertised in `ready` (also visible in `get_state.capabilities`).
+It adds two commands outside the serialized input queue:
+
+```json
+{"id":"history-1","type":"get_session_history","readId":"unique-read-1","expectedSessionId":"native-session-id","expectedSessionPath":"/workspace/sessions/2026-10-09_native-session-id.jsonl","before":0,"limit":50,"expiresAt":1791500000000}
+{"id":"cancel-1","type":"cancel_session_history","readId":"unique-read-1"}
+```
+
+`expiresAt` is an absolute Unix epoch millisecond timestamp, at most five seconds
+after engine admission; `before` is a nonnegative index (zero selects the newest
+page), and `limit` is 1–100. The expected Session ID and exact recorded guest
+path are identity preconditions, not a request to open a file. Hosts MUST allow
+for clock skew: expiry already elapsed at the engine is refused rather than
+retried with a later expiry. The engine converts the admitted remaining interval
+to a monotonic deadline so wall-clock changes cannot prolong work.
+
+Success has ordinary response framing and `data` containing `sessionId`,
+`sourceKind: "native-engine"`, `total`, `omittedLines: 0`, `leafEntryId`,
+and `entries`. Each entry has `index`, `entryId`, `timestamp`, `kind`,
+`attribution`, `text`, `truncated`, `images`, `tools`, `toolName`, `isError`,
+and `model` where applicable. It projects the already-loaded committed native
+journal, not `get_messages` or guest disk lines. A page fits 512 KiB and the
+complete response fits one physical frame (1 MiB); oversized pages return
+`session-page-too-large` and callers can explicitly request a smaller page.
+Failure responses include a safe `code`: `invalid-arguments`,
+`session-source-unavailable`, `session-history-changed`, `session-read-busy`,
+`session-read-expired`, or `session-page-too-large`. They contain no path or
+raw session diagnostics.
+
+Identity is checked against the current loaded header and exact manager path:
+clean absolute session paths beneath `/workspace/sessions/`, filenames ending
+in `_<sessionId>.jsonl`, and recorded header cwd equal to or beneath `/workspace`.
+Unresolved atomic entry batches refuse the read. Appends, rewrites (including
+image removal), rollback, header and leaf changes invalidate a captured view,
+including while its response waits for stdout. The newest committed journal
+entry determines the branch, not the selected navigation leaf.
+
+Each query permits at most 100,000 entry links, 16 MiB retained structure,
+100,000 inspected content parts and 16 MiB inspected string prefixes. IDs are
+bounded to 256 UTF-8 bytes; other projected metadata to 1 KiB. Text is truncated
+at 16 KiB UTF-8 with a flag; thinking, system messages, tool arguments/output,
+image data and compaction summaries are never projected. Traversal yields to
+an actual event-loop turn every 256 work items or 64 KiB of inspected strings,
+with cancellation, monotonic deadline and revision checks.
+
+Only one query is admitted per engine, including its computation and pending
+stdout delivery. An unknown/mismatched cancel is a no-op; matching cancellation
+suppresses any response not yet sent (the cancel command itself is acknowledged).
+Abort, quiesce, Session replacement, and termination cancel immediately without
+waiting for projection or stdout. Cancellation of a frame already handed to
+stdout cannot truncate it; query credit stays occupied until its actual write
+completes. A pending unsent history frame occupies one bounded slot, gives
+ordinary responses priority, and is discarded on expiry. Stalled stdout therefore
+shares the ordinary transport availability limit rather than creating an
+unbounded history-specific queue. History emits responses only, never activity
+or agent events. Quiesce remains `quiesce-exit/2` only.
 
 ## Command Schema (canonical)
 

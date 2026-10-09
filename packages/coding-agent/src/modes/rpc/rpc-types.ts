@@ -28,6 +28,7 @@ import type { LivePhase } from "@oh-my-pi/pi-tui/apps/live-visualizer";
 import type { RpcMessagesPage } from "./rpc-messages";
 import type { GoalModeState } from "../../goals/state";
 import type { RpcGoalOp, RpcGoalResult } from "./rpc-goal";
+import type { SessionHistoryPage } from "./rpc-session-history";
 import {
 	OWNED_JOBS_CAPABILITY,
 	QUIESCE_EXIT_CAPABILITY,
@@ -72,6 +73,8 @@ export type RpcCommand =
 
 	// State
 	| { id?: string; type: "get_state" }
+	| { id?: string; type: "get_session_history"; readId: string; expectedSessionId: string; expectedSessionPath: string; before: number; limit: number; expiresAt: number }
+	| { id?: string; type: "cancel_session_history"; readId: string }
 	| { id?: string; type: "set_fast_mode"; enabled: boolean }
 	| {
 			id?: string;
@@ -358,6 +361,9 @@ export const TOOL_APPROVAL_BINDING_CAPABILITY = "tool-approval-binding/1";
 /** Opt-in extension of upstream's ask dialog for notes, images and chat redirects in RPC UI. */
 export const RICH_ASK_CAPABILITY = "rich-ask/2";
 
+/** Read-only, bounded native committed journal projection. */
+export const SESSION_HISTORY_CAPABILITY = "session_history_v1";
+
 /**
  * Capabilities the engine always supports, one versioned name per feature
  * (`name/major`). Features that change what a host receives also require the
@@ -370,6 +376,7 @@ export const RPC_ENGINE_CAPABILITIES: readonly string[] = [
 	EXTERNAL_DELIVERY_CAPABILITY,
 	QUIESCE_EXIT_CAPABILITY,
 	OWNED_JOBS_CAPABILITY,
+	SESSION_HISTORY_CAPABILITY,
 ];
 
 export interface RpcChunkFrame {
@@ -456,6 +463,8 @@ export type RpcResponse =
 
 	// State
 	| { id?: string; type: "response"; command: "get_state"; success: true; data: RpcSessionState }
+	| { id?: string; type: "response"; command: "get_session_history"; success: true; data: SessionHistoryPage }
+	| { id?: string; type: "response"; command: "cancel_session_history"; success: true }
 	| { id?: string; type: "response"; command: "attest"; success: true; data: WorkAttestation }
 	| { id?: string; type: "response"; command: "quiesce_and_exit"; success: true; data: QuiesceResult }
 	| {
