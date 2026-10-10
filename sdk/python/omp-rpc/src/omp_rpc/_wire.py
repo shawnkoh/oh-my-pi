@@ -968,6 +968,32 @@ class MessagesPage:
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
+class SessionHistoryEntry:
+    index: int
+    kind: Literal["user", "assistant", "tool-result", "compaction"]
+    entry_id: str | None = None
+    timestamp: str | None = None
+    attribution: str | None = None
+    text: str | None = None
+    truncated: bool | None = None
+    images: int | None = None
+    tools: tuple[str, ...] | None = None
+    tool_name: str | None = None
+    is_error: bool | None = None
+    model: str | None = None
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class SessionHistoryPage:
+    session_id: str
+    source_kind: Literal["native-engine"] = "native-engine"
+    total: int
+    omitted_lines: Literal[0] = 0
+    leaf_entry_id: str
+    entries: tuple[SessionHistoryEntry, ...]
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
 class SlashCommandInput:
     hint: str | None = None
 
@@ -2452,6 +2478,36 @@ def parse_messages_page(value: object, path: str = "MessagesPage") -> MessagesPa
     )
 
 
+def parse_session_history_entry(value: object, path: str = "SessionHistoryEntry") -> SessionHistoryEntry:
+    payload = expect_object(value, path)
+    return SessionHistoryEntry(
+        index=required(payload, "index", decode_int, path),
+        kind=required(payload, "kind", cast('Decoder[Literal["user", "assistant", "tool-result", "compaction"]]', literal(frozenset({"user", "assistant", "tool-result", "compaction"}))), path),
+        entry_id=optional(payload, "entryId", decode_str, path),
+        timestamp=optional(payload, "timestamp", decode_str, path),
+        attribution=optional(payload, "attribution", decode_str, path),
+        text=optional(payload, "text", decode_str, path),
+        truncated=optional(payload, "truncated", decode_bool, path),
+        images=optional(payload, "images", decode_int, path),
+        tools=optional(payload, "tools", array(decode_str), path),
+        tool_name=optional(payload, "toolName", decode_str, path),
+        is_error=optional(payload, "isError", decode_bool, path),
+        model=optional(payload, "model", decode_str, path),
+    )
+
+
+def parse_session_history_page(value: object, path: str = "SessionHistoryPage") -> SessionHistoryPage:
+    payload = expect_object(value, path)
+    required(payload, "sourceKind", cast('Decoder[Literal["native-engine"]]', literal(frozenset({"native-engine"}))), path)
+    required(payload, "omittedLines", cast('Decoder[Literal[0]]', literal_number(0)), path)
+    return SessionHistoryPage(
+        session_id=required(payload, "sessionId", decode_str, path),
+        total=required(payload, "total", decode_int, path),
+        leaf_entry_id=required(payload, "leafEntryId", decode_str, path),
+        entries=required(payload, "entries", array(parse_session_history_entry), path),
+    )
+
+
 def parse_slash_command_input(value: object, path: str = "SlashCommandInput") -> SlashCommandInput:
     payload = expect_object(value, path)
     return SlashCommandInput(
@@ -3812,6 +3868,23 @@ class WireClient:
             params["limit"] = limit
         return parse_messages_page(self._command("get_messages_page", params), "get_messages_page")
 
+    def get_session_history(self, read_id: str, expected_session_id: str, expected_session_path: str, before: int, limit: int, expires_at: int) -> SessionHistoryPage:
+        """Read a bounded committed native history page from the exact current Session without extending the supplied expiry."""
+        params: dict[str, object] = {}
+        params["readId"] = read_id
+        params["expectedSessionId"] = expected_session_id
+        params["expectedSessionPath"] = expected_session_path
+        params["before"] = before
+        params["limit"] = limit
+        params["expiresAt"] = expires_at
+        return parse_session_history_page(self._command("get_session_history", params, timeout=5), "get_session_history")
+
+    def cancel_session_history(self, read_id: str) -> None:
+        """Cancel one ephemeral history read without aborting the agent or terminating its transport."""
+        params: dict[str, object] = {}
+        params["readId"] = read_id
+        self._command("cancel_session_history", params, timeout=5)
+
     def get_login_providers(self) -> tuple[LoginProvider, ...]:
         """List OAuth providers and their authentication status."""
         params: dict[str, object] = {}
@@ -4201,6 +4274,8 @@ __all__ = [
     "SelectUiRequest",
     "SessionCredits",
     "SessionEntries",
+    "SessionHistoryEntry",
+    "SessionHistoryPage",
     "SessionInfoUpdateEvent",
     "SessionSettledEvent",
     "SessionState",
@@ -4388,6 +4463,8 @@ __all__ = [
     "parse_select_ui_request",
     "parse_session_credits",
     "parse_session_entries",
+    "parse_session_history_entry",
+    "parse_session_history_page",
     "parse_session_info_update_event",
     "parse_session_settled_event",
     "parse_session_state",

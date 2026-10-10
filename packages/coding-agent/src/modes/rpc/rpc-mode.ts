@@ -68,6 +68,7 @@ import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameEncoder } from 
 import { claimRpcInput, readRpcInputFrames } from "./rpc-input";
 import { pageRpcMessages, RPC_MESSAGES_PAGE_BUSY_ERROR, RpcMessagesPageError } from "./rpc-messages";
 import { RpcGoalController } from "./rpc-goal";
+import { RpcHistoryAdmission } from "./rpc-history-admission";
 import { RpcLiveBridge, type RpcLiveSessionFactory } from "./rpc-live";
 import { RpcOutputWriter } from "./rpc-output";
 import {
@@ -381,13 +382,18 @@ export interface RpcInputFrameDeps {
 	onHostUriResult: (frame: RpcHostUriResult) => void;
 	/**
 	 * Handles commands that must run on receipt rather than wait behind queued commands
-	 * (`attest`, `quiesce_and_exit`). Writes its own response frame.
+	 * (`attest`, `quiesce_and_exit`, history and history cancellation). Writes its own response frame.
 	 */
 	handleImmediateCommand?: (command: RpcCommand) => void;
 }
 
 /** Commands answered on receipt, ahead of the serialized command queue. */
-const IMMEDIATE_RPC_COMMANDS: ReadonlySet<string> = new Set(["attest", "quiesce_and_exit"]);
+const IMMEDIATE_RPC_COMMANDS: Readonly<Record<string, true>> = {
+	attest: true,
+	quiesce_and_exit: true,
+	get_session_history: true,
+	cancel_session_history: true,
+};
 
 /**
  * Commands still answered normally once admission is closed for exit (a passed quiesce or a
@@ -417,6 +423,8 @@ export const RPC_COMMAND_ADMISSION = {
 	get_messages_page: "read",
 	get_session_stats: "read",
 	get_state: "read",
+	get_session_history: "read",
+	cancel_session_history: "read",
 	get_subagent_messages: "read",
 	get_subagents: "read",
 	get_tree: "read",
@@ -506,7 +514,7 @@ export function dispatchRpcControlFrame(parsed: unknown, deps: RpcInputFrameDeps
 		return true;
 	}
 
-	if (deps.handleImmediateCommand && isRecord(parsed) && IMMEDIATE_RPC_COMMANDS.has(String(parsed.type))) {
+	if (deps.handleImmediateCommand && isRecord(parsed) && Object.hasOwn(IMMEDIATE_RPC_COMMANDS, String(parsed.type))) {
 		deps.handleImmediateCommand(parsed as RpcCommand);
 		return true;
 	}
@@ -1432,9 +1440,16 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	// writes from the threadpool and reports backpressure, letting the writer spool.
 	const stdout = process.platform === "win32" ? fs.createWriteStream("", { fd: 1, autoClose: false }) : process.stdout;
 	const outputWriter = new RpcOutputWriter(stdout, failure => {
+		history.cancelActive();
 		logger.error("RPC output delivery failed", { error: String(failure) });
 		void session.dispose().finally(() => process.exit(1));
 	});
+	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
+		outputWriter.write(frameEncoder.encodeFrames(obj));
+		if (isRecord(obj) && obj.type === "response" && obj.command === "negotiate_protocol" && obj.success === true)
+			frameEncoder.setProtocolVersion(2);
+	};
+	const history = new RpcHistoryAdmission(session.sessionManager, outputWriter, response => output(response));
 	outputWriter.write(
 		frameEncoder.encodeFrames({
 			type: "ready",
@@ -1445,11 +1460,6 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			capabilities,
 		}),
 	);
-	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
-		outputWriter.write(frameEncoder.encodeFrames(obj));
-		if (isRecord(obj) && obj.type === "response" && obj.command === "negotiate_protocol" && obj.success === true)
-			frameEncoder.setProtocolVersion(2);
-	};
 	const emitRpcTitles = shouldEmitRpcTitles();
 
 	const success = <T extends RpcCommand["type"]>(
@@ -1709,6 +1719,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			change: () => Promise<T>,
 			{ detachesRun }: { detachesRun: boolean },
 		): Promise<T> => {
+			history?.cancelActive();
 			await goalController.beginSessionChange();
 			let result: T | undefined;
 			try {
@@ -1775,6 +1786,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	 * rejection with no latched store failure still surfaces to the caller.
 	 */
 	const disposeAndExit = async (): Promise<never> => {
+		history?.cancelActive();
 		if (session.isSealedBlocked) {
 			// A pending promise alone does not keep Bun alive after stdin EOF.
 			return new Promise<never>(() => {
@@ -2763,6 +2775,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			}
 			return success(command.id, "attest", session.attest(command.operationId, command.nonce));
 		}
+		history?.cancelActive();
 		const result = session.quiesceForExit({
 			operationId: command.operationId,
 			completeness: command.completeness,
@@ -2784,6 +2797,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	 * stream of read-only commands never lets it finish.
 	 */
 	const exitAfterQuiesce = (code: number): void => {
+		history?.cancelActive();
 		if (quiesceExit) return;
 		const deadline = setTimeout(() => {
 			logger.error("Exit after quiesce exceeded its deadline; exiting now", { code });
@@ -2828,14 +2842,30 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		onHostToolUpdate: frame => hostToolBridge.handleUpdate(frame),
 		onHostUriResult: frame => hostUriBridge.handleResult(frame),
 		handleImmediateCommand: command => {
-			if (command.type === "attest" || command.type === "quiesce_and_exit") output(answerQuiescence(command));
+			if (command.type === "get_session_history") history?.start(command);
+			else if (command.type === "cancel_session_history") {
+				history?.cancel(command.readId);
+				output(success(command.id, "cancel_session_history"));
+			} else if (command.type === "attest" || command.type === "quiesce_and_exit") output(answerQuiescence(command));
 		},
 	};
 
 	const inputDispatcher = new RpcInputDispatcher({
 		deps: dispatchFrameDeps,
 		afterSerialCommand: () => shutdownCoordinator.checkShutdownRequested(),
-		acceptInput: command => inputGate.accept(command),
+		acceptInput: command => {
+			if (
+				command.type === "abort" ||
+				command.type === "abort_and_prompt" ||
+				command.type === "new_session" ||
+				command.type === "open_session" ||
+				command.type === "switch_session" ||
+				command.type === "branch" ||
+				command.type === "fork"
+			)
+				history?.cancelActive();
+			inputGate.accept(command);
+		},
 	});
 	// Commands read but not yet answered, and ordered input still in the gate (an
 	// `abort_and_prompt` is answered before its prompt is admitted), are admitted input
@@ -2857,8 +2887,9 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		message => output(error(undefined, "parse", message)),
 	);
 
-	// stdin closed — RPC client is gone. Fail pending side-channel requests
-	// first so active/queued commands can settle, then drain accepted work.
+	// stdin closed — RPC client is gone. Cancel history without waiting for it,
+	// then fail side-channel requests before draining ordinary accepted work.
+	history?.cancelActive();
 	pendingExtensionRequests.rejectAll("RPC client disconnected before extension UI response completed");
 	hostToolBridge.close("RPC client disconnected before host tool execution completed");
 	hostUriBridge.clear("RPC client disconnected before host URI request completed");

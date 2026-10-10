@@ -769,6 +769,16 @@ export class ForkSourceNotFoundError extends Error {
 	}
 }
 
+/** A bounded, revision-checked window over the manager's loaded committed journal. */
+export interface SessionHistoryReadView {
+	readonly sessionId: string;
+	readonly sessionFile: string | undefined;
+	readonly cwd: string;
+	readonly entryCount: number;
+	getEntry(index: number): Readonly<SessionEntry> | undefined;
+	isCurrent(): boolean;
+}
+
 /**
  * Stores and navigates an append-only conversation journal.
  *
@@ -814,6 +824,8 @@ export class SessionManager {
 	#entries: SessionEntry[] = [];
 	#index = new SessionEntryIndex();
 	#historyRewriteRevision = 0;
+	/** Invalidates borrowed history views on every observable mutation, including staged writes. */
+	#historyReadRevision = 0;
 
 	/** File reflects all current entries; appends can go incrementally. */
 	#fileIsCurrent = false;
@@ -953,6 +965,7 @@ export class SessionManager {
 	}
 
 	#clearDiskError(): void {
+		if (this.#diskFailure) this.#historyReadRevision++;
 		this.#diskFailure = undefined;
 		this.#diskFailureLogged = false;
 	}
@@ -977,7 +990,10 @@ export class SessionManager {
 
 	#noteDiskFailure(errorLike: unknown): Error {
 		const error = toError(errorLike);
-		if (!this.#diskFailure) this.#diskFailure = error;
+		if (!this.#diskFailure) {
+			this.#historyReadRevision++;
+			this.#diskFailure = error;
+		}
 
 		if (!this.#diskFailureLogged) {
 			this.#diskFailureLogged = true;
@@ -1087,6 +1103,7 @@ export class SessionManager {
 			adopted++;
 		}
 		this.#index.setLeaf(leaf);
+		if (adopted > 0) this.#historyReadRevision++;
 		this.#expectedDiskSize = diskSize;
 		if (adopted > 0)
 			logger.warn("Kept session entries another writer added", { sessionFile: this.#sessionFile, adopted });
@@ -1170,6 +1187,7 @@ export class SessionManager {
 		const previousSessionId = this.#sessionId;
 		const timestamp = nowIso();
 		this.#siblingLineage.push(previousSessionId);
+		this.#historyReadRevision++;
 		this.#sessionId = mintSessionId();
 		const to = path.join(path.dirname(from), `${fileSafeTimestamp(timestamp)}_${this.#sessionId}.jsonl`);
 		this.#header = {
@@ -1251,6 +1269,7 @@ export class SessionManager {
 
 	#latchIndeterminate(operationError: Error, recoveryErrors: readonly Error[]): SessionPersistenceIndeterminateError {
 		const error = new SessionPersistenceIndeterminateError(operationError, recoveryErrors);
+		this.#historyReadRevision++;
 		this.#diskFailure = error;
 		if (!this.#diskFailureLogged) {
 			this.#diskFailureLogged = true;
@@ -1296,7 +1315,10 @@ export class SessionManager {
 		this.#fileIsCurrent = false;
 		this.#rewriteRequired = true;
 		this.#atomicRewriteFenceEpoch = epoch;
-		if (!this.#diskFailure) this.#diskFailure = operationError;
+		if (!this.#diskFailure) {
+			this.#historyReadRevision++;
+			this.#diskFailure = operationError;
+		}
 		try {
 			await previousDiskTail.catch(() => undefined);
 			let closeError: Error | undefined;
@@ -1852,6 +1874,7 @@ export class SessionManager {
 	}
 
 	#resetToNewSession(options?: NewSessionOptions, forcedSessionFile?: string): string | undefined {
+		this.#historyReadRevision++;
 		this.#diskTail = Promise.resolve();
 		this.#clearDiskError();
 		this.#expectedDiskSize = null;
@@ -1916,6 +1939,7 @@ export class SessionManager {
 
 	#applyEntries(header: SessionHeader, entries: SessionEntry[]): void {
 		this.#historyRewriteRevision++;
+		this.#historyReadRevision++;
 		this.#header = header;
 		this.#entries = entries;
 		this.#adoptSessionId(header.id);
@@ -1936,6 +1960,7 @@ export class SessionManager {
 	}
 
 	#setLeaf(id: string | null): void {
+		if (this.#index.leafId() !== id) this.#historyReadRevision++;
 		this.#index.setLeaf(id);
 		const batch = this.#atomicEntryBatch;
 		if (batch && !batch.collecting) {
@@ -1952,6 +1977,7 @@ export class SessionManager {
 		if (entry.type === "message" && entry.message.role === "assistant" && normalizeAssistantUsage(entry.message)) {
 			logger.warn("Assistant message recorded with incomplete usage", { id: entry.id });
 		}
+		this.#historyReadRevision++;
 		this.#entries.push(entry);
 		this.#index.insert(entry);
 		const batch = this.#atomicEntryBatch;
@@ -1967,6 +1993,7 @@ export class SessionManager {
 
 	#rollbackAtomicEntryBatch(batch: AtomicEntryBatch): void {
 		this.#historyRewriteRevision++;
+		this.#historyReadRevision++;
 		const retainedAncestor = (id: string | null): string | null => {
 			const seen = new Set<string>();
 			while (id && batch.entryIds.has(id) && !seen.has(id)) {
@@ -2109,6 +2136,7 @@ export class SessionManager {
 	}
 
 	restoreState(snapshot: SessionManagerStateSnapshot): void {
+		this.#historyReadRevision++;
 		this.#closeWriterEventually();
 		this.#diskTail = Promise.resolve();
 		this.#clearDiskError();
@@ -2185,6 +2213,7 @@ export class SessionManager {
 		loadedSession?: SessionLoadResult,
 		options?: { throwIfMissing?: boolean; newSession?: NewSessionOptions },
 	): Promise<void> {
+		this.#historyReadRevision++;
 		await this.#drainAndCloseWriter();
 		this.#clearDiskError();
 		this.#draftOnlySessionCleanupArmed = false;
@@ -2207,6 +2236,7 @@ export class SessionManager {
 			);
 		}
 
+		this.#historyReadRevision++;
 		this.#sessionFile = resolvedSessionFile;
 		this.#rememberBreadcrumb(this.#cwd, resolvedSessionFile);
 
@@ -2276,6 +2306,7 @@ export class SessionManager {
 	 * from selecting the previous conversation as the most recent session.
 	 */
 	async newSession(options?: NewSessionOptions): Promise<string | undefined> {
+		this.#historyReadRevision++;
 		await this.#drainAndCloseWriter();
 		const sessionFile = this.#resetToNewSession(options);
 		await this.ensureOnDisk();
@@ -2307,6 +2338,7 @@ export class SessionManager {
 
 		const timestamp = nowIso();
 		this.#adoptSessionId(mintSessionId());
+		this.#historyReadRevision++;
 		this.#sessionFile = path.join(this.#sessionDir, `${fileSafeTimestamp(timestamp)}_${this.#sessionId}.jsonl`);
 		this.#expectedDiskSize = null;
 		this.#header = {
@@ -2359,6 +2391,7 @@ export class SessionManager {
 			return;
 		}
 
+		this.#historyReadRevision++;
 		// A move writes both paths: it must neither move a session another live
 		// omp process writes nor replace a destination one writes. Checked before
 		// relocation starts (appends still go to the source) and before any
@@ -2496,6 +2529,7 @@ export class SessionManager {
 				}
 
 				if (sessionFileExisted && sessionPathChanged) {
+					this.#historyReadRevision++;
 					this.#header.previousSessionFiles = [
 						...new Set([...(this.#header.previousSessionFiles ?? []), path.resolve(oldSessionFile)]),
 					];
@@ -2514,6 +2548,7 @@ export class SessionManager {
 				this.#sessionFileRelocating = null;
 			}
 
+			this.#historyReadRevision++;
 			this.#cwd = resolvedCwd;
 			this.#sessionDir = nextSessionDir;
 			this.#header.cwd = resolvedCwd;
@@ -2621,6 +2656,7 @@ export class SessionManager {
 			externalLeafChanged: false,
 			externalLeafId: null,
 		};
+		this.#historyReadRevision++;
 		this.#atomicEntryBatch = batch;
 		let result!: T;
 		try {
@@ -2829,6 +2865,7 @@ export class SessionManager {
 	 */
 	seal(): void {
 		if (this.#released) return;
+		this.#historyReadRevision++;
 		this.#released = true;
 		this.#diskEpoch++;
 	}
@@ -2945,6 +2982,7 @@ export class SessionManager {
 	 */
 	releaseRetainedEntries(): void {
 		this.seal();
+		this.#historyReadRevision++;
 		this.#entries = [];
 		this.#index.clear();
 		this.#inMemoryArtifacts = null;
@@ -2967,6 +3005,7 @@ export class SessionManager {
 			this.#fallbackRuntimeOnly = true;
 			return;
 		}
+		this.#historyReadRevision++;
 		this.#cwd = resolvedCwd;
 		this.#fallbackRuntimeOnly = true;
 		if (this.#sessionFile) {
@@ -2976,6 +3015,7 @@ export class SessionManager {
 	adoptRecordedCwd(): void {
 		const recordedCwd = this.#header.cwd;
 		if (!recordedCwd) return;
+		if (this.#cwd !== path.resolve(recordedCwd)) this.#historyReadRevision++;
 		this.#cwd = path.resolve(recordedCwd);
 		if (this.#sessionFile) this.#sessionDir = path.dirname(this.#sessionFile);
 		this.#fallbackRuntimeOnly = false;
@@ -3031,6 +3071,7 @@ export class SessionManager {
 		if (this.#fallbackRuntimeOnly) {
 			return resolved;
 		}
+		this.#historyReadRevision++;
 		this.#header.additionalDirectories = this.#additionalDirectories;
 		await this.#persistWorkspaceDirectoriesChange();
 		return resolved;
@@ -3050,6 +3091,7 @@ export class SessionManager {
 		if (this.#fallbackRuntimeOnly) {
 			return resolved;
 		}
+		this.#historyReadRevision++;
 		if (this.#additionalDirectories.length === 0) {
 			this.#header.additionalDirectories = undefined;
 		} else {
@@ -3074,6 +3116,7 @@ export class SessionManager {
 		) {
 			return;
 		}
+		this.#historyReadRevision++;
 		this.#additionalDirectories = next;
 		if (this.#additionalDirectories.length > 0) {
 			this.#header.additionalDirectories = this.#additionalDirectories;
@@ -3311,6 +3354,7 @@ export class SessionManager {
 		this.#titleSource = source;
 		if (source === "user") this.#titleRevision++;
 		this.#titleUpdatedAt = timestamp;
+		this.#historyReadRevision++;
 		this.#header.title = title;
 		this.#header.titleSource = source;
 
@@ -3568,6 +3612,7 @@ export class SessionManager {
 	 */
 	async rewriteEntries(): Promise<void> {
 		// Callers may have mutated existing entries, retaining the leaf object.
+		this.#historyReadRevision++;
 		this.#historyRewriteRevision++;
 		if (!this.#persist || !this.#sessionFile) return;
 		await this.#rewriteAtomically();
@@ -3673,6 +3718,38 @@ export class SessionManager {
 		return this.#index.leafEntry();
 	}
 
+	/**
+	 * Borrow indexed entries without copying the transcript or touching storage.
+	 * Entries are read-only by contract: callers must project before yielding and
+	 * discard the view when isCurrent() turns false.
+	 */
+	captureHistoryReadView(): SessionHistoryReadView | undefined {
+		if (this.#atomicEntryBatch || this.#entriesReleased || this.#released || this.#diskFailure || !this.#header)
+			return undefined;
+		const revision = this.#historyReadRevision;
+		const sessionId = this.#sessionId;
+		const sessionFile = this.#sessionFile;
+		const cwd = this.#header.cwd;
+		const entryCount = this.#entries.length;
+		const isCurrent = (): boolean =>
+			this.#historyReadRevision === revision &&
+			!this.#atomicEntryBatch &&
+			!this.#entriesReleased &&
+			!this.#released &&
+			!this.#diskFailure;
+		return {
+			sessionId,
+			sessionFile,
+			cwd,
+			entryCount,
+			isCurrent,
+			getEntry: (index: number): Readonly<SessionEntry> | undefined =>
+				isCurrent() && Number.isSafeInteger(index) && index >= 0 && index < entryCount
+					? this.#entries[index]
+					: undefined,
+		};
+	}
+
 	/** Changes when existing history is rewritten, not on ordinary appends. */
 	getHistoryRewriteRevision(): number {
 		return this.#historyRewriteRevision;
@@ -3742,6 +3819,7 @@ export class SessionManager {
 			const sanitized = sanitizeRehydratedOpenAIResponsesAssistantMessage(entry.message);
 			if (sanitized === entry.message) continue;
 
+			this.#historyReadRevision++;
 			entry.message = sanitized;
 			changed = true;
 		}
@@ -3798,6 +3876,7 @@ export class SessionManager {
 		let leafId = entry.parentId;
 		if (canReparentChildren) {
 			this.#historyRewriteRevision++;
+			this.#historyReadRevision++;
 			for (const child of children) {
 				child.parentId = leafId;
 				leafId = child.id;
@@ -3882,6 +3961,7 @@ export class SessionManager {
 			parentId = labelEntry.id;
 		}
 
+		this.#historyReadRevision++;
 		this.#header = header;
 		this.#historyRewriteRevision++;
 		this.#entries = [...entriesToKeep, ...labels];

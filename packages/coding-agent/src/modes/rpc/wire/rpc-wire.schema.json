@@ -672,6 +672,28 @@
 				"clientOmit": []
 			},
 			{
+				"name": "get_session_history",
+				"doc": "Read a bounded committed native history page from the exact current Session without extending the supplied expiry.",
+				"params": "GetSessionHistoryParams",
+				"result": "SessionHistoryPage",
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": 5000,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
+				"name": "cancel_session_history",
+				"doc": "Cancel one ephemeral history read without aborting the agent or terminating its transport.",
+				"params": "CancelSessionHistoryParams",
+				"result": null,
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": 5000,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
 				"name": "get_login_providers",
 				"doc": "List OAuth providers and their authentication status.",
 				"params": null,
@@ -3681,6 +3703,94 @@
 			"required": [
 				"messages",
 				"totalMessages"
+			]
+		},
+		"SessionHistoryEntry": {
+			"type": "object",
+			"properties": {
+				"index": {
+					"type": "integer"
+				},
+				"kind": {
+					"enum": [
+						"user",
+						"assistant",
+						"tool-result",
+						"compaction"
+					],
+					"type": "string"
+				},
+				"entryId": {
+					"type": "string"
+				},
+				"timestamp": {
+					"type": "string"
+				},
+				"attribution": {
+					"type": "string"
+				},
+				"text": {
+					"type": "string"
+				},
+				"truncated": {
+					"type": "boolean"
+				},
+				"images": {
+					"type": "integer"
+				},
+				"tools": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
+				},
+				"toolName": {
+					"type": "string"
+				},
+				"isError": {
+					"type": "boolean"
+				},
+				"model": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"index",
+				"kind"
+			]
+		},
+		"SessionHistoryPage": {
+			"type": "object",
+			"properties": {
+				"sessionId": {
+					"type": "string"
+				},
+				"sourceKind": {
+					"const": "native-engine"
+				},
+				"total": {
+					"type": "integer"
+				},
+				"omittedLines": {
+					"const": 0
+				},
+				"leafEntryId": {
+					"type": "string"
+				},
+				"entries": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/SessionHistoryEntry"
+					}
+				}
+			},
+			"required": [
+				"sessionId",
+				"sourceKind",
+				"total",
+				"omittedLines",
+				"leafEntryId",
+				"entries"
 			]
 		},
 		"SlashCommandInput": {
@@ -7221,6 +7331,48 @@
 					"type": "integer"
 				}
 			}
+		},
+		"GetSessionHistoryParams": {
+			"type": "object",
+			"properties": {
+				"readId": {
+					"type": "string"
+				},
+				"expectedSessionId": {
+					"type": "string"
+				},
+				"expectedSessionPath": {
+					"type": "string"
+				},
+				"before": {
+					"type": "integer"
+				},
+				"limit": {
+					"type": "integer"
+				},
+				"expiresAt": {
+					"type": "integer"
+				}
+			},
+			"required": [
+				"readId",
+				"expectedSessionId",
+				"expectedSessionPath",
+				"before",
+				"limit",
+				"expiresAt"
+			]
+		},
+		"CancelSessionHistoryParams": {
+			"type": "object",
+			"properties": {
+				"readId": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"readId"
+			]
 		},
 		"GetLoginProvidersResult": {
 			"type": "object",

@@ -1,0 +1,9 @@
+{"type":"session","version":3,"id":"11111111-1111-4111-8111-111111111111","timestamp":"2026-10-09T00:00:00.000Z","cwd":"/workspace"}
+{"type":"message","id":"q","parentId":null,"message":{"role":"user","attribution":"person:test","content":[{"type":"text","text":"Hello"},{"type":"text","text":"world"},{"type":"image","data":"forbidden-image-payload"}]}}
+{"type":"message","id":"abandoned","parentId":"q","message":{"role":"assistant","content":"abandoned answer"}}
+{"type":"message","id":"a","parentId":"q","message":{"role":"assistant","provider":"synthetic","model":"tiny","content":[{"type":"thinking","thinking":"forbidden-thinking"},{"type":"text","text":"Visible"},{"type":"toolCall","name":"read","arguments":{"secret":"forbidden-tool-arguments"}}]}}
+{"type":"message","id":"t","parentId":"a","message":{"role":"toolResult","toolName":"read","isError":true,"content":[{"type":"text","text":"forbidden-tool-output"}]}}
+{"type":"message","id":"s","parentId":"t","message":{"role":"system","content":"forbidden-system-message"}}
+{"type":"compaction","id":"c","parentId":"s","summary":"forbidden-compaction-summary"}
+{"type":"message","id":"u","parentId":"c","message":{"role":"user","content":[{"type":"toolCall","name":"user-tool","arguments":{"secret":"forbidden-user-tool-arguments"}},{"type":"text","text":"again"}]}}
+{"type":"message","id":"last","parentId":"u","message":{"role":"assistant","provider":"synthetic","model":"tiny","content":"Final"}}
