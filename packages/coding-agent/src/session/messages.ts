@@ -4,7 +4,7 @@
  * Extends the base AgentMessage type with coding-agent specific message types,
  * and provides a transformer to convert them to LLM-compatible messages.
  */
-import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { type AgentMessage, inheritAssistantMessageIdentity } from "@oh-my-pi/pi-agent-core";
 import {
 	isUserInterruptAbort,
 	isCustomMessageContent,
@@ -103,7 +103,7 @@ export function sanitizeAssistantForReparentedHistory(message: AssistantMessage)
 		}
 		content.push(block);
 	}
-	return { ...message, content, providerPayload: undefined };
+	return inheritAssistantMessageIdentity(message, { ...message, content, providerPayload: undefined });
 }
 
 /**
@@ -461,7 +461,9 @@ function followedByInterruptedThinking(messages: AgentMessage[], index: number):
 /** Drop an incomplete trailing thinking run from an interrupted assistant in the LLM view. */
 function stripDemotedThinkingForLlm(message: AssistantMessage): AssistantMessage {
 	const demoted = demoteInterruptedThinking(message);
-	return demoted ? { ...message, content: demoted.strippedContent } : message;
+	return demoted
+		? inheritAssistantMessageIdentity(message, { ...message, content: demoted.strippedContent })
+		: message;
 }
 
 /**
@@ -480,7 +482,7 @@ function canonicalizeXdToolCallNames(message: AssistantMessage): AssistantMessag
 		content ??= message.content.slice();
 		content[i] = { ...block, name };
 	}
-	return content ? { ...message, content } : message;
+	return content ? inheritAssistantMessageIdentity(message, { ...message, content }) : message;
 }
 
 /** A provider-rejection turn carrying nothing but the error flag: stopReason
@@ -939,15 +941,20 @@ export function sanitizeRehydratedOpenAIResponsesAssistantMessage(message: Assis
 	// it belongs to a previous live Copilot connection and replaying it on a
 	// warmed session causes 401 rejections. User/developer payloads are preserved
 	// separately by the caller.
-	return {
+	return inheritAssistantMessageIdentity(message, {
 		...message,
 		...(didSanitizeContent ? { content: sanitizedContent } : {}),
 		providerPayload: undefined,
-	};
+	});
 }
 
 function customMessageContentToLlmContent(content: CustomMessage["content"]): (TextContent | ImageContent)[] {
 	return typeof content === "string" ? [{ type: "text", text: content }] : content;
+}
+
+/** Whether a custom record declares a provider projection (see `convertMessageToLlm` in agent-core). */
+function hasLlmProjection(details: unknown): boolean {
+	return isRecord(details) && "omp.llm" in details;
 }
 
 function convertImageBearingCustomMessage(message: CustomMessage | HookMessage): Message[] | undefined {
@@ -1112,14 +1119,17 @@ function convertOne(m: AgentMessage, interruptedNext: boolean): Message[] {
 					},
 				];
 			}
-			const split = convertImageBearingCustomMessage(m);
+			// A record carrying an owner projection (`details["omp.llm"]`) reaches the
+			// provider only through the core projection: its `content` is a display
+			// header and must never be split into provider parts.
+			const split = hasLlmProjection(m.details) ? undefined : convertImageBearingCustomMessage(m);
 			if (split) return split;
 			const converted = convertMessageToLlm(m);
 			return converted ? [converted] : [];
 		}
 		case "hookMessage": {
 			if (!isCustomMessageContent(m.content)) return [];
-			const split = convertImageBearingCustomMessage(m);
+			const split = hasLlmProjection(m.details) ? undefined : convertImageBearingCustomMessage(m);
 			if (split) return split;
 			const converted = convertMessageToLlm(m);
 			return converted ? [converted] : [];

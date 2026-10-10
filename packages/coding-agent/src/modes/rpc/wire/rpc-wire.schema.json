@@ -10,6 +10,28 @@
 		"inbound": "RpcInbound",
 		"commands": [
 			{
+				"name": "attest",
+				"doc": "Snapshot identity, activity epoch, work census and owned-job registry soundness.",
+				"params": "AttestParams",
+				"result": "WorkAttestation",
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
+				"name": "quiesce_and_exit",
+				"doc": "Require explicit strict or attested completeness; close admission and retire, retaining strict sealed failures for retry.",
+				"params": "QuiesceRequest",
+				"result": "QuiesceResult",
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
 				"name": "negotiate_protocol",
 				"doc": "Switch the connection to a protocol version advertised by `ready`.",
 				"params": "NegotiateProtocolParams",
@@ -47,6 +69,28 @@
 				"doc": "Queue a follow-up message.",
 				"params": "FollowUpParams",
 				"result": null,
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
+				"name": "deliver",
+				"doc": "Deliver an externally authored record with owned admission and settlement receipts.",
+				"params": "DeliverParams",
+				"result": "DeliverResult",
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
+				"name": "cancel_delivery",
+				"doc": "Cancel a delivery only while it remains queued.",
+				"params": "CancelDeliveryParams",
+				"result": "CancelDeliveryResult",
 				"nullable": false,
 				"unwrap": null,
 				"timeoutMs": null,
@@ -158,7 +202,7 @@
 				"params": "SetAskDialogParams",
 				"result": "SetAskDialogResult",
 				"nullable": false,
-				"unwrap": "enabled",
+				"unwrap": null,
 				"timeoutMs": null,
 				"completion": null,
 				"clientOmit": []
@@ -624,6 +668,28 @@
 				"nullable": false,
 				"unwrap": null,
 				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
+				"name": "get_session_history",
+				"doc": "Read a bounded committed native history page from the exact current Session without extending the supplied expiry.",
+				"params": "GetSessionHistoryParams",
+				"result": "SessionHistoryPage",
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": 5000,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
+				"name": "cancel_session_history",
+				"doc": "Cancel one ephemeral history read without aborting the agent or terminating its transport.",
+				"params": "CancelSessionHistoryParams",
+				"result": null,
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": 5000,
 				"completion": null,
 				"clientOmit": []
 			},
@@ -2067,6 +2133,690 @@
 			],
 			"description": "Model descriptor: the client-relevant subset of the server's model record."
 		},
+		"WorkCounts": {
+			"type": "object",
+			"properties": {
+				"streaming": {
+					"type": "number"
+				},
+				"queuedInput": {
+					"type": "number"
+				},
+				"asyncJobs": {
+					"type": "number"
+				},
+				"subagents": {
+					"type": "number"
+				},
+				"retainedJobs": {
+					"type": "number"
+				},
+				"detachedJobs": {
+					"type": "number"
+				},
+				"compacting": {
+					"type": "number"
+				},
+				"handoff": {
+					"type": "number"
+				},
+				"goalContinuationScheduled": {
+					"type": "number"
+				},
+				"scheduledTurns": {
+					"type": "number"
+				}
+			},
+			"required": [
+				"streaming",
+				"queuedInput",
+				"asyncJobs",
+				"subagents",
+				"retainedJobs",
+				"detachedJobs",
+				"compacting",
+				"handoff",
+				"goalContinuationScheduled",
+				"scheduledTurns"
+			]
+		},
+		"InvocationIdentity": {
+			"type": "object",
+			"properties": {
+				"pid": {
+					"type": "number"
+				},
+				"startId": {
+					"anyOf": [
+						{
+							"type": "string"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"startTime": {
+					"anyOf": [
+						{
+							"type": "number"
+						},
+						{
+							"type": "null"
+						}
+					]
+				}
+			},
+			"required": [
+				"pid",
+				"startId",
+				"startTime"
+			]
+		},
+		"AttestedSessionIdentity": {
+			"type": "object",
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"file": {
+					"anyOf": [
+						{
+							"type": "string"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"size": {
+					"anyOf": [
+						{
+							"type": "number"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"sha256": {
+					"anyOf": [
+						{
+							"type": "string"
+						},
+						{
+							"type": "null"
+						}
+					]
+				}
+			},
+			"required": [
+				"id",
+				"file"
+			]
+		},
+		"OpaqueOwnedProcess": {
+			"type": "object",
+			"properties": {
+				"pid": {
+					"type": "number"
+				},
+				"command": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"pid",
+				"command"
+			]
+		},
+		"OwnerScanSummary": {
+			"type": "object",
+			"properties": {
+				"supported": {
+					"type": "boolean"
+				},
+				"sound": {
+					"type": "boolean"
+				},
+				"scanned": {
+					"type": "number"
+				},
+				"discovered": {
+					"type": "number"
+				},
+				"opaque": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/OpaqueOwnedProcess"
+					}
+				}
+			},
+			"required": [
+				"supported",
+				"sound",
+				"scanned",
+				"discovered",
+				"opaque"
+			]
+		},
+		"OwnedJobRegistryState": {
+			"type": "object",
+			"properties": {
+				"path": {
+					"anyOf": [
+						{
+							"type": "string"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"complete": {
+					"type": "boolean"
+				},
+				"ownerScan": {
+					"anyOf": [
+						{
+							"$ref": "#/$defs/OwnerScanSummary"
+						},
+						{
+							"type": "null"
+						}
+					]
+				}
+			},
+			"required": [
+				"path",
+				"complete",
+				"ownerScan"
+			]
+		},
+		"WorkAttestation": {
+			"type": "object",
+			"properties": {
+				"version": {
+					"const": 1
+				},
+				"operationId": {
+					"type": "string"
+				},
+				"nonce": {
+					"type": "string"
+				},
+				"epoch": {
+					"type": "number"
+				},
+				"instanceId": {
+					"type": "string"
+				},
+				"session": {
+					"$ref": "#/$defs/AttestedSessionIdentity"
+				},
+				"invocation": {
+					"$ref": "#/$defs/InvocationIdentity"
+				},
+				"counts": {
+					"$ref": "#/$defs/WorkCounts"
+				},
+				"admission": {
+					"enum": [
+						"open",
+						"closed"
+					],
+					"type": "string"
+				},
+				"sealed": {
+					"type": "boolean"
+				},
+				"registry": {
+					"$ref": "#/$defs/OwnedJobRegistryState"
+				},
+				"observedAt": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"version",
+				"operationId",
+				"nonce",
+				"epoch",
+				"instanceId",
+				"session",
+				"invocation",
+				"counts",
+				"admission",
+				"sealed",
+				"registry",
+				"observedAt"
+			]
+		},
+		"QuiesceRequest": {
+			"type": "object",
+			"properties": {
+				"operationId": {
+					"type": "string"
+				},
+				"completeness": {
+					"enum": [
+						"strict",
+						"attested"
+					],
+					"type": "string"
+				},
+				"attempt": {
+					"type": "number"
+				},
+				"epoch": {
+					"type": "number"
+				},
+				"instanceId": {
+					"type": "string"
+				},
+				"sessionId": {
+					"type": "string"
+				},
+				"deadline": {
+					"type": "number"
+				}
+			},
+			"required": [
+				"operationId",
+				"completeness",
+				"attempt",
+				"epoch",
+				"instanceId",
+				"sessionId",
+				"deadline"
+			]
+		},
+		"QuiesceRefusalReason": {
+			"enum": [
+				"invalid_request",
+				"invocation_mismatch",
+				"session_mismatch",
+				"stale_attempt",
+				"admission_closed",
+				"deadline_expired",
+				"epoch_mismatch",
+				"work_active",
+				"completeness_unknown",
+				"attestation_unavailable"
+			],
+			"type": "string"
+		},
+		"TerminalAttestation": {
+			"type": "object",
+			"properties": {
+				"version": {
+					"const": 1
+				},
+				"kind": {
+					"enum": [
+						"quiesce",
+						"hangup",
+						"sealed_blocked"
+					],
+					"type": "string"
+				},
+				"session": {
+					"$ref": "#/$defs/AttestedSessionIdentity"
+				},
+				"invocation": {
+					"$ref": "#/$defs/InvocationIdentity"
+				},
+				"instanceId": {
+					"type": "string"
+				},
+				"epoch": {
+					"type": "number"
+				},
+				"counts": {
+					"$ref": "#/$defs/WorkCounts"
+				},
+				"interrupted": {
+					"type": "boolean"
+				},
+				"registryComplete": {
+					"type": "boolean"
+				},
+				"registryPath": {
+					"anyOf": [
+						{
+							"type": "string"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"ownerScan": {
+					"anyOf": [
+						{
+							"$ref": "#/$defs/OwnerScanSummary"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"writtenAt": {
+					"type": "string"
+				},
+				"operationId": {
+					"type": "string"
+				},
+				"attempt": {
+					"type": "number"
+				},
+				"signal": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"version",
+				"kind",
+				"session",
+				"invocation",
+				"instanceId",
+				"epoch",
+				"counts",
+				"interrupted",
+				"registryComplete",
+				"registryPath",
+				"ownerScan",
+				"writtenAt"
+			]
+		},
+		"CensusProcess": {
+			"type": "object",
+			"properties": {
+				"pid": {
+					"type": "number"
+				},
+				"comm": {
+					"type": "string"
+				},
+				"ppid": {
+					"type": "number"
+				}
+			},
+			"required": [
+				"pid",
+				"comm",
+				"ppid"
+			]
+		},
+		"CensusResult": {
+			"type": "object",
+			"properties": {
+				"complete": {
+					"type": "boolean"
+				},
+				"work": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/CensusProcess"
+					}
+				},
+				"reasons": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
+				}
+			},
+			"required": [
+				"complete",
+				"work",
+				"reasons"
+			]
+		},
+		"QuiesceSnapshot": {
+			"type": "object",
+			"properties": {
+				"epoch": {
+					"type": "number"
+				},
+				"counts": {
+					"$ref": "#/$defs/WorkCounts"
+				},
+				"observedAt": {
+					"type": "string"
+				},
+				"registry": {
+					"$ref": "#/$defs/OwnedJobRegistryState"
+				},
+				"census": {
+					"$ref": "#/$defs/CensusResult"
+				},
+				"completenessReasons": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
+				}
+			},
+			"required": [
+				"epoch",
+				"counts",
+				"observedAt"
+			]
+		},
+		"SealedQuiesceSnapshot": {
+			"type": "object",
+			"properties": {
+				"epoch": {
+					"type": "number"
+				},
+				"counts": {
+					"$ref": "#/$defs/WorkCounts"
+				},
+				"observedAt": {
+					"type": "string"
+				},
+				"registry": {
+					"$ref": "#/$defs/OwnedJobRegistryState"
+				},
+				"census": {
+					"anyOf": [
+						{
+							"$ref": "#/$defs/CensusResult"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"completenessReasons": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
+				}
+			},
+			"required": [
+				"epoch",
+				"counts",
+				"observedAt",
+				"registry",
+				"census",
+				"completenessReasons"
+			]
+		},
+		"QuiesceProgress": {
+			"type": "object",
+			"properties": {
+				"finalized": {
+					"type": "boolean"
+				},
+				"bound": {
+					"type": "boolean"
+				},
+				"attested": {
+					"type": "boolean"
+				}
+			},
+			"required": [
+				"finalized",
+				"bound",
+				"attested"
+			]
+		},
+		"QuiesceSealedBlockedResult": {
+			"type": "object",
+			"properties": {
+				"status": {
+					"const": "sealed_blocked"
+				},
+				"operationId": {
+					"type": "string"
+				},
+				"attempt": {
+					"type": "number"
+				},
+				"reason": {
+					"type": "string"
+				},
+				"snapshot": {
+					"$ref": "#/$defs/SealedQuiesceSnapshot"
+				},
+				"progress": {
+					"$ref": "#/$defs/QuiesceProgress"
+				}
+			},
+			"required": [
+				"status",
+				"operationId",
+				"attempt",
+				"reason",
+				"snapshot",
+				"progress"
+			]
+		},
+		"QuiescedResult": {
+			"type": "object",
+			"properties": {
+				"status": {
+					"const": "quiesced"
+				},
+				"operationId": {
+					"type": "string"
+				},
+				"attempt": {
+					"type": "number"
+				},
+				"attestation": {
+					"$ref": "#/$defs/TerminalAttestation"
+				},
+				"path": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"status",
+				"operationId",
+				"attempt",
+				"attestation",
+				"path"
+			]
+		},
+		"QuiesceRefusedResult": {
+			"type": "object",
+			"properties": {
+				"status": {
+					"const": "refused"
+				},
+				"operationId": {
+					"type": "string"
+				},
+				"attempt": {
+					"type": "number"
+				},
+				"reason": {
+					"$ref": "#/$defs/QuiesceRefusalReason"
+				},
+				"snapshot": {
+					"$ref": "#/$defs/QuiesceSnapshot"
+				}
+			},
+			"required": [
+				"status",
+				"operationId",
+				"attempt",
+				"reason",
+				"snapshot"
+			]
+		},
+		"QuiesceUnattestedResult": {
+			"type": "object",
+			"properties": {
+				"status": {
+					"const": "exit_unattested"
+				},
+				"operationId": {
+					"type": "string"
+				},
+				"attempt": {
+					"type": "number"
+				},
+				"reason": {
+					"const": "attestation_unavailable"
+				},
+				"error": {
+					"type": "string"
+				},
+				"snapshot": {
+					"$ref": "#/$defs/QuiesceSnapshot"
+				}
+			},
+			"required": [
+				"status",
+				"operationId",
+				"attempt",
+				"reason",
+				"error",
+				"snapshot"
+			]
+		},
+		"QuiesceResult": {
+			"anyOf": [
+				{
+					"$ref": "#/$defs/QuiescedResult"
+				},
+				{
+					"$ref": "#/$defs/QuiesceRefusedResult"
+				},
+				{
+					"$ref": "#/$defs/QuiesceUnattestedResult"
+				},
+				{
+					"$ref": "#/$defs/QuiesceSealedBlockedResult"
+				}
+			]
+		},
+		"ToolApprovalBinding": {
+			"type": "object",
+			"properties": {
+				"toolCallId": {
+					"type": "string"
+				},
+				"toolName": {
+					"type": "string"
+				},
+				"arguments": {},
+				"reason": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"toolCallId",
+				"toolName",
+				"arguments"
+			],
+			"description": "Exact call and evaluated arguments decided by a tool-approval select."
+		},
 		"QueueMode": {
 			"enum": [
 				"all",
@@ -2382,6 +3132,86 @@
 			],
 			"description": "Outcome of every `goal` op; both fields are null when the session has no goal."
 		},
+		"DeliveryMode": {
+			"enum": [
+				"aside",
+				"steer"
+			],
+			"type": "string"
+		},
+		"DeliveryOptions": {
+			"type": "object",
+			"properties": {
+				"mode": {
+					"$ref": "#/$defs/DeliveryMode"
+				},
+				"quiet": {
+					"const": true
+				},
+				"wakeAfterInterrupt": {
+					"const": true
+				},
+				"wakeInPlanMode": {
+					"const": true
+				}
+			},
+			"required": [
+				"mode"
+			],
+			"x-open": true
+		},
+		"DeliveryRecord": {
+			"type": "object",
+			"properties": {
+				"customType": {
+					"type": "string"
+				},
+				"content": {
+					"$ref": "#/$defs/MessageContent"
+				},
+				"details": {
+					"type": "object",
+					"properties": {},
+					"additionalProperties": {},
+					"description": "Requires a valid `omp.llm` user projection and `omp.llm.source` for admission."
+				},
+				"display": {
+					"type": "boolean"
+				},
+				"attribution": {
+					"$ref": "#/$defs/Attribution"
+				}
+			},
+			"required": [
+				"customType",
+				"content",
+				"details"
+			],
+			"x-open": true
+		},
+		"ExternalDeliveryListing": {
+			"type": "object",
+			"properties": {
+				"deliveryId": {
+					"type": "string"
+				},
+				"state": {
+					"enum": [
+						"queued",
+						"accepted"
+					],
+					"type": "string"
+				},
+				"mode": {
+					"$ref": "#/$defs/DeliveryMode"
+				}
+			},
+			"required": [
+				"deliveryId",
+				"state",
+				"mode"
+			]
+		},
 		"SessionState": {
 			"type": "object",
 			"properties": {
@@ -2472,6 +3302,20 @@
 					"type": "array",
 					"items": {
 						"$ref": "#/$defs/TodoPhase"
+					},
+					"default": []
+				},
+				"capabilities": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"default": []
+				},
+				"externalDeliveries": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/ExternalDeliveryListing"
 					},
 					"default": []
 				},
@@ -2859,6 +3703,94 @@
 			"required": [
 				"messages",
 				"totalMessages"
+			]
+		},
+		"SessionHistoryEntry": {
+			"type": "object",
+			"properties": {
+				"index": {
+					"type": "integer"
+				},
+				"kind": {
+					"enum": [
+						"user",
+						"assistant",
+						"tool-result",
+						"compaction"
+					],
+					"type": "string"
+				},
+				"entryId": {
+					"type": "string"
+				},
+				"timestamp": {
+					"type": "string"
+				},
+				"attribution": {
+					"type": "string"
+				},
+				"text": {
+					"type": "string"
+				},
+				"truncated": {
+					"type": "boolean"
+				},
+				"images": {
+					"type": "integer"
+				},
+				"tools": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
+				},
+				"toolName": {
+					"type": "string"
+				},
+				"isError": {
+					"type": "boolean"
+				},
+				"model": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"index",
+				"kind"
+			]
+		},
+		"SessionHistoryPage": {
+			"type": "object",
+			"properties": {
+				"sessionId": {
+					"type": "string"
+				},
+				"sourceKind": {
+					"const": "native-engine"
+				},
+				"total": {
+					"type": "integer"
+				},
+				"omittedLines": {
+					"const": 0
+				},
+				"leafEntryId": {
+					"type": "string"
+				},
+				"entries": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/SessionHistoryEntry"
+					}
+				}
+			},
+			"required": [
+				"sessionId",
+				"sourceKind",
+				"total",
+				"omittedLines",
+				"leafEntryId",
+				"entries"
 			]
 		},
 		"SlashCommandInput": {
@@ -3939,12 +4871,127 @@
 				},
 				"maxReassembledFrameBytes": {
 					"type": "integer"
+				},
+				"capabilities": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"default": []
 				}
 			},
 			"required": [
 				"type"
 			],
-			"description": "First frame after startup; transport fields are absent on servers without protocol v2."
+			"description": "First frame after startup; capabilities include quiesce-exit/2 and owned-jobs/1. Transport fields are absent on servers without protocol v2."
+		},
+		"DeliveryAcceptedEvent": {
+			"type": "object",
+			"properties": {
+				"type": {
+					"const": "delivery_accepted"
+				},
+				"deliveryId": {
+					"type": "string"
+				},
+				"at": {
+					"type": "number"
+				},
+				"mode": {
+					"$ref": "#/$defs/DeliveryMode"
+				},
+				"mechanism": {
+					"enum": [
+						"wake",
+						"aside",
+						"steer-boundary"
+					],
+					"type": "string"
+				}
+			},
+			"required": [
+				"type",
+				"deliveryId",
+				"at",
+				"mode",
+				"mechanism"
+			]
+		},
+		"DeliverySettledEvent": {
+			"type": "object",
+			"properties": {
+				"type": {
+					"const": "delivery_settled"
+				},
+				"deliveryId": {
+					"type": "string"
+				},
+				"outcome": {
+					"enum": [
+						"quiet",
+						"text",
+						"refused",
+						"error",
+						"aborted"
+					],
+					"type": "string"
+				},
+				"included": {
+					"type": "boolean"
+				},
+				"requests": {
+					"type": "number"
+				},
+				"sole": {
+					"type": "boolean"
+				},
+				"interactive": {
+					"type": "boolean"
+				}
+			},
+			"required": [
+				"type",
+				"deliveryId",
+				"outcome",
+				"included",
+				"requests",
+				"sole",
+				"interactive"
+			]
+		},
+		"DeliveryDiscardedEvent": {
+			"type": "object",
+			"properties": {
+				"type": {
+					"const": "delivery_discarded"
+				},
+				"deliveryId": {
+					"type": "string"
+				},
+				"reason": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"type",
+				"deliveryId",
+				"reason"
+			]
+		},
+		"DeliveryCancelledEvent": {
+			"type": "object",
+			"properties": {
+				"type": {
+					"const": "delivery_cancelled"
+				},
+				"deliveryId": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"type",
+				"deliveryId"
+			]
 		},
 		"PromptStatus": {
 			"enum": [
@@ -4001,6 +5048,18 @@
 				},
 				"error": {
 					"$ref": "#/$defs/PromptError"
+				},
+				"run": {
+					"type": "integer"
+				},
+				"promptEntryId": {
+					"type": "string"
+				},
+				"replyEntryIds": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
 				}
 			},
 			"required": [
@@ -4483,6 +5542,9 @@
 						"$ref": "#/$defs/SelectOptionDetail"
 					}
 				},
+				"approval": {
+					"$ref": "#/$defs/ToolApprovalBinding"
+				},
 				"timeout": {
 					"type": "integer"
 				}
@@ -4603,6 +5665,9 @@
 				},
 				"timeout": {
 					"type": "integer"
+				},
+				"acceptImages": {
+					"type": "boolean"
 				}
 			},
 			"required": [
@@ -4852,6 +5917,21 @@
 				},
 				"customInput": {
 					"type": "string"
+				},
+				"customInputImages": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/ImageContent"
+					}
+				},
+				"note": {
+					"type": "string"
+				},
+				"noteImages": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/ImageContent"
+					}
 				}
 			},
 			"required": [
@@ -4946,6 +6026,26 @@
 			],
 			"description": "Answers an `ask` request: one `AskAnswer` per question, in question order."
 		},
+		"ChatUiResponse": {
+			"type": "object",
+			"properties": {
+				"type": {
+					"const": "extension_ui_response"
+				},
+				"id": {
+					"type": "string"
+				},
+				"chat": {
+					"const": true
+				}
+			},
+			"required": [
+				"type",
+				"id",
+				"chat"
+			],
+			"description": "Redirects a negotiated rich ask dialog to chat."
+		},
 		"ExtensionUiResponse": {
 			"anyOf": [
 				{
@@ -4959,6 +6059,9 @@
 				},
 				{
 					"$ref": "#/$defs/AnswersUiResponse"
+				},
+				{
+					"$ref": "#/$defs/ChatUiResponse"
 				}
 			],
 			"description": "Host reply to an extension UI request; variants share `type` and differ by their payload key."
@@ -5230,6 +6333,14 @@
 				"data": {
 					"description": "Command result on success; its shape is the command's `result`."
 				},
+				"deliveryId": {
+					"type": "string",
+					"description": "Engine-minted delivery id on a successful deliver response; also in data."
+				},
+				"cancelled": {
+					"type": "boolean",
+					"description": "Pre-acceptance cancellation result on cancel_delivery; also in data."
+				},
 				"error": {
 					"type": "string",
 					"description": "Failure message when `success` is false."
@@ -5312,6 +6423,18 @@
 					"$ref": "#/$defs/ReadyEvent"
 				},
 				{
+					"$ref": "#/$defs/DeliveryAcceptedEvent"
+				},
+				{
+					"$ref": "#/$defs/DeliverySettledEvent"
+				},
+				{
+					"$ref": "#/$defs/DeliveryDiscardedEvent"
+				},
+				{
+					"$ref": "#/$defs/DeliveryCancelledEvent"
+				},
+				{
 					"$ref": "#/$defs/PromptResultEvent"
 				},
 				{
@@ -5379,6 +6502,21 @@
 			],
 			"description": "Any frame the server writes to stdout (after reassembling `rpc_chunk` sequences), discriminated by `type`."
 		},
+		"AttestParams": {
+			"type": "object",
+			"properties": {
+				"operationId": {
+					"type": "string"
+				},
+				"nonce": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"operationId",
+				"nonce"
+			]
+		},
 		"NegotiateProtocolParams": {
 			"type": "object",
 			"properties": {
@@ -5416,6 +6554,9 @@
 				},
 				"streamingBehavior": {
 					"$ref": "#/$defs/StreamingBehavior"
+				},
+				"literal": {
+					"type": "boolean"
 				}
 			},
 			"required": [
@@ -5434,6 +6575,9 @@
 						"$ref": "#/$defs/ImageContent"
 					},
 					"description": "Images attached to the message."
+				},
+				"literal": {
+					"type": "boolean"
 				}
 			},
 			"required": [
@@ -5452,10 +6596,61 @@
 						"$ref": "#/$defs/ImageContent"
 					},
 					"description": "Images attached to the message."
+				},
+				"literal": {
+					"type": "boolean"
 				}
 			},
 			"required": [
 				"message"
+			]
+		},
+		"DeliverParams": {
+			"type": "object",
+			"properties": {
+				"record": {
+					"$ref": "#/$defs/DeliveryRecord"
+				},
+				"options": {
+					"$ref": "#/$defs/DeliveryOptions"
+				}
+			},
+			"required": [
+				"record",
+				"options"
+			]
+		},
+		"DeliverResult": {
+			"type": "object",
+			"properties": {
+				"deliveryId": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"deliveryId"
+			]
+		},
+		"CancelDeliveryParams": {
+			"type": "object",
+			"properties": {
+				"deliveryId": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"deliveryId"
+			]
+		},
+		"CancelDeliveryResult": {
+			"type": "object",
+			"properties": {
+				"cancelled": {
+					"type": "boolean"
+				}
+			},
+			"required": [
+				"cancelled"
 			]
 		},
 		"RemoveQueuedMessageParams": {
@@ -5496,6 +6691,9 @@
 						"$ref": "#/$defs/ImageContent"
 					},
 					"description": "Images attached to the message."
+				},
+				"literal": {
+					"type": "boolean"
 				}
 			},
 			"required": [
@@ -5554,6 +6752,9 @@
 			"properties": {
 				"enabled": {
 					"type": "boolean"
+				},
+				"rich": {
+					"type": "boolean"
 				}
 			},
 			"required": [
@@ -5564,6 +6765,9 @@
 			"type": "object",
 			"properties": {
 				"enabled": {
+					"type": "boolean"
+				},
+				"rich": {
 					"type": "boolean"
 				}
 			},
@@ -6127,6 +7331,48 @@
 					"type": "integer"
 				}
 			}
+		},
+		"GetSessionHistoryParams": {
+			"type": "object",
+			"properties": {
+				"readId": {
+					"type": "string"
+				},
+				"expectedSessionId": {
+					"type": "string"
+				},
+				"expectedSessionPath": {
+					"type": "string"
+				},
+				"before": {
+					"type": "integer"
+				},
+				"limit": {
+					"type": "integer"
+				},
+				"expiresAt": {
+					"type": "integer"
+				}
+			},
+			"required": [
+				"readId",
+				"expectedSessionId",
+				"expectedSessionPath",
+				"before",
+				"limit",
+				"expiresAt"
+			]
+		},
+		"CancelSessionHistoryParams": {
+			"type": "object",
+			"properties": {
+				"readId": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"readId"
+			]
 		},
 		"GetLoginProvidersResult": {
 			"type": "object",

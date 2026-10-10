@@ -59,6 +59,7 @@ import {
 	cfgEvalToolsEnabled,
 } from "../eval/settings";
 import { cfgTaskMaxRecursionDepth } from "../task/settings";
+import { OwnedJobRegistry } from "../session/owned-job-registry";
 import { cfgToolsMaxTimeout, cfgToolsSpeculativeExecutionEnabled } from "./settings";
 
 /** Language tokens the eval tool accepts, in stable display order. */
@@ -937,6 +938,8 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				pushUpdate();
 
 				const startTime = Date.now();
+				// Cell code can start processes the owned-job registry never sees.
+				OwnedJobRegistry.instance()?.markIncomplete("eval code can start untracked processes", "eval-untracked");
 				let result: ExecutorBackendResult;
 				try {
 					result = await backend.execute(cell.code, {

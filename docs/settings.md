@@ -61,6 +61,13 @@ omp config set startup.showSplash true
 
 This only controls the startup splash animation. It does not rerun setup or change setup state, and `startup.quiet: true` still suppresses all startup chrome including the splash.
 
+To let an agent start goal mode from an ordinary conversation, set `goal.toolDefault: true`
+(off by default). `goal.enabled` must also be on. Alternatively, request the tool
+for one launch with `--tools=read,goal`; after a goal is completed or dropped,
+the opted-in tool remains available for another goal. The setting applies to the
+top-level agent only; subagents get `goal` only when their `tools:` list requests it.
+A goal you pause stays paused until you run `/goal resume`.
+
 ### Subcommands
 
 | Command                        | Effect                                                                                                                                                                                                                                                                                            |
@@ -685,6 +692,7 @@ lsp:
 | `lsp.enabled`                     | boolean | `true`    | Language-server integration. `--no-lsp` disables for the run.                                                                                               |
 | `lsp.lazy`                        | boolean | `true`    | Start servers on demand.                                                                                                                                    |
 | `lsp.shared`                      | boolean | `true`    | Share one language server per project across local `omp` processes through the daemon broker; falls back to private servers when the broker is unavailable. |
+| `strictIdle.idleSafeServers`       | array   | `[]`      | Audited idleSafe MCP server names or LSP commands (the names shown in LSP status). Strict census may exclude their exact Linux processes only when all requests, unsettled cancellations and server-initiated handlers have settled. Does not affect attested retirement. |
 | `lsp.diagnosticsOnWrite`          | boolean | `true`    | Run diagnostics after a write.                                                                                                                              |
 | `lsp.diagnosticsOnEdit`           | boolean | `false`   | Run diagnostics after an edit.                                                                                                                              |
 | `lsp.formatOnWrite`               | boolean | `false`   | Format files on write.                                                                                                                                      |

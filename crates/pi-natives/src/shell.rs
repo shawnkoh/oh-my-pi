@@ -204,7 +204,48 @@ impl From<CoreMinimizerResult> for MinimizerResult {
 	}
 }
 
+/// A process a shell run launched that was still alive when the run resolved.
+#[napi(object)]
+pub struct SpawnedProcess {
+	/// OS process id.
+	pub pid:          i32,
+	/// Process group id when known (reparented launches: the detached
+	/// session/group id).
+	pub pgid:         Option<i32>,
+	/// OS process start time, Unix epoch SECONDS (floor) — the same instant
+	/// `ps -o lstart` prints. Display only; omitted when the process could not
+	/// be identity-pinned.
+	pub start_time:   Option<i64>,
+	/// Opaque start identity pinned when the process was recorded — the same
+	/// value as `processIdentity(pid).startId`. Omitted when the process could
+	/// not be identity-pinned (then `spawnedComplete` is false).
+	pub start_id:     Option<String>,
+	/// True for a reparented launch (e.g. `nohup cmd &`): the real
+	/// double-forked descendant, not the dead intermediate.
+	pub reparented:   bool,
+	/// True for a live same-user member of a process group an owned spawn
+	/// created, found by enumerating the group (e.g. `sh -c '/bin/sleep 3202
+	/// &'` leaves the sleep in the dead sh's group).
+	pub group_member: Option<bool>,
+}
+
+impl From<pi_shell::process::SpawnedProcess> for SpawnedProcess {
+	fn from(value: pi_shell::process::SpawnedProcess) -> Self {
+		Self {
+			pid:          value.pid,
+			pgid:         value.pgid,
+			start_time:   value.start_time.and_then(|secs| i64::try_from(secs).ok()),
+			start_id:     value.start_id.map(|id| id.to_string()),
+			reparented:   value.reparented,
+			group_member: value.group_member.then_some(true),
+		}
+	}
+}
+
 /// Result of running a shell command.
+///
+/// A run that rejects (throws) carries no `spawnedProcesses`: what it left
+/// running is unknown.
 #[napi(object)]
 pub struct ShellRunResult {
 	/// Exit code when the command completes normally.
@@ -218,19 +259,42 @@ pub struct ShellRunResult {
 	/// original buffer + telemetry so the session layer can persist it as
 	/// an artifact and splice an `artifact://<id>` reference into the
 	/// minimized text shown to the agent. `None` when nothing was rewritten.
-	pub minimized:   Option<MinimizerResult>,
+	pub minimized:            Option<MinimizerResult>,
 	/// Shell working directory after command completion.
-	pub working_dir: Option<String>,
+	pub working_dir:          Option<String>,
+	/// Live background jobs at settlement; absent when they could not be
+	/// counted.
+	pub live_background_jobs: Option<u32>,
+	/// Processes this run launched that were still alive when it resolved,
+	/// identity-pinned (pid + start id), including the real process of
+	/// reparented launches such as `nohup cmd &` and leftover members of
+	/// process groups the run's spawns created. Set on every result.
+	pub spawned_processes:    Option<Vec<SpawnedProcess>>,
+	/// False when the run may have left a process the list does not contain:
+	/// an owned spawn could not be identity-pinned, a reparented launch fired
+	/// no report (report pipe missing/clobbered, or neither hook fired e.g.
+	/// `nohup cmd </dev/tty &`), or process-group enumeration failed. Set on
+	/// every result.
+	pub spawned_complete:     Option<bool>,
 }
 
 impl From<CoreShellRunResult> for ShellRunResult {
 	fn from(value: CoreShellRunResult) -> Self {
 		Self {
-			exit_code:   value.exit_code,
-			cancelled:   value.cancelled,
-			timed_out:   value.timed_out,
-			minimized:   value.minimized.map(Into::into),
-			working_dir: value.working_dir,
+			exit_code:            value.exit_code,
+			cancelled:            value.cancelled,
+			timed_out:            value.timed_out,
+			minimized:            value.minimized.map(Into::into),
+			working_dir:          value.working_dir,
+			live_background_jobs: value.live_background_jobs,
+			spawned_processes:    Some(
+				value
+					.spawned_processes
+					.into_iter()
+					.map(Into::into)
+					.collect(),
+			),
+			spawned_complete:     Some(value.spawned_complete),
 		}
 	}
 }
@@ -593,11 +657,14 @@ mod tests {
 			.expect("pump should be connected");
 		drop(tx);
 		let result = Ok(ShellRunResult {
-			exit_code:   Some(0),
-			cancelled:   false,
-			timed_out:   false,
-			minimized:   None,
-			working_dir: None,
+			exit_code:            Some(0),
+			cancelled:            false,
+			timed_out:            false,
+			minimized:            None,
+			working_dir:          None,
+			live_background_jobs: Some(0),
+			spawned_processes:    None,
+			spawned_complete:     None,
 		});
 
 		time::timeout(
@@ -625,11 +692,14 @@ mod tests {
 			napi::tokio::spawn(pump_chunks(rx, FORWARD_STALL_TIMEOUT, async |_payload: String| true));
 		drop(tx);
 		let result = Ok(ShellRunResult {
-			exit_code:   None,
-			cancelled:   false,
-			timed_out:   true,
-			minimized:   None,
-			working_dir: None,
+			exit_code:            None,
+			cancelled:            false,
+			timed_out:            true,
+			minimized:            None,
+			working_dir:          None,
+			live_background_jobs: None,
+			spawned_processes:    None,
+			spawned_complete:     None,
 		});
 		let started = time::Instant::now();
 		time::timeout(

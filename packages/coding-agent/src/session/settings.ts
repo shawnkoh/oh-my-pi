@@ -33,6 +33,12 @@ const EMPTY_NUMBER_RECORD: Record<string, number> = {};
 const EMPTY_STRING_ARRAYS_RECORD: Record<string, string[]> = {};
 const DEFAULT_TOOL_CALL_LOOP_EXEMPT_TOOLS: string[] = ["wait"];
 
+export const cfgStrictIdleIdleSafeServers = register({
+	id: "strictIdle.idleSafeServers",
+	type: "array",
+	default: EMPTY_STRING_ARRAY,
+});
+
 // Power assertions: macOS IOKit, Linux login1/ScreenSaver, Windows execution state.
 export const cfgPowerSleepPrevention = register({
 	id: "power.sleepPrevention",

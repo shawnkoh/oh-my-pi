@@ -1,3 +1,5 @@
+import type { CensusIdentity } from "./session/namespace-census";
+import type { InstanceIdentity } from "./session/instance-identity";
 import * as path from "node:path";
 import {
 	Agent,
@@ -352,7 +354,7 @@ import {
 import { cfgTtsr } from "./export/ttsr-settings";
 import { cfgDisabledProviders, cfgEnabledModels, cfgEnabledProviders, cfgModelRoles } from "./config/model-settings";
 import { cfgEditRecoverInlineEdits } from "./edit/settings";
-import { cfgGoalEnabled } from "./goals/settings";
+import { cfgGoalEnabled, cfgGoalToolDefault } from "./goals/settings";
 import { cfgImagesBlockImages, cfgStartupQuiet, cfgTuiReactions, cfgTuiRenderMermaid } from "./modes/settings";
 import { cfgLspEnabled, cfgLspLazy, cfgLspShared } from "./lsp/settings";
 import {
@@ -619,6 +621,9 @@ export interface CreateAgentSessionOptions {
 	providerSessionId?: string;
 	/** Optional provider-facing prompt cache key, distinct from request lineage. */
 	providerPromptCacheKey?: string;
+	a13Identity?: CensusIdentity;
+	a13Instance?: InstanceIdentity;
+	a13Extinct?: InstanceIdentity[];
 	/** Whether `providerPromptCacheKey` is caller-pinned or inherited from a full fork. */
 	providerPromptCacheKeySource?: "explicit" | "fork";
 	/** Absolute wall-clock deadline in Unix epoch milliseconds. */
@@ -2209,6 +2214,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				);
 			},
 			restrictToolNames,
+			goalToolRequested:
+				!restrictToolNames && (options.toolNames ? normalizeToolNames(options.toolNames).includes("goal") : false),
 			get hasEditTool() {
 				const requestedToolNames = options.toolNames ? normalizeToolNames(options.toolNames) : undefined;
 				return restrictToolNames
@@ -2266,6 +2273,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			getServiceTierByFamily: () => session?.serviceTierByFamily,
 			getImageAttachments: () => session?.getImageAttachments() ?? [],
 			getPlanModeState: () => session?.getPlanModeState(),
+			isPlanModePaused: () => session?.isPlanModePaused() ?? false,
 			getPlanReferencePath: () => session?.getPlanReferencePath() ?? "local://PLAN.md",
 			getGoalModeState: () => session?.getGoalModeState(),
 			getGoalRuntime: () => session?.goalRuntime,
@@ -3934,7 +3942,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				return tool?.defaultInactive === true || tool?.hidden === true;
 			}),
 		);
-		const requestedActiveToolNames = normalizedRequested.filter(name => name !== "goal");
+		// `goal.toolDefault` applies to the top-level agent only; subagents need an explicit request.
+		const exposeGoalInitially =
+			!restrictToolNames &&
+			cfgGoalEnabled.get(settings) &&
+			((taskDepth === 0 && cfgGoalToolDefault.get(settings)) ||
+				explicitlyRequestedToolNames?.includes("goal") === true);
+		const requestedActiveToolNames = normalizedRequested.filter(name => name !== "goal" || exposeGoalInitially);
 		const explicitlyRequestedToolNameSet = explicitlyRequestedToolNames
 			? new Set(explicitlyRequestedToolNames)
 			: undefined;
@@ -3948,7 +3962,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				toolSession.deviceOnlyWrite === true);
 		const initialRequestedActiveToolNames = options.toolNames
 			? requestedActiveToolNames
-			: requestedActiveToolNames.filter(name => !defaultInactiveToolNames.has(name));
+			: requestedActiveToolNames.filter(
+					name => !defaultInactiveToolNames.has(name) || (name === "goal" && exposeGoalInitially),
+				);
 		let initialToolNames = [...initialRequestedActiveToolNames];
 
 		// Custom tools and extension-registered tools are always included
@@ -4454,6 +4470,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// block createAgentSession for tens of seconds while the whole file is
 		// streamed and parsed on the main thread.
 		session = new AgentSession({
+			a13Identity: options.a13Identity,
+			a13Instance: options.a13Instance,
+			a13Extinct: options.a13Extinct,
 			codeModeState,
 			cacheWarmer,
 			advisorWatchdogPrompt,
@@ -5175,6 +5194,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				notificationDebounceTimers.clear();
 			};
 			postmortem.register("mcp-notification-cleanup", clearDebounceTimers);
+			// An armed debounce timer is a notification already received but not yet queued.
+			session.registerWorkSource({ kind: "queuedInput", count: () => notificationDebounceTimers.size });
 			mcpManager.setOnResourcesChanged((serverName, uri) => {
 				logger.debug("MCP resources changed", { path: `mcp:${serverName}`, uri });
 				if (!cfgMcpNotifications.get(settings)) return;

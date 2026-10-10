@@ -1848,6 +1848,655 @@ func (v *ModelInfo) decodeFrom(raw map[string]json.RawMessage) error {
 	return nil
 }
 
+type WorkCounts struct {
+	Streaming                 float64 `json:"streaming"`
+	QueuedInput               float64 `json:"queuedInput"`
+	AsyncJobs                 float64 `json:"asyncJobs"`
+	Subagents                 float64 `json:"subagents"`
+	RetainedJobs              float64 `json:"retainedJobs"`
+	DetachedJobs              float64 `json:"detachedJobs"`
+	Compacting                float64 `json:"compacting"`
+	Handoff                   float64 `json:"handoff"`
+	GoalContinuationScheduled float64 `json:"goalContinuationScheduled"`
+	ScheduledTurns            float64 `json:"scheduledTurns"`
+}
+
+func (v *WorkCounts) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "WorkCounts", v.decodeFrom)
+}
+
+func (v *WorkCounts) decodeFrom(raw map[string]json.RawMessage) error {
+	var out WorkCounts
+	d := fieldDecoder{raw: raw, owner: "WorkCounts"}
+	d.required("streaming", &out.Streaming)
+	d.required("queuedInput", &out.QueuedInput)
+	d.required("asyncJobs", &out.AsyncJobs)
+	d.required("subagents", &out.Subagents)
+	d.required("retainedJobs", &out.RetainedJobs)
+	d.required("detachedJobs", &out.DetachedJobs)
+	d.required("compacting", &out.Compacting)
+	d.required("handoff", &out.Handoff)
+	d.required("goalContinuationScheduled", &out.GoalContinuationScheduled)
+	d.required("scheduledTurns", &out.ScheduledTurns)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+type InvocationIdentity struct {
+	Pid       float64  `json:"pid"`
+	StartID   *string  `json:"startId"`
+	StartTime *float64 `json:"startTime"`
+}
+
+func (v *InvocationIdentity) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "InvocationIdentity", v.decodeFrom)
+}
+
+func (v *InvocationIdentity) decodeFrom(raw map[string]json.RawMessage) error {
+	var out InvocationIdentity
+	d := fieldDecoder{raw: raw, owner: "InvocationIdentity"}
+	d.required("pid", &out.Pid)
+	d.nullable("startId", &out.StartID)
+	d.nullable("startTime", &out.StartTime)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+type AttestedSessionIdentity struct {
+	ID     string   `json:"id"`
+	File   *string  `json:"file"`
+	Size   *float64 `json:"size,omitempty"`
+	Sha256 *string  `json:"sha256,omitempty"`
+}
+
+func (v *AttestedSessionIdentity) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "AttestedSessionIdentity", v.decodeFrom)
+}
+
+func (v *AttestedSessionIdentity) decodeFrom(raw map[string]json.RawMessage) error {
+	var out AttestedSessionIdentity
+	d := fieldDecoder{raw: raw, owner: "AttestedSessionIdentity"}
+	d.required("id", &out.ID)
+	d.nullable("file", &out.File)
+	d.optional("size", &out.Size)
+	d.optional("sha256", &out.Sha256)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+type OpaqueOwnedProcess struct {
+	Pid     float64 `json:"pid"`
+	Command string  `json:"command"`
+}
+
+func (v *OpaqueOwnedProcess) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "OpaqueOwnedProcess", v.decodeFrom)
+}
+
+func (v *OpaqueOwnedProcess) decodeFrom(raw map[string]json.RawMessage) error {
+	var out OpaqueOwnedProcess
+	d := fieldDecoder{raw: raw, owner: "OpaqueOwnedProcess"}
+	d.required("pid", &out.Pid)
+	d.required("command", &out.Command)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+type OwnerScanSummary struct {
+	Supported  bool                 `json:"supported"`
+	Sound      bool                 `json:"sound"`
+	Scanned    float64              `json:"scanned"`
+	Discovered float64              `json:"discovered"`
+	Opaque     []OpaqueOwnedProcess `json:"opaque"`
+}
+
+func (v *OwnerScanSummary) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "OwnerScanSummary", v.decodeFrom)
+}
+
+func (v *OwnerScanSummary) decodeFrom(raw map[string]json.RawMessage) error {
+	var out OwnerScanSummary
+	d := fieldDecoder{raw: raw, owner: "OwnerScanSummary"}
+	d.required("supported", &out.Supported)
+	d.required("sound", &out.Sound)
+	d.required("scanned", &out.Scanned)
+	d.required("discovered", &out.Discovered)
+	d.required("opaque", &out.Opaque)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+type OwnedJobRegistryState struct {
+	Path      *string           `json:"path"`
+	Complete  bool              `json:"complete"`
+	OwnerScan *OwnerScanSummary `json:"ownerScan"`
+}
+
+func (v *OwnedJobRegistryState) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "OwnedJobRegistryState", v.decodeFrom)
+}
+
+func (v *OwnedJobRegistryState) decodeFrom(raw map[string]json.RawMessage) error {
+	var out OwnedJobRegistryState
+	d := fieldDecoder{raw: raw, owner: "OwnedJobRegistryState"}
+	d.nullable("path", &out.Path)
+	d.required("complete", &out.Complete)
+	d.nullable("ownerScan", &out.OwnerScan)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+type WorkAttestation struct {
+	OperationID string                   `json:"operationId"`
+	Nonce       string                   `json:"nonce"`
+	Epoch       float64                  `json:"epoch"`
+	InstanceID  string                   `json:"instanceId"`
+	Session     AttestedSessionIdentity  `json:"session"`
+	Invocation  InvocationIdentity       `json:"invocation"`
+	Counts      WorkCounts               `json:"counts"`
+	Admission   WorkAttestationAdmission `json:"admission"`
+	Sealed      bool                     `json:"sealed"`
+	Registry    OwnedJobRegistryState    `json:"registry"`
+	ObservedAt  string                   `json:"observedAt"`
+}
+
+func (v *WorkAttestation) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "WorkAttestation", v.decodeFrom)
+}
+
+func (v *WorkAttestation) decodeFrom(raw map[string]json.RawMessage) error {
+	var out WorkAttestation
+	d := fieldDecoder{raw: raw, owner: "WorkAttestation"}
+	d.constant("version", float64(1))
+	d.required("operationId", &out.OperationID)
+	d.required("nonce", &out.Nonce)
+	d.required("epoch", &out.Epoch)
+	d.required("instanceId", &out.InstanceID)
+	d.required("session", &out.Session)
+	d.required("invocation", &out.Invocation)
+	d.required("counts", &out.Counts)
+	d.required("admission", &out.Admission)
+	d.required("sealed", &out.Sealed)
+	d.required("registry", &out.Registry)
+	d.required("observedAt", &out.ObservedAt)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v WorkAttestation) MarshalJSON() ([]byte, error) {
+	type plain WorkAttestation
+	return encodeObject(plain(v), `"version":1`, nil)
+}
+
+type WorkAttestationAdmission string
+
+const (
+	WorkAttestationAdmissionOpen   WorkAttestationAdmission = "open"
+	WorkAttestationAdmissionClosed WorkAttestationAdmission = "closed"
+)
+
+func (v *WorkAttestationAdmission) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "WorkAttestationAdmission")
+	if err != nil {
+		return err
+	}
+	switch value := WorkAttestationAdmission(s); value {
+	case WorkAttestationAdmissionOpen, WorkAttestationAdmissionClosed:
+		*v = value
+		return nil
+	}
+	return unknownValue("WorkAttestationAdmission", s)
+}
+
+type QuiesceRefusalReason string
+
+const (
+	QuiesceRefusalReasonInvalidRequest         QuiesceRefusalReason = "invalid_request"
+	QuiesceRefusalReasonInvocationMismatch     QuiesceRefusalReason = "invocation_mismatch"
+	QuiesceRefusalReasonSessionMismatch        QuiesceRefusalReason = "session_mismatch"
+	QuiesceRefusalReasonStaleAttempt           QuiesceRefusalReason = "stale_attempt"
+	QuiesceRefusalReasonAdmissionClosed        QuiesceRefusalReason = "admission_closed"
+	QuiesceRefusalReasonDeadlineExpired        QuiesceRefusalReason = "deadline_expired"
+	QuiesceRefusalReasonEpochMismatch          QuiesceRefusalReason = "epoch_mismatch"
+	QuiesceRefusalReasonWorkActive             QuiesceRefusalReason = "work_active"
+	QuiesceRefusalReasonCompletenessUnknown    QuiesceRefusalReason = "completeness_unknown"
+	QuiesceRefusalReasonAttestationUnavailable QuiesceRefusalReason = "attestation_unavailable"
+)
+
+func (v *QuiesceRefusalReason) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "QuiesceRefusalReason")
+	if err != nil {
+		return err
+	}
+	switch value := QuiesceRefusalReason(s); value {
+	case QuiesceRefusalReasonInvalidRequest, QuiesceRefusalReasonInvocationMismatch, QuiesceRefusalReasonSessionMismatch, QuiesceRefusalReasonStaleAttempt, QuiesceRefusalReasonAdmissionClosed, QuiesceRefusalReasonDeadlineExpired, QuiesceRefusalReasonEpochMismatch, QuiesceRefusalReasonWorkActive, QuiesceRefusalReasonCompletenessUnknown, QuiesceRefusalReasonAttestationUnavailable:
+		*v = value
+		return nil
+	}
+	return unknownValue("QuiesceRefusalReason", s)
+}
+
+type TerminalAttestation struct {
+	Kind             TerminalAttestationKind `json:"kind"`
+	Session          AttestedSessionIdentity `json:"session"`
+	Invocation       InvocationIdentity      `json:"invocation"`
+	InstanceID       string                  `json:"instanceId"`
+	Epoch            float64                 `json:"epoch"`
+	Counts           WorkCounts              `json:"counts"`
+	Interrupted      bool                    `json:"interrupted"`
+	RegistryComplete bool                    `json:"registryComplete"`
+	RegistryPath     *string                 `json:"registryPath"`
+	OwnerScan        *OwnerScanSummary       `json:"ownerScan"`
+	WrittenAt        string                  `json:"writtenAt"`
+	OperationID      *string                 `json:"operationId,omitempty"`
+	Attempt          *float64                `json:"attempt,omitempty"`
+	Signal           *string                 `json:"signal,omitempty"`
+}
+
+func (v *TerminalAttestation) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "TerminalAttestation", v.decodeFrom)
+}
+
+func (v *TerminalAttestation) decodeFrom(raw map[string]json.RawMessage) error {
+	var out TerminalAttestation
+	d := fieldDecoder{raw: raw, owner: "TerminalAttestation"}
+	d.constant("version", float64(1))
+	d.required("kind", &out.Kind)
+	d.required("session", &out.Session)
+	d.required("invocation", &out.Invocation)
+	d.required("instanceId", &out.InstanceID)
+	d.required("epoch", &out.Epoch)
+	d.required("counts", &out.Counts)
+	d.required("interrupted", &out.Interrupted)
+	d.required("registryComplete", &out.RegistryComplete)
+	d.nullable("registryPath", &out.RegistryPath)
+	d.nullable("ownerScan", &out.OwnerScan)
+	d.required("writtenAt", &out.WrittenAt)
+	d.optional("operationId", &out.OperationID)
+	d.optional("attempt", &out.Attempt)
+	d.optional("signal", &out.Signal)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v TerminalAttestation) MarshalJSON() ([]byte, error) {
+	type plain TerminalAttestation
+	return encodeObject(plain(v), `"version":1`, nil)
+}
+
+type TerminalAttestationKind string
+
+const (
+	TerminalAttestationKindQuiesce       TerminalAttestationKind = "quiesce"
+	TerminalAttestationKindHangup        TerminalAttestationKind = "hangup"
+	TerminalAttestationKindSealedBlocked TerminalAttestationKind = "sealed_blocked"
+)
+
+func (v *TerminalAttestationKind) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "TerminalAttestationKind")
+	if err != nil {
+		return err
+	}
+	switch value := TerminalAttestationKind(s); value {
+	case TerminalAttestationKindQuiesce, TerminalAttestationKindHangup, TerminalAttestationKindSealedBlocked:
+		*v = value
+		return nil
+	}
+	return unknownValue("TerminalAttestationKind", s)
+}
+
+type CensusProcess struct {
+	Pid  float64 `json:"pid"`
+	Comm string  `json:"comm"`
+	Ppid float64 `json:"ppid"`
+}
+
+func (v *CensusProcess) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "CensusProcess", v.decodeFrom)
+}
+
+func (v *CensusProcess) decodeFrom(raw map[string]json.RawMessage) error {
+	var out CensusProcess
+	d := fieldDecoder{raw: raw, owner: "CensusProcess"}
+	d.required("pid", &out.Pid)
+	d.required("comm", &out.Comm)
+	d.required("ppid", &out.Ppid)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+type CensusResult struct {
+	Complete bool            `json:"complete"`
+	Work     []CensusProcess `json:"work"`
+	Reasons  []string        `json:"reasons"`
+}
+
+func (v *CensusResult) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "CensusResult", v.decodeFrom)
+}
+
+func (v *CensusResult) decodeFrom(raw map[string]json.RawMessage) error {
+	var out CensusResult
+	d := fieldDecoder{raw: raw, owner: "CensusResult"}
+	d.required("complete", &out.Complete)
+	d.required("work", &out.Work)
+	d.required("reasons", &out.Reasons)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+type QuiesceSnapshot struct {
+	Epoch               float64                `json:"epoch"`
+	Counts              WorkCounts             `json:"counts"`
+	ObservedAt          string                 `json:"observedAt"`
+	Registry            *OwnedJobRegistryState `json:"registry,omitempty"`
+	Census              *CensusResult          `json:"census,omitempty"`
+	CompletenessReasons []string               `json:"completenessReasons,omitempty"`
+}
+
+func (v *QuiesceSnapshot) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "QuiesceSnapshot", v.decodeFrom)
+}
+
+func (v *QuiesceSnapshot) decodeFrom(raw map[string]json.RawMessage) error {
+	var out QuiesceSnapshot
+	d := fieldDecoder{raw: raw, owner: "QuiesceSnapshot"}
+	d.required("epoch", &out.Epoch)
+	d.required("counts", &out.Counts)
+	d.required("observedAt", &out.ObservedAt)
+	d.optional("registry", &out.Registry)
+	d.optional("census", &out.Census)
+	d.optional("completenessReasons", &out.CompletenessReasons)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+type SealedQuiesceSnapshot struct {
+	Epoch               float64               `json:"epoch"`
+	Counts              WorkCounts            `json:"counts"`
+	ObservedAt          string                `json:"observedAt"`
+	Registry            OwnedJobRegistryState `json:"registry"`
+	Census              *CensusResult         `json:"census"`
+	CompletenessReasons []string              `json:"completenessReasons"`
+}
+
+func (v *SealedQuiesceSnapshot) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "SealedQuiesceSnapshot", v.decodeFrom)
+}
+
+func (v *SealedQuiesceSnapshot) decodeFrom(raw map[string]json.RawMessage) error {
+	var out SealedQuiesceSnapshot
+	d := fieldDecoder{raw: raw, owner: "SealedQuiesceSnapshot"}
+	d.required("epoch", &out.Epoch)
+	d.required("counts", &out.Counts)
+	d.required("observedAt", &out.ObservedAt)
+	d.required("registry", &out.Registry)
+	d.nullable("census", &out.Census)
+	d.required("completenessReasons", &out.CompletenessReasons)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+type QuiesceProgress struct {
+	Finalized bool `json:"finalized"`
+	Bound     bool `json:"bound"`
+	Attested  bool `json:"attested"`
+}
+
+func (v *QuiesceProgress) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "QuiesceProgress", v.decodeFrom)
+}
+
+func (v *QuiesceProgress) decodeFrom(raw map[string]json.RawMessage) error {
+	var out QuiesceProgress
+	d := fieldDecoder{raw: raw, owner: "QuiesceProgress"}
+	d.required("finalized", &out.Finalized)
+	d.required("bound", &out.Bound)
+	d.required("attested", &out.Attested)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+type QuiesceSealedBlockedResult struct {
+	OperationID string                `json:"operationId"`
+	Attempt     float64               `json:"attempt"`
+	Reason      string                `json:"reason"`
+	Snapshot    SealedQuiesceSnapshot `json:"snapshot"`
+	Progress    QuiesceProgress       `json:"progress"`
+}
+
+func (v *QuiesceSealedBlockedResult) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "QuiesceSealedBlockedResult", v.decodeFrom)
+}
+
+func (v *QuiesceSealedBlockedResult) decodeFrom(raw map[string]json.RawMessage) error {
+	var out QuiesceSealedBlockedResult
+	d := fieldDecoder{raw: raw, owner: "QuiesceSealedBlockedResult"}
+	d.constant("status", "sealed_blocked")
+	d.required("operationId", &out.OperationID)
+	d.required("attempt", &out.Attempt)
+	d.required("reason", &out.Reason)
+	d.required("snapshot", &out.Snapshot)
+	d.required("progress", &out.Progress)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v QuiesceSealedBlockedResult) MarshalJSON() ([]byte, error) {
+	type plain QuiesceSealedBlockedResult
+	return encodeObject(plain(v), `"status":"sealed_blocked"`, nil)
+}
+
+type QuiescedResult struct {
+	OperationID string              `json:"operationId"`
+	Attempt     float64             `json:"attempt"`
+	Attestation TerminalAttestation `json:"attestation"`
+	Path        string              `json:"path"`
+}
+
+func (v *QuiescedResult) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "QuiescedResult", v.decodeFrom)
+}
+
+func (v *QuiescedResult) decodeFrom(raw map[string]json.RawMessage) error {
+	var out QuiescedResult
+	d := fieldDecoder{raw: raw, owner: "QuiescedResult"}
+	d.constant("status", "quiesced")
+	d.required("operationId", &out.OperationID)
+	d.required("attempt", &out.Attempt)
+	d.required("attestation", &out.Attestation)
+	d.required("path", &out.Path)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v QuiescedResult) MarshalJSON() ([]byte, error) {
+	type plain QuiescedResult
+	return encodeObject(plain(v), `"status":"quiesced"`, nil)
+}
+
+type QuiesceRefusedResult struct {
+	OperationID string               `json:"operationId"`
+	Attempt     float64              `json:"attempt"`
+	Reason      QuiesceRefusalReason `json:"reason"`
+	Snapshot    QuiesceSnapshot      `json:"snapshot"`
+}
+
+func (v *QuiesceRefusedResult) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "QuiesceRefusedResult", v.decodeFrom)
+}
+
+func (v *QuiesceRefusedResult) decodeFrom(raw map[string]json.RawMessage) error {
+	var out QuiesceRefusedResult
+	d := fieldDecoder{raw: raw, owner: "QuiesceRefusedResult"}
+	d.constant("status", "refused")
+	d.required("operationId", &out.OperationID)
+	d.required("attempt", &out.Attempt)
+	d.required("reason", &out.Reason)
+	d.required("snapshot", &out.Snapshot)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v QuiesceRefusedResult) MarshalJSON() ([]byte, error) {
+	type plain QuiesceRefusedResult
+	return encodeObject(plain(v), `"status":"refused"`, nil)
+}
+
+type QuiesceUnattestedResult struct {
+	OperationID string          `json:"operationId"`
+	Attempt     float64         `json:"attempt"`
+	Error       string          `json:"error"`
+	Snapshot    QuiesceSnapshot `json:"snapshot"`
+}
+
+func (v *QuiesceUnattestedResult) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "QuiesceUnattestedResult", v.decodeFrom)
+}
+
+func (v *QuiesceUnattestedResult) decodeFrom(raw map[string]json.RawMessage) error {
+	var out QuiesceUnattestedResult
+	d := fieldDecoder{raw: raw, owner: "QuiesceUnattestedResult"}
+	d.constant("status", "exit_unattested")
+	d.required("operationId", &out.OperationID)
+	d.required("attempt", &out.Attempt)
+	d.constant("reason", "attestation_unavailable")
+	d.required("error", &out.Error)
+	d.required("snapshot", &out.Snapshot)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v QuiesceUnattestedResult) MarshalJSON() ([]byte, error) {
+	type plain QuiesceUnattestedResult
+	return encodeObject(plain(v), `"status":"exit_unattested","reason":"attestation_unavailable"`, nil)
+}
+
+type QuiesceResult struct {
+	// Value holds one variant, chosen by "status" on decode.
+	Value QuiesceResultVariant
+}
+
+// QuiesceResultVariant is implemented by the types QuiesceResult can hold.
+type QuiesceResultVariant interface {
+	isQuiesceResult()
+}
+
+func (QuiescedResult) isQuiesceResult()             {}
+func (QuiesceRefusedResult) isQuiesceResult()       {}
+func (QuiesceUnattestedResult) isQuiesceResult()    {}
+func (QuiesceSealedBlockedResult) isQuiesceResult() {}
+
+func (v QuiesceResult) MarshalJSON() ([]byte, error) {
+	return encodeVariant("QuiesceResult", v.Value)
+}
+
+func (v *QuiesceResult) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "QuiesceResult", v.decodeFrom)
+}
+
+func (v *QuiesceResult) decodeFrom(raw map[string]json.RawMessage) error {
+	tag, err := unionTag(raw, "QuiesceResult", "status")
+	if err != nil {
+		return err
+	}
+	var value QuiesceResultVariant
+	switch tag {
+	case "quiesced":
+		value, err = decodeVariant[QuiescedResult](raw)
+	case "refused":
+		value, err = decodeVariant[QuiesceRefusedResult](raw)
+	case "exit_unattested":
+		value, err = decodeVariant[QuiesceUnattestedResult](raw)
+	case "sealed_blocked":
+		value, err = decodeVariant[QuiesceSealedBlockedResult](raw)
+	default:
+		return unknownValue("QuiesceResult.status", tag)
+	}
+	if err != nil {
+		return err
+	}
+	v.Value = value
+	return nil
+}
+
+// Exact call and evaluated arguments decided by a tool-approval select.
+type ToolApprovalBinding struct {
+	ToolCallID string          `json:"toolCallId"`
+	ToolName   string          `json:"toolName"`
+	Arguments  json.RawMessage `json:"arguments"`
+	Reason     *string         `json:"reason,omitempty"`
+}
+
+func (v *ToolApprovalBinding) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "ToolApprovalBinding", v.decodeFrom)
+}
+
+func (v *ToolApprovalBinding) decodeFrom(raw map[string]json.RawMessage) error {
+	var out ToolApprovalBinding
+	d := fieldDecoder{raw: raw, owner: "ToolApprovalBinding"}
+	d.required("toolCallId", &out.ToolCallID)
+	d.required("toolName", &out.ToolName)
+	d.required("arguments", &out.Arguments)
+	d.optional("reason", &out.Reason)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
 type QueueMode string
 
 const (
@@ -2369,6 +3018,203 @@ func (v *GoalResult) decodeFrom(raw map[string]json.RawMessage) error {
 	return nil
 }
 
+type DeliveryMode string
+
+const (
+	DeliveryModeAside DeliveryMode = "aside"
+	DeliveryModeSteer DeliveryMode = "steer"
+)
+
+func (v *DeliveryMode) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "DeliveryMode")
+	if err != nil {
+		return err
+	}
+	switch value := DeliveryMode(s); value {
+	case DeliveryModeAside, DeliveryModeSteer:
+		*v = value
+		return nil
+	}
+	return unknownValue("DeliveryMode", s)
+}
+
+type DeliveryOptions struct {
+	Mode               DeliveryMode                       `json:"mode"`
+	Quiet              *DeliveryOptionsQuiet              `json:"quiet,omitempty"`
+	WakeAfterInterrupt *DeliveryOptionsWakeAfterInterrupt `json:"wakeAfterInterrupt,omitempty"`
+	WakeInPlanMode     *DeliveryOptionsWakeInPlanMode     `json:"wakeInPlanMode,omitempty"`
+	// Extra holds undeclared keys and declared keys whose value did not decode (that field stays zero).
+	// Encoding writes them back, over a declared field with the same key.
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+func (v *DeliveryOptions) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "DeliveryOptions", v.decodeFrom)
+}
+
+func (v *DeliveryOptions) decodeFrom(raw map[string]json.RawMessage) error {
+	var out DeliveryOptions
+	d := fieldDecoder{raw: raw, owner: "DeliveryOptions", open: true}
+	d.required("mode", &out.Mode)
+	d.optional("quiet", &out.Quiet)
+	d.optional("wakeAfterInterrupt", &out.WakeAfterInterrupt)
+	d.optional("wakeInPlanMode", &out.WakeInPlanMode)
+	out.Extra = d.rest()
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v DeliveryOptions) MarshalJSON() ([]byte, error) {
+	type plain DeliveryOptions
+	return encodeObject(plain(v), "", v.Extra)
+}
+
+type DeliveryOptionsQuiet bool
+
+func (v *DeliveryOptionsQuiet) UnmarshalJSON(data []byte) error {
+	var value bool
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	if value != true || isNull(data) {
+		return unknownValue("DeliveryOptionsQuiet", string(data))
+	}
+	*v = DeliveryOptionsQuiet(value)
+	return nil
+}
+
+func (v DeliveryOptionsQuiet) MarshalJSON() ([]byte, error) {
+	if bool(v) != true {
+		return nil, unknownValue("DeliveryOptionsQuiet", "false")
+	}
+	return []byte("true"), nil
+}
+
+type DeliveryOptionsWakeAfterInterrupt bool
+
+func (v *DeliveryOptionsWakeAfterInterrupt) UnmarshalJSON(data []byte) error {
+	var value bool
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	if value != true || isNull(data) {
+		return unknownValue("DeliveryOptionsWakeAfterInterrupt", string(data))
+	}
+	*v = DeliveryOptionsWakeAfterInterrupt(value)
+	return nil
+}
+
+func (v DeliveryOptionsWakeAfterInterrupt) MarshalJSON() ([]byte, error) {
+	if bool(v) != true {
+		return nil, unknownValue("DeliveryOptionsWakeAfterInterrupt", "false")
+	}
+	return []byte("true"), nil
+}
+
+type DeliveryOptionsWakeInPlanMode bool
+
+func (v *DeliveryOptionsWakeInPlanMode) UnmarshalJSON(data []byte) error {
+	var value bool
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	if value != true || isNull(data) {
+		return unknownValue("DeliveryOptionsWakeInPlanMode", string(data))
+	}
+	*v = DeliveryOptionsWakeInPlanMode(value)
+	return nil
+}
+
+func (v DeliveryOptionsWakeInPlanMode) MarshalJSON() ([]byte, error) {
+	if bool(v) != true {
+		return nil, unknownValue("DeliveryOptionsWakeInPlanMode", "false")
+	}
+	return []byte("true"), nil
+}
+
+type DeliveryRecord struct {
+	CustomType string         `json:"customType"`
+	Content    MessageContent `json:"content"`
+	// Requires a valid `omp.llm` user projection and `omp.llm.source` for admission.
+	Details     map[string]json.RawMessage `json:"details"`
+	Display     *bool                      `json:"display,omitempty"`
+	Attribution *Attribution               `json:"attribution,omitempty"`
+	// Extra holds undeclared keys and declared keys whose value did not decode (that field stays zero).
+	// Encoding writes them back, over a declared field with the same key.
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+func (v *DeliveryRecord) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "DeliveryRecord", v.decodeFrom)
+}
+
+func (v *DeliveryRecord) decodeFrom(raw map[string]json.RawMessage) error {
+	var out DeliveryRecord
+	d := fieldDecoder{raw: raw, owner: "DeliveryRecord", open: true}
+	d.required("customType", &out.CustomType)
+	d.required("content", &out.Content)
+	d.required("details", &out.Details)
+	d.optional("display", &out.Display)
+	d.optional("attribution", &out.Attribution)
+	out.Extra = d.rest()
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v DeliveryRecord) MarshalJSON() ([]byte, error) {
+	type plain DeliveryRecord
+	return encodeObject(plain(v), "", v.Extra)
+}
+
+type ExternalDeliveryListing struct {
+	DeliveryID string                       `json:"deliveryId"`
+	State      ExternalDeliveryListingState `json:"state"`
+	Mode       DeliveryMode                 `json:"mode"`
+}
+
+func (v *ExternalDeliveryListing) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "ExternalDeliveryListing", v.decodeFrom)
+}
+
+func (v *ExternalDeliveryListing) decodeFrom(raw map[string]json.RawMessage) error {
+	var out ExternalDeliveryListing
+	d := fieldDecoder{raw: raw, owner: "ExternalDeliveryListing"}
+	d.required("deliveryId", &out.DeliveryID)
+	d.required("state", &out.State)
+	d.required("mode", &out.Mode)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+type ExternalDeliveryListingState string
+
+const (
+	ExternalDeliveryListingStateQueued   ExternalDeliveryListingState = "queued"
+	ExternalDeliveryListingStateAccepted ExternalDeliveryListingState = "accepted"
+)
+
+func (v *ExternalDeliveryListingState) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "ExternalDeliveryListingState")
+	if err != nil {
+		return err
+	}
+	switch value := ExternalDeliveryListingState(s); value {
+	case ExternalDeliveryListingStateQueued, ExternalDeliveryListingStateAccepted:
+		*v = value
+		return nil
+	}
+	return unknownValue("ExternalDeliveryListingState", s)
+}
+
 type SessionState struct {
 	SessionID             string         `json:"sessionId"`
 	Model                 *ModelInfo     `json:"model,omitempty"`
@@ -2389,9 +3235,11 @@ type SessionState struct {
 	// Background jobs or deliveries can still inject a follow-up and wake the session.
 	HasPendingAsyncWork bool `json:"hasPendingAsyncWork"`
 	// Idle with nothing queued or pending; same predicate as `session_settled`.
-	IsSettled      bool                `json:"isSettled"`
-	QueuedMessages QueuedMessagesState `json:"queuedMessages"`
-	TodoPhases     []TodoPhase         `json:"todoPhases"`
+	IsSettled          bool                      `json:"isSettled"`
+	QueuedMessages     QueuedMessagesState       `json:"queuedMessages"`
+	TodoPhases         []TodoPhase               `json:"todoPhases"`
+	Capabilities       []string                  `json:"capabilities"`
+	ExternalDeliveries []ExternalDeliveryListing `json:"externalDeliveries"`
 	// System prompt sections, for session dumps.
 	SystemPrompt []string         `json:"systemPrompt"`
 	DumpTools    []ToolDescriptor `json:"dumpTools"`
@@ -2427,6 +3275,8 @@ func (v *SessionState) decodeFrom(raw map[string]json.RawMessage) error {
 	d.defaulted("isSettled", &out.IsSettled, `false`)
 	d.defaulted("queuedMessages", &out.QueuedMessages, `{"steering":[],"followUp":[]}`)
 	d.defaulted("todoPhases", &out.TodoPhases, `[]`)
+	d.defaulted("capabilities", &out.Capabilities, `[]`)
+	d.defaulted("externalDeliveries", &out.ExternalDeliveries, `[]`)
 	d.scalarOrArray("systemPrompt")
 	d.defaulted("systemPrompt", &out.SystemPrompt, `[]`)
 	d.defaulted("dumpTools", &out.DumpTools, `[]`)
@@ -2818,6 +3668,101 @@ func (v *MessagesPage) decodeFrom(raw map[string]json.RawMessage) error {
 	}
 	*v = out
 	return nil
+}
+
+type SessionHistoryEntry struct {
+	Index       int64                   `json:"index"`
+	Kind        SessionHistoryEntryKind `json:"kind"`
+	EntryID     *string                 `json:"entryId,omitempty"`
+	Timestamp   *string                 `json:"timestamp,omitempty"`
+	Attribution *string                 `json:"attribution,omitempty"`
+	Text        *string                 `json:"text,omitempty"`
+	Truncated   *bool                   `json:"truncated,omitempty"`
+	Images      *int64                  `json:"images,omitempty"`
+	Tools       []string                `json:"tools,omitempty"`
+	ToolName    *string                 `json:"toolName,omitempty"`
+	IsError     *bool                   `json:"isError,omitempty"`
+	Model       *string                 `json:"model,omitempty"`
+}
+
+func (v *SessionHistoryEntry) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "SessionHistoryEntry", v.decodeFrom)
+}
+
+func (v *SessionHistoryEntry) decodeFrom(raw map[string]json.RawMessage) error {
+	var out SessionHistoryEntry
+	d := fieldDecoder{raw: raw, owner: "SessionHistoryEntry"}
+	d.required("index", &out.Index)
+	d.required("kind", &out.Kind)
+	d.optional("entryId", &out.EntryID)
+	d.optional("timestamp", &out.Timestamp)
+	d.optional("attribution", &out.Attribution)
+	d.optional("text", &out.Text)
+	d.optional("truncated", &out.Truncated)
+	d.optional("images", &out.Images)
+	d.optional("tools", &out.Tools)
+	d.optional("toolName", &out.ToolName)
+	d.optional("isError", &out.IsError)
+	d.optional("model", &out.Model)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+type SessionHistoryEntryKind string
+
+const (
+	SessionHistoryEntryKindUser       SessionHistoryEntryKind = "user"
+	SessionHistoryEntryKindAssistant  SessionHistoryEntryKind = "assistant"
+	SessionHistoryEntryKindToolResult SessionHistoryEntryKind = "tool-result"
+	SessionHistoryEntryKindCompaction SessionHistoryEntryKind = "compaction"
+)
+
+func (v *SessionHistoryEntryKind) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "SessionHistoryEntryKind")
+	if err != nil {
+		return err
+	}
+	switch value := SessionHistoryEntryKind(s); value {
+	case SessionHistoryEntryKindUser, SessionHistoryEntryKindAssistant, SessionHistoryEntryKindToolResult, SessionHistoryEntryKindCompaction:
+		*v = value
+		return nil
+	}
+	return unknownValue("SessionHistoryEntryKind", s)
+}
+
+type SessionHistoryPage struct {
+	SessionID   string                `json:"sessionId"`
+	Total       int64                 `json:"total"`
+	LeafEntryID string                `json:"leafEntryId"`
+	Entries     []SessionHistoryEntry `json:"entries"`
+}
+
+func (v *SessionHistoryPage) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "SessionHistoryPage", v.decodeFrom)
+}
+
+func (v *SessionHistoryPage) decodeFrom(raw map[string]json.RawMessage) error {
+	var out SessionHistoryPage
+	d := fieldDecoder{raw: raw, owner: "SessionHistoryPage"}
+	d.required("sessionId", &out.SessionID)
+	d.constant("sourceKind", "native-engine")
+	d.required("total", &out.Total)
+	d.constant("omittedLines", float64(0))
+	d.required("leafEntryId", &out.LeafEntryID)
+	d.required("entries", &out.Entries)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v SessionHistoryPage) MarshalJSON() ([]byte, error) {
+	type plain SessionHistoryPage
+	return encodeObject(plain(v), `"sourceKind":"native-engine","omittedLines":0`, nil)
 }
 
 type SlashCommandInput struct {
@@ -4198,12 +5143,13 @@ func (v *RpcAgentEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	return nil
 }
 
-// First frame after startup; transport fields are absent on servers without protocol v2.
+// First frame after startup; capabilities include quiesce-exit/2 and owned-jobs/1. Transport fields are absent on servers without protocol v2.
 type ReadyEvent struct {
-	ProtocolVersion           *int64  `json:"protocolVersion,omitempty"`
-	SupportedProtocolVersions []int64 `json:"supportedProtocolVersions,omitempty"`
-	MaxFrameBytes             *int64  `json:"maxFrameBytes,omitempty"`
-	MaxReassembledFrameBytes  *int64  `json:"maxReassembledFrameBytes,omitempty"`
+	ProtocolVersion           *int64   `json:"protocolVersion,omitempty"`
+	SupportedProtocolVersions []int64  `json:"supportedProtocolVersions,omitempty"`
+	MaxFrameBytes             *int64   `json:"maxFrameBytes,omitempty"`
+	MaxReassembledFrameBytes  *int64   `json:"maxReassembledFrameBytes,omitempty"`
+	Capabilities              []string `json:"capabilities"`
 }
 
 func (v *ReadyEvent) UnmarshalJSON(data []byte) error {
@@ -4218,6 +5164,7 @@ func (v *ReadyEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	d.optional("supportedProtocolVersions", &out.SupportedProtocolVersions)
 	d.optional("maxFrameBytes", &out.MaxFrameBytes)
 	d.optional("maxReassembledFrameBytes", &out.MaxReassembledFrameBytes)
+	d.defaulted("capabilities", &out.Capabilities, `[]`)
 	if d.err != nil {
 		return d.err
 	}
@@ -4228,6 +5175,168 @@ func (v *ReadyEvent) decodeFrom(raw map[string]json.RawMessage) error {
 func (v ReadyEvent) MarshalJSON() ([]byte, error) {
 	type plain ReadyEvent
 	return encodeObject(plain(v), `"type":"ready"`, nil)
+}
+
+type DeliveryAcceptedEvent struct {
+	DeliveryID string                         `json:"deliveryId"`
+	At         float64                        `json:"at"`
+	Mode       DeliveryMode                   `json:"mode"`
+	Mechanism  DeliveryAcceptedEventMechanism `json:"mechanism"`
+}
+
+func (v *DeliveryAcceptedEvent) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "DeliveryAcceptedEvent", v.decodeFrom)
+}
+
+func (v *DeliveryAcceptedEvent) decodeFrom(raw map[string]json.RawMessage) error {
+	var out DeliveryAcceptedEvent
+	d := fieldDecoder{raw: raw, owner: "DeliveryAcceptedEvent"}
+	d.constant("type", "delivery_accepted")
+	d.required("deliveryId", &out.DeliveryID)
+	d.required("at", &out.At)
+	d.required("mode", &out.Mode)
+	d.required("mechanism", &out.Mechanism)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v DeliveryAcceptedEvent) MarshalJSON() ([]byte, error) {
+	type plain DeliveryAcceptedEvent
+	return encodeObject(plain(v), `"type":"delivery_accepted"`, nil)
+}
+
+type DeliveryAcceptedEventMechanism string
+
+const (
+	DeliveryAcceptedEventMechanismWake          DeliveryAcceptedEventMechanism = "wake"
+	DeliveryAcceptedEventMechanismAside         DeliveryAcceptedEventMechanism = "aside"
+	DeliveryAcceptedEventMechanismSteerBoundary DeliveryAcceptedEventMechanism = "steer-boundary"
+)
+
+func (v *DeliveryAcceptedEventMechanism) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "DeliveryAcceptedEventMechanism")
+	if err != nil {
+		return err
+	}
+	switch value := DeliveryAcceptedEventMechanism(s); value {
+	case DeliveryAcceptedEventMechanismWake, DeliveryAcceptedEventMechanismAside, DeliveryAcceptedEventMechanismSteerBoundary:
+		*v = value
+		return nil
+	}
+	return unknownValue("DeliveryAcceptedEventMechanism", s)
+}
+
+type DeliverySettledEvent struct {
+	DeliveryID  string                      `json:"deliveryId"`
+	Outcome     DeliverySettledEventOutcome `json:"outcome"`
+	Included    bool                        `json:"included"`
+	Requests    float64                     `json:"requests"`
+	Sole        bool                        `json:"sole"`
+	Interactive bool                        `json:"interactive"`
+}
+
+func (v *DeliverySettledEvent) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "DeliverySettledEvent", v.decodeFrom)
+}
+
+func (v *DeliverySettledEvent) decodeFrom(raw map[string]json.RawMessage) error {
+	var out DeliverySettledEvent
+	d := fieldDecoder{raw: raw, owner: "DeliverySettledEvent"}
+	d.constant("type", "delivery_settled")
+	d.required("deliveryId", &out.DeliveryID)
+	d.required("outcome", &out.Outcome)
+	d.required("included", &out.Included)
+	d.required("requests", &out.Requests)
+	d.required("sole", &out.Sole)
+	d.required("interactive", &out.Interactive)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v DeliverySettledEvent) MarshalJSON() ([]byte, error) {
+	type plain DeliverySettledEvent
+	return encodeObject(plain(v), `"type":"delivery_settled"`, nil)
+}
+
+type DeliverySettledEventOutcome string
+
+const (
+	DeliverySettledEventOutcomeQuiet   DeliverySettledEventOutcome = "quiet"
+	DeliverySettledEventOutcomeText    DeliverySettledEventOutcome = "text"
+	DeliverySettledEventOutcomeRefused DeliverySettledEventOutcome = "refused"
+	DeliverySettledEventOutcomeError   DeliverySettledEventOutcome = "error"
+	DeliverySettledEventOutcomeAborted DeliverySettledEventOutcome = "aborted"
+)
+
+func (v *DeliverySettledEventOutcome) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "DeliverySettledEventOutcome")
+	if err != nil {
+		return err
+	}
+	switch value := DeliverySettledEventOutcome(s); value {
+	case DeliverySettledEventOutcomeQuiet, DeliverySettledEventOutcomeText, DeliverySettledEventOutcomeRefused, DeliverySettledEventOutcomeError, DeliverySettledEventOutcomeAborted:
+		*v = value
+		return nil
+	}
+	return unknownValue("DeliverySettledEventOutcome", s)
+}
+
+type DeliveryDiscardedEvent struct {
+	DeliveryID string `json:"deliveryId"`
+	Reason     string `json:"reason"`
+}
+
+func (v *DeliveryDiscardedEvent) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "DeliveryDiscardedEvent", v.decodeFrom)
+}
+
+func (v *DeliveryDiscardedEvent) decodeFrom(raw map[string]json.RawMessage) error {
+	var out DeliveryDiscardedEvent
+	d := fieldDecoder{raw: raw, owner: "DeliveryDiscardedEvent"}
+	d.constant("type", "delivery_discarded")
+	d.required("deliveryId", &out.DeliveryID)
+	d.required("reason", &out.Reason)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v DeliveryDiscardedEvent) MarshalJSON() ([]byte, error) {
+	type plain DeliveryDiscardedEvent
+	return encodeObject(plain(v), `"type":"delivery_discarded"`, nil)
+}
+
+type DeliveryCancelledEvent struct {
+	DeliveryID string `json:"deliveryId"`
+}
+
+func (v *DeliveryCancelledEvent) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "DeliveryCancelledEvent", v.decodeFrom)
+}
+
+func (v *DeliveryCancelledEvent) decodeFrom(raw map[string]json.RawMessage) error {
+	var out DeliveryCancelledEvent
+	d := fieldDecoder{raw: raw, owner: "DeliveryCancelledEvent"}
+	d.constant("type", "delivery_cancelled")
+	d.required("deliveryId", &out.DeliveryID)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v DeliveryCancelledEvent) MarshalJSON() ([]byte, error) {
+	type plain DeliveryCancelledEvent
+	return encodeObject(plain(v), `"type":"delivery_cancelled"`, nil)
 }
 
 type PromptStatus string
@@ -4288,6 +5397,9 @@ type PromptResultEvent struct {
 	SessionSettled bool         `json:"sessionSettled"`
 	ID             *string      `json:"id,omitempty"`
 	Error          *PromptError `json:"error,omitempty"`
+	Run            *int64       `json:"run,omitempty"`
+	PromptEntryID  *string      `json:"promptEntryId,omitempty"`
+	ReplyEntryIds  []string     `json:"replyEntryIds,omitempty"`
 }
 
 func (v *PromptResultEvent) UnmarshalJSON(data []byte) error {
@@ -4303,6 +5415,9 @@ func (v *PromptResultEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("sessionSettled", &out.SessionSettled)
 	d.optional("id", &out.ID)
 	d.optional("error", &out.Error)
+	d.optional("run", &out.Run)
+	d.optional("promptEntryId", &out.PromptEntryID)
+	d.optional("replyEntryIds", &out.ReplyEntryIds)
 	if d.err != nil {
 		return d.err
 	}
@@ -4959,6 +6074,7 @@ type SelectUiRequest struct {
 	Title         string               `json:"title"`
 	Options       []string             `json:"options"`
 	OptionDetails []SelectOptionDetail `json:"optionDetails,omitempty"`
+	Approval      *ToolApprovalBinding `json:"approval,omitempty"`
 	Timeout       *int64               `json:"timeout,omitempty"`
 }
 
@@ -4975,6 +6091,7 @@ func (v *SelectUiRequest) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("title", &out.Title)
 	d.required("options", &out.Options)
 	d.optional("optionDetails", &out.OptionDetails)
+	d.optional("approval", &out.Approval)
 	d.optional("timeout", &out.Timeout)
 	if d.err != nil {
 		return d.err
@@ -5086,9 +6203,10 @@ func (v EditorUiRequest) MarshalJSON() ([]byte, error) {
 
 // Every question of one `ask` tool call; sent only after `set_ask_dialog` enables it.
 type AskUiRequest struct {
-	ID        string        `json:"id"`
-	Questions []AskQuestion `json:"questions"`
-	Timeout   *int64        `json:"timeout,omitempty"`
+	ID           string        `json:"id"`
+	Questions    []AskQuestion `json:"questions"`
+	Timeout      *int64        `json:"timeout,omitempty"`
+	AcceptImages *bool         `json:"acceptImages,omitempty"`
 }
 
 func (v *AskUiRequest) UnmarshalJSON(data []byte) error {
@@ -5103,6 +6221,7 @@ func (v *AskUiRequest) decodeFrom(raw map[string]json.RawMessage) error {
 	d.constant("method", "ask")
 	d.required("questions", &out.Questions)
 	d.optional("timeout", &out.Timeout)
+	d.optional("acceptImages", &out.AcceptImages)
 	if d.err != nil {
 		return d.err
 	}
@@ -5400,9 +6519,12 @@ func (v *ExtensionUiRequest) decodeFrom(raw map[string]json.RawMessage) error {
 
 // Answer to one `ask` question: exact option labels, plus optional free text.
 type AskAnswer struct {
-	ID              string   `json:"id"`
-	SelectedOptions []string `json:"selectedOptions"`
-	CustomInput     *string  `json:"customInput,omitempty"`
+	ID                string         `json:"id"`
+	SelectedOptions   []string       `json:"selectedOptions"`
+	CustomInput       *string        `json:"customInput,omitempty"`
+	CustomInputImages []ImageContent `json:"customInputImages,omitempty"`
+	Note              *string        `json:"note,omitempty"`
+	NoteImages        []ImageContent `json:"noteImages,omitempty"`
 }
 
 func (v *AskAnswer) UnmarshalJSON(data []byte) error {
@@ -5415,6 +6537,9 @@ func (v *AskAnswer) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("id", &out.ID)
 	d.required("selectedOptions", &out.SelectedOptions)
 	d.optional("customInput", &out.CustomInput)
+	d.optional("customInputImages", &out.CustomInputImages)
+	d.optional("note", &out.Note)
+	d.optional("noteImages", &out.NoteImages)
 	if d.err != nil {
 		return d.err
 	}
@@ -5535,6 +6660,33 @@ func (v AnswersUiResponse) MarshalJSON() ([]byte, error) {
 	return encodeObject(plain(v), `"type":"extension_ui_response"`, nil)
 }
 
+// Redirects a negotiated rich ask dialog to chat.
+type ChatUiResponse struct {
+	ID string `json:"id"`
+}
+
+func (v *ChatUiResponse) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "ChatUiResponse", v.decodeFrom)
+}
+
+func (v *ChatUiResponse) decodeFrom(raw map[string]json.RawMessage) error {
+	var out ChatUiResponse
+	d := fieldDecoder{raw: raw, owner: "ChatUiResponse"}
+	d.constant("type", "extension_ui_response")
+	d.required("id", &out.ID)
+	d.constant("chat", true)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v ChatUiResponse) MarshalJSON() ([]byte, error) {
+	type plain ChatUiResponse
+	return encodeObject(plain(v), `"type":"extension_ui_response","chat":true`, nil)
+}
+
 // Host reply to an extension UI request; variants share `type` and differ by their payload key.
 type ExtensionUiResponse struct {
 	// Value holds one variant. Encode-only: no discriminator tells the variants apart.
@@ -5550,6 +6702,7 @@ func (ValueUiResponse) isExtensionUiResponse()   {}
 func (ConfirmUiResponse) isExtensionUiResponse() {}
 func (CancelUiResponse) isExtensionUiResponse()  {}
 func (AnswersUiResponse) isExtensionUiResponse() {}
+func (ChatUiResponse) isExtensionUiResponse()    {}
 
 func (v ExtensionUiResponse) MarshalJSON() ([]byte, error) {
 	return encodeVariant("ExtensionUiResponse", v.Value)
@@ -5902,6 +7055,7 @@ func (ValueUiResponse) isRpcInbound()   {}
 func (ConfirmUiResponse) isRpcInbound() {}
 func (CancelUiResponse) isRpcInbound()  {}
 func (AnswersUiResponse) isRpcInbound() {}
+func (ChatUiResponse) isRpcInbound()    {}
 func (HostToolUpdate) isRpcInbound()    {}
 func (HostToolResult) isRpcInbound()    {}
 func (HostUriResult) isRpcInbound()     {}
@@ -5918,6 +7072,10 @@ type RpcResponse struct {
 	ID *string `json:"id,omitempty"`
 	// Command result on success; its shape is the command's `result`.
 	Data json.RawMessage `json:"data,omitempty"`
+	// Engine-minted delivery id on a successful deliver response; also in data.
+	DeliveryID *string `json:"deliveryId,omitempty"`
+	// Pre-acceptance cancellation result on cancel_delivery; also in data.
+	Cancelled *bool `json:"cancelled,omitempty"`
 	// Failure message when `success` is false.
 	Error *string `json:"error,omitempty"`
 	// Machine-readable failure reason, when one applies.
@@ -5936,6 +7094,8 @@ func (v *RpcResponse) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("success", &out.Success)
 	d.optional("id", &out.ID)
 	d.optional("data", &out.Data)
+	d.optional("deliveryId", &out.DeliveryID)
+	d.optional("cancelled", &out.Cancelled)
 	d.optional("error", &out.Error)
 	d.optional("code", &out.Code)
 	if d.err != nil {
@@ -6038,6 +7198,10 @@ type RpcNotificationVariant interface {
 }
 
 func (ReadyEvent) isRpcNotification()                   {}
+func (DeliveryAcceptedEvent) isRpcNotification()        {}
+func (DeliverySettledEvent) isRpcNotification()         {}
+func (DeliveryDiscardedEvent) isRpcNotification()       {}
+func (DeliveryCancelledEvent) isRpcNotification()       {}
 func (PromptResultEvent) isRpcNotification()            {}
 func (SessionSettledEvent) isRpcNotification()          {}
 func (ExtensionError) isRpcNotification()               {}
@@ -6101,6 +7265,14 @@ func (v *RpcNotification) UnmarshalJSON(data []byte) error {
 	switch tag {
 	case "ready":
 		value, err = decodeVariant[ReadyEvent](raw)
+	case "delivery_accepted":
+		value, err = decodeVariant[DeliveryAcceptedEvent](raw)
+	case "delivery_settled":
+		value, err = decodeVariant[DeliverySettledEvent](raw)
+	case "delivery_discarded":
+		value, err = decodeVariant[DeliveryDiscardedEvent](raw)
+	case "delivery_cancelled":
+		value, err = decodeVariant[DeliveryCancelledEvent](raw)
 	case "prompt_result":
 		value, err = decodeVariant[PromptResultEvent](raw)
 	case "session_settled":
@@ -6222,6 +7394,10 @@ func (HostToolCancelRequest) isRpcServerFrame()        {}
 func (HostUriRequest) isRpcServerFrame()               {}
 func (HostUriCancelRequest) isRpcServerFrame()         {}
 func (ReadyEvent) isRpcServerFrame()                   {}
+func (DeliveryAcceptedEvent) isRpcServerFrame()        {}
+func (DeliverySettledEvent) isRpcServerFrame()         {}
+func (DeliveryDiscardedEvent) isRpcServerFrame()       {}
+func (DeliveryCancelledEvent) isRpcServerFrame()       {}
 func (PromptResultEvent) isRpcServerFrame()            {}
 func (SessionSettledEvent) isRpcServerFrame()          {}
 func (ExtensionError) isRpcServerFrame()               {}
@@ -6295,6 +7471,14 @@ func (v *RpcServerFrame) UnmarshalJSON(data []byte) error {
 		value, err = decodeVariant[HostUriCancelRequest](raw)
 	case "ready":
 		value, err = decodeVariant[ReadyEvent](raw)
+	case "delivery_accepted":
+		value, err = decodeVariant[DeliveryAcceptedEvent](raw)
+	case "delivery_settled":
+		value, err = decodeVariant[DeliverySettledEvent](raw)
+	case "delivery_discarded":
+		value, err = decodeVariant[DeliveryDiscardedEvent](raw)
+	case "delivery_cancelled":
+		value, err = decodeVariant[DeliveryCancelledEvent](raw)
 	case "prompt_result":
 		value, err = decodeVariant[PromptResultEvent](raw)
 	case "session_settled":
@@ -6418,8 +7602,47 @@ func (v *NegotiateProtocolResult) decodeFrom(raw map[string]json.RawMessage) err
 	return nil
 }
 
+type DeliverResult struct {
+	DeliveryID string `json:"deliveryId"`
+}
+
+func (v *DeliverResult) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "DeliverResult", v.decodeFrom)
+}
+
+func (v *DeliverResult) decodeFrom(raw map[string]json.RawMessage) error {
+	var out DeliverResult
+	d := fieldDecoder{raw: raw, owner: "DeliverResult"}
+	d.required("deliveryId", &out.DeliveryID)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+type CancelDeliveryResult struct {
+	Cancelled bool `json:"cancelled"`
+}
+
+func (v *CancelDeliveryResult) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "CancelDeliveryResult", v.decodeFrom)
+}
+
+func (v *CancelDeliveryResult) decodeFrom(raw map[string]json.RawMessage) error {
+	var out CancelDeliveryResult
+	d := fieldDecoder{raw: raw, owner: "CancelDeliveryResult"}
+	d.required("cancelled", &out.Cancelled)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
 type SetAskDialogResult struct {
-	Enabled bool `json:"enabled"`
+	Enabled bool  `json:"enabled"`
+	Rich    *bool `json:"rich,omitempty"`
 }
 
 func (v *SetAskDialogResult) UnmarshalJSON(data []byte) error {
@@ -6430,6 +7653,7 @@ func (v *SetAskDialogResult) decodeFrom(raw map[string]json.RawMessage) error {
 	var out SetAskDialogResult
 	d := fieldDecoder{raw: raw, owner: "SetAskDialogResult"}
 	d.required("enabled", &out.Enabled)
+	d.optional("rich", &out.Rich)
 	if d.err != nil {
 		return d.err
 	}
@@ -6819,6 +8043,57 @@ func (v *PredictWordResult) decodeFrom(raw map[string]json.RawMessage) error {
 	return nil
 }
 
+// AttestCommand holds the parameters of "attest".
+type AttestCommand struct {
+	OperationID string `json:"operationId"`
+	Nonce       string `json:"nonce"`
+}
+
+// Attest sends "attest": Snapshot identity, activity epoch, work census and owned-job registry soundness.
+func (c Commands) Attest(ctx context.Context, p AttestCommand) (WorkAttestation, error) {
+	var out WorkAttestation
+	err := c.call(ctx, "attest", p, 0, &out)
+	return out, err
+}
+
+// QuiesceAndExitCommand holds the parameters of "quiesce_and_exit".
+type QuiesceAndExitCommand struct {
+	OperationID  string                            `json:"operationId"`
+	Completeness QuiesceAndExitCommandCompleteness `json:"completeness"`
+	Attempt      float64                           `json:"attempt"`
+	Epoch        float64                           `json:"epoch"`
+	InstanceID   string                            `json:"instanceId"`
+	SessionID    string                            `json:"sessionId"`
+	Deadline     float64                           `json:"deadline"`
+}
+
+// QuiesceAndExit sends "quiesce_and_exit": Require explicit strict or attested completeness; close admission and retire, retaining strict sealed failures for retry.
+func (c Commands) QuiesceAndExit(ctx context.Context, p QuiesceAndExitCommand) (QuiesceResult, error) {
+	var out QuiesceResult
+	err := c.call(ctx, "quiesce_and_exit", p, 0, &out)
+	return out, err
+}
+
+type QuiesceAndExitCommandCompleteness string
+
+const (
+	QuiesceAndExitCommandCompletenessStrict   QuiesceAndExitCommandCompleteness = "strict"
+	QuiesceAndExitCommandCompletenessAttested QuiesceAndExitCommandCompleteness = "attested"
+)
+
+func (v *QuiesceAndExitCommandCompleteness) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "QuiesceAndExitCommandCompleteness")
+	if err != nil {
+		return err
+	}
+	switch value := QuiesceAndExitCommandCompleteness(s); value {
+	case QuiesceAndExitCommandCompletenessStrict, QuiesceAndExitCommandCompletenessAttested:
+		*v = value
+		return nil
+	}
+	return unknownValue("QuiesceAndExitCommandCompleteness", s)
+}
+
 // NegotiateProtocolCommand holds the parameters of "negotiate_protocol".
 type NegotiateProtocolCommand struct {
 	ProtocolVersion int64 `json:"protocolVersion"`
@@ -6837,6 +8112,7 @@ type PromptCommand struct {
 	// Images attached to the message.
 	Images            []ImageContent     `json:"images,omitempty"`
 	StreamingBehavior *StreamingBehavior `json:"streamingBehavior,omitempty"`
+	Literal           *bool              `json:"literal,omitempty"`
 }
 
 // Prompt sends "prompt": Submit a prompt; acknowledged once admitted, completed by its `prompt_result`.
@@ -6851,7 +8127,8 @@ func (c Commands) Prompt(ctx context.Context, p PromptCommand) (PromptAck, error
 type SteerCommand struct {
 	Message string `json:"message"`
 	// Images attached to the message.
-	Images []ImageContent `json:"images,omitempty"`
+	Images  []ImageContent `json:"images,omitempty"`
+	Literal *bool          `json:"literal,omitempty"`
 }
 
 // Steer sends "steer": Queue a steering message.
@@ -6863,12 +8140,38 @@ func (c Commands) Steer(ctx context.Context, p SteerCommand) error {
 type FollowUpCommand struct {
 	Message string `json:"message"`
 	// Images attached to the message.
-	Images []ImageContent `json:"images,omitempty"`
+	Images  []ImageContent `json:"images,omitempty"`
+	Literal *bool          `json:"literal,omitempty"`
 }
 
 // FollowUp sends "follow_up": Queue a follow-up message.
 func (c Commands) FollowUp(ctx context.Context, p FollowUpCommand) error {
 	return c.call(ctx, "follow_up", p, 0, nil)
+}
+
+// DeliverCommand holds the parameters of "deliver".
+type DeliverCommand struct {
+	Record  DeliveryRecord  `json:"record"`
+	Options DeliveryOptions `json:"options"`
+}
+
+// Deliver sends "deliver": Deliver an externally authored record with owned admission and settlement receipts.
+func (c Commands) Deliver(ctx context.Context, p DeliverCommand) (DeliverResult, error) {
+	var out DeliverResult
+	err := c.call(ctx, "deliver", p, 0, &out)
+	return out, err
+}
+
+// CancelDeliveryCommand holds the parameters of "cancel_delivery".
+type CancelDeliveryCommand struct {
+	DeliveryID string `json:"deliveryId"`
+}
+
+// CancelDelivery sends "cancel_delivery": Cancel a delivery only while it remains queued.
+func (c Commands) CancelDelivery(ctx context.Context, p CancelDeliveryCommand) (CancelDeliveryResult, error) {
+	var out CancelDeliveryResult
+	err := c.call(ctx, "cancel_delivery", p, 0, &out)
+	return out, err
 }
 
 // RemoveQueuedMessageCommand holds the parameters of "remove_queued_message".
@@ -6905,7 +8208,8 @@ func (c Commands) Abort(ctx context.Context) error {
 type AbortAndPromptCommand struct {
 	Message string `json:"message"`
 	// Images attached to the message.
-	Images []ImageContent `json:"images,omitempty"`
+	Images  []ImageContent `json:"images,omitempty"`
+	Literal *bool          `json:"literal,omitempty"`
 }
 
 // AbortAndPrompt sends "abort_and_prompt": Abort the current run and submit a prompt; completed by its `prompt_result`.
@@ -6973,14 +8277,15 @@ func (c Commands) Goal(ctx context.Context, p GoalCommand) (GoalResult, error) {
 
 // SetAskDialogCommand holds the parameters of "set_ask_dialog".
 type SetAskDialogCommand struct {
-	Enabled bool `json:"enabled"`
+	Enabled bool  `json:"enabled"`
+	Rich    *bool `json:"rich,omitempty"`
 }
 
 // SetAskDialog sends "set_ask_dialog": Opt in to `ask` UI requests; returns the applied setting.
-func (c Commands) SetAskDialog(ctx context.Context, p SetAskDialogCommand) (bool, error) {
+func (c Commands) SetAskDialog(ctx context.Context, p SetAskDialogCommand) (SetAskDialogResult, error) {
 	var out SetAskDialogResult
 	err := c.call(ctx, "set_ask_dialog", p, 0, &out)
-	return out.Enabled, err
+	return out, err
 }
 
 // GetAvailableCommands sends "get_available_commands": List the slash-command catalog.
@@ -7399,6 +8704,33 @@ func (c Commands) GetMessagesPage(ctx context.Context, p GetMessagesPageCommand)
 	var out MessagesPage
 	err := c.call(ctx, "get_messages_page", p, 0, &out)
 	return out, err
+}
+
+// GetSessionHistoryCommand holds the parameters of "get_session_history".
+type GetSessionHistoryCommand struct {
+	ReadID              string `json:"readId"`
+	ExpectedSessionID   string `json:"expectedSessionId"`
+	ExpectedSessionPath string `json:"expectedSessionPath"`
+	Before              int64  `json:"before"`
+	Limit               int64  `json:"limit"`
+	ExpiresAt           int64  `json:"expiresAt"`
+}
+
+// GetSessionHistory sends "get_session_history": Read a bounded committed native history page from the exact current Session without extending the supplied expiry.
+func (c Commands) GetSessionHistory(ctx context.Context, p GetSessionHistoryCommand) (SessionHistoryPage, error) {
+	var out SessionHistoryPage
+	err := c.call(ctx, "get_session_history", p, 5*time.Second, &out)
+	return out, err
+}
+
+// CancelSessionHistoryCommand holds the parameters of "cancel_session_history".
+type CancelSessionHistoryCommand struct {
+	ReadID string `json:"readId"`
+}
+
+// CancelSessionHistory sends "cancel_session_history": Cancel one ephemeral history read without aborting the agent or terminating its transport.
+func (c Commands) CancelSessionHistory(ctx context.Context, p CancelSessionHistoryCommand) error {
+	return c.call(ctx, "cancel_session_history", p, 5*time.Second, nil)
 }
 
 // GetLoginProviders sends "get_login_providers": List OAuth providers and their authentication status.

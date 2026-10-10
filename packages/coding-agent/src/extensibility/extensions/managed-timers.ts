@@ -21,8 +21,16 @@ export type ManagedTimerErrorHandler = (event: string, error: string, stack?: st
 
 export class ManagedTimers {
 	readonly #timers = new Set<Timer>();
+	#activeCallbacks = 0;
 
-	constructor(private readonly onError: ManagedTimerErrorHandler) {}
+	get activeCallbacks(): number {
+		return this.#activeCallbacks;
+	}
+
+	constructor(
+		private readonly onError: ManagedTimerErrorHandler,
+		private readonly onActivity?: () => void,
+	) {}
 
 	/** Schedule a repeating callback whose throws are contained. */
 	setInterval(callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]): Timer {
@@ -64,13 +72,27 @@ export class ManagedTimers {
 	}
 
 	#run(kind: "interval" | "timeout", callback: (...args: unknown[]) => void, args: unknown[]): void {
+		this.onActivity?.();
+		this.#activeCallbacks++;
+		let pending = false;
 		try {
 			const result = callback(...args) as unknown;
 			if (result instanceof Promise) {
-				result.catch((err: unknown) => this.#report(kind, err));
+				pending = true;
+				void result.then(
+					() => {
+						this.#activeCallbacks--;
+					},
+					(err: unknown) => {
+						this.#activeCallbacks--;
+						this.#report(kind, err);
+					},
+				);
 			}
 		} catch (err) {
 			this.#report(kind, err);
+		} finally {
+			if (!pending) this.#activeCallbacks--;
 		}
 	}
 

@@ -2571,6 +2571,7 @@ export class AcpAgent implements Agent {
 				sendUserMessage: (content, options) => {
 					this.#trackExtensionUserMessage(record, record.session.sendUserMessage(content, options));
 				},
+				deliverMessage: (message, options) => record.session.deliverExternalMessage(message, options),
 				appendEntry: (customType, data) => {
 					record.session.sessionManager.appendCustomEntry(customType, data);
 				},
@@ -2767,6 +2768,8 @@ export class AcpAgent implements Agent {
 	}
 
 	async #disposeSessionRecord(record: ManagedSessionRecord, reason?: postmortem.Reason): Promise<void> {
+		// Mark the session disposing (and capture a hang-up) before any await below.
+		record.session.beginDispose(reason);
 		record.lifetimeUnsubscribe?.();
 		if (record.mcpManager) {
 			try {
@@ -2804,6 +2807,9 @@ export class AcpAgent implements Agent {
 			await Promise.all(
 				records.map(async ([sessionId, record]) => {
 					try {
+						// Synchronously, before this pass's first await: a hang-up is captured and
+						// the session knows its host is tearing it down.
+						record.session.beginDispose(reason);
 						record.closedError ??= this.#createPromptLifecycleError(
 							"ACP agent disposed before queued prompt could run",
 						);

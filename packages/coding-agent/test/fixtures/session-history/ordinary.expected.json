@@ -1,0 +1,13 @@
+{
+  "total": 6,
+  "omittedLines": 0,
+  "leafEntryId": "last",
+  "entries": [
+    {"index":1,"entryId":"q","kind":"user","attribution":"person:test","text":"Hello\nworld","images":1},
+    {"index":2,"entryId":"a","kind":"assistant","text":"Visible","tools":["read"],"model":"synthetic/tiny"},
+    {"index":3,"entryId":"t","kind":"tool-result","toolName":"read","isError":true},
+    {"index":4,"entryId":"c","kind":"compaction"},
+    {"index":5,"entryId":"u","kind":"user","text":"again","tools":["user-tool"]},
+    {"index":6,"entryId":"last","kind":"assistant","text":"Final","model":"synthetic/tiny"}
+  ]
+}

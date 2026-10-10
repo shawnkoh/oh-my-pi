@@ -22,6 +22,16 @@ export class RpcOutputWriter {
 	#failure: Error | undefined;
 	#closing = false;
 	#completion: { promise: Promise<void>; resolve: () => void; reject: (error: Error) => void } | undefined;
+	#deferred:
+		| {
+				line: string;
+				deadline: number;
+				complete: (delivered: boolean) => void;
+				timer: NodeJS.Timeout;
+				prepare?: () => string | undefined;
+		  }
+		| undefined;
+	#deferredTurn: NodeJS.Immediate | undefined;
 
 	constructor(
 		private readonly sink: Writable,
@@ -45,8 +55,32 @@ export class RpcOutputWriter {
 		}
 	}
 
+	/**
+	 * Hold one bounded history response outside the ordinary spool. Ordinary frames
+	 * already accepted by write() take priority; an unsent frame can be discarded.
+	 * Once passed to sink.write, credit remains held until its write callback.
+	 */
+	defer(
+		line: string,
+		deadline: number,
+		complete: (delivered: boolean) => void,
+		prepare?: () => string | undefined,
+	): () => void {
+		if (this.#deferred) throw new Error("RPC deferred output slot occupied");
+		if (this.#failure || this.#closing || deadline <= performance.now()) {
+			complete(false);
+			return () => {};
+		}
+		const timer = setTimeout(() => this.#discardDeferred(), Math.max(0, deadline - performance.now()));
+		timer.unref();
+		this.#deferred = { line, deadline, complete, timer, prepare };
+		this.#scheduleDeferred();
+		return () => this.#discardDeferred();
+	}
+
 	async close(): Promise<void> {
 		this.#closing = true;
+		this.#discardDeferred();
 		if (this.#failure) throw this.#failure;
 		if (this.#pendingWrites || this.#spool || this.#pumping) {
 			this.#completion ??= Promise.withResolvers<void>();
@@ -58,12 +92,13 @@ export class RpcOutputWriter {
 		process.off("exit", this.#onExit);
 	}
 
-	#write(bytes: string | Uint8Array): void {
+	#write(bytes: string | Uint8Array, complete?: (delivered: boolean) => void): void {
 		this.#pendingWrites++;
 		this.#blocked = !this.sink.write(bytes, error => {
 			this.#pendingWrites--;
 			if (error) this.#fail(error);
-			else this.#settle();
+			complete?.(!error);
+			if (!error) this.#settle();
 		});
 	}
 
@@ -140,12 +175,51 @@ export class RpcOutputWriter {
 		}
 	}
 
+	#scheduleDeferred(): void {
+		if (this.#deferredTurn || !this.#deferred || this.#blocked || this.#pendingWrites || this.#spool || this.#pumping)
+			return;
+		// Let ordinary responses produced in this event-loop turn enter the writer first.
+		this.#deferredTurn = setImmediate(() => {
+			this.#deferredTurn = undefined;
+			const pending = this.#deferred;
+			if (!pending || this.#blocked || this.#pendingWrites || this.#spool || this.#pumping) return;
+			if (performance.now() >= pending.deadline || this.#failure || this.#closing) {
+				this.#discardDeferred();
+				return;
+			}
+			this.#deferred = undefined;
+			clearTimeout(pending.timer);
+			const line = pending.prepare ? pending.prepare() : pending.line;
+			if (line === undefined) pending.complete(false);
+			else {
+				try {
+					this.#write(line, pending.complete);
+				} catch (error) {
+					pending.complete(false);
+					this.#fail(error);
+				}
+			}
+		});
+	}
+
+	#discardDeferred(): void {
+		const pending = this.#deferred;
+		if (!pending) return;
+		this.#deferred = undefined;
+		clearTimeout(pending.timer);
+		pending.complete(false);
+	}
+
 	#settle(): void {
-		if (!this.#pendingWrites && !this.#spool && !this.#pumping && !this.#failure) this.#completion?.resolve();
+		if (!this.#pendingWrites && !this.#spool && !this.#pumping && !this.#failure) {
+			this.#completion?.resolve();
+			this.#scheduleDeferred();
+		}
 	}
 
 	#fail(error: unknown): void {
 		if (this.#failure) return;
+		this.#discardDeferred();
 		this.#failure = error instanceof Error ? error : new Error(String(error));
 		try {
 			this.#removeSpool();

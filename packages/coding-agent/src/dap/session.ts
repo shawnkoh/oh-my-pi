@@ -2,6 +2,7 @@ import * as path from "node:path";
 import * as timers from "node:timers/promises";
 import { logger, ptree, untilAborted } from "@oh-my-pi/pi-utils";
 import { NON_INTERACTIVE_ENV } from "../exec/non-interactive-env";
+import { OwnedJobRegistry } from "../session/owned-job-registry";
 import { DapClient } from "./client";
 import type {
 	DapAttachArguments,
@@ -62,6 +63,18 @@ import type {
 	DapWriteMemoryArguments,
 	DapWriteMemoryResponse,
 } from "./types";
+
+/**
+ * Debug adapters and the programs they launch (including `runInTerminal` children) are not
+ * enumerated by the owned-job registry, so a session that debugs cannot vouch for every
+ * process it owns.
+ */
+function markDebugSessionUntracked(): void {
+	OwnedJobRegistry.instance()?.markIncomplete(
+		"debug sessions start processes the registry does not track",
+		"debug-untracked",
+	);
+}
 
 interface DapSession {
 	id: string;
@@ -311,6 +324,7 @@ export class DapSessionManager {
 		timeoutMs: number = 30_000,
 	): Promise<DapSessionSummary> {
 		await this.#ensureLaunchSlot();
+		markDebugSessionUntracked();
 		const client = await DapClient.spawn({ adapter: options.adapter, cwd: options.cwd });
 		const session = this.#registerSession(client, options.adapter, options.cwd, options.program);
 		try {
@@ -384,6 +398,7 @@ export class DapSessionManager {
 		timeoutMs: number = 30_000,
 	): Promise<DapSessionSummary> {
 		await this.#ensureLaunchSlot();
+		markDebugSessionUntracked();
 		const client = await DapClient.spawn({ adapter: options.adapter, cwd: options.cwd });
 		const session = this.#registerSession(client, options.adapter, options.cwd);
 		try {

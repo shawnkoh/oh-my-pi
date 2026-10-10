@@ -23,6 +23,7 @@ from ._wire_runtime import (
     JsonObject,
     JsonValue,
     literal,
+    literal_number,
     nullable,
     open_record,
     optional,
@@ -60,6 +61,11 @@ ConfiguredThinkingLevel: TypeAlias = Literal["auto", "inherit", "off", "minimal"
 """User-configured thinking selector, including automatic selection."""
 _CONFIGURED_THINKING_LEVEL_VALUES: Final[frozenset[str]] = frozenset({"auto", "inherit", "off", "minimal", "low", "medium", "high", "xhigh", "max"})
 _decode_configured_thinking_level = cast("Decoder[ConfiguredThinkingLevel]", literal(_CONFIGURED_THINKING_LEVEL_VALUES))
+
+
+QuiesceRefusalReason: TypeAlias = Literal["invalid_request", "invocation_mismatch", "session_mismatch", "stale_attempt", "admission_closed", "deadline_expired", "epoch_mismatch", "work_active", "completeness_unknown", "attestation_unavailable"]
+_QUIESCE_REFUSAL_REASON_VALUES: Final[frozenset[str]] = frozenset({"invalid_request", "invocation_mismatch", "session_mismatch", "stale_attempt", "admission_closed", "deadline_expired", "epoch_mismatch", "work_active", "completeness_unknown", "attestation_unavailable"})
+_decode_quiesce_refusal_reason = cast("Decoder[QuiesceRefusalReason]", literal(_QUIESCE_REFUSAL_REASON_VALUES))
 
 
 QueueMode: TypeAlias = Literal["all", "one-at-a-time"]
@@ -127,6 +133,11 @@ _decode_agent_source = cast("Decoder[AgentSource]", literal(_AGENT_SOURCE_VALUES
 SubagentStatus: TypeAlias = Literal["pending", "running", "completed", "failed", "aborted"]
 _SUBAGENT_STATUS_VALUES: Final[frozenset[str]] = frozenset({"pending", "running", "completed", "failed", "aborted"})
 _decode_subagent_status = cast("Decoder[SubagentStatus]", literal(_SUBAGENT_STATUS_VALUES))
+
+
+DeliveryMode: TypeAlias = Literal["aside", "steer"]
+_DELIVERY_MODE_VALUES: Final[frozenset[str]] = frozenset({"aside", "steer"})
+_decode_delivery_mode = cast("Decoder[DeliveryMode]", literal(_DELIVERY_MODE_VALUES))
 
 
 AutoCompactionReason: TypeAlias = Literal["threshold", "overflow", "idle", "incomplete"]
@@ -481,6 +492,22 @@ class AssistantErrorEvent(TypedDict):
     error: AssistantMessage
 
 
+class DeliveryOptions(TypedDict):
+    mode: DeliveryMode
+    quiet: NotRequired[Literal[True]]
+    wakeAfterInterrupt: NotRequired[Literal[True]]
+    wakeInPlanMode: NotRequired[Literal[True]]
+
+
+class DeliveryRecord(TypedDict):
+    customType: str
+    content: MessageContent
+    details: JsonObject
+    """Requires a valid `omp.llm` user projection and `omp.llm.source` for admission."""
+    display: NotRequired[bool]
+    attribution: NotRequired[Attribution]
+
+
 class SelectOptionDetail(TypedDict):
     """Presentation metadata aligned positionally with `options`."""
     description: NotRequired[str]
@@ -532,6 +559,180 @@ class ModelInfo:
     priority: int | None = None
     thinking: ThinkingConfig | None = None
     compat: JsonObject | None = None
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class WorkCounts:
+    streaming: float
+    queued_input: float
+    async_jobs: float
+    subagents: float
+    retained_jobs: float
+    detached_jobs: float
+    compacting: float
+    handoff: float
+    goal_continuation_scheduled: float
+    scheduled_turns: float
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class InvocationIdentity:
+    pid: float
+    start_id: str | None
+    start_time: float | None
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class AttestedSessionIdentity:
+    id: str
+    file: str | None
+    size: float | None = None
+    sha256: str | None = None
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class OpaqueOwnedProcess:
+    pid: float
+    command: str
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class OwnerScanSummary:
+    supported: bool
+    sound: bool
+    scanned: float
+    discovered: float
+    opaque: tuple[OpaqueOwnedProcess, ...]
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class OwnedJobRegistryState:
+    path: str | None
+    complete: bool
+    owner_scan: OwnerScanSummary | None
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class WorkAttestation:
+    version: Literal[1] = 1
+    operation_id: str
+    nonce: str
+    epoch: float
+    instance_id: str
+    session: AttestedSessionIdentity
+    invocation: InvocationIdentity
+    counts: WorkCounts
+    admission: Literal["open", "closed"]
+    sealed: bool
+    registry: OwnedJobRegistryState
+    observed_at: str
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class TerminalAttestation:
+    version: Literal[1] = 1
+    kind: Literal["quiesce", "hangup", "sealed_blocked"]
+    session: AttestedSessionIdentity
+    invocation: InvocationIdentity
+    instance_id: str
+    epoch: float
+    counts: WorkCounts
+    interrupted: bool
+    registry_complete: bool
+    registry_path: str | None
+    owner_scan: OwnerScanSummary | None
+    written_at: str
+    operation_id: str | None = None
+    attempt: float | None = None
+    signal: str | None = None
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class CensusProcess:
+    pid: float
+    comm: str
+    ppid: float
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class CensusResult:
+    complete: bool
+    work: tuple[CensusProcess, ...]
+    reasons: tuple[str, ...]
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class QuiesceSnapshot:
+    epoch: float
+    counts: WorkCounts
+    observed_at: str
+    registry: OwnedJobRegistryState | None = None
+    census: CensusResult | None = None
+    completeness_reasons: tuple[str, ...] | None = None
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class SealedQuiesceSnapshot:
+    epoch: float
+    counts: WorkCounts
+    observed_at: str
+    registry: OwnedJobRegistryState
+    census: CensusResult | None
+    completeness_reasons: tuple[str, ...]
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class QuiesceProgress:
+    finalized: bool
+    bound: bool
+    attested: bool
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class QuiesceSealedBlockedResult:
+    status: Literal["sealed_blocked"] = "sealed_blocked"
+    operation_id: str
+    attempt: float
+    reason: str
+    snapshot: SealedQuiesceSnapshot
+    progress: QuiesceProgress
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class QuiescedResult:
+    status: Literal["quiesced"] = "quiesced"
+    operation_id: str
+    attempt: float
+    attestation: TerminalAttestation
+    path: str
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class QuiesceRefusedResult:
+    status: Literal["refused"] = "refused"
+    operation_id: str
+    attempt: float
+    reason: QuiesceRefusalReason
+    snapshot: QuiesceSnapshot
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class QuiesceUnattestedResult:
+    status: Literal["exit_unattested"] = "exit_unattested"
+    operation_id: str
+    attempt: float
+    reason: Literal["attestation_unavailable"] = "attestation_unavailable"
+    error: str
+    snapshot: QuiesceSnapshot
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class ToolApprovalBinding:
+    """Exact call and evaluated arguments decided by a tool-approval select."""
+    tool_call_id: str
+    tool_name: str
+    arguments: JsonValue
+    reason: str | None = None
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -602,6 +803,13 @@ class GoalResult:
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
+class ExternalDeliveryListing:
+    delivery_id: str
+    state: Literal["queued", "accepted"]
+    mode: DeliveryMode
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
 class SessionState:
     session_id: str
     model: ModelInfo | None = None
@@ -625,6 +833,8 @@ class SessionState:
     """Idle with nothing queued or pending; same predicate as `session_settled`."""
     queued_messages: QueuedMessagesState = field(default_factory=lambda: parse_queued_messages_state({"steering": [], "followUp": []}, "queuedMessages"))
     todo_phases: tuple[TodoPhase, ...] = ()
+    capabilities: tuple[str, ...] = ()
+    external_deliveries: tuple[ExternalDeliveryListing, ...] = ()
     system_prompt: tuple[str, ...] = ()
     """System prompt sections, for session dumps."""
     dump_tools: tuple[ToolDescriptor, ...] = ()
@@ -755,6 +965,32 @@ class MessagesPage:
     total_messages: int
     next_cursor: str | None = None
     """Opaque cursor for the next page; absent on the last page."""
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class SessionHistoryEntry:
+    index: int
+    kind: Literal["user", "assistant", "tool-result", "compaction"]
+    entry_id: str | None = None
+    timestamp: str | None = None
+    attribution: str | None = None
+    text: str | None = None
+    truncated: bool | None = None
+    images: int | None = None
+    tools: tuple[str, ...] | None = None
+    tool_name: str | None = None
+    is_error: bool | None = None
+    model: str | None = None
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class SessionHistoryPage:
+    session_id: str
+    source_kind: Literal["native-engine"] = "native-engine"
+    total: int
+    omitted_lines: Literal[0] = 0
+    leaf_entry_id: str
+    entries: tuple[SessionHistoryEntry, ...]
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -1096,12 +1332,46 @@ class QueueUpdateEvent:
 
 @dataclass(slots=True, frozen=True, kw_only=True)
 class ReadyEvent:
-    """First frame after startup; transport fields are absent on servers without protocol v2."""
+    """First frame after startup; capabilities include quiesce-exit/2 and owned-jobs/1. Transport fields are absent on servers without protocol v2."""
     type: Literal["ready"] = "ready"
     protocol_version: int | None = None
     supported_protocol_versions: tuple[int, ...] | None = None
     max_frame_bytes: int | None = None
     max_reassembled_frame_bytes: int | None = None
+    capabilities: tuple[str, ...] = ()
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class DeliveryAcceptedEvent:
+    type: Literal["delivery_accepted"] = "delivery_accepted"
+    delivery_id: str
+    at: float
+    mode: DeliveryMode
+    mechanism: Literal["wake", "aside", "steer-boundary"]
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class DeliverySettledEvent:
+    type: Literal["delivery_settled"] = "delivery_settled"
+    delivery_id: str
+    outcome: Literal["quiet", "text", "refused", "error", "aborted"]
+    included: bool
+    requests: float
+    sole: bool
+    interactive: bool
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class DeliveryDiscardedEvent:
+    type: Literal["delivery_discarded"] = "delivery_discarded"
+    delivery_id: str
+    reason: str
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class DeliveryCancelledEvent:
+    type: Literal["delivery_cancelled"] = "delivery_cancelled"
+    delivery_id: str
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -1125,6 +1395,9 @@ class PromptResultEvent:
     """Nothing will wake the session again; when false a `session_settled` follows once background work drains."""
     id: str | None = None
     error: PromptError | None = None
+    run: int | None = None
+    prompt_entry_id: str | None = None
+    reply_entry_ids: tuple[str, ...] | None = None
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -1292,6 +1565,7 @@ class SelectUiRequest:
     title: str
     options: tuple[str, ...]
     option_details: tuple[SelectOptionDetail, ...] | None = None
+    approval: ToolApprovalBinding | None = None
     timeout: int | None = None
 
 
@@ -1333,6 +1607,7 @@ class AskUiRequest:
     method: Literal["ask"] = "ask"
     questions: tuple[AskQuestion, ...]
     timeout: int | None = None
+    accept_images: bool | None = None
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -1408,12 +1683,14 @@ class ExtensionUiRequest(ExtensionUiRequestMixin):
     title: str | None = None
     options: tuple[str, ...] | None = None
     option_details: tuple[SelectOptionDetail, ...] | None = None
+    approval: ToolApprovalBinding | None = None
     timeout: int | None = None
     message: str | None = None
     placeholder: str | None = None
     prefill: str | None = None
     prompt_style: bool | None = None
     questions: tuple[AskQuestion, ...] | None = None
+    accept_images: bool | None = None
     target_id: str | None = None
     notify_type: NotifyType | None = None
     status_key: str | None = None
@@ -1434,6 +1711,9 @@ class AskAnswer:
     id: str
     selected_options: tuple[str, ...]
     custom_input: str | None = None
+    custom_input_images: tuple[ImageContent, ...] | None = None
+    note: str | None = None
+    note_images: tuple[ImageContent, ...] | None = None
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -1460,6 +1740,22 @@ class NegotiateProtocolResult:
     protocol_version: int
 
 
+@dataclass(slots=True, frozen=True, kw_only=True)
+class DeliverResult:
+    delivery_id: str
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class CancelDeliveryResult:
+    cancelled: bool
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class SetAskDialogResult:
+    enabled: bool
+    rich: bool | None = None
+
+
 UserContent: TypeAlias = TextContent | ImageContent
 
 
@@ -1474,11 +1770,14 @@ AssistantMessageEvent: TypeAlias = AssistantStartEvent | AssistantTextStartEvent
 """Streaming update for one assistant message, discriminated by `type`."""
 
 
+QuiesceResult: TypeAlias = QuiescedResult | QuiesceRefusedResult | QuiesceUnattestedResult | QuiesceSealedBlockedResult
+
+
 RpcAgentEvent: TypeAlias = AgentStartEvent | AgentEndEvent | TurnStartEvent | TurnEndEvent | MessageStartEvent | MessageUpdateEvent | MessageEndEvent | ToolExecutionStartEvent | ToolExecutionUpdateEvent | ToolStreamUpdateEvent | ToolExecutionEndEvent | AutoCompactionStartEvent | AutoCompactionEndEvent | AutoRetryStartEvent | AutoRetryEndEvent | CacheWarmingStartEvent | CacheWarmingEndEvent | RetryFallbackAppliedEvent | RetryFallbackSucceededEvent | ModelChangedEvent | ConfigWarningsChangedEvent | AdvisorCostChangedEvent | AdvisorYieldedEvent | TtsrTriggeredEvent | TodoReminderEvent | TodoAutoClearEvent | IrcMessageEvent | NoticeEvent | ThinkingLevelChangedEvent | GoalUpdatedEvent | QueueUpdateEvent
 """A session event, discriminated by `type`; `set_event_filter` selects which are sent."""
 
 
-RpcNotification: TypeAlias = ReadyEvent | PromptResultEvent | SessionSettledEvent | ExtensionError | ExtensionUiRequest | AvailableCommandsUpdateEvent | SubagentLifecycleEvent | SubagentProgressEvent | SubagentEvent | LivePhaseEvent | LiveLevelsEvent | LiveTranscriptEvent | LiveEndEvent | CommandOutputEvent | SessionInfoUpdateEvent | ConfigUpdateEvent | RpcFrameErrorEvent | RpcAgentEvent | UnknownNotification
+RpcNotification: TypeAlias = ReadyEvent | DeliveryAcceptedEvent | DeliverySettledEvent | DeliveryDiscardedEvent | DeliveryCancelledEvent | PromptResultEvent | SessionSettledEvent | ExtensionError | ExtensionUiRequest | AvailableCommandsUpdateEvent | SubagentLifecycleEvent | SubagentProgressEvent | SubagentEvent | LivePhaseEvent | LiveLevelsEvent | LiveTranscriptEvent | LiveEndEvent | CommandOutputEvent | SessionInfoUpdateEvent | ConfigUpdateEvent | RpcFrameErrorEvent | RpcAgentEvent | UnknownNotification
 """Unsolicited outbound frame (everything except responses and host tool/URI requests), discriminated by `type`."""
 
 
@@ -1622,6 +1921,14 @@ parse_assistant_error_event = cast("Decoder[AssistantErrorEvent]", open_record("
 """Decodes a `AssistantErrorEvent` open record: checks the discriminator and keeps every key."""
 
 
+parse_delivery_options = cast("Decoder[DeliveryOptions]", open_record(None, None))
+"""Decodes a `DeliveryOptions` open record: checks the discriminator and keeps every key."""
+
+
+parse_delivery_record = cast("Decoder[DeliveryRecord]", open_record(None, None))
+"""Decodes a `DeliveryRecord` open record: checks the discriminator and keeps every key."""
+
+
 parse_select_option_detail = cast("Decoder[SelectOptionDetail]", open_record(None, None))
 """Decodes a `SelectOptionDetail` open record: checks the discriminator and keeps every key."""
 
@@ -1688,6 +1995,215 @@ def parse_model_info(value: object, path: str = "ModelInfo") -> ModelInfo:
         priority=optional(payload, "priority", decode_int, path),
         thinking=optional(payload, "thinking", parse_thinking_config, path),
         compat=optional(payload, "compat", decode_json_object, path),
+    )
+
+
+def parse_work_counts(value: object, path: str = "WorkCounts") -> WorkCounts:
+    payload = expect_object(value, path)
+    return WorkCounts(
+        streaming=required(payload, "streaming", decode_float, path),
+        queued_input=required(payload, "queuedInput", decode_float, path),
+        async_jobs=required(payload, "asyncJobs", decode_float, path),
+        subagents=required(payload, "subagents", decode_float, path),
+        retained_jobs=required(payload, "retainedJobs", decode_float, path),
+        detached_jobs=required(payload, "detachedJobs", decode_float, path),
+        compacting=required(payload, "compacting", decode_float, path),
+        handoff=required(payload, "handoff", decode_float, path),
+        goal_continuation_scheduled=required(payload, "goalContinuationScheduled", decode_float, path),
+        scheduled_turns=required(payload, "scheduledTurns", decode_float, path),
+    )
+
+
+def parse_invocation_identity(value: object, path: str = "InvocationIdentity") -> InvocationIdentity:
+    payload = expect_object(value, path)
+    return InvocationIdentity(
+        pid=required(payload, "pid", decode_float, path),
+        start_id=required(payload, "startId", nullable(decode_str), path),
+        start_time=required(payload, "startTime", nullable(decode_float), path),
+    )
+
+
+def parse_attested_session_identity(value: object, path: str = "AttestedSessionIdentity") -> AttestedSessionIdentity:
+    payload = expect_object(value, path)
+    return AttestedSessionIdentity(
+        id=required(payload, "id", decode_str, path),
+        file=required(payload, "file", nullable(decode_str), path),
+        size=optional(payload, "size", nullable(decode_float), path),
+        sha256=optional(payload, "sha256", nullable(decode_str), path),
+    )
+
+
+def parse_opaque_owned_process(value: object, path: str = "OpaqueOwnedProcess") -> OpaqueOwnedProcess:
+    payload = expect_object(value, path)
+    return OpaqueOwnedProcess(
+        pid=required(payload, "pid", decode_float, path),
+        command=required(payload, "command", decode_str, path),
+    )
+
+
+def parse_owner_scan_summary(value: object, path: str = "OwnerScanSummary") -> OwnerScanSummary:
+    payload = expect_object(value, path)
+    return OwnerScanSummary(
+        supported=required(payload, "supported", decode_bool, path),
+        sound=required(payload, "sound", decode_bool, path),
+        scanned=required(payload, "scanned", decode_float, path),
+        discovered=required(payload, "discovered", decode_float, path),
+        opaque=required(payload, "opaque", array(parse_opaque_owned_process), path),
+    )
+
+
+def parse_owned_job_registry_state(value: object, path: str = "OwnedJobRegistryState") -> OwnedJobRegistryState:
+    payload = expect_object(value, path)
+    return OwnedJobRegistryState(
+        path=required(payload, "path", nullable(decode_str), path),
+        complete=required(payload, "complete", decode_bool, path),
+        owner_scan=required(payload, "ownerScan", nullable(parse_owner_scan_summary), path),
+    )
+
+
+def parse_work_attestation(value: object, path: str = "WorkAttestation") -> WorkAttestation:
+    payload = expect_object(value, path)
+    required(payload, "version", cast('Decoder[Literal[1]]', literal_number(1)), path)
+    return WorkAttestation(
+        operation_id=required(payload, "operationId", decode_str, path),
+        nonce=required(payload, "nonce", decode_str, path),
+        epoch=required(payload, "epoch", decode_float, path),
+        instance_id=required(payload, "instanceId", decode_str, path),
+        session=required(payload, "session", parse_attested_session_identity, path),
+        invocation=required(payload, "invocation", parse_invocation_identity, path),
+        counts=required(payload, "counts", parse_work_counts, path),
+        admission=required(payload, "admission", cast('Decoder[Literal["open", "closed"]]', literal(frozenset({"open", "closed"}))), path),
+        sealed=required(payload, "sealed", decode_bool, path),
+        registry=required(payload, "registry", parse_owned_job_registry_state, path),
+        observed_at=required(payload, "observedAt", decode_str, path),
+    )
+
+
+def parse_terminal_attestation(value: object, path: str = "TerminalAttestation") -> TerminalAttestation:
+    payload = expect_object(value, path)
+    required(payload, "version", cast('Decoder[Literal[1]]', literal_number(1)), path)
+    return TerminalAttestation(
+        kind=required(payload, "kind", cast('Decoder[Literal["quiesce", "hangup", "sealed_blocked"]]', literal(frozenset({"quiesce", "hangup", "sealed_blocked"}))), path),
+        session=required(payload, "session", parse_attested_session_identity, path),
+        invocation=required(payload, "invocation", parse_invocation_identity, path),
+        instance_id=required(payload, "instanceId", decode_str, path),
+        epoch=required(payload, "epoch", decode_float, path),
+        counts=required(payload, "counts", parse_work_counts, path),
+        interrupted=required(payload, "interrupted", decode_bool, path),
+        registry_complete=required(payload, "registryComplete", decode_bool, path),
+        registry_path=required(payload, "registryPath", nullable(decode_str), path),
+        owner_scan=required(payload, "ownerScan", nullable(parse_owner_scan_summary), path),
+        written_at=required(payload, "writtenAt", decode_str, path),
+        operation_id=optional(payload, "operationId", decode_str, path),
+        attempt=optional(payload, "attempt", decode_float, path),
+        signal=optional(payload, "signal", decode_str, path),
+    )
+
+
+def parse_census_process(value: object, path: str = "CensusProcess") -> CensusProcess:
+    payload = expect_object(value, path)
+    return CensusProcess(
+        pid=required(payload, "pid", decode_float, path),
+        comm=required(payload, "comm", decode_str, path),
+        ppid=required(payload, "ppid", decode_float, path),
+    )
+
+
+def parse_census_result(value: object, path: str = "CensusResult") -> CensusResult:
+    payload = expect_object(value, path)
+    return CensusResult(
+        complete=required(payload, "complete", decode_bool, path),
+        work=required(payload, "work", array(parse_census_process), path),
+        reasons=required(payload, "reasons", array(decode_str), path),
+    )
+
+
+def parse_quiesce_snapshot(value: object, path: str = "QuiesceSnapshot") -> QuiesceSnapshot:
+    payload = expect_object(value, path)
+    return QuiesceSnapshot(
+        epoch=required(payload, "epoch", decode_float, path),
+        counts=required(payload, "counts", parse_work_counts, path),
+        observed_at=required(payload, "observedAt", decode_str, path),
+        registry=optional(payload, "registry", parse_owned_job_registry_state, path),
+        census=optional(payload, "census", parse_census_result, path),
+        completeness_reasons=optional(payload, "completenessReasons", array(decode_str), path),
+    )
+
+
+def parse_sealed_quiesce_snapshot(value: object, path: str = "SealedQuiesceSnapshot") -> SealedQuiesceSnapshot:
+    payload = expect_object(value, path)
+    return SealedQuiesceSnapshot(
+        epoch=required(payload, "epoch", decode_float, path),
+        counts=required(payload, "counts", parse_work_counts, path),
+        observed_at=required(payload, "observedAt", decode_str, path),
+        registry=required(payload, "registry", parse_owned_job_registry_state, path),
+        census=required(payload, "census", nullable(parse_census_result), path),
+        completeness_reasons=required(payload, "completenessReasons", array(decode_str), path),
+    )
+
+
+def parse_quiesce_progress(value: object, path: str = "QuiesceProgress") -> QuiesceProgress:
+    payload = expect_object(value, path)
+    return QuiesceProgress(
+        finalized=required(payload, "finalized", decode_bool, path),
+        bound=required(payload, "bound", decode_bool, path),
+        attested=required(payload, "attested", decode_bool, path),
+    )
+
+
+def parse_quiesce_sealed_blocked_result(value: object, path: str = "QuiesceSealedBlockedResult") -> QuiesceSealedBlockedResult:
+    payload = expect_object(value, path)
+    required(payload, "status", cast('Decoder[Literal["sealed_blocked"]]', literal(frozenset({"sealed_blocked"}))), path)
+    return QuiesceSealedBlockedResult(
+        operation_id=required(payload, "operationId", decode_str, path),
+        attempt=required(payload, "attempt", decode_float, path),
+        reason=required(payload, "reason", decode_str, path),
+        snapshot=required(payload, "snapshot", parse_sealed_quiesce_snapshot, path),
+        progress=required(payload, "progress", parse_quiesce_progress, path),
+    )
+
+
+def parse_quiesced_result(value: object, path: str = "QuiescedResult") -> QuiescedResult:
+    payload = expect_object(value, path)
+    required(payload, "status", cast('Decoder[Literal["quiesced"]]', literal(frozenset({"quiesced"}))), path)
+    return QuiescedResult(
+        operation_id=required(payload, "operationId", decode_str, path),
+        attempt=required(payload, "attempt", decode_float, path),
+        attestation=required(payload, "attestation", parse_terminal_attestation, path),
+        path=required(payload, "path", decode_str, path),
+    )
+
+
+def parse_quiesce_refused_result(value: object, path: str = "QuiesceRefusedResult") -> QuiesceRefusedResult:
+    payload = expect_object(value, path)
+    required(payload, "status", cast('Decoder[Literal["refused"]]', literal(frozenset({"refused"}))), path)
+    return QuiesceRefusedResult(
+        operation_id=required(payload, "operationId", decode_str, path),
+        attempt=required(payload, "attempt", decode_float, path),
+        reason=required(payload, "reason", _decode_quiesce_refusal_reason, path),
+        snapshot=required(payload, "snapshot", parse_quiesce_snapshot, path),
+    )
+
+
+def parse_quiesce_unattested_result(value: object, path: str = "QuiesceUnattestedResult") -> QuiesceUnattestedResult:
+    payload = expect_object(value, path)
+    required(payload, "status", cast('Decoder[Literal["exit_unattested"]]', literal(frozenset({"exit_unattested"}))), path)
+    required(payload, "reason", cast('Decoder[Literal["attestation_unavailable"]]', literal(frozenset({"attestation_unavailable"}))), path)
+    return QuiesceUnattestedResult(
+        operation_id=required(payload, "operationId", decode_str, path),
+        attempt=required(payload, "attempt", decode_float, path),
+        error=required(payload, "error", decode_str, path),
+        snapshot=required(payload, "snapshot", parse_quiesce_snapshot, path),
+    )
+
+
+def parse_tool_approval_binding(value: object, path: str = "ToolApprovalBinding") -> ToolApprovalBinding:
+    payload = expect_object(value, path)
+    return ToolApprovalBinding(
+        tool_call_id=required(payload, "toolCallId", decode_str, path),
+        tool_name=required(payload, "toolName", decode_str, path),
+        arguments=required(payload, "arguments", decode_json, path),
+        reason=optional(payload, "reason", decode_str, path),
     )
 
 
@@ -1769,6 +2285,15 @@ def parse_goal_result(value: object, path: str = "GoalResult") -> GoalResult:
     )
 
 
+def parse_external_delivery_listing(value: object, path: str = "ExternalDeliveryListing") -> ExternalDeliveryListing:
+    payload = expect_object(value, path)
+    return ExternalDeliveryListing(
+        delivery_id=required(payload, "deliveryId", decode_str, path),
+        state=required(payload, "state", cast('Decoder[Literal["queued", "accepted"]]', literal(frozenset({"queued", "accepted"}))), path),
+        mode=required(payload, "mode", _decode_delivery_mode, path),
+    )
+
+
 def parse_session_state(value: object, path: str = "SessionState") -> SessionState:
     payload = expect_object(value, path)
     return SessionState(
@@ -1792,6 +2317,8 @@ def parse_session_state(value: object, path: str = "SessionState") -> SessionSta
         is_settled=defaulted(payload, "isSettled", decode_bool, path, False),
         queued_messages=defaulted(payload, "queuedMessages", parse_queued_messages_state, path, parse_queued_messages_state({"steering": [], "followUp": []}, path)),
         todo_phases=defaulted(payload, "todoPhases", array(parse_todo_phase), path, ()),
+        capabilities=defaulted(payload, "capabilities", array(decode_str), path, ()),
+        external_deliveries=defaulted(payload, "externalDeliveries", array(parse_external_delivery_listing), path, ()),
         system_prompt=defaulted(payload, "systemPrompt", scalar_or_array(decode_str), path, ()),
         dump_tools=defaulted(payload, "dumpTools", array(parse_tool_descriptor), path, ()),
         context_usage=optional(payload, "contextUsage", parse_context_usage, path),
@@ -1948,6 +2475,36 @@ def parse_messages_page(value: object, path: str = "MessagesPage") -> MessagesPa
         messages=required(payload, "messages", array(parse_agent_message), path),
         total_messages=required(payload, "totalMessages", decode_int, path),
         next_cursor=optional(payload, "nextCursor", decode_str, path),
+    )
+
+
+def parse_session_history_entry(value: object, path: str = "SessionHistoryEntry") -> SessionHistoryEntry:
+    payload = expect_object(value, path)
+    return SessionHistoryEntry(
+        index=required(payload, "index", decode_int, path),
+        kind=required(payload, "kind", cast('Decoder[Literal["user", "assistant", "tool-result", "compaction"]]', literal(frozenset({"user", "assistant", "tool-result", "compaction"}))), path),
+        entry_id=optional(payload, "entryId", decode_str, path),
+        timestamp=optional(payload, "timestamp", decode_str, path),
+        attribution=optional(payload, "attribution", decode_str, path),
+        text=optional(payload, "text", decode_str, path),
+        truncated=optional(payload, "truncated", decode_bool, path),
+        images=optional(payload, "images", decode_int, path),
+        tools=optional(payload, "tools", array(decode_str), path),
+        tool_name=optional(payload, "toolName", decode_str, path),
+        is_error=optional(payload, "isError", decode_bool, path),
+        model=optional(payload, "model", decode_str, path),
+    )
+
+
+def parse_session_history_page(value: object, path: str = "SessionHistoryPage") -> SessionHistoryPage:
+    payload = expect_object(value, path)
+    required(payload, "sourceKind", cast('Decoder[Literal["native-engine"]]', literal(frozenset({"native-engine"}))), path)
+    required(payload, "omittedLines", cast('Decoder[Literal[0]]', literal_number(0)), path)
+    return SessionHistoryPage(
+        session_id=required(payload, "sessionId", decode_str, path),
+        total=required(payload, "total", decode_int, path),
+        leaf_entry_id=required(payload, "leafEntryId", decode_str, path),
+        entries=required(payload, "entries", array(parse_session_history_entry), path),
     )
 
 
@@ -2352,6 +2909,48 @@ def parse_ready_event(value: object, path: str = "ReadyEvent") -> ReadyEvent:
         supported_protocol_versions=optional(payload, "supportedProtocolVersions", array(decode_int), path),
         max_frame_bytes=optional(payload, "maxFrameBytes", decode_int, path),
         max_reassembled_frame_bytes=optional(payload, "maxReassembledFrameBytes", decode_int, path),
+        capabilities=defaulted(payload, "capabilities", array(decode_str), path, ()),
+    )
+
+
+def parse_delivery_accepted_event(value: object, path: str = "DeliveryAcceptedEvent") -> DeliveryAcceptedEvent:
+    payload = expect_object(value, path)
+    required(payload, "type", cast('Decoder[Literal["delivery_accepted"]]', literal(frozenset({"delivery_accepted"}))), path)
+    return DeliveryAcceptedEvent(
+        delivery_id=required(payload, "deliveryId", decode_str, path),
+        at=required(payload, "at", decode_float, path),
+        mode=required(payload, "mode", _decode_delivery_mode, path),
+        mechanism=required(payload, "mechanism", cast('Decoder[Literal["wake", "aside", "steer-boundary"]]', literal(frozenset({"wake", "aside", "steer-boundary"}))), path),
+    )
+
+
+def parse_delivery_settled_event(value: object, path: str = "DeliverySettledEvent") -> DeliverySettledEvent:
+    payload = expect_object(value, path)
+    required(payload, "type", cast('Decoder[Literal["delivery_settled"]]', literal(frozenset({"delivery_settled"}))), path)
+    return DeliverySettledEvent(
+        delivery_id=required(payload, "deliveryId", decode_str, path),
+        outcome=required(payload, "outcome", cast('Decoder[Literal["quiet", "text", "refused", "error", "aborted"]]', literal(frozenset({"quiet", "text", "refused", "error", "aborted"}))), path),
+        included=required(payload, "included", decode_bool, path),
+        requests=required(payload, "requests", decode_float, path),
+        sole=required(payload, "sole", decode_bool, path),
+        interactive=required(payload, "interactive", decode_bool, path),
+    )
+
+
+def parse_delivery_discarded_event(value: object, path: str = "DeliveryDiscardedEvent") -> DeliveryDiscardedEvent:
+    payload = expect_object(value, path)
+    required(payload, "type", cast('Decoder[Literal["delivery_discarded"]]', literal(frozenset({"delivery_discarded"}))), path)
+    return DeliveryDiscardedEvent(
+        delivery_id=required(payload, "deliveryId", decode_str, path),
+        reason=required(payload, "reason", decode_str, path),
+    )
+
+
+def parse_delivery_cancelled_event(value: object, path: str = "DeliveryCancelledEvent") -> DeliveryCancelledEvent:
+    payload = expect_object(value, path)
+    required(payload, "type", cast('Decoder[Literal["delivery_cancelled"]]', literal(frozenset({"delivery_cancelled"}))), path)
+    return DeliveryCancelledEvent(
+        delivery_id=required(payload, "deliveryId", decode_str, path),
     )
 
 
@@ -2375,6 +2974,9 @@ def parse_prompt_result_event(value: object, path: str = "PromptResultEvent") ->
         session_settled=required(payload, "sessionSettled", decode_bool, path),
         id=optional(payload, "id", decode_str, path),
         error=optional(payload, "error", parse_prompt_error, path),
+        run=optional(payload, "run", decode_int, path),
+        prompt_entry_id=optional(payload, "promptEntryId", decode_str, path),
+        reply_entry_ids=optional(payload, "replyEntryIds", array(decode_str), path),
     )
 
 
@@ -2566,6 +3168,7 @@ def parse_select_ui_request(value: object, path: str = "SelectUiRequest") -> Sel
         title=required(payload, "title", decode_str, path),
         options=required(payload, "options", array(decode_str), path),
         option_details=optional(payload, "optionDetails", array(parse_select_option_detail), path),
+        approval=optional(payload, "approval", parse_tool_approval_binding, path),
         timeout=optional(payload, "timeout", decode_int, path),
     )
 
@@ -2614,6 +3217,7 @@ def parse_ask_ui_request(value: object, path: str = "AskUiRequest") -> AskUiRequ
         id=required(payload, "id", decode_str, path),
         questions=required(payload, "questions", array(parse_ask_question), path),
         timeout=optional(payload, "timeout", decode_int, path),
+        accept_images=optional(payload, "acceptImages", decode_bool, path),
     )
 
 
@@ -2702,12 +3306,14 @@ def parse_extension_ui_request(value: object, path: str = "ExtensionUiRequest") 
         title=optional(payload, "title", decode_str, path),
         options=optional(payload, "options", array(decode_str), path),
         option_details=optional(payload, "optionDetails", array(parse_select_option_detail), path),
+        approval=optional(payload, "approval", parse_tool_approval_binding, path),
         timeout=optional(payload, "timeout", decode_int, path),
         message=optional(payload, "message", decode_str, path),
         placeholder=optional(payload, "placeholder", decode_str, path),
         prefill=optional(payload, "prefill", decode_str, path),
         prompt_style=optional(payload, "promptStyle", decode_bool, path),
         questions=optional(payload, "questions", array(parse_ask_question), path),
+        accept_images=optional(payload, "acceptImages", decode_bool, path),
         target_id=optional(payload, "targetId", decode_str, path),
         notify_type=optional(payload, "notifyType", _decode_notify_type, path),
         status_key=optional(payload, "statusKey", decode_str, path),
@@ -2728,6 +3334,9 @@ def parse_ask_answer(value: object, path: str = "AskAnswer") -> AskAnswer:
         id=required(payload, "id", decode_str, path),
         selected_options=required(payload, "selectedOptions", array(decode_str), path),
         custom_input=optional(payload, "customInput", decode_str, path),
+        custom_input_images=optional(payload, "customInputImages", array(parse_image_content), path),
+        note=optional(payload, "note", decode_str, path),
+        note_images=optional(payload, "noteImages", array(parse_image_content), path),
     )
 
 
@@ -2761,6 +3370,32 @@ def parse_negotiate_protocol_result(value: object, path: str = "NegotiateProtoco
     )
 
 
+def parse_deliver_result(value: object, path: str = "DeliverResult") -> DeliverResult:
+    payload = expect_object(value, path)
+    return DeliverResult(
+        delivery_id=required(payload, "deliveryId", decode_str, path),
+    )
+
+
+def parse_cancel_delivery_result(value: object, path: str = "CancelDeliveryResult") -> CancelDeliveryResult:
+    payload = expect_object(value, path)
+    return CancelDeliveryResult(
+        cancelled=required(payload, "cancelled", decode_bool, path),
+    )
+
+
+def parse_set_ask_dialog_result(value: object, path: str = "SetAskDialogResult") -> SetAskDialogResult:
+    payload = expect_object(value, path)
+    return SetAskDialogResult(
+        enabled=required(payload, "enabled", decode_bool, path),
+        rich=optional(payload, "rich", decode_bool, path),
+    )
+
+
+def parse_quiesce_result(value: object, path: str = "QuiesceResult") -> QuiesceResult:
+    return dispatch("status", _QUIESCE_RESULT_CASES)(value, path)
+
+
 def parse_rpc_agent_event(value: object, path: str = "RpcAgentEvent") -> RpcAgentEvent:
     return dispatch("type", _RPC_AGENT_EVENT_CASES)(value, path)
 
@@ -2772,6 +3407,14 @@ def parse_notification(value: object, path: str = "notification") -> RpcNotifica
     if not isinstance(tag, str) or tag not in _RPC_NOTIFICATION_CASES:
         return UnknownNotification(decode_json_object(payload, path))
     return _RPC_NOTIFICATION_CASES[tag](payload, tag)
+
+
+_QUIESCE_RESULT_CASES: Final[dict[str, Decoder[QuiesceResult]]] = {
+        "quiesced": parse_quiesced_result,
+        "refused": parse_quiesce_refused_result,
+        "exit_unattested": parse_quiesce_unattested_result,
+        "sealed_blocked": parse_quiesce_sealed_blocked_result,
+}
 
 
 _RPC_AGENT_EVENT_CASES: Final[dict[str, Decoder[RpcAgentEvent]]] = {
@@ -2811,6 +3454,10 @@ _RPC_AGENT_EVENT_CASES: Final[dict[str, Decoder[RpcAgentEvent]]] = {
 
 _RPC_NOTIFICATION_CASES: Final[dict[str, Decoder[RpcNotification]]] = {
         "ready": parse_ready_event,
+        "delivery_accepted": parse_delivery_accepted_event,
+        "delivery_settled": parse_delivery_settled_event,
+        "delivery_discarded": parse_delivery_discarded_event,
+        "delivery_cancelled": parse_delivery_cancelled_event,
         "prompt_result": parse_prompt_result_event,
         "session_settled": parse_session_settled_event,
         "extension_error": parse_extension_error,
@@ -2872,21 +3519,57 @@ class WireClient:
     def _listen(self, frame_type: str, listener: Callable[..., None]) -> Callable[[], None]:
         raise NotImplementedError
 
-    def steer(self, message: str, *, images: Sequence[ImageContent] | None = None) -> None:
+    def attest(self, operation_id: str, nonce: str) -> WorkAttestation:
+        """Snapshot identity, activity epoch, work census and owned-job registry soundness."""
+        params: dict[str, object] = {}
+        params["operationId"] = operation_id
+        params["nonce"] = nonce
+        return parse_work_attestation(self._command("attest", params), "attest")
+
+    def quiesce_and_exit(self, operation_id: str, completeness: Literal["strict", "attested"], attempt: float, epoch: float, instance_id: str, session_id: str, deadline: float) -> QuiesceResult:
+        """Require explicit strict or attested completeness; close admission and retire, retaining strict sealed failures for retry."""
+        params: dict[str, object] = {}
+        params["operationId"] = operation_id
+        params["completeness"] = completeness
+        params["attempt"] = attempt
+        params["epoch"] = epoch
+        params["instanceId"] = instance_id
+        params["sessionId"] = session_id
+        params["deadline"] = deadline
+        return parse_quiesce_result(self._command("quiesce_and_exit", params), "quiesce_and_exit")
+
+    def steer(self, message: str, *, images: Sequence[ImageContent] | None = None, literal: bool | None = None) -> None:
         """Queue a steering message."""
         params: dict[str, object] = {}
         params["message"] = message
         if images is not None:
             params["images"] = list(images)
+        if literal is not None:
+            params["literal"] = literal
         self._command("steer", params)
 
-    def follow_up(self, message: str, *, images: Sequence[ImageContent] | None = None) -> None:
+    def follow_up(self, message: str, *, images: Sequence[ImageContent] | None = None, literal: bool | None = None) -> None:
         """Queue a follow-up message."""
         params: dict[str, object] = {}
         params["message"] = message
         if images is not None:
             params["images"] = list(images)
+        if literal is not None:
+            params["literal"] = literal
         self._command("follow_up", params)
+
+    def deliver(self, record: DeliveryRecord, options: DeliveryOptions) -> DeliverResult:
+        """Deliver an externally authored record with owned admission and settlement receipts."""
+        params: dict[str, object] = {}
+        params["record"] = record
+        params["options"] = options
+        return parse_deliver_result(self._command("deliver", params), "deliver")
+
+    def cancel_delivery(self, delivery_id: str) -> CancelDeliveryResult:
+        """Cancel a delivery only while it remains queued."""
+        params: dict[str, object] = {}
+        params["deliveryId"] = delivery_id
+        return parse_cancel_delivery_result(self._command("cancel_delivery", params), "cancel_delivery")
 
     def remove_queued_message(self, message: str, queue: QueuedMessageQueue) -> RemoveQueuedMessageResult:
         """Remove one pending queued message by its queue-chip text."""
@@ -2940,11 +3623,13 @@ class WireClient:
             params["token_budget"] = token_budget
         return parse_goal_result(self._command("goal", params), "goal")
 
-    def set_ask_dialog(self, enabled: bool) -> bool:
+    def set_ask_dialog(self, *, enabled: bool, rich: bool | None = None) -> SetAskDialogResult:
         """Opt in to `ask` UI requests; returns the applied setting."""
         params: dict[str, object] = {}
         params["enabled"] = enabled
-        return required(expect_object(self._command("set_ask_dialog", params), "set_ask_dialog"), "enabled", decode_bool, "set_ask_dialog")
+        if rich is not None:
+            params["rich"] = rich
+        return parse_set_ask_dialog_result(self._command("set_ask_dialog", params), "set_ask_dialog")
 
     def get_available_commands(self) -> tuple[AvailableSlashCommand, ...]:
         """List the slash-command catalog."""
@@ -3183,6 +3868,23 @@ class WireClient:
             params["limit"] = limit
         return parse_messages_page(self._command("get_messages_page", params), "get_messages_page")
 
+    def get_session_history(self, read_id: str, expected_session_id: str, expected_session_path: str, before: int, limit: int, expires_at: int) -> SessionHistoryPage:
+        """Read a bounded committed native history page from the exact current Session without extending the supplied expiry."""
+        params: dict[str, object] = {}
+        params["readId"] = read_id
+        params["expectedSessionId"] = expected_session_id
+        params["expectedSessionPath"] = expected_session_path
+        params["before"] = before
+        params["limit"] = limit
+        params["expiresAt"] = expires_at
+        return parse_session_history_page(self._command("get_session_history", params, timeout=5), "get_session_history")
+
+    def cancel_session_history(self, read_id: str) -> None:
+        """Cancel one ephemeral history read without aborting the agent or terminating its transport."""
+        params: dict[str, object] = {}
+        params["readId"] = read_id
+        self._command("cancel_session_history", params, timeout=5)
+
     def get_login_providers(self) -> tuple[LoginProvider, ...]:
         """List OAuth providers and their authentication status."""
         params: dict[str, object] = {}
@@ -3211,8 +3913,24 @@ class WireClient:
         self._command("predict_word_feedback", params)
 
     def on_ready(self, listener: Callable[[ReadyEvent], None]) -> Callable[[], None]:
-        """Subscribe to `ready`: First frame after startup; transport fields are absent on servers without protocol v2."""
+        """Subscribe to `ready`: First frame after startup; capabilities include quiesce-exit/2 and owned-jobs/1. Transport fields are absent on servers without protocol v2."""
         return self._listen("ready", listener)
+
+    def on_delivery_accepted(self, listener: Callable[[DeliveryAcceptedEvent], None]) -> Callable[[], None]:
+        """Subscribe to `delivery_accepted` frames."""
+        return self._listen("delivery_accepted", listener)
+
+    def on_delivery_settled(self, listener: Callable[[DeliverySettledEvent], None]) -> Callable[[], None]:
+        """Subscribe to `delivery_settled` frames."""
+        return self._listen("delivery_settled", listener)
+
+    def on_delivery_discarded(self, listener: Callable[[DeliveryDiscardedEvent], None]) -> Callable[[], None]:
+        """Subscribe to `delivery_discarded` frames."""
+        return self._listen("delivery_discarded", listener)
+
+    def on_delivery_cancelled(self, listener: Callable[[DeliveryCancelledEvent], None]) -> Callable[[], None]:
+        """Subscribe to `delivery_cancelled` frames."""
+        return self._listen("delivery_cancelled", listener)
 
     def on_prompt_result(self, listener: Callable[[PromptResultEvent], None]) -> Callable[[], None]:
         """Subscribe to `prompt_result`: Terminal outcome of one accepted `prompt` / `abort_and_prompt`, keyed by request `id`."""
@@ -3431,6 +4149,7 @@ __all__ = [
     "AssistantToolCallDeltaEvent",
     "AssistantToolCallEndEvent",
     "AssistantToolCallStartEvent",
+    "AttestedSessionIdentity",
     "Attribution",
     "AutoCompactionAction",
     "AutoCompactionEndEvent",
@@ -3450,8 +4169,11 @@ __all__ = [
     "CacheWarmingOutcome",
     "CacheWarmingPhase",
     "CacheWarmingStartEvent",
+    "CancelDeliveryResult",
     "CancelUiRequest",
     "CancellationResult",
+    "CensusProcess",
+    "CensusResult",
     "CommandOutputEvent",
     "CompactionResult",
     "CompactionSummaryMessage",
@@ -3461,12 +4183,21 @@ __all__ = [
     "ConfirmUiRequest",
     "ContextUsage",
     "CustomMessage",
+    "DeliverResult",
+    "DeliveryAcceptedEvent",
+    "DeliveryCancelledEvent",
+    "DeliveryDiscardedEvent",
+    "DeliveryMode",
+    "DeliveryOptions",
+    "DeliveryRecord",
+    "DeliverySettledEvent",
     "DeveloperMessage",
     "EditorUiRequest",
     "Effort",
     "ExtensionError",
     "ExtensionUiMethod",
     "ExtensionUiRequest",
+    "ExternalDeliveryListing",
     "FallbackContent",
     "FastModeResult",
     "FileMentionItem",
@@ -3484,6 +4215,7 @@ __all__ = [
     "ImageContent",
     "InputUiRequest",
     "InterruptMode",
+    "InvocationIdentity",
     "IrcMessageEvent",
     "LiveEndEvent",
     "LiveLevelsEvent",
@@ -3506,8 +4238,11 @@ __all__ = [
     "NoticeEvent",
     "NotifyType",
     "NotifyUiRequest",
+    "OpaqueOwnedProcess",
     "OpenSessionResult",
     "OpenUrlUiRequest",
+    "OwnedJobRegistryState",
+    "OwnerScanSummary",
     "PromoteQueuedMessageResult",
     "PromptAck",
     "PromptError",
@@ -3518,6 +4253,14 @@ __all__ = [
     "QueueUpdateEvent",
     "QueuedMessageQueue",
     "QueuedMessagesState",
+    "QuiesceProgress",
+    "QuiesceRefusalReason",
+    "QuiesceRefusedResult",
+    "QuiesceResult",
+    "QuiesceSealedBlockedResult",
+    "QuiesceSnapshot",
+    "QuiesceUnattestedResult",
+    "QuiescedResult",
     "ReadyEvent",
     "RedactedThinkingContent",
     "RemoveQueuedMessageResult",
@@ -3526,15 +4269,19 @@ __all__ = [
     "RpcAgentEvent",
     "RpcFrameErrorEvent",
     "RpcNotification",
+    "SealedQuiesceSnapshot",
     "SelectOptionDetail",
     "SelectUiRequest",
     "SessionCredits",
     "SessionEntries",
+    "SessionHistoryEntry",
+    "SessionHistoryPage",
     "SessionInfoUpdateEvent",
     "SessionSettledEvent",
     "SessionState",
     "SessionStats",
     "SessionTree",
+    "SetAskDialogResult",
     "SetEditorTextUiRequest",
     "SetStatusUiRequest",
     "SetTitleUiRequest",
@@ -3555,6 +4302,7 @@ __all__ = [
     "SubagentSnapshot",
     "SubagentStatus",
     "SubagentSubscriptionLevel",
+    "TerminalAttestation",
     "TextContent",
     "ThinkingConfig",
     "ThinkingContent",
@@ -3567,6 +4315,7 @@ __all__ = [
     "TodoReminderEvent",
     "TodoStatus",
     "TokenUsage",
+    "ToolApprovalBinding",
     "ToolCall",
     "ToolDescriptor",
     "ToolExecutionEndEvent",
@@ -3583,6 +4332,8 @@ __all__ = [
     "UserContent",
     "UserMessage",
     "WidgetPlacement",
+    "WorkAttestation",
+    "WorkCounts",
     "parse_advisor_cost_changed_event",
     "parse_advisor_yielded_event",
     "parse_agent_end_event",
@@ -3609,6 +4360,7 @@ __all__ = [
     "parse_assistant_tool_call_delta_event",
     "parse_assistant_tool_call_end_event",
     "parse_assistant_tool_call_start_event",
+    "parse_attested_session_identity",
     "parse_auto_compaction_end_event",
     "parse_auto_compaction_start_event",
     "parse_auto_retry_end_event",
@@ -3622,8 +4374,11 @@ __all__ = [
     "parse_branch_summary_message",
     "parse_cache_warming_end_event",
     "parse_cache_warming_start_event",
+    "parse_cancel_delivery_result",
     "parse_cancel_ui_request",
     "parse_cancellation_result",
+    "parse_census_process",
+    "parse_census_result",
     "parse_command_output_event",
     "parse_compaction_result",
     "parse_compaction_summary_message",
@@ -3632,10 +4387,18 @@ __all__ = [
     "parse_confirm_ui_request",
     "parse_context_usage",
     "parse_custom_message",
+    "parse_deliver_result",
+    "parse_delivery_accepted_event",
+    "parse_delivery_cancelled_event",
+    "parse_delivery_discarded_event",
+    "parse_delivery_options",
+    "parse_delivery_record",
+    "parse_delivery_settled_event",
     "parse_developer_message",
     "parse_editor_ui_request",
     "parse_extension_error",
     "parse_extension_ui_request",
+    "parse_external_delivery_listing",
     "parse_fallback_content",
     "parse_fast_mode_result",
     "parse_file_mention_item",
@@ -3650,6 +4413,7 @@ __all__ = [
     "parse_host_uri_scheme_definition",
     "parse_image_content",
     "parse_input_ui_request",
+    "parse_invocation_identity",
     "parse_irc_message_event",
     "parse_live_end_event",
     "parse_live_levels_event",
@@ -3668,8 +4432,11 @@ __all__ = [
     "parse_notice_event",
     "parse_notification",
     "parse_notify_ui_request",
+    "parse_opaque_owned_process",
     "parse_open_session_result",
     "parse_open_url_ui_request",
+    "parse_owned_job_registry_state",
+    "parse_owner_scan_summary",
     "parse_promote_queued_message_result",
     "parse_prompt_ack",
     "parse_prompt_error",
@@ -3677,6 +4444,13 @@ __all__ = [
     "parse_python_execution_message",
     "parse_queue_update_event",
     "parse_queued_messages_state",
+    "parse_quiesce_progress",
+    "parse_quiesce_refused_result",
+    "parse_quiesce_result",
+    "parse_quiesce_sealed_blocked_result",
+    "parse_quiesce_snapshot",
+    "parse_quiesce_unattested_result",
+    "parse_quiesced_result",
     "parse_ready_event",
     "parse_redacted_thinking_content",
     "parse_remove_queued_message_result",
@@ -3684,15 +4458,19 @@ __all__ = [
     "parse_retry_fallback_succeeded_event",
     "parse_rpc_agent_event",
     "parse_rpc_frame_error_event",
+    "parse_sealed_quiesce_snapshot",
     "parse_select_option_detail",
     "parse_select_ui_request",
     "parse_session_credits",
     "parse_session_entries",
+    "parse_session_history_entry",
+    "parse_session_history_page",
     "parse_session_info_update_event",
     "parse_session_settled_event",
     "parse_session_state",
     "parse_session_stats",
     "parse_session_tree",
+    "parse_set_ask_dialog_result",
     "parse_set_editor_text_ui_request",
     "parse_set_status_ui_request",
     "parse_set_title_ui_request",
@@ -3707,6 +4485,7 @@ __all__ = [
     "parse_subagent_progress_event",
     "parse_subagent_progress_payload",
     "parse_subagent_snapshot",
+    "parse_terminal_attestation",
     "parse_text_content",
     "parse_thinking_config",
     "parse_thinking_content",
@@ -3717,6 +4496,7 @@ __all__ = [
     "parse_todo_phase",
     "parse_todo_reminder_event",
     "parse_token_usage",
+    "parse_tool_approval_binding",
     "parse_tool_call",
     "parse_tool_descriptor",
     "parse_tool_execution_end_event",
@@ -3731,4 +4511,6 @@ __all__ = [
     "parse_usage_cost",
     "parse_user_content",
     "parse_user_message",
+    "parse_work_attestation",
+    "parse_work_counts",
 ]

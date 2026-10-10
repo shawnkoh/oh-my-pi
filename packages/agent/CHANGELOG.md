@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- `Agent.setRunScope(scope)` wraps the start of every run (`prompt` and `continue`), so a host can start runs outside its own async context
+
+### Fixed
+
+- Fixed streamed assistant replies receiving different identities at message start and end when the provider restarts the stream or returns a separate final message.
+
 ## [18.6.0] - 2026-10-03
 
 ### Fixed

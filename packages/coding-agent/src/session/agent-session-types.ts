@@ -1,3 +1,5 @@
+import type { CensusIdentity, CensusOptions, CensusResult } from "./namespace-census";
+import type { InstanceIdentity } from "./instance-identity";
 import type {
 	Agent,
 	AgentMessage,
@@ -152,6 +154,11 @@ export interface InitialRetryFallbackState {
 
 /** Dependencies and initial state used to construct an AgentSession. */
 export interface AgentSessionConfig {
+	a13Identity?: CensusIdentity;
+	a13Instance?: InstanceIdentity;
+	a13Extinct?: InstanceIdentity[];
+	namespaceCensus?: (options: CensusOptions) => CensusResult;
+	idleInfrastructure?: CensusOptions["idleInfrastructure"];
 	agent: Agent;
 	/** Shared with the provider stream wrapper: current Codex Code Mode tool exposure snapshot for turn metadata. */
 	codeModeState?: { namespacesInfo?: unknown };
@@ -414,6 +421,13 @@ export interface PromptOptions {
 	 * failed before admission still only settles through the returned promise.
 	 */
 	onPromptAdmitted?: () => void;
+	/**
+	 * Deliver the text exactly as the user's message: no slash, skill, builtin,
+	 * extension or custom command dispatch, no prompt-template expansion and no
+	 * model-mention rewriting. For remote hosts whose users may send conversation
+	 * but must not reach administrative commands through message text.
+	 */
+	literal?: boolean;
 }
 
 /** Payload for {@link AgentSession.setPromptDropped}: a user prompt cancelled
@@ -434,12 +448,16 @@ export interface FollowUpOptions {
 	expandPromptTemplates?: boolean;
 	/** Explicit billing/initiator attribution. */
 	attribution?: MessageAttribution;
+	/** Queue the text verbatim; see {@link PromptOptions.literal}. */
+	literal?: boolean;
 }
 
 /** Options for AgentSession.steer(). */
 export interface SteerOptions {
 	/** Explicit billing/initiator attribution. */
 	attribution?: MessageAttribution;
+	/** Queue the text verbatim; see {@link PromptOptions.literal}. */
+	literal?: boolean;
 }
 
 /** Options for AgentSession.sendUserMessage(). */

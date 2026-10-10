@@ -6,11 +6,13 @@ import { formatDuration, replaceTabs } from "@oh-my-pi/pi-tui/render/render-util
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { getDaemonRuntimeDir, logger, sanitizeText } from "@oh-my-pi/pi-utils";
 import { type DaemonBrokerClient, daemonClientForProject } from "./client";
-import { canonicalProjectDir } from "./paths";
+import { canonicalProjectDir, daemonMetadataPath } from "./paths";
+import { readLiveDaemonBrokerPid } from "./presence";
 import type { DaemonOperation, DaemonRpcResult } from "./protocol";
 import { renderTerminalOutputIsolated } from "./terminal-output-worker-client";
 import type { ToolSession } from "../tools";
 import { resolveToCwd } from "../tools/path-utils";
+import { OwnedJobRegistry, ownerMarkerEnv } from "../session/owned-job-registry";
 
 import { cfgLaunchEnabled } from "../tools/settings";
 
@@ -26,6 +28,8 @@ export interface ServiceStart {
 	cwd?: string;
 	pty?: boolean;
 	ready?: ServiceReady;
+	/** The service may keep running while the owning session is suspended. Recorded at start; never changed later. */
+	sleepable?: boolean;
 }
 
 const serviceStateKey = Symbol("ownedServices");
@@ -227,7 +231,8 @@ export async function startService(
 		name: params.name,
 		application: shell.shell,
 		args: [...shell.args, `${shell.prefix ? `${shell.prefix} ` : ""}${params.command}`],
-		env: shell.env,
+		// The broker is shared, so the owner marker travels in the service's own environment.
+		env: { ...shell.env, ...ownerMarkerEnv() },
 		cwd: resolveToCwd(params.cwd ?? session.cwd, session.cwd),
 		pty: params.pty ?? true,
 		ready: ready
@@ -242,17 +247,88 @@ export async function startService(
 		persist: false,
 		detached: false,
 	};
-	const result = await request(
-		session,
-		{ op: "start", spec, owner: serviceOwner(session) ?? undefined, replace: true },
-		signal,
-	);
-	if (result.op !== "start") throw new Error("Unexpected daemon start response");
+	// Until the broker reports the service pid, a crash would leave an unrecorded process.
+	const registry = OwnedJobRegistry.instance();
+	const pendingId = registry?.registerInProcessJob({
+		jobId: `service-start:${params.name}:${Date.now()}`,
+		kind: "service-start",
+		command: params.command,
+		cwd: spec.cwd,
+	});
+	let result: DaemonRpcResult;
+	try {
+		result = await request(
+			session,
+			{ op: "start", spec, owner: serviceOwner(session) ?? undefined, replace: true },
+			signal,
+		);
+		if (result.op !== "start") throw new Error("Unexpected daemon start response");
+		recordServiceProcess(
+			registry,
+			result.daemon,
+			{ command: params.command, cwd: spec.cwd ?? null, sleepable: params.sleepable === true },
+			await serviceHost(session, result.daemon.name),
+		);
+	} catch (error) {
+		// Aborted, timed out, failed in transit or answered unexpectedly: the broker may still
+		// have started the service, and its pid was never reported.
+		registry?.markIncomplete("a service start ended without reporting its process", "service-identity-unknown");
+		throw error;
+	} finally {
+		if (pendingId) registry?.end(pendingId, "settled");
+	}
 	return {
 		daemon: result.daemon,
 		readyTimedOut: result.readyTimedOut,
 		log: await serviceLogs(session, params.name, signal),
 	};
+}
+
+/** Where a service runs: the broker serving its scope, and the file the broker publishes it in. */
+interface ServiceHost {
+	/** Pid in the scope's broker lease; `undefined` when no live broker is recorded there. */
+	brokerPid: number | undefined;
+	meta: string;
+}
+
+async function serviceHost(session: ToolSession, name: string): Promise<ServiceHost> {
+	const client = await daemonClientForProject(session.cwd);
+	return {
+		brokerPid: await readLiveDaemonBrokerPid(client.runtimeDir),
+		meta: daemonMetadataPath(client.runtimeDir, name),
+	};
+}
+
+/**
+ * Record the process a service runs as, with the broker hosting it: the broker can relaunch
+ * the service under a new pid, so the record stays work while that broker lives (see
+ * `OwnedJobStartRecord.broker`). `sleepable` is the value given when the service was
+ * started; a restart (e.g. a mode change) keeps it rather than deciding it again.
+ */
+function recordServiceProcess(
+	registry: OwnedJobRegistry | undefined,
+	daemon: DaemonSnapshot,
+	spawn: { command: string; cwd: string | null; sleepable: boolean },
+	host: ServiceHost,
+): void {
+	if (!registry) return;
+	if (daemon.pid !== undefined) {
+		// Without the broker the record would read as ended while the broker relaunches it.
+		if (host.brokerPid === undefined)
+			registry.markIncomplete("a service's daemon broker could not be identified", "service-identity-unknown");
+		registry.registerProcess({
+			kind: "service",
+			jobId: `service:${daemon.id}:${daemon.startedAt}`,
+			pid: daemon.pid,
+			command: spawn.command,
+			cwd: spawn.cwd,
+			sleepable: spawn.sleepable,
+			broker: host.brokerPid === undefined ? undefined : { pid: host.brokerPid },
+			daemon: { id: daemon.id, meta: host.meta },
+		});
+	} else if (!TERMINAL_STATES[daemon.state]) {
+		registry.markIncomplete("service started without a reported pid", "service-identity-unknown");
+	}
 }
 
 export async function sendService(
@@ -279,9 +355,33 @@ export async function modeService(
 	mode: "persist" | "session" | "detached",
 	signal?: AbortSignal,
 ): Promise<DaemonSnapshot> {
-	const result = await request(session, { op: "mode", name, mode }, signal);
-	if (result.op !== "mode") throw new Error("Unexpected daemon mode response");
-	return result.daemon;
+	const registry = OwnedJobRegistry.instance();
+	let result: DaemonRpcResult;
+	try {
+		result = await request(session, { op: "mode", name, mode }, signal);
+		if (result.op !== "mode") throw new Error("Unexpected daemon mode response");
+	} catch (error) {
+		// A mode change can restart the service under a new pid that was never reported.
+		registry?.markIncomplete("a service mode change ended without reporting its process", "service-identity-unknown");
+		throw error;
+	}
+	// Switching to or from `detached` restarts the service: record the new process, keeping
+	// what was recorded when it was first started.
+	const daemon = result.daemon;
+	const previous = registry
+		?.openJobs()
+		.find(record => record.kind === "service" && record.jobId.startsWith(`service:${daemon.id}:`));
+	recordServiceProcess(
+		registry,
+		daemon,
+		{
+			command: previous?.command ?? daemon.name,
+			cwd: previous?.cwd ?? null,
+			sleepable: previous?.sleepable ?? false,
+		},
+		await serviceHost(session, daemon.name),
+	);
+	return daemon;
 }
 
 export function serviceStatus(daemon: DaemonSnapshot): string {

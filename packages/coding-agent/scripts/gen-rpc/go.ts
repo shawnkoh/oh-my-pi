@@ -389,6 +389,20 @@ class GoEmitter {
 			case "null":
 				throw new Error(`${owner}: bare null type`);
 			case "literal":
+				if (typeof type.value === "boolean") {
+					this.#claim(owner, `boolean literal ${type.value}`);
+					this.#pending.push(
+						`type ${owner} bool\n\n` +
+							`func (v *${owner}) UnmarshalJSON(data []byte) error {\n` +
+							`\tvar value bool\n\tif err := json.Unmarshal(data, &value); err != nil {\n\t\treturn err\n\t}\n` +
+							`\tif value != ${type.value} || isNull(data) {\n\t\treturn unknownValue(${goString(owner)}, string(data))\n\t}\n` +
+							`\t*v = ${owner}(value)\n\treturn nil\n}\n\n` +
+							`func (v ${owner}) MarshalJSON() ([]byte, error) {\n` +
+							`\tif bool(v) != ${type.value} {\n\t\treturn nil, unknownValue(${goString(owner)}, "${!type.value}")\n\t}\n` +
+							`\treturn []byte("${type.value}"), nil\n}\n`,
+					);
+					return owner;
+				}
 				if (typeof type.value !== "string") throw new Error(`${owner}: only string literals can be optional`);
 				return this.#syntheticEnum(owner, [type.value]);
 			case "enum":
@@ -550,11 +564,9 @@ class GoEmitter {
 		for (const field of def.fields) {
 			if (field.required && field.type.kind === "literal") {
 				const value = field.type.value;
-				if (typeof value === "number")
-					throw new Error(`${def.name}.${field.key}: numeric constants are not supported`);
 				constants.push(`${JSON.stringify(field.key)}:${JSON.stringify(value)}`);
 				decode.push(
-					`\td.constant(${goString(field.key)}, ${typeof value === "string" ? goString(value) : value})\n`,
+					`\td.constant(${goString(field.key)}, ${typeof value === "string" ? goString(value) : typeof value === "number" ? `float64(${value})` : value})\n`,
 				);
 				continue;
 			}
@@ -685,8 +697,8 @@ class GoEmitter {
 			return parts.join("\n");
 		}
 		const result = this.#def(command.result);
-		if (result.kind !== "object") throw new Error(`${command.name}: result must be an object`);
 		if (command.unwrap) {
+			if (result.kind !== "object") throw new Error(`${command.name}: unwrapped result must be an object`);
 			if (command.nullable) throw new Error(`${command.name}: nullable unwrapped results are not supported`);
 			const field = result.fields.find(candidate => candidate.key === command.unwrap);
 			if (!field) throw new Error(`${command.name}: unwrap field ${command.unwrap} not in ${command.result}`);

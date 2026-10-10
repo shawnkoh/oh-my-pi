@@ -285,6 +285,11 @@ class PythonEmitter {
 				return "decode_json";
 			case "literal":
 			case "enum": {
+				if (type.kind === "literal" && typeof type.value === "number") {
+					this.#runtime.add("literal_number");
+					this.#runtime.add("Decoder");
+					return `cast('Decoder[${this.#annotation(type, "record")}]', literal_number(${type.value}))`;
+				}
 				this.#runtime.add("literal");
 				this.#runtime.add("Decoder");
 				const values = type.kind === "literal" ? [String(type.value)] : type.values;

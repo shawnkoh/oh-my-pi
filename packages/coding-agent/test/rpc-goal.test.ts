@@ -47,7 +47,7 @@ describe("RPC goal command", () => {
 
 	async function start(options: {
 		continuation: boolean;
-		script?: "complete" | "idle" | "slow";
+		script?: "complete" | "idle" | "slow" | "abort-resume";
 		plan?: boolean;
 		persist?: boolean;
 	}): Promise<RpcClient> {
@@ -202,6 +202,95 @@ describe("RPC goal command", () => {
 		expect(state.goal?.goal.status).toBe("paused");
 		expect(state.isStreaming).toBe(false);
 		expect(state.isSettled).toBe(true);
+	}, 30_000);
+
+	for (const input of ["prompt", "follow_up"] as const) {
+		test(`after a host abort, a host ${input} re-arms a goal resumed without a host goal command`, async () => {
+			const rpc = await start({ continuation: true, script: "abort-resume" });
+			// The fixture resumes the runtime during this turn, without a host goal command.
+			// Only accepted host input may re-arm the controller's continuation latch.
+			const added = await continuationsAfterAbortAndResume(
+				rpc,
+				async () => {},
+				() => (input === "prompt" ? rpc.prompt("pick the goal back up") : rpc.followUp("pick the goal back up")),
+			);
+			expect(added).toBe(1);
+		}, 30_000);
+	}
+
+	/**
+	 * Creates a goal, aborts its slow continuation turn, runs `between`, then sends `input`
+	 * (whose turn resumes the runtime without a host goal command) and waits for the session
+	 * to settle. Returns the goal-continuation messages added after the abort.
+	 */
+	async function continuationsAfterAbortAndResume(
+		rpc: RpcClient,
+		between: () => Promise<void>,
+		input: () => Promise<unknown>,
+	): Promise<number> {
+		const started = Promise.withResolvers<void>();
+		let agentEnds = 0;
+		/** Created when the input is sent: the abort's own settle must not count. */
+		let settledAfterInput: PromiseWithResolvers<void> | undefined;
+		const unsubscribe = rpc.onSessionEvent(event => {
+			if (event.type === "agent_start") started.resolve();
+			if (event.type === "agent_end") agentEnds++;
+		});
+		const unsubscribeSettled = rpc.onSessionSettled(() => {
+			if (agentEnds > 0) settledAfterInput?.resolve();
+		});
+		const continuations = async () =>
+			(await rpc.getMessages()).filter(
+				message => message.role === "custom" && message.customType === "goal-continuation",
+			).length;
+		try {
+			await rpc.goal("create", { objective: "long task" });
+			await withTimeout(started.promise, 10_000, "Continuation turn never started");
+			await rpc.abort();
+			expect((await rpc.getState()).goal?.goal.status).toBe("paused");
+			const before = await continuations();
+			await between();
+			agentEnds = 0;
+			settledAfterInput = Promise.withResolvers<void>();
+			await input();
+			await withTimeout(settledAfterInput.promise, 15_000, "Session never settled after the input");
+			expect((await rpc.getState()).goal?.goal.status).toBe("active");
+			return (await continuations()) - before;
+		} finally {
+			unsubscribe();
+			unsubscribeSettled();
+		}
+	}
+
+	test("after a host abort, a refused steer does not re-arm a goal resumed without a host goal command", async () => {
+		const rpc = await start({ continuation: true, script: "abort-resume" });
+		const added = await continuationsAfterAbortAndResume(
+			rpc,
+			// An extension command cannot be queued as a steer: the session refuses it (RpcClient.steer
+			// does not surface the error response, so check that nothing was queued or run).
+			async () => {
+				const before = await rpc.getState();
+				await rpc.steer("/goaltest-navigate-here");
+				const after = await rpc.getState();
+				expect(after.queuedMessages.steering).toEqual([]);
+				expect(after.isStreaming).toBe(false);
+				expect(after.messageCount).toBe(before.messageCount);
+			},
+			// A turn the host did not start (an input hook's own sendUserMessage) resumes the goal.
+			() => rpc.prompt("goaltest-extension-turn"),
+		);
+		expect(added).toBe(0);
+	}, 30_000);
+
+	test("after a host abort, /retry re-arms a goal resumed without a host goal command", async () => {
+		const rpc = await start({ continuation: true, script: "abort-resume" });
+		// The fixture resumes the runtime during the retried turn.
+		const added = await continuationsAfterAbortAndResume(
+			rpc,
+			async () => {},
+			() => rpc.prompt("/retry"),
+		);
+		expect(added).toBe(1);
 	}, 30_000);
 
 	test("a new session leaves the previous session's goal, goal tool and continuation behind", async () => {
@@ -415,7 +504,11 @@ describe("RPC goal command", () => {
 
 describe("RpcGoalController continuation gate", () => {
 	const agentEnd = { type: "agent_end", messages: [], isTerminal: true } as unknown as AgentSessionEvent;
-	const hostInput = { type: "message_start", message: { role: "user", content: [] } } as unknown as AgentSessionEvent;
+	/** A non-synthetic user message entering the transcript, e.g. an extension's `sendUserMessage`. */
+	const userMessageStart = {
+		type: "message_start",
+		message: { role: "user", content: [] },
+	} as unknown as AgentSessionEvent;
 
 	function fakeSession(admit: (customType: string) => Promise<boolean>) {
 		let goalState: GoalModeState | undefined = {
@@ -433,6 +526,8 @@ describe("RpcGoalController continuation gate", () => {
 		};
 		let idle = Promise.withResolvers<void>();
 		idle.resolve();
+		let dispatch = Promise.withResolvers<void>();
+		dispatch.resolve();
 		const journal: string[] = [];
 		let tools: string[] = ["read"];
 		let journaledGoal = false;
@@ -441,12 +536,22 @@ describe("RpcGoalController continuation gate", () => {
 		let threadResumes = 0;
 		const preservedActive: boolean[] = [];
 		const transcript = { id: "t1" };
+		/** Sibling moves: the id each sibling continued, keyed by the sibling's id. */
+		const siblingMovedFrom = new Map<string, string>();
+		/** Goal-continuation reservations the session currently holds (quiesce work). */
+		const reservations = { held: 0 };
 		const session = {
 			settings: Settings.isolated({ "goal.continuationModes": ["rpc"] }),
 			// Provider-facing id pinned by the host: must not be used to detect a session change.
 			sessionId: "pinned-provider-id",
 			sessionManager: {
 				getSessionId: () => transcript.id,
+				continuesSession: (id: string) => {
+					for (let current: string | undefined = transcript.id; current; current = siblingMovedFrom.get(current)) {
+						if (current === id) return true;
+					}
+					return false;
+				},
 				buildSessionContext: () =>
 					journaledGoal
 						? {
@@ -471,6 +576,8 @@ describe("RpcGoalController continuation gate", () => {
 			isSessionTransitioning: false,
 			isStreaming: false,
 			hasAdmittedSubmission: false,
+			hasPendingTurnDispatch: false,
+			waitForPendingTurnDispatch: () => dispatch.promise,
 			queuedMessageCount: 0,
 			hasPendingAsyncWork: () => false,
 			settleAsyncWork: async () => {},
@@ -509,6 +616,17 @@ describe("RpcGoalController continuation gate", () => {
 			},
 			promptCustomMessage: (message: { customType: string }) => admit(message.customType),
 			waitForIdle: () => idle.promise,
+			reserveGoalContinuation: () => {
+				reservations.held++;
+				let released = false;
+				return {
+					release: () => {
+						if (released) return;
+						released = true;
+						reservations.held--;
+					},
+				};
+			},
 		};
 		let dropped = 0;
 		const controller = new RpcGoalController(session as unknown as RpcGoalSession, () => dropped++);
@@ -530,13 +648,60 @@ describe("RpcGoalController continuation gate", () => {
 			},
 			releaseResume: () => resumed.resolve(),
 			dropped: () => dropped,
+			reservations,
 			/** Hold waitForIdle until {@link release}. */
 			hold: () => {
 				idle = Promise.withResolvers<void>();
 			},
 			release: () => idle.resolve(),
+			/** Host input enters its hooks: the session's turn dispatch is pending. */
+			holdDispatch: () => {
+				session.hasPendingTurnDispatch = true;
+				dispatch = Promise.withResolvers<void>();
+			},
+			releaseDispatch: () => {
+				session.hasPendingTurnDispatch = false;
+				dispatch.resolve();
+			},
+			/** A #13997 sibling move: same transcript, new id whose parent is the current one. */
+			siblingMove: (to: string) => {
+				siblingMovedFrom.set(to, transcript.id);
+				transcript.id = to;
+			},
 		};
 	}
+
+	test("a stale continuation task never releases the reservation of a newer one", async () => {
+		const heldAtAdmission: number[] = [];
+		const fake = fakeSession(async () => {
+			heldAtAdmission.push(fake.reservations.held);
+			return true;
+		});
+		const { controller, reservations } = fake;
+
+		// Continuation 1 is decided and its task waits for the session to go idle.
+		fake.hold();
+		controller.observe(agentEnd);
+		await nextMacrotask();
+		expect(reservations.held).toBe(1);
+		// The host aborts (releasing 1), then re-arms; continuation 2 is decided.
+		controller.stopForHostAbort();
+		expect(reservations.held).toBe(0);
+		controller.noteHostInput();
+		controller.observe(agentEnd);
+		expect(reservations.held).toBe(1);
+		// Task 1 wakes while continuation 2 still waits on a later idle.
+		fake.release();
+		fake.hold();
+		await nextMacrotask();
+		expect(controller.continuationPending).toBe(true);
+		expect(reservations.held).toBe(1);
+		// Continuation 2 is admitted, its reservation handed over in the same step.
+		fake.release();
+		await nextMacrotask();
+		expect(heldAtAdmission).toEqual([0]);
+		expect(reservations.held).toBe(0);
+	});
 
 	test("a continuation decided before the session closes is never admitted after it", async () => {
 		const admitted: string[] = [];
@@ -560,7 +725,7 @@ describe("RpcGoalController continuation gate", () => {
 		expect(admitted).toEqual([]);
 
 		// Host input re-arms it; the next yield continues exactly once.
-		controller.observe(hostInput);
+		controller.noteHostInput();
 		controller.observe(agentEnd);
 		controller.observe(agentEnd);
 		await nextMacrotask();
@@ -614,13 +779,15 @@ describe("RpcGoalController continuation gate", () => {
 		await nextMacrotask();
 		expect(admitted).toEqual(["goal-continuation", "goal-continuation"]);
 
-		// After a host abort, such a turn does not re-arm; only host input does.
+		// After a host abort, such a turn does not re-arm, and neither does a user message
+		// the host did not send (an extension's sendUserMessage); only host input does.
 		controller.stopForHostAbort();
 		controller.observe(agentEnd);
+		controller.observe(userMessageStart);
 		controller.observe(agentEnd);
 		await nextMacrotask();
 		expect(admitted).toEqual(["goal-continuation", "goal-continuation"]);
-		controller.observe(hostInput);
+		controller.noteHostInput();
 		controller.observe(agentEnd);
 		await nextMacrotask();
 		expect(admitted).toEqual(["goal-continuation", "goal-continuation", "goal-continuation"]);
@@ -679,6 +846,37 @@ describe("RpcGoalController continuation gate", () => {
 		expect(controller.continuationPending).toBe(false);
 	});
 
+	test("a continuation waits for host input still in its hooks, then yields to a run it starts", async () => {
+		const admitted: string[] = [];
+		const { session, controller, holdDispatch, releaseDispatch } = fakeSession(async customType => {
+			admitted.push(customType);
+			return true;
+		});
+
+		// A host prompt is in its input hooks when the run yields: the continuation waits.
+		holdDispatch();
+		controller.observe(agentEnd);
+		await nextMacrotask();
+		expect(admitted).toEqual([]);
+		expect(controller.continuationPending).toBe(true);
+		// The prompt is admitted and starts its run: the continuation drops; that run's end decides.
+		session.isStreaming = true;
+		releaseDispatch();
+		await nextMacrotask();
+		expect(admitted).toEqual([]);
+		expect(controller.continuationPending).toBe(false);
+
+		// An input its hooks handled starts no run: the continuation proceeds once they return.
+		session.isStreaming = false;
+		holdDispatch();
+		controller.observe(agentEnd);
+		await nextMacrotask();
+		expect(admitted).toEqual([]);
+		releaseDispatch();
+		await nextMacrotask();
+		expect(admitted).toEqual(["goal-continuation"]);
+	});
+
 	test("a change that stays in the same session holds, then resumes the goal without settling in between", async () => {
 		const admitted: string[] = [];
 		const { controller, hold, release, dropped } = fakeSession(async customType => {
@@ -721,6 +919,30 @@ describe("RpcGoalController continuation gate", () => {
 		// The old goal is left behind, and nothing continues it in the new transcript.
 		expect(goalState()).toBeUndefined();
 		expect(admitted).toEqual([]);
+	});
+
+	test("a sibling move during a change is the same session: the goal and a host abort stay in force", async () => {
+		const admitted: string[] = [];
+		const { controller, goalState, siblingMove, threadResumes } = fakeSession(async customType => {
+			admitted.push(customType);
+			return true;
+		});
+		controller.stopForHostAbort();
+		await controller.beginSessionChange();
+		// Another process wrote the transcript file meanwhile, so the session moved to a sibling.
+		siblingMove("t1-sibling");
+		await controller.endSessionChange();
+		await nextMacrotask();
+		// Not reconciled as a switch: the goal stays, and nothing re-arms the aborted goal.
+		expect(goalState()?.goal.id).toBe("g1");
+		expect(threadResumes()).toBe(0);
+		controller.observe(agentEnd);
+		await nextMacrotask();
+		expect(admitted).toEqual([]);
+		controller.noteHostInput();
+		controller.observe(agentEnd);
+		await nextMacrotask();
+		expect(admitted).toEqual(["goal-continuation"]);
 	});
 
 	test("a goal completed while a switch is pending is journaled in its own session", async () => {

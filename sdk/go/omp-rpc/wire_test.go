@@ -9,6 +9,52 @@ import (
 	"time"
 )
 
+func TestQuiesceResultAndAttestationVersion(t *testing.T) {
+	counts := `{"streaming":0,"queuedInput":0,"asyncJobs":0,"subagents":0,"retainedJobs":0,"detachedJobs":0,"compacting":0,"handoff":0,"goalContinuationScheduled":0,"scheduledTurns":0}`
+	attestation := `{"version":1,"kind":"quiesce","session":{"id":"s","file":null},"invocation":{"pid":1,"startId":null,"startTime":null},"instanceId":"i","epoch":2,"counts":` + counts + `,"interrupted":false,"registryComplete":true,"registryPath":null,"ownerScan":null,"writtenAt":"now"}`
+	raw := `{"status":"quiesced","operationId":"op","attempt":1,"attestation":` + attestation + `,"path":"s.terminal.json"}`
+	var result QuiesceResult
+	if err := json.Unmarshal([]byte(raw), &result); err != nil {
+		t.Fatal(err)
+	}
+	passed, ok := result.Value.(QuiescedResult)
+	if !ok || passed.Attestation.Session.ID != "s" {
+		t.Fatalf("unexpected quiescence result: %#v", result.Value)
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil || !strings.Contains(string(encoded), `"version":1`) {
+		t.Fatalf("lost numeric attestation version: %s %v", encoded, err)
+	}
+	for _, invalid := range []string{"2", `"1"`, "true", "null"} {
+		if err := json.Unmarshal([]byte(strings.Replace(raw, `"version":1`, `"version":`+invalid, 1)), &result); err == nil {
+			t.Fatalf("accepted invalid version %s", invalid)
+		}
+	}
+	if err := json.Unmarshal([]byte(strings.Replace(raw, `"quiesced"`, `"future"`, 1)), &result); err == nil {
+		t.Fatal("accepted unrecognized quiescence status")
+	}
+}
+
+func TestDeliveryQuietLiteral(t *testing.T) {
+	for _, input := range []string{"false", "null", " null ", `"true"`, "1"} {
+		var quiet DeliveryOptionsQuiet
+		if err := json.Unmarshal([]byte(input), &quiet); err == nil {
+			t.Fatalf("accepted invalid quiet flag %s", input)
+		}
+	}
+	var quiet DeliveryOptionsQuiet
+	if err := json.Unmarshal([]byte("true"), &quiet); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(quiet)
+	if err != nil || string(encoded) != "true" {
+		t.Fatalf("quiet round trip: %s %v", encoded, err)
+	}
+	if _, err := json.Marshal(DeliveryOptionsQuiet(false)); err == nil {
+		t.Fatal("encoded false for a true-only delivery option")
+	}
+}
+
 func decodeFrame(t *testing.T, line string) RpcServerFrameVariant {
 	t.Helper()
 	var frame RpcServerFrame

@@ -83,8 +83,10 @@ import type { CustomEditor } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import type { NativeToolView } from "@oh-my-pi/pi-tui/tools/renderer";
 import type { AsyncJobSnapshot, SendUserMessageOptions } from "../../session/agent-session";
+import type { QuiesceRequest, QuiesceResult, WorkAttestation } from "../../session/quiescence";
 import type { EphemeralTurnOptions, EphemeralTurnResult } from "../../session/agent-session-types";
 import type { CompactMode } from "../../session/compact-modes";
+import type { DeliveryHandle, DeliveryOptions } from "../../session/external-delivery";
 import type { CustomMessagePayload } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
 import type { BashToolInput, GlobToolInput, GrepToolInput, ReadToolInput, WriteToolInput } from "../../tools";
@@ -228,6 +230,22 @@ export interface ExtensionUIDialogOptions {
 	markableCount?: number;
 	/** Allow image pastes in rich ask-dialog custom-answer and note prompts. */
 	acceptImages?: boolean;
+	/** Present for a tool-approval select: the exact call the answer approves. */
+	approval?: ToolApprovalBinding;
+}
+
+/**
+ * The tool call a tool-approval dialog decides. `arguments` are what the
+ * approval policy evaluated: the call's parameters after any preflight
+ * revision, or a provider computer-use call's `{ actions }`. An eval prelude
+ * approval carries the enclosing eval call's `toolCallId`, so one call can ask
+ * several times: `(toolCallId, toolName)` identifies the decision.
+ */
+export interface ToolApprovalBinding {
+	toolCallId: string;
+	toolName: string;
+	arguments: unknown;
+	reason?: string;
 }
 
 /** Raw terminal input listener for extensions. */
@@ -483,6 +501,8 @@ export interface ExtensionAgentIdentity {
 }
 
 export interface ExtensionContext {
+	/** Report background work until it truly settles, including after cancellation. */
+	holdWork(reason: string): { release(): void };
 	/** UI methods for user interaction */
 	ui: ExtensionUIContext;
 	/** Current run mode. Use `"tui"` to guard terminal-only UI such as custom components. */
@@ -515,6 +535,19 @@ export interface ExtensionContext {
 	hasPendingMessages(): boolean;
 	/** Gracefully shutdown and exit. */
 	shutdown(): void;
+	/**
+	 * Protocol capabilities this host implements (`quiesce-exit/2`, `owned-jobs/1`).
+	 * Empty when the host cannot quiesce and exit.
+	 */
+	capabilities: readonly string[];
+	/** Read-only snapshot of outstanding work, echoing `operationId` and `nonce`. */
+	attest(operationId: string, nonce: string): WorkAttestation;
+	/**
+	 * Close input admission and, when nothing is outstanding, the epoch is unchanged and the
+	 * deadline has not passed, write the terminal attestation and exit the process after this
+	 * returns. Otherwise reopen admission and return the refusal; nothing is cancelled.
+	 */
+	quiesceAndExit(request: QuiesceRequest): QuiesceResult;
 	/** Identity of the agent this session runs: the top-level session or a subagent. */
 	agent: ExtensionAgentIdentity;
 	/**
@@ -1355,6 +1388,8 @@ export type ExtensionServiceTier<Family extends ServiceTierFamily> = Family exte
  * Methods retain their extension binding when destructured or passed as callbacks.
  */
 export interface ExtensionAPI {
+	/** Declare that all background activity is reported through ctx.holdWork(). */
+	workReporting?: "complete";
 	// =========================================================================
 	// Module Access
 	// =========================================================================
@@ -1599,6 +1634,32 @@ export interface ExtensionAPI {
 	 *  batch while streaming; idle still starts a turn. */
 	sendUserMessage(content: string | (TextContent | ImageContent)[], options?: SendUserMessageOptions): void;
 
+	/**
+	 * Host capability ids (e.g. `"external-delivery/1"`). Populated when the host
+	 * binds its runtime actions (before `session_start`); empty while the
+	 * extension factory itself runs.
+	 */
+	readonly capabilities: ReadonlySet<string>;
+
+	/**
+	 * Admit a directed external record with honest receipts (`external-delivery/1`).
+	 * The record is a `custom` message (`attribution: "agent"`) that only enters
+	 * context through the loop's own admission; the returned handle reports
+	 * acceptance (`mode`/`mechanism`), settlement, discard or cancellation.
+	 * Throws when the host lacks the capability — check `capabilities` first.
+	 * After the session closed input admission (a passed quiesce or a hang-up) the
+	 * record is not admitted: the handle is already discarded with `admission_closed`.
+	 *
+	 * `accepted` and `settled` never resolve for a discarded or cancelled record, and a
+	 * cancelled one resolves no promise at all (read `state()`). An `input` hook that waits
+	 * for its own delivery holds every later input until it returns, so it must race
+	 * `accepted` with `discarded` (a session change or shutdown discards the record), must
+	 * not cancel what it awaits, and must deliver in its own async context (code it calls,
+	 * and promises, timers and callbacks it creates): only such a delivery is exempt from the
+	 * holds, interrupt and plan mode its own input would otherwise impose (see `docs/rpc.md`).
+	 */
+	deliverMessage<T = unknown>(record: CustomMessagePayload<T>, options: DeliveryOptions): DeliveryHandle;
+
 	/** Append a custom entry to the session for state persistence (not sent to LLM). */
 	appendEntry<T = unknown>(customType: string, data?: T): void;
 
@@ -1834,6 +1895,12 @@ export type SendUserMessageHandler = (
 	options?: SendUserMessageOptions,
 ) => void;
 
+/** `external-delivery/1`: bound only by hosts that own an `AgentSession`. */
+export type DeliverMessageHandler = <T = unknown>(
+	record: CustomMessagePayload<T>,
+	options: DeliveryOptions,
+) => DeliveryHandle;
+
 export type AppendEntryHandler = <T = unknown>(customType: string, data?: T) => void;
 
 export type GetActiveToolsHandler = () => string[];
@@ -1859,6 +1926,8 @@ export interface ExtensionRuntimeState {
 	flagValues: Map<string, boolean | string>;
 	/** Provider registrations queued during extension loading, processed during session initialization */
 	pendingProviderRegistrations: Array<{ name: string; config: ProviderConfig; sourceId: string }>;
+	/** Host capability ids; the host adds `"external-delivery/1"` when it binds `deliverMessage`. */
+	readonly capabilities: Set<string>;
 	/** Queue a provider registration until initialization, then apply it immediately. */
 	registerProvider(name: string, config: ProviderConfig, sourceId: string): void;
 	/** Remove a queued or initialized provider registration. */
@@ -1869,6 +1938,8 @@ export interface ExtensionRuntimeState {
 export interface ExtensionActions {
 	sendMessage: SendMessageHandler;
 	sendUserMessage: SendUserMessageHandler;
+	/** Absent ⇒ `capabilities` lacks `"external-delivery/1"` and `deliverMessage` throws. */
+	deliverMessage?: DeliverMessageHandler;
 	appendEntry: AppendEntryHandler;
 	setLabel: (targetId: string, label: string | undefined) => void;
 	getActiveTools: GetActiveToolsHandler;
@@ -1895,6 +1966,9 @@ export interface ExtensionContextActions {
 	compact: (instructionsOrOptions?: string | CompactOptions) => Promise<void>;
 	getSystemPrompt: () => string[];
 	runEphemeralTurn?: (options: EphemeralTurnOptions) => Promise<EphemeralTurnResult>;
+	/** Hosts that can exit on a passed quiesce supply both; see {@link ExtensionContext.quiesceAndExit}. */
+	attest?: (operationId: string, nonce: string) => WorkAttestation;
+	quiesceAndExit?: (request: QuiesceRequest) => QuiesceResult;
 }
 
 /** Actions for ExtensionCommandContext (ctx.* in command handlers). */
@@ -1923,6 +1997,7 @@ export interface Extension {
 	path: string;
 	resolvedPath: string;
 	label?: string;
+	workReporting?: "complete";
 	handlers: Map<string, HandlerFn[]>;
 	tools: Map<string, RegisteredTool<any, any>>;
 	toolRegistrationListeners?: Set<ToolRegistrationListener>;

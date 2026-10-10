@@ -33,6 +33,18 @@ const IMAGES = doc("ImageContent[]", "Images attached to the message.");
 
 export const rpcCommands: readonly RpcCommandSpec[] = [
 	{
+		name: "attest",
+		doc: "Snapshot identity, activity epoch, work census and owned-job registry soundness.",
+		params: { operationId: "string", nonce: "string" },
+		result: "WorkAttestation",
+	},
+	{
+		name: "quiesce_and_exit",
+		doc: "Require explicit strict or attested completeness; close admission and retire, retaining strict sealed failures for retry.",
+		params: "QuiesceRequest",
+		result: "QuiesceResult",
+	},
+	{
 		name: "negotiate_protocol",
 		doc: "Switch the connection to a protocol version advertised by `ready`.",
 		params: { protocolVersion: "number.integer" },
@@ -41,12 +53,37 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 	{
 		name: "prompt",
 		doc: "Submit a prompt; acknowledged once admitted, completed by its `prompt_result`.",
-		params: { message: "string", "images?": IMAGES, "streamingBehavior?": "StreamingBehavior" },
+		params: {
+			message: "string",
+			"images?": IMAGES,
+			"streamingBehavior?": "StreamingBehavior",
+			"literal?": "boolean",
+		},
 		result: "PromptAck",
 		completion: "prompt_result",
 	},
-	{ name: "steer", doc: "Queue a steering message.", params: { message: "string", "images?": IMAGES } },
-	{ name: "follow_up", doc: "Queue a follow-up message.", params: { message: "string", "images?": IMAGES } },
+	{
+		name: "steer",
+		doc: "Queue a steering message.",
+		params: { message: "string", "images?": IMAGES, "literal?": "boolean" },
+	},
+	{
+		name: "follow_up",
+		doc: "Queue a follow-up message.",
+		params: { message: "string", "images?": IMAGES, "literal?": "boolean" },
+	},
+	{
+		name: "deliver",
+		doc: "Deliver an externally authored record with owned admission and settlement receipts.",
+		params: { record: "DeliveryRecord", options: "DeliveryOptions" },
+		result: { deliveryId: "string" },
+	},
+	{
+		name: "cancel_delivery",
+		doc: "Cancel a delivery only while it remains queued.",
+		params: { deliveryId: "string" },
+		result: { cancelled: "boolean" },
+	},
 	{
 		name: "remove_queued_message",
 		doc: "Remove one pending queued message by its queue-chip text.",
@@ -63,7 +100,7 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 	{
 		name: "abort_and_prompt",
 		doc: "Abort the current run and submit a prompt; completed by its `prompt_result`.",
-		params: { message: "string", "images?": IMAGES },
+		params: { message: "string", "images?": IMAGES, "literal?": "boolean" },
 		completion: "prompt_result",
 	},
 	{
@@ -95,9 +132,8 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 	{
 		name: "set_ask_dialog",
 		doc: "Opt in to `ask` UI requests; returns the applied setting.",
-		params: { enabled: "boolean" },
-		result: { enabled: "boolean" },
-		unwrap: "enabled",
+		params: { enabled: "boolean", "rich?": "boolean" },
+		result: { enabled: "boolean", "rich?": "boolean" },
 	},
 	{
 		name: "get_available_commands",
@@ -294,6 +330,26 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 		doc: "One stable page of messages.",
 		params: { "cursor?": "string", "limit?": "number.integer" },
 		result: "MessagesPage",
+	},
+	{
+		name: "get_session_history",
+		doc: "Read a bounded committed native history page from the exact current Session without extending the supplied expiry.",
+		params: {
+			readId: "string",
+			expectedSessionId: "string",
+			expectedSessionPath: "string",
+			before: "number.integer",
+			limit: "number.integer",
+			expiresAt: "number.integer",
+		},
+		result: "SessionHistoryPage",
+		timeoutMs: 5000,
+	},
+	{
+		name: "cancel_session_history",
+		doc: "Cancel one ephemeral history read without aborting the agent or terminating its transport.",
+		params: { readId: "string" },
+		timeoutMs: 5000,
 	},
 
 	{

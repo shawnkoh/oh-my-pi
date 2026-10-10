@@ -9,7 +9,7 @@ import type {
 	TextContent,
 	Usage,
 } from "@oh-my-pi/pi-ai";
-import { createSyntheticToolResultMessage } from "@oh-my-pi/pi-agent-core";
+import { createSyntheticToolResultMessage, inheritAssistantMessageIdentity } from "@oh-my-pi/pi-agent-core";
 import {
 	directoryIsEnterable,
 	getBlobsDir,
@@ -122,6 +122,8 @@ const DISCARDED_ENTRY_BRANCH_MARKER = "discarded-entry-branch";
  * inside every read-to-publish window exhausts them.
  */
 const MAX_WRITE_CONFLICT_RECOVERIES = 3;
+/** Read size when hashing a transcript for an exit attestation. */
+const DIGEST_CHUNK_BYTES = 1 << 20;
 
 /** A fresh session id. */
 export function mintSessionId(): string {
@@ -649,6 +651,12 @@ class SessionEntryIndex {
 	}
 }
 
+/** Size and SHA-256 of a finalized session file; both `null` when no file exists. */
+export interface TranscriptDigest {
+	size: number | null;
+	sha256: string | null;
+}
+
 export type ReadonlySessionManager = Pick<
 	SessionManager,
 	| "getCwd"
@@ -679,6 +687,8 @@ interface SessionManagerStateSnapshot {
 	cwd: string;
 	sessionDir: string;
 	sessionId: string;
+	/** Sibling-move lineage ({@link SessionManager.continuesSession}); a restore puts it back. */
+	siblingLineage: string[];
 	sessionName: string | undefined;
 	titleSource: SessionTitleSource | undefined;
 	sessionFile: string | undefined;
@@ -759,6 +769,16 @@ export class ForkSourceNotFoundError extends Error {
 	}
 }
 
+/** A bounded, revision-checked window over the manager's loaded committed journal. */
+export interface SessionHistoryReadView {
+	readonly sessionId: string;
+	readonly sessionFile: string | undefined;
+	readonly cwd: string;
+	readonly entryCount: number;
+	getEntry(index: number): Readonly<SessionEntry> | undefined;
+	isCurrent(): boolean;
+}
+
 /**
  * Stores and navigates an append-only conversation journal.
  *
@@ -803,6 +823,9 @@ export class SessionManager {
 	#hasTitleSlot = true;
 	#entries: SessionEntry[] = [];
 	#index = new SessionEntryIndex();
+	#historyRewriteRevision = 0;
+	/** Invalidates borrowed history views on every observable mutation, including staged writes. */
+	#historyReadRevision = 0;
 
 	/** File reflects all current entries; appends can go incrementally. */
 	#fileIsCurrent = false;
@@ -817,6 +840,9 @@ export class SessionManager {
 	 * nothing (rvEW).
 	 */
 	#deferredPublishGen = 0;
+	/** Strict retirement confirms deferred storage once, retaining failures under the seal. */
+	#strictPublicationStarted = false;
+	#strictPublicationDigest: TranscriptDigest | undefined;
 	/** Lazy gate crossed (ensureOnDisk / loaded file): every entry must persist from now on. */
 	#forceFileCreation = false;
 	/**
@@ -839,7 +865,7 @@ export class SessionManager {
 
 	/** The single open append writer; the manager only ever writes one file at a time. */
 	#writer: SessionStorageWriter | undefined;
-	/** Sealed by {@link releaseRetainedEntries}: every later append/title/rewrite is a dropped no-op. */
+	/** Terminal write barrier; only explicit finalization recovery may persist retained entries. */
 	#released = false;
 	/** Set by {@link releaseRetainedEntries}: `#entries` was cleared, so `#fileBody()` is no longer authoritative. */
 	#entriesReleased = false;
@@ -894,6 +920,11 @@ export class SessionManager {
 	/** Every notice raised so far, replayed to each later subscriber. */
 	#persistenceNotices: SessionPersistenceNotice[] = [];
 	/**
+	 * Ids the current session continues through sibling moves ({@link SessionPersistenceNotice}),
+	 * oldest first. Any other id change ({@link #adoptSessionId}) starts a new lineage.
+	 */
+	#siblingLineage: string[] = [];
+	/**
 	 * This process's ownership claim on the session it last wrote (file storage
 	 * only), keyed by session id so every path to the journal meets it.
 	 * `release` is unset while another live process holds the session, and
@@ -934,6 +965,7 @@ export class SessionManager {
 	}
 
 	#clearDiskError(): void {
+		if (this.#diskFailure) this.#historyReadRevision++;
 		this.#diskFailure = undefined;
 		this.#diskFailureLogged = false;
 	}
@@ -958,7 +990,10 @@ export class SessionManager {
 
 	#noteDiskFailure(errorLike: unknown): Error {
 		const error = toError(errorLike);
-		if (!this.#diskFailure) this.#diskFailure = error;
+		if (!this.#diskFailure) {
+			this.#historyReadRevision++;
+			this.#diskFailure = error;
+		}
 
 		if (!this.#diskFailureLogged) {
 			this.#diskFailureLogged = true;
@@ -1068,6 +1103,7 @@ export class SessionManager {
 			adopted++;
 		}
 		this.#index.setLeaf(leaf);
+		if (adopted > 0) this.#historyReadRevision++;
 		this.#expectedDiskSize = diskSize;
 		if (adopted > 0)
 			logger.warn("Kept session entries another writer added", { sessionFile: this.#sessionFile, adopted });
@@ -1150,6 +1186,8 @@ export class SessionManager {
 		const from = this.#sessionFile as string;
 		const previousSessionId = this.#sessionId;
 		const timestamp = nowIso();
+		this.#siblingLineage.push(previousSessionId);
+		this.#historyReadRevision++;
 		this.#sessionId = mintSessionId();
 		const to = path.join(path.dirname(from), `${fileSafeTimestamp(timestamp)}_${this.#sessionId}.jsonl`);
 		this.#header = {
@@ -1231,6 +1269,7 @@ export class SessionManager {
 
 	#latchIndeterminate(operationError: Error, recoveryErrors: readonly Error[]): SessionPersistenceIndeterminateError {
 		const error = new SessionPersistenceIndeterminateError(operationError, recoveryErrors);
+		this.#historyReadRevision++;
 		this.#diskFailure = error;
 		if (!this.#diskFailureLogged) {
 			this.#diskFailureLogged = true;
@@ -1276,7 +1315,10 @@ export class SessionManager {
 		this.#fileIsCurrent = false;
 		this.#rewriteRequired = true;
 		this.#atomicRewriteFenceEpoch = epoch;
-		if (!this.#diskFailure) this.#diskFailure = operationError;
+		if (!this.#diskFailure) {
+			this.#historyReadRevision++;
+			this.#diskFailure = operationError;
+		}
 		try {
 			await previousDiskTail.catch(() => undefined);
 			let closeError: Error | undefined;
@@ -1486,8 +1528,8 @@ export class SessionManager {
 	 * rename, destination post-rename) rather than always `#sessionFile`, so
 	 * concurrent completed entries are durable without recreating a vacated source.
 	 */
-	#rewriteSynchronously(): void {
-		if (this.#released) return;
+	#rewriteSynchronously(recoverSealed = false): void {
+		if (this.#released && (!recoverSealed || this.#entriesReleased)) return;
 		if (!this.#persist || !this.#shouldHaveSessionFile()) return;
 		let targetPath = this.#liveRelocationWritePath() ?? this.#sessionFile;
 		if (!targetPath) return;
@@ -1832,6 +1874,7 @@ export class SessionManager {
 	}
 
 	#resetToNewSession(options?: NewSessionOptions, forcedSessionFile?: string): string | undefined {
+		this.#historyReadRevision++;
 		this.#diskTail = Promise.resolve();
 		this.#clearDiskError();
 		this.#expectedDiskSize = null;
@@ -1840,7 +1883,7 @@ export class SessionManager {
 			this.#sessionDir = path.resolve(options.sessionDir);
 			this.#storage.ensureDirSync(this.#sessionDir);
 		}
-		this.#sessionId = mintSessionId();
+		this.#adoptSessionId(mintSessionId());
 		this.#sessionName = undefined;
 		this.#titleSource = undefined;
 		this.#titleUpdatedAt = "";
@@ -1895,9 +1938,11 @@ export class SessionManager {
 	}
 
 	#applyEntries(header: SessionHeader, entries: SessionEntry[]): void {
+		this.#historyRewriteRevision++;
+		this.#historyReadRevision++;
 		this.#header = header;
 		this.#entries = entries;
-		this.#sessionId = header.id;
+		this.#adoptSessionId(header.id);
 		this.#sessionName = header.title;
 		this.#titleSource = header.titleSource;
 		this.#titleUpdatedAt = header.timestamp;
@@ -1915,6 +1960,7 @@ export class SessionManager {
 	}
 
 	#setLeaf(id: string | null): void {
+		if (this.#index.leafId() !== id) this.#historyReadRevision++;
 		this.#index.setLeaf(id);
 		const batch = this.#atomicEntryBatch;
 		if (batch && !batch.collecting) {
@@ -1931,6 +1977,7 @@ export class SessionManager {
 		if (entry.type === "message" && entry.message.role === "assistant" && normalizeAssistantUsage(entry.message)) {
 			logger.warn("Assistant message recorded with incomplete usage", { id: entry.id });
 		}
+		this.#historyReadRevision++;
 		this.#entries.push(entry);
 		this.#index.insert(entry);
 		const batch = this.#atomicEntryBatch;
@@ -1945,6 +1992,8 @@ export class SessionManager {
 	}
 
 	#rollbackAtomicEntryBatch(batch: AtomicEntryBatch): void {
+		this.#historyRewriteRevision++;
+		this.#historyReadRevision++;
 		const retainedAncestor = (id: string | null): string | null => {
 			const seen = new Set<string>();
 			while (id && batch.entryIds.has(id) && !seen.has(id)) {
@@ -2045,6 +2094,7 @@ export class SessionManager {
 			cwd: this.#cwd,
 			sessionDir: this.#sessionDir,
 			sessionId: this.#sessionId,
+			siblingLineage: [...this.#siblingLineage],
 			sessionName: this.#sessionName,
 			titleSource: this.#titleSource,
 			titleUpdatedAt: this.#titleUpdatedAt,
@@ -2086,6 +2136,7 @@ export class SessionManager {
 	}
 
 	restoreState(snapshot: SessionManagerStateSnapshot): void {
+		this.#historyReadRevision++;
 		this.#closeWriterEventually();
 		this.#diskTail = Promise.resolve();
 		this.#clearDiskError();
@@ -2100,6 +2151,8 @@ export class SessionManager {
 		this.#draftOnlySessionCleanupArmed = snapshot.draftOnlySessionCleanupArmed;
 		this.#fallbackRuntimeOnly = snapshot.fallbackRuntimeOnly;
 		this.#applyEntries(snapshot.header, [...snapshot.entries]);
+		// After #applyEntries: its id adoption resets the lineage on an id change.
+		this.#siblingLineage = [...snapshot.siblingLineage];
 		this.#additionalDirectories = snapshot.header.additionalDirectories ?? [];
 		this.#sessionName = snapshot.sessionName;
 
@@ -2160,6 +2213,7 @@ export class SessionManager {
 		loadedSession?: SessionLoadResult,
 		options?: { throwIfMissing?: boolean; newSession?: NewSessionOptions },
 	): Promise<void> {
+		this.#historyReadRevision++;
 		await this.#drainAndCloseWriter();
 		this.#clearDiskError();
 		this.#draftOnlySessionCleanupArmed = false;
@@ -2182,6 +2236,7 @@ export class SessionManager {
 			);
 		}
 
+		this.#historyReadRevision++;
 		this.#sessionFile = resolvedSessionFile;
 		this.#rememberBreadcrumb(this.#cwd, resolvedSessionFile);
 
@@ -2251,6 +2306,7 @@ export class SessionManager {
 	 * from selecting the previous conversation as the most recent session.
 	 */
 	async newSession(options?: NewSessionOptions): Promise<string | undefined> {
+		this.#historyReadRevision++;
 		await this.#drainAndCloseWriter();
 		const sessionFile = this.#resetToNewSession(options);
 		await this.ensureOnDisk();
@@ -2281,7 +2337,8 @@ export class SessionManager {
 		this.#reconcileSessionDirForFallback();
 
 		const timestamp = nowIso();
-		this.#sessionId = mintSessionId();
+		this.#adoptSessionId(mintSessionId());
+		this.#historyReadRevision++;
 		this.#sessionFile = path.join(this.#sessionDir, `${fileSafeTimestamp(timestamp)}_${this.#sessionId}.jsonl`);
 		this.#expectedDiskSize = null;
 		this.#header = {
@@ -2334,6 +2391,7 @@ export class SessionManager {
 			return;
 		}
 
+		this.#historyReadRevision++;
 		// A move writes both paths: it must neither move a session another live
 		// omp process writes nor replace a destination one writes. Checked before
 		// relocation starts (appends still go to the source) and before any
@@ -2471,6 +2529,7 @@ export class SessionManager {
 				}
 
 				if (sessionFileExisted && sessionPathChanged) {
+					this.#historyReadRevision++;
 					this.#header.previousSessionFiles = [
 						...new Set([...(this.#header.previousSessionFiles ?? []), path.resolve(oldSessionFile)]),
 					];
@@ -2489,6 +2548,7 @@ export class SessionManager {
 				this.#sessionFileRelocating = null;
 			}
 
+			this.#historyReadRevision++;
 			this.#cwd = resolvedCwd;
 			this.#sessionDir = nextSessionDir;
 			this.#header.cwd = resolvedCwd;
@@ -2550,6 +2610,13 @@ export class SessionManager {
 		manager.#header.additionalDirectories =
 			manager.#additionalDirectories.length > 0 ? [...manager.#additionalDirectories] : undefined;
 		manager.#entries = structuredClone(this.#entries);
+		for (let index = 0; index < this.#entries.length; index++) {
+			const source = this.#entries[index]!;
+			const copy = manager.#entries[index]!;
+			if (source.type === "message" && copy.type === "message") {
+				inheritAssistantMessageIdentity(source.message, copy.message);
+			}
+		}
 		manager.#index.rebuild(manager.#entries);
 		manager.#forceFileCreation = true;
 		await manager.#rewriteAtomically();
@@ -2589,6 +2656,7 @@ export class SessionManager {
 			externalLeafChanged: false,
 			externalLeafId: null,
 		};
+		this.#historyReadRevision++;
 		this.#atomicEntryBatch = batch;
 		let result!: T;
 		try {
@@ -2784,7 +2852,7 @@ export class SessionManager {
 	/**
 	 * Raise the terminal write barrier ahead of the final {@link close}. Once
 	 * sealed:
-	 * - every later append, title change, and rewrite is a dropped no-op —
+	 * - every later append, title change, and ordinary rewrite is a dropped no-op —
 	 *   including work an event handler tries to enqueue while dispose is
 	 *   awaiting `close()` on the disk tail;
 	 * - the disk epoch is bumped, so queued-but-unexecuted tail work is
@@ -2797,8 +2865,103 @@ export class SessionManager {
 	 */
 	seal(): void {
 		if (this.#released) return;
+		this.#historyReadRevision++;
 		this.#released = true;
 		this.#diskEpoch++;
+	}
+
+	/**
+	 * Make the transcript final for an exit attestation: flush every entry synchronously,
+	 * disarm draft-only cleanup (the attested file must not be deleted at close), and
+	 * {@link seal} so no later append lands. Returns the on-disk size and SHA-256 of the
+	 * session file, `{ size: null, sha256: null }` when no file exists (it will not be
+	 * created afterwards), or `null` when the transcript has no local file to hash
+	 * (in-memory or deferred-publish backends). Throws when the synchronous flush fails;
+	 * the session is then left unsealed.
+	 */
+	finalizeForExit(): TranscriptDigest | null {
+		if (this.#persist && this.#sessionFile) this.flushSync();
+		this.#draftOnlySessionCleanupArmed = false;
+		this.seal();
+		return this.transcriptDigest();
+	}
+
+	/**
+	 * Retry strict exit finalization without lifting the terminal write barrier.
+	 * The retained journal already contains the exit record; replace it rather
+	 * than append another. Ordinary finalization and mid-life recovery are unchanged.
+	 */
+	recoverFinalizationForExit(): TranscriptDigest | null {
+		if (this.#persist && this.#sessionFile && this.#storage.defersSyncPublish) {
+			if (this.#entriesReleased) throw new Error("Cannot recover a released session transcript.");
+			this.#draftOnlySessionCleanupArmed = false;
+			this.seal();
+			if (this.#diskFailure) throw this.#diskFailure;
+			if (this.#strictPublicationDigest) return this.#strictPublicationDigest;
+			if (!this.#strictPublicationStarted) {
+				this.#strictPublicationStarted = true;
+				void this.#confirmStrictPublication(this.#sessionFile).catch(error => this.#noteDiskFailure(error));
+			}
+			throw new Error("Deferred transcript publication is not yet confirmed.");
+		}
+		if (!this.#released) return this.finalizeForExit();
+		if (this.#entriesReleased) throw new Error("Cannot recover a released session transcript.");
+		if (this.#diskFailure) {
+			this.#rewriteSynchronously(true);
+			if (this.#diskFailure) throw this.#diskFailure;
+		}
+		return this.finalizeForExit();
+	}
+
+	/** Drain pre-seal writes, then publish any retained entries they did not include. */
+	async #confirmStrictPublication(file: string): Promise<void> {
+		await this.#diskTail;
+		await this.#closeWriterHandle();
+		await this.#storage.drain();
+		if (this.#diskFailure) throw this.#diskFailure;
+		const body = this.#fileBody();
+		// Entries can carry post-append metadata; publish the sealed authoritative
+		// journal rather than equating a drained append queue with that journal.
+		await this.#storage.writeTextAtomic(file, body, { expectedSize: this.#expectedDiskSize });
+		if (this.#diskFailure) throw this.#diskFailure;
+		this.#recordFullRewrite(body);
+		this.#fileIsCurrent = true;
+		this.#rewriteRequired = false;
+		this.#strictPublicationDigest = {
+			size: Buffer.byteLength(body, "utf8"),
+			sha256: new Bun.CryptoHasher("sha256").update(body).digest("hex"),
+		};
+	}
+
+	/**
+	 * Size and SHA-256 of the session file as it is on disk now; `null` when the transcript
+	 * has no local file to hash (in-memory or deferred-publish backends).
+	 */
+	transcriptDigest(): TranscriptDigest | null {
+		const file = this.#sessionFile;
+		if (!this.#persist || !file || this.#storage.defersSyncPublish) return null;
+		let fd: number;
+		try {
+			fd = fs.openSync(file, "r");
+		} catch (error) {
+			if (isEnoent(error)) return { size: null, sha256: null };
+			throw error;
+		}
+		// Hash in fixed chunks so a large transcript never has to fit in memory at exit.
+		const hasher = new Bun.CryptoHasher("sha256");
+		const chunk = Buffer.allocUnsafe(DIGEST_CHUNK_BYTES);
+		let size = 0;
+		try {
+			for (;;) {
+				const read = fs.readSync(fd, chunk, 0, chunk.byteLength, null);
+				if (read === 0) break;
+				hasher.update(chunk.subarray(0, read));
+				size += read;
+			}
+		} finally {
+			fs.closeSync(fd);
+		}
+		return { size, sha256: hasher.digest("hex") };
 	}
 
 	/**
@@ -2819,6 +2982,7 @@ export class SessionManager {
 	 */
 	releaseRetainedEntries(): void {
 		this.seal();
+		this.#historyReadRevision++;
 		this.#entries = [];
 		this.#index.clear();
 		this.#inMemoryArtifacts = null;
@@ -2841,6 +3005,7 @@ export class SessionManager {
 			this.#fallbackRuntimeOnly = true;
 			return;
 		}
+		this.#historyReadRevision++;
 		this.#cwd = resolvedCwd;
 		this.#fallbackRuntimeOnly = true;
 		if (this.#sessionFile) {
@@ -2850,6 +3015,7 @@ export class SessionManager {
 	adoptRecordedCwd(): void {
 		const recordedCwd = this.#header.cwd;
 		if (!recordedCwd) return;
+		if (this.#cwd !== path.resolve(recordedCwd)) this.#historyReadRevision++;
 		this.#cwd = path.resolve(recordedCwd);
 		if (this.#sessionFile) this.#sessionDir = path.dirname(this.#sessionFile);
 		this.#fallbackRuntimeOnly = false;
@@ -2905,6 +3071,7 @@ export class SessionManager {
 		if (this.#fallbackRuntimeOnly) {
 			return resolved;
 		}
+		this.#historyReadRevision++;
 		this.#header.additionalDirectories = this.#additionalDirectories;
 		await this.#persistWorkspaceDirectoriesChange();
 		return resolved;
@@ -2924,6 +3091,7 @@ export class SessionManager {
 		if (this.#fallbackRuntimeOnly) {
 			return resolved;
 		}
+		this.#historyReadRevision++;
 		if (this.#additionalDirectories.length === 0) {
 			this.#header.additionalDirectories = undefined;
 		} else {
@@ -2948,6 +3116,7 @@ export class SessionManager {
 		) {
 			return;
 		}
+		this.#historyReadRevision++;
 		this.#additionalDirectories = next;
 		if (this.#additionalDirectories.length > 0) {
 			this.#header.additionalDirectories = this.#additionalDirectories;
@@ -2987,6 +3156,21 @@ export class SessionManager {
 
 	getSessionId(): string {
 		return this.#sessionId;
+	}
+
+	/**
+	 * True when the current session is `sessionId`, or continues it through sibling moves
+	 * only: a move to a fresh file after a write conflict (see {@link SessionPersistenceNotice})
+	 * mints a new id for the same transcript. A fork, branch, new or opened session never does.
+	 */
+	continuesSession(sessionId: string): boolean {
+		return sessionId === this.#sessionId || this.#siblingLineage.includes(sessionId);
+	}
+
+	/** Every id change except a sibling move: a different id ends the sibling lineage. */
+	#adoptSessionId(sessionId: string): void {
+		if (sessionId !== this.#sessionId) this.#siblingLineage = [];
+		this.#sessionId = sessionId;
 	}
 
 	getSessionFile(): string | undefined {
@@ -3056,6 +3240,8 @@ export class SessionManager {
 		}
 
 		const sessionFile = this.#sessionFile;
+		// A sealed transcript is final: never materialize a session file for a draft after it.
+		if (this.#released && (!sessionFile || !this.#storage.existsSync(sessionFile))) return;
 		const draftWillMaterializeMetadataOnlyFile =
 			sessionFile !== undefined &&
 			!this.#storage.existsSync(sessionFile) &&
@@ -3168,6 +3354,7 @@ export class SessionManager {
 		this.#titleSource = source;
 		if (source === "user") this.#titleRevision++;
 		this.#titleUpdatedAt = timestamp;
+		this.#historyReadRevision++;
 		this.#header.title = title;
 		this.#header.titleSource = source;
 
@@ -3424,6 +3611,9 @@ export class SessionManager {
 	 * outputs). Use sparingly.
 	 */
 	async rewriteEntries(): Promise<void> {
+		// Callers may have mutated existing entries, retaining the leaf object.
+		this.#historyReadRevision++;
+		this.#historyRewriteRevision++;
 		if (!this.#persist || !this.#sessionFile) return;
 		await this.#rewriteAtomically();
 	}
@@ -3529,6 +3719,43 @@ export class SessionManager {
 	}
 
 	/**
+	 * Borrow indexed entries without copying the transcript or touching storage.
+	 * Entries are read-only by contract: callers must project before yielding and
+	 * discard the view when isCurrent() turns false.
+	 */
+	captureHistoryReadView(): SessionHistoryReadView | undefined {
+		if (this.#atomicEntryBatch || this.#entriesReleased || this.#released || this.#diskFailure || !this.#header)
+			return undefined;
+		const revision = this.#historyReadRevision;
+		const sessionId = this.#sessionId;
+		const sessionFile = this.#sessionFile;
+		const cwd = this.#header.cwd;
+		const entryCount = this.#entries.length;
+		const isCurrent = (): boolean =>
+			this.#historyReadRevision === revision &&
+			!this.#atomicEntryBatch &&
+			!this.#entriesReleased &&
+			!this.#released &&
+			!this.#diskFailure;
+		return {
+			sessionId,
+			sessionFile,
+			cwd,
+			entryCount,
+			isCurrent,
+			getEntry: (index: number): Readonly<SessionEntry> | undefined =>
+				isCurrent() && Number.isSafeInteger(index) && index >= 0 && index < entryCount
+					? this.#entries[index]
+					: undefined,
+		};
+	}
+
+	/** Changes when existing history is rewritten, not on ordinary appends. */
+	getHistoryRewriteRevision(): number {
+		return this.#historyRewriteRevision;
+	}
+
+	/**
 	 * The most recent model role on the current branch, or undefined when no
 	 * model change has been recorded.
 	 */
@@ -3592,6 +3819,7 @@ export class SessionManager {
 			const sanitized = sanitizeRehydratedOpenAIResponsesAssistantMessage(entry.message);
 			if (sanitized === entry.message) continue;
 
+			this.#historyReadRevision++;
 			entry.message = sanitized;
 			changed = true;
 		}
@@ -3647,6 +3875,8 @@ export class SessionManager {
 		const canReparentChildren = children.every(child => child.type === "service_tier_change");
 		let leafId = entry.parentId;
 		if (canReparentChildren) {
+			this.#historyRewriteRevision++;
+			this.#historyReadRevision++;
 			for (const child of children) {
 				child.parentId = leafId;
 				leafId = child.id;
@@ -3731,9 +3961,11 @@ export class SessionManager {
 			parentId = labelEntry.id;
 		}
 
+		this.#historyReadRevision++;
 		this.#header = header;
+		this.#historyRewriteRevision++;
 		this.#entries = [...entriesToKeep, ...labels];
-		this.#sessionId = newSessionId;
+		this.#adoptSessionId(newSessionId);
 		this.#sessionName = header.title;
 		this.#titleSource = header.titleSource;
 		this.#titleUpdatedAt = timestamp;

@@ -27,6 +27,31 @@ import type { AgentRunCoverage, AgentRunSummary } from "./run-collector";
 import type { SentToolDefinitions } from "./sent-tool-definitions";
 import type { AgentTelemetryConfig } from "./telemetry";
 
+const assistantMessageIdentities = new WeakMap<AssistantMessage, string>();
+let nextAssistantMessageIdentity = 0n;
+
+/**
+ * Process-local emission identity, deliberately outside the message value.
+ * JSON, structuredClone and deep equality must not observe persistence metadata.
+ * Same-emission copies must explicitly inherit it; independent emissions do not.
+ */
+export function assistantMessageIdentity(message: AssistantMessage): string {
+	let identity = assistantMessageIdentities.get(message);
+	if (identity === undefined) {
+		identity = `assistant:${++nextAssistantMessageIdentity}`;
+		assistantMessageIdentities.set(message, identity);
+	}
+	return identity;
+}
+
+/** Carry emission identity across a snapshot or same-message transformation. */
+export function inheritAssistantMessageIdentity<T extends AgentMessage>(source: AgentMessage, copy: T): T {
+	if (source.role === "assistant" && copy.role === "assistant") {
+		assistantMessageIdentities.set(copy, assistantMessageIdentity(source));
+	}
+	return copy;
+}
+
 /** Stream function - can return sync or Promise for async config lookup */
 export type StreamFn = (
 	...args: Parameters<typeof streamSimple>
@@ -55,6 +80,60 @@ export type CommittableAsideMessage = AgentMessage & {
 	[ASIDE_MESSAGE_COMMIT]?: () => void;
 	[ASIDE_MESSAGE_DISCARD]?: (error: Error) => void;
 };
+
+/**
+ * Owned admission veto, consulted at each context-append site immediately
+ * before append. `"admit"` appends and fires {@link ASIDE_MESSAGE_COMMIT};
+ * `"defer"` skips the append, fires {@link ASIDE_MESSAGE_DEFER} and hands the
+ * record to {@link AgentLoopConfig.onDeferredMessages}; `"drop"` skips the
+ * record entirely (no append, no commit, no event).
+ */
+export const ASIDE_MESSAGE_ADMIT = Symbol("aside-message-admit");
+/** Called when an admit returned "defer": the record is re-queued once by the host. */
+export const ASIDE_MESSAGE_DEFER = Symbol("aside-message-defer");
+
+/** Owner's answer at a context-append site; see {@link ASIDE_MESSAGE_ADMIT}. */
+export type OwnedAsideAdmission = "admit" | "defer" | "drop";
+
+/**
+ * An aside whose owner decides admission at append time. Owned records never
+ * ride live steering: the whole batch waits for the boundary so the veto runs
+ * before anything reaches the provider.
+ */
+export type OwnedAsideMessage = CommittableAsideMessage & {
+	[ASIDE_MESSAGE_ADMIT]: () => OwnedAsideAdmission;
+	[ASIDE_MESSAGE_DEFER]?: () => void;
+};
+
+export function isOwnedAsideMessage(m: AgentMessage): m is OwnedAsideMessage {
+	return ASIDE_MESSAGE_ADMIT in m;
+}
+
+/**
+ * Messages the engine injects into a run on its own — soft-requirement
+ * reminders, execution additional context, host nudges and context frames —
+ * as opposed to input admitted through `prompt()` or a queue poll. Marked by
+ * identity at the creation site so consumers (e.g. delivery receipts) can
+ * classify by origin instead of by display or role.
+ */
+const ENGINE_INJECTED_MESSAGES = new WeakSet<object>();
+
+export function markEngineInjected<T extends AgentMessage>(message: T): T {
+	ENGINE_INJECTED_MESSAGES.add(message);
+	return message;
+}
+
+export function isEngineInjected(message: AgentMessage): boolean {
+	return ENGINE_INJECTED_MESSAGES.has(message);
+}
+
+/**
+ * Provider projection stamp: a user-role {@link Message} converted from an
+ * app record's `details["omp.llm"]` projection carries the owner's source id
+ * (`details["omp.llm.source"]`) under this symbol so hosts can verify what the
+ * provider request included.
+ */
+export const LLM_MESSAGE_SOURCE = Symbol("llm-message-source");
 
 /**
  * An aside entry: a ready {@link AgentMessage}, or a sync thunk evaluated at
@@ -346,8 +425,28 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * should reach the model between requests without waiting for the agent to
 	 * fully stop. Returned messages are appended to the context with normal
 	 * message events and keep the loop running so the model can react.
+	 *
+	 * `boundary.atStopBoundary` is `false` for the mid-work poll (more tool
+	 * calls follow) and `true` for the drain where the agent would otherwise
+	 * stop, so a provider can hold back asides that must not wake a finished run.
 	 */
-	getAsideMessages?: () => Promise<AsideMessage[]>;
+	getAsideMessages?: (boundary?: { atStopBoundary: boolean }) => Promise<AsideMessage[]>;
+	/**
+	 * Receives owned records ({@link OwnedAsideMessage}) whose admission
+	 * returned `"defer"` at a context-append site, in queue order, after each
+	 * record's {@link ASIDE_MESSAGE_DEFER} hook ran. The loop hands every deferred
+	 * record over exactly once and forgets it; the host re-queues it exactly once
+	 * for a later boundary. Without this hook a deferred record is dropped.
+	 */
+	onDeferredMessages?: (messages: AgentMessage[]) => void;
+	/**
+	 * Receives every owned record whose admission returned `"drop"` or
+	 * `"defer"` at a context-append site, in queue order, before
+	 * {@link onDeferredMessages}. Bookkeeping only: a host that tracks dequeued
+	 * records for abort-time queue restoration forgets them here, since a vetoed
+	 * record never produces the transcript event that would otherwise retire it.
+	 */
+	onVetoedMessages?: (messages: AgentMessage[]) => void;
 	/**
 	 * Hook fired right before the loop would exit.
 	 *

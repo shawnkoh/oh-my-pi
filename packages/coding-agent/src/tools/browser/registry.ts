@@ -22,6 +22,7 @@ import { waitForRelayExtension } from "./relay/probe";
 import { ensureSharedBrowser } from "./shared-daemon";
 import type { TernKind } from "./tern/kind";
 import { TernSocketClient } from "./tern/wire";
+import { OwnedJobRegistry, ownerMarkerEnv } from "../../session/owned-job-registry";
 
 export type PuppeteerBrowserKind =
 	| {
@@ -303,11 +304,20 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 		const launchArgs = [...appArgs, `--remote-debugging-port=${port}`];
 		const child = Bun.spawn([exe, ...launchArgs], {
 			cwd: opts.cwd,
+			// Marked and recorded like any process the agent starts: if a crash or a skipped
+			// dispose leaves the app running, the owned-job registry still accounts for it.
+			env: { ...process.env, ...ownerMarkerEnv() },
 			stdout: "ignore",
 			stderr: "ignore",
 			stdin: "ignore",
 		});
 		child.unref();
+		OwnedJobRegistry.instance()?.registerProcess({
+			kind: "process",
+			pid: child.pid,
+			command: [exe, ...launchArgs].join(" "),
+			cwd: opts.cwd,
+		});
 		subprocess = child;
 		pid = child.pid;
 		cdpUrl = `http://127.0.0.1:${port}`;

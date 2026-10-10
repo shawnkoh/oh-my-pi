@@ -64,7 +64,7 @@ import type {
 	ToolCallContext,
 	ToolChoiceDirective,
 } from "./types";
-import { isSoftToolRequirement } from "./types";
+import { inheritAssistantMessageIdentity, isSoftToolRequirement } from "./types";
 import { EventLoopKeepalive } from "./utils/yield";
 
 /**
@@ -485,8 +485,9 @@ export class Agent {
 	#onBeforeYield?: () => Promise<void> | void;
 	#onTurnEnd?: (messages: AgentMessage[], signal?: AbortSignal, context?: AgentTurnEndContext) => Promise<void> | void;
 	#beforeModelCall?: AgentBeforeModelCall;
+	#runScope?: <T>(run: () => Promise<T>) => Promise<T>;
 	#additionalBeforeModelCalls = new Set<AgentBeforeModelCall>();
-	#asideMessageProvider?: () => AsideMessage[] | Promise<AsideMessage[]>;
+	#asideMessageProvider?: (boundary: { atStopBoundary: boolean }) => AsideMessage[] | Promise<AsideMessage[]>;
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
 	#beforeQueuedMessageDequeueHooks = new Set<(signal?: AbortSignal) => Promise<void> | void>();
@@ -500,6 +501,12 @@ export class Agent {
 	getApiKey?: (model: Model) => Promise<ApiKey | undefined> | ApiKey | undefined;
 	/** Prepare actual queue deliveries after dequeue gates; commit runs only while ownership remains valid. */
 	prepareQueuedMessages?: PrepareQueuedMessages;
+	/**
+	 * Receives owned records (`OwnedAsideMessage`) the loop deferred at a
+	 * context-append site. The agent already forgot them: re-queue each exactly
+	 * once. Reassign at any time. See `AgentLoopConfig.onDeferredMessages`.
+	 */
+	onDeferredMessages?: AgentLoopConfig["onDeferredMessages"];
 	/**
 	 * Hook invoked after tool arguments are validated and before execution.
 	 * Reassign at any time to swap the implementation (e.g. on extension reload).
@@ -1061,6 +1068,27 @@ export class Agent {
 	}
 
 	/**
+	 * Retire owned records the loop vetoed (dropped or deferred) from the
+	 * queue-delivery records and {@link #liveSteered}. They never reach the
+	 * transcript, so without this the run's end would restore them to a queue
+	 * — and, for a dropped record ahead of delivered ones, restore those too.
+	 */
+	#forgetVetoedMessages(vetoed: readonly AgentMessage[]): void {
+		this.#liveSteered = this.#liveSteered.filter(entry => !vetoed.includes(entry.message));
+		for (const delivery of this.#queuedMessageDeliveries) {
+			const pending = delivery.messages.slice(delivery.next);
+			const kept = pending.filter(message => !vetoed.includes(message));
+			if (kept.length === pending.length) continue;
+			if (kept.length === 0) {
+				this.#queuedMessageDeliveries.delete(delivery);
+			} else {
+				delivery.messages = kept;
+				delivery.next = 0;
+			}
+		}
+	}
+
+	/**
 	 * Take back live-steered messages ahead of an abort (Esc restores them to the editor):
 	 * the aborted run then neither records nor requeues them.
 	 */
@@ -1102,6 +1130,15 @@ export class Agent {
 	}
 
 	/**
+	 * Install or remove the scope every run starts in: {@link prompt} and {@link continue}
+	 * call `scope(run)` and the run, with everything it schedules, executes inside it (e.g.
+	 * to start runs outside the caller's async context). `scope` must call `run` synchronously.
+	 */
+	setRunScope(scope: (<T>(run: () => Promise<T>) => Promise<T>) | undefined): void {
+		this.#runScope = scope;
+	}
+
+	/**
 	 * Install or replace the host pre-model-call gate; pass `undefined` to
 	 * remove it. Gates are sampled when a run starts: installing the first
 	 * gate while a run is in flight takes effect on the next run.
@@ -1126,10 +1163,29 @@ export class Agent {
 	/**
 	 * Provide a source of non-interrupting "aside" messages (e.g. background-job
 	 * completions, late LSP diagnostics) drained at each step boundary. Never
-	 * aborts in-flight tools. See `AgentLoopConfig.getAsideMessages`.
+	 * aborts in-flight tools. The provider learns whether it is polled mid-work
+	 * or at the boundary where the agent would otherwise stop. See
+	 * `AgentLoopConfig.getAsideMessages`.
 	 */
-	setAsideMessageProvider(fn: (() => AsideMessage[] | Promise<AsideMessage[]>) | undefined): void {
+	setAsideMessageProvider(
+		fn: ((boundary: { atStopBoundary: boolean }) => AsideMessage[] | Promise<AsideMessage[]>) | undefined,
+	): void {
 		this.#asideMessageProvider = fn;
+	}
+
+	/**
+	 * Replace the `AgentMessage[]` → `Message[]` converter used for every
+	 * provider request (see `AgentLoopConfig.convertToLlm`). Takes effect on the
+	 * next provider call, so a host can wrap the current converter — read it
+	 * with {@link getConvertToLlm} — to observe or rewrite the provider view.
+	 */
+	setConvertToLlm(fn: AgentLoopConfig["convertToLlm"]): void {
+		this.#convertToLlm = fn;
+	}
+
+	/** The converter currently applied before each provider request. */
+	getConvertToLlm(): AgentLoopConfig["convertToLlm"] {
+		return this.#convertToLlm;
 	}
 
 	emitExternalEvent(event: AgentEvent) {
@@ -1538,7 +1594,8 @@ export class Agent {
 			promptOptions = imagesOrOptions as AgentPromptOptions | undefined;
 		}
 
-		await this.#runLoop(msgs, promptOptions);
+		const run = () => this.#runLoop(msgs, promptOptions);
+		await (this.#runScope ? this.#runScope(run) : run());
 	}
 
 	/**
@@ -1562,7 +1619,12 @@ export class Agent {
 		return signals.length === 1 ? signals[0] : AbortSignal.any(signals);
 	}
 
-	async continue(signal?: AbortSignal) {
+	continue(signal?: AbortSignal): Promise<void> {
+		const run = () => this.#continue(signal);
+		return this.#runScope ? this.#runScope(run) : run();
+	}
+
+	async #continue(signal?: AbortSignal): Promise<void> {
 		if (this.#state.isStreaming) {
 			throw new AgentBusyError();
 		}
@@ -1785,7 +1847,7 @@ export class Agent {
 			maxRetryDelayMs: this.#maxRetryDelayMs,
 			kimiApiFormat: this.#kimiApiFormat,
 			preferWebsockets: this.#preferWebsockets,
-			convertToLlm: this.#convertToLlm,
+			convertToLlm: messages => this.#convertToLlm(messages),
 			transformProviderContext: this.#transformProviderContext,
 			sentToolDefinitions: this.#sentToolDefinitions,
 			transformContext: this.#transformContext,
@@ -1865,7 +1927,10 @@ export class Agent {
 			hasIrcInterrupts: this.hasIrcInterrupts,
 			hasBackgroundCompletions: this.hasBackgroundCompletions,
 			getFollowUpMessages: signal => this.#dequeueFollowUpMessagesAfterHooks(signal ?? loopSignal),
-			getAsideMessages: async () => (await this.#asideMessageProvider?.()) ?? [],
+			getAsideMessages: async boundary =>
+				(await this.#asideMessageProvider?.(boundary ?? { atStopBoundary: false })) ?? [],
+			onVetoedMessages: messages => this.#forgetVetoedMessages(messages),
+			onDeferredMessages: messages => this.onDeferredMessages?.(messages),
 			onBeforeYield: () => this.#onBeforeYield?.(),
 			telemetry: this.#telemetry,
 		};
@@ -1978,14 +2043,14 @@ export class Agent {
 			for (const { toolCallId } of bufferedCursorResults) retainedToolCallIds.add(toolCallId);
 			const errorMsg: AssistantMessage =
 				shouldEmitVisibleError && assistantPartial
-					? {
+					? inheritAssistantMessageIdentity(assistantPartial, {
 							...assistantPartial,
 							content: assistantPartial.content.filter(
 								block => block.type !== "toolCall" || retainedToolCallIds.has(block.id),
 							),
 							stopReason: "error",
 							errorMessage,
-						}
+						})
 					: {
 							role: "assistant",
 							content: [{ type: "text", text: "" }],

@@ -81,6 +81,16 @@ export async function readStoredDaemonRecord(dir: string): Promise<StoredDaemonR
 	return { meta, spec, legacyLayout: false };
 }
 
+/** Directory where a broker keeps one daemon's metadata, spec and logs. */
+export function daemonRecordDir(runtimeDir: string, name: string): string {
+	return path.join(runtimeDir, "daemons", name);
+}
+
+/** File where a broker publishes one daemon's snapshot ({@link DAEMON_META_FILE}). */
+export function daemonMetadataPath(runtimeDir: string, name: string): string {
+	return path.join(daemonRecordDir(runtimeDir, name), DAEMON_META_FILE);
+}
+
 /** Resolve the Unix socket or Windows named pipe used by one daemon broker scope. */
 export function daemonBrokerEndpoint(projectDir: string, runtimeDir: string): string {
 	if (process.platform === "win32") {

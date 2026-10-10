@@ -24,6 +24,7 @@ import type {
 	RpcAvailableCommandsUpdateFrame,
 	RpcAvailableSlashCommand,
 	RpcCommand,
+	RpcDeliveryEventFrame,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
 	RpcHostToolCallRequest,
@@ -118,6 +119,13 @@ type Inbound<WireType, Server> = Report<
 >;
 
 type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : { left: A; right: B }) : { left: A; right: B };
+
+type DeliveryWireEvent =
+	| Wire.DeliveryAcceptedEvent
+	| Wire.DeliverySettledEvent
+	| Wire.DeliveryDiscardedEvent
+	| Wire.DeliveryCancelledEvent;
+export type DeliveryReceipts = Assert<Same<RpcDeliveryEventFrame, DeliveryWireEvent>>;
 
 // --- Commands -------------------------------------------------------------
 

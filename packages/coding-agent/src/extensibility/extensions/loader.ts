@@ -28,6 +28,7 @@ import { execCommand } from "../../exec/exec";
 // Runtime self-reference: dereference this namespace only inside loader functions to keep the index.ts cycle safe.
 import * as PiCodingAgent from "../../index";
 import type { SendUserMessageOptions } from "../../session/agent-session";
+import type { DeliveryHandle, DeliveryOptions } from "../../session/external-delivery";
 import type { CustomMessagePayload } from "../../session/messages";
 import type { FileDeleteFallbackHandler, FileWriteFallbackHandler } from "../../tools/file-write-fallback";
 import { isFilesystemSourcePath } from "../../tools/path-utils";
@@ -54,6 +55,7 @@ import type {
 	SourceInfo,
 	ToolDefinition,
 	ToolInfo,
+	DeliverMessageHandler,
 } from "./types";
 
 installLegacyPiSpecifierShim();
@@ -100,6 +102,9 @@ export class ExtensionRuntimeNotInitializedError extends Error {
 export class ExtensionRuntime implements IExtensionRuntime {
 	flagValues = new Map<string, boolean | string>();
 	pendingProviderRegistrations: Array<{ name: string; config: ProviderConfig; sourceId: string }> = [];
+	/** Filled by the host at initialization; hosts without a session never bind `deliverMessage`. */
+	readonly capabilities = new Set<string>();
+	deliverMessage?: DeliverMessageHandler;
 
 	registerProvider(name: string, config: ProviderConfig, sourceId: string): void {
 		this.pendingProviderRegistrations.push({ name, config, sourceId });
@@ -207,6 +212,14 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		}
 	}
 
+	get workReporting(): "complete" | undefined {
+		return this.extension.workReporting;
+	}
+
+	set workReporting(value: "complete" | undefined) {
+		this.extension.workReporting = value;
+	}
+
 	on<F extends HandlerFn>(event: string, handler: F): void {
 		const list = this.extension.handlers.get(event) ?? [];
 		list.push(handler);
@@ -302,6 +315,16 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 
 	sendUserMessage(content: string | (TextContent | ImageContent)[], options?: SendUserMessageOptions): void {
 		this.runtime.sendUserMessage(content, options);
+	}
+
+	get capabilities(): Set<string> {
+		return this.runtime.capabilities;
+	}
+
+	deliverMessage<T = unknown>(record: CustomMessagePayload<T>, options: DeliveryOptions): DeliveryHandle {
+		const deliver = this.runtime.deliverMessage;
+		if (!deliver) throw new Error("This host does not provide the external-delivery/1 capability");
+		return deliver(record, options);
 	}
 
 	appendEntry(customType: string, data?: unknown): void {

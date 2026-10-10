@@ -14,6 +14,7 @@ import type { BashResult } from "../../exec/bash-executor";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
 import type { CacheWarmingMode } from "../../session/cache-warmer";
 import type { SessionEntry, SessionTreeNode } from "../../session/session-entries";
+import type { QuiesceRequest, QuiesceResult, WorkAttestation } from "../../session/quiescence";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameDecoder, type RpcProtocolVersion } from "./rpc-frame";
 import type { RpcGoalOp, RpcGoalResult } from "./rpc-goal";
 import {
@@ -96,6 +97,17 @@ export interface RpcClientOptions {
 	terminationGraceMs?: number;
 	/** Custom tools owned by the embedding host and exposed over the RPC transport */
 	customTools?: RpcClientCustomTool[];
+}
+
+/** Per-message options for prompt/steer/follow-up/abort-and-prompt. */
+export interface RpcTextInputOptions {
+	/** Deliver the text verbatim (engine capability `literal-input/1`). */
+	literal?: boolean;
+}
+
+// Omit the field unless requested so older engines receive unchanged commands.
+function literalField(options: RpcTextInputOptions | undefined): { literal?: true } {
+	return options?.literal === true ? { literal: true } : {};
 }
 
 export type ModelInfo = Pick<Model, "provider" | "id" | "contextWindow" | "reasoning" | "thinking">;
@@ -303,6 +315,12 @@ function isPageFallbackError(error: unknown): boolean {
 
 export class RpcClient {
 	#process: RpcAgentProcess | null = null;
+	#capabilities: readonly string[] = [];
+
+	/** Engine capabilities advertised on the ready frame; empty before start or on older engines. */
+	get capabilities(): readonly string[] {
+		return this.#capabilities;
+	}
 	#reaping: Promise<void> | null = null;
 	#eventListeners: RpcEventListener[] = [];
 	#sessionEventListeners: RpcSessionEventListener[] = [];
@@ -410,6 +428,9 @@ export class RpcClient {
 			for await (const line of lines) {
 				if (!readySettled && isRecord(line) && line.type === "ready") {
 					protocolV2Supported = supportsRpcProtocolV2(line);
+					this.#capabilities = Array.isArray(line.capabilities)
+						? line.capabilities.filter((entry): entry is string => typeof entry === "string")
+						: [];
 					readySettled = true;
 					readyResolve();
 					continue;
@@ -663,8 +684,20 @@ export class RpcClient {
 	 * use onEvent() to receive streaming events and onPromptResult() to observe its
 	 * completion under that id.
 	 */
-	async prompt(message: string, images?: ImageContent[], streamingBehavior?: "steer" | "followUp"): Promise<string> {
-		const response = await this.#send({ type: "prompt", message, images, streamingBehavior });
+	async prompt(
+		message: string,
+		images?: ImageContent[],
+		options?: "steer" | "followUp" | (RpcTextInputOptions & { streamingBehavior?: "steer" | "followUp" }),
+	): Promise<string> {
+		// A bare string is the streaming behavior (upstream's positional form).
+		const resolved = typeof options === "string" ? { streamingBehavior: options } : options;
+		const response = await this.#send({
+			type: "prompt",
+			message,
+			images,
+			streamingBehavior: resolved?.streamingBehavior,
+			...literalField(resolved),
+		});
 		this.#getData(response);
 		return response.id ?? "";
 	}
@@ -672,15 +705,15 @@ export class RpcClient {
 	/**
 	 * Queue a steering message to interrupt the agent mid-run.
 	 */
-	async steer(message: string, images?: ImageContent[]): Promise<void> {
-		await this.#send({ type: "steer", message, images });
+	async steer(message: string, images?: ImageContent[], options?: RpcTextInputOptions): Promise<void> {
+		await this.#send({ type: "steer", message, images, ...literalField(options) });
 	}
 
 	/**
 	 * Queue a follow-up message to be processed after the agent finishes.
 	 */
-	async followUp(message: string, images?: ImageContent[]): Promise<void> {
-		await this.#send({ type: "follow_up", message, images });
+	async followUp(message: string, images?: ImageContent[], options?: RpcTextInputOptions): Promise<void> {
+		await this.#send({ type: "follow_up", message, images, ...literalField(options) });
 	}
 
 	/**
@@ -701,6 +734,23 @@ export class RpcClient {
 	}
 
 	/**
+	 * Read-only snapshot of outstanding work. Requires the `quiesce-exit/2` capability.
+	 */
+	async attest(operationId: string, nonce: string): Promise<WorkAttestation> {
+		const response = await this.#send({ type: "attest", operationId, nonce });
+		return this.#getData(response);
+	}
+
+	/**
+	 * Exit the agent if nothing is outstanding and `request.epoch` is still current. On
+	 * `status: "quiesced"` the process exits after answering; a refusal changes nothing.
+	 */
+	async quiesceAndExit(request: QuiesceRequest): Promise<QuiesceResult> {
+		const response = await this.#send({ type: "quiesce_and_exit", ...request });
+		return this.#getData(response);
+	}
+
+	/**
 	 * Abort current operation.
 	 */
 	async abort(): Promise<void> {
@@ -710,8 +760,8 @@ export class RpcClient {
 	/**
 	 * Abort current operation and immediately start a new turn with the given message.
 	 */
-	async abortAndPrompt(message: string, images?: ImageContent[]): Promise<void> {
-		await this.#send({ type: "abort_and_prompt", message, images });
+	async abortAndPrompt(message: string, images?: ImageContent[], options?: RpcTextInputOptions): Promise<void> {
+		await this.#send({ type: "abort_and_prompt", message, images, ...literalField(options) });
 	}
 
 	/**

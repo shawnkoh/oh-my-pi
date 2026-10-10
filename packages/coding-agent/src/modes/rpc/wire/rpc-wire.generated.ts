@@ -366,6 +366,176 @@ export interface ModelInfo {
 	compat?: Record<string, unknown>;
 }
 
+export interface WorkCounts {
+	streaming: number;
+	queuedInput: number;
+	asyncJobs: number;
+	subagents: number;
+	retainedJobs: number;
+	detachedJobs: number;
+	compacting: number;
+	handoff: number;
+	goalContinuationScheduled: number;
+	scheduledTurns: number;
+}
+
+export interface InvocationIdentity {
+	pid: number;
+	startId: string | null;
+	startTime: number | null;
+}
+
+export interface AttestedSessionIdentity {
+	id: string;
+	file: string | null;
+	size?: number | null;
+	sha256?: string | null;
+}
+
+export interface OpaqueOwnedProcess {
+	pid: number;
+	command: string;
+}
+
+export interface OwnerScanSummary {
+	supported: boolean;
+	sound: boolean;
+	scanned: number;
+	discovered: number;
+	opaque: OpaqueOwnedProcess[];
+}
+
+export interface OwnedJobRegistryState {
+	path: string | null;
+	complete: boolean;
+	ownerScan: OwnerScanSummary | null;
+}
+
+export interface WorkAttestation {
+	version: 1;
+	operationId: string;
+	nonce: string;
+	epoch: number;
+	instanceId: string;
+	session: AttestedSessionIdentity;
+	invocation: InvocationIdentity;
+	counts: WorkCounts;
+	admission: "open" | "closed";
+	sealed: boolean;
+	registry: OwnedJobRegistryState;
+	observedAt: string;
+}
+
+export interface QuiesceRequest {
+	operationId: string;
+	completeness: "strict" | "attested";
+	attempt: number;
+	epoch: number;
+	instanceId: string;
+	sessionId: string;
+	deadline: number;
+}
+
+export type QuiesceRefusalReason = "invalid_request" | "invocation_mismatch" | "session_mismatch" | "stale_attempt" | "admission_closed" | "deadline_expired" | "epoch_mismatch" | "work_active" | "completeness_unknown" | "attestation_unavailable";
+
+export interface TerminalAttestation {
+	version: 1;
+	kind: "quiesce" | "hangup" | "sealed_blocked";
+	session: AttestedSessionIdentity;
+	invocation: InvocationIdentity;
+	instanceId: string;
+	epoch: number;
+	counts: WorkCounts;
+	interrupted: boolean;
+	registryComplete: boolean;
+	registryPath: string | null;
+	ownerScan: OwnerScanSummary | null;
+	writtenAt: string;
+	operationId?: string;
+	attempt?: number;
+	signal?: string;
+}
+
+export interface CensusProcess {
+	pid: number;
+	comm: string;
+	ppid: number;
+}
+
+export interface CensusResult {
+	complete: boolean;
+	work: CensusProcess[];
+	reasons: string[];
+}
+
+export interface QuiesceSnapshot {
+	epoch: number;
+	counts: WorkCounts;
+	observedAt: string;
+	registry?: OwnedJobRegistryState;
+	census?: CensusResult;
+	completenessReasons?: string[];
+}
+
+export interface SealedQuiesceSnapshot {
+	epoch: number;
+	counts: WorkCounts;
+	observedAt: string;
+	registry: OwnedJobRegistryState;
+	census: CensusResult | null;
+	completenessReasons: string[];
+}
+
+export interface QuiesceProgress {
+	finalized: boolean;
+	bound: boolean;
+	attested: boolean;
+}
+
+export interface QuiesceSealedBlockedResult {
+	status: "sealed_blocked";
+	operationId: string;
+	attempt: number;
+	reason: string;
+	snapshot: SealedQuiesceSnapshot;
+	progress: QuiesceProgress;
+}
+
+export interface QuiescedResult {
+	status: "quiesced";
+	operationId: string;
+	attempt: number;
+	attestation: TerminalAttestation;
+	path: string;
+}
+
+export interface QuiesceRefusedResult {
+	status: "refused";
+	operationId: string;
+	attempt: number;
+	reason: QuiesceRefusalReason;
+	snapshot: QuiesceSnapshot;
+}
+
+export interface QuiesceUnattestedResult {
+	status: "exit_unattested";
+	operationId: string;
+	attempt: number;
+	reason: "attestation_unavailable";
+	error: string;
+	snapshot: QuiesceSnapshot;
+}
+
+export type QuiesceResult = QuiescedResult | QuiesceRefusedResult | QuiesceUnattestedResult | QuiesceSealedBlockedResult;
+
+/** Exact call and evaluated arguments decided by a tool-approval select. */
+export interface ToolApprovalBinding {
+	toolCallId: string;
+	toolName: string;
+	arguments: unknown;
+	reason?: string;
+}
+
 export type QueueMode = "all" | "one-at-a-time";
 
 export type InterruptMode = "immediate" | "wait";
@@ -453,6 +623,30 @@ export interface GoalResult {
 	state: GoalModeState | null;
 }
 
+export type DeliveryMode = "aside" | "steer";
+
+export interface DeliveryOptions {
+	mode: DeliveryMode;
+	quiet?: true;
+	wakeAfterInterrupt?: true;
+	wakeInPlanMode?: true;
+}
+
+export interface DeliveryRecord {
+	customType: string;
+	content: MessageContent;
+	/** Requires a valid `omp.llm` user projection and `omp.llm.source` for admission. */
+	details: Record<string, unknown>;
+	display?: boolean;
+	attribution?: Attribution;
+}
+
+export interface ExternalDeliveryListing {
+	deliveryId: string;
+	state: "queued" | "accepted";
+	mode: DeliveryMode;
+}
+
 export interface SessionState {
 	sessionId: string;
 	model?: ModelInfo;
@@ -476,6 +670,8 @@ export interface SessionState {
 	isSettled?: boolean;
 	queuedMessages?: QueuedMessagesState;
 	todoPhases?: TodoPhase[];
+	capabilities?: string[];
+	externalDeliveries?: ExternalDeliveryListing[];
 	/** System prompt sections, for session dumps. */
 	systemPrompt?: string[];
 	dumpTools?: ToolDescriptor[];
@@ -591,6 +787,30 @@ export interface MessagesPage {
 	totalMessages: number;
 	/** Opaque cursor for the next page; absent on the last page. */
 	nextCursor?: string;
+}
+
+export interface SessionHistoryEntry {
+	index: number;
+	kind: "user" | "assistant" | "tool-result" | "compaction";
+	entryId?: string;
+	timestamp?: string;
+	attribution?: string;
+	text?: string;
+	truncated?: boolean;
+	images?: number;
+	tools?: string[];
+	toolName?: string;
+	isError?: boolean;
+	model?: string;
+}
+
+export interface SessionHistoryPage {
+	sessionId: string;
+	sourceKind: "native-engine";
+	total: number;
+	omittedLines: 0;
+	leafEntryId: string;
+	entries: SessionHistoryEntry[];
 }
 
 export interface SlashCommandInput {
@@ -902,13 +1122,43 @@ export interface QueueUpdateEvent {
 /** A session event, discriminated by `type`; `set_event_filter` selects which are sent. */
 export type RpcAgentEvent = AgentStartEvent | AgentEndEvent | TurnStartEvent | TurnEndEvent | MessageStartEvent | MessageUpdateEvent | MessageEndEvent | ToolExecutionStartEvent | ToolExecutionUpdateEvent | ToolStreamUpdateEvent | ToolExecutionEndEvent | AutoCompactionStartEvent | AutoCompactionEndEvent | AutoRetryStartEvent | AutoRetryEndEvent | CacheWarmingStartEvent | CacheWarmingEndEvent | RetryFallbackAppliedEvent | RetryFallbackSucceededEvent | ModelChangedEvent | ConfigWarningsChangedEvent | AdvisorCostChangedEvent | AdvisorYieldedEvent | TtsrTriggeredEvent | TodoReminderEvent | TodoAutoClearEvent | IrcMessageEvent | NoticeEvent | ThinkingLevelChangedEvent | GoalUpdatedEvent | QueueUpdateEvent;
 
-/** First frame after startup; transport fields are absent on servers without protocol v2. */
+/** First frame after startup; capabilities include quiesce-exit/2 and owned-jobs/1. Transport fields are absent on servers without protocol v2. */
 export interface ReadyEvent {
 	type: "ready";
 	protocolVersion?: number;
 	supportedProtocolVersions?: number[];
 	maxFrameBytes?: number;
 	maxReassembledFrameBytes?: number;
+	capabilities?: string[];
+}
+
+export interface DeliveryAcceptedEvent {
+	type: "delivery_accepted";
+	deliveryId: string;
+	at: number;
+	mode: DeliveryMode;
+	mechanism: "wake" | "aside" | "steer-boundary";
+}
+
+export interface DeliverySettledEvent {
+	type: "delivery_settled";
+	deliveryId: string;
+	outcome: "quiet" | "text" | "refused" | "error" | "aborted";
+	included: boolean;
+	requests: number;
+	sole: boolean;
+	interactive: boolean;
+}
+
+export interface DeliveryDiscardedEvent {
+	type: "delivery_discarded";
+	deliveryId: string;
+	reason: string;
+}
+
+export interface DeliveryCancelledEvent {
+	type: "delivery_cancelled";
+	deliveryId: string;
 }
 
 export type PromptStatus = "completed" | "aborted" | "error";
@@ -932,6 +1182,9 @@ export interface PromptResultEvent {
 	sessionSettled: boolean;
 	id?: string;
 	error?: PromptError;
+	run?: number;
+	promptEntryId?: string;
+	replyEntryIds?: string[];
 }
 
 /** The session went quiet: the last run yielded and no background work can wake it. */
@@ -1092,6 +1345,7 @@ export interface SelectUiRequest {
 	title: string;
 	options: string[];
 	optionDetails?: SelectOptionDetail[];
+	approval?: ToolApprovalBinding;
 	timeout?: number;
 }
 
@@ -1129,6 +1383,7 @@ export interface AskUiRequest {
 	method: "ask";
 	questions: AskQuestion[];
 	timeout?: number;
+	acceptImages?: boolean;
 }
 
 /** Close the dialog opened by request `targetId`; a later answer to it is ignored. */
@@ -1196,6 +1451,9 @@ export interface AskAnswer {
 	id: string;
 	selectedOptions: string[];
 	customInput?: string;
+	customInputImages?: ImageContent[];
+	note?: string;
+	noteImages?: ImageContent[];
 }
 
 /** Answers a `select`, `input`, or `editor` request. */
@@ -1227,8 +1485,15 @@ export interface AnswersUiResponse {
 	answers: AskAnswer[];
 }
 
+/** Redirects a negotiated rich ask dialog to chat. */
+export interface ChatUiResponse {
+	type: "extension_ui_response";
+	id: string;
+	chat: true;
+}
+
 /** Host reply to an extension UI request; variants share `type` and differ by their payload key. */
-export type ExtensionUiResponse = ValueUiResponse | ConfirmUiResponse | CancelUiResponse | AnswersUiResponse;
+export type ExtensionUiResponse = ValueUiResponse | ConfirmUiResponse | CancelUiResponse | AnswersUiResponse | ChatUiResponse;
 
 export interface HostToolCallRequest {
 	type: "host_tool_call";
@@ -1313,6 +1578,10 @@ export interface RpcResponse {
 	id?: string;
 	/** Command result on success; its shape is the command's `result`. */
 	data?: unknown;
+	/** Engine-minted delivery id on a successful deliver response; also in data. */
+	deliveryId?: string;
+	/** Pre-acceptance cancellation result on cancel_delivery; also in data. */
+	cancelled?: boolean;
 	/** Failure message when `success` is false. */
 	error?: string;
 	/** Machine-readable failure reason, when one applies. */
@@ -1339,10 +1608,15 @@ export interface HostUriSchemeDefinition {
 }
 
 /** Unsolicited outbound frame (everything except responses and host tool/URI requests), discriminated by `type`. */
-export type RpcNotification = ReadyEvent | PromptResultEvent | SessionSettledEvent | ExtensionError | ExtensionUiRequest | AvailableCommandsUpdateEvent | SubagentLifecycleEvent | SubagentProgressEvent | SubagentEvent | LivePhaseEvent | LiveLevelsEvent | LiveTranscriptEvent | LiveEndEvent | CommandOutputEvent | SessionInfoUpdateEvent | ConfigUpdateEvent | RpcFrameErrorEvent | RpcAgentEvent;
+export type RpcNotification = ReadyEvent | DeliveryAcceptedEvent | DeliverySettledEvent | DeliveryDiscardedEvent | DeliveryCancelledEvent | PromptResultEvent | SessionSettledEvent | ExtensionError | ExtensionUiRequest | AvailableCommandsUpdateEvent | SubagentLifecycleEvent | SubagentProgressEvent | SubagentEvent | LivePhaseEvent | LiveLevelsEvent | LiveTranscriptEvent | LiveEndEvent | CommandOutputEvent | SessionInfoUpdateEvent | ConfigUpdateEvent | RpcFrameErrorEvent | RpcAgentEvent;
 
 /** Any frame the server writes to stdout (after reassembling `rpc_chunk` sequences), discriminated by `type`. */
 export type RpcServerFrame = RpcResponse | RpcHostRequest | RpcNotification;
+
+export interface AttestParams {
+	operationId: string;
+	nonce: string;
+}
 
 export interface NegotiateProtocolParams {
 	protocolVersion: number;
@@ -1357,18 +1631,38 @@ export interface PromptParams {
 	/** Images attached to the message. */
 	images?: ImageContent[];
 	streamingBehavior?: StreamingBehavior;
+	literal?: boolean;
 }
 
 export interface SteerParams {
 	message: string;
 	/** Images attached to the message. */
 	images?: ImageContent[];
+	literal?: boolean;
 }
 
 export interface FollowUpParams {
 	message: string;
 	/** Images attached to the message. */
 	images?: ImageContent[];
+	literal?: boolean;
+}
+
+export interface DeliverParams {
+	record: DeliveryRecord;
+	options: DeliveryOptions;
+}
+
+export interface DeliverResult {
+	deliveryId: string;
+}
+
+export interface CancelDeliveryParams {
+	deliveryId: string;
+}
+
+export interface CancelDeliveryResult {
+	cancelled: boolean;
 }
 
 export interface RemoveQueuedMessageParams {
@@ -1384,6 +1678,7 @@ export interface AbortAndPromptParams {
 	message: string;
 	/** Images attached to the message. */
 	images?: ImageContent[];
+	literal?: boolean;
 }
 
 export interface NewSessionParams {
@@ -1406,10 +1701,12 @@ export interface GoalParams {
 
 export interface SetAskDialogParams {
 	enabled: boolean;
+	rich?: boolean;
 }
 
 export interface SetAskDialogResult {
 	enabled: boolean;
+	rich?: boolean;
 }
 
 export interface GetAvailableCommandsResult {
@@ -1600,6 +1897,19 @@ export interface GetMessagesPageParams {
 	limit?: number;
 }
 
+export interface GetSessionHistoryParams {
+	readId: string;
+	expectedSessionId: string;
+	expectedSessionPath: string;
+	before: number;
+	limit: number;
+	expiresAt: number;
+}
+
+export interface CancelSessionHistoryParams {
+	readId: string;
+}
+
 export interface GetLoginProvidersResult {
 	providers: LoginProvider[];
 }
@@ -1630,10 +1940,14 @@ export interface PredictWordFeedbackParams {
 
 /** Every RPC command's parameters and successful response `data`. */
 export interface RpcWireCommands {
+	attest: { params: AttestParams; result: WorkAttestation };
+	quiesce_and_exit: { params: QuiesceRequest; result: QuiesceResult };
 	negotiate_protocol: { params: NegotiateProtocolParams; result: NegotiateProtocolResult };
 	prompt: { params: PromptParams; result: PromptAck };
 	steer: { params: SteerParams; result: undefined };
 	follow_up: { params: FollowUpParams; result: undefined };
+	deliver: { params: DeliverParams; result: DeliverResult };
+	cancel_delivery: { params: CancelDeliveryParams; result: CancelDeliveryResult };
 	remove_queued_message: { params: RemoveQueuedMessageParams; result: RemoveQueuedMessageResult };
 	promote_queued_message: { params: PromoteQueuedMessageParams; result: PromoteQueuedMessageResult };
 	abort: { params: undefined; result: undefined };
@@ -1686,6 +2000,8 @@ export interface RpcWireCommands {
 	handoff: { params: HandoffParams; result: HandoffResult | null };
 	get_messages: { params: undefined; result: GetMessagesResult };
 	get_messages_page: { params: GetMessagesPageParams; result: MessagesPage };
+	get_session_history: { params: GetSessionHistoryParams; result: SessionHistoryPage };
+	cancel_session_history: { params: CancelSessionHistoryParams; result: undefined };
 	get_login_providers: { params: undefined; result: GetLoginProvidersResult };
 	login: { params: LoginParams; result: LoginResult };
 	predict_word: { params: PredictWordParams; result: PredictWordResult };

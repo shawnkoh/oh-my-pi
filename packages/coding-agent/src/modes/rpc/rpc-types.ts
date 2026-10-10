@@ -10,6 +10,14 @@ import type { AssistantMessageEvent, Effort, ImageContent, Model, ToolExample } 
 import type { BashResult } from "../../exec/bash-executor";
 import type { ContextUsage } from "../../extensibility/extensions/types";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
+import type {
+	DeliveryAcceptance,
+	DeliveryOptions,
+	DeliverySettlement,
+	ExternalDeliveryListing,
+} from "../../session/external-delivery";
+import { EXTERNAL_DELIVERY_CAPABILITY } from "../../session/external-delivery";
+import type { CustomMessagePayload } from "../../session/messages";
 import type { CacheWarmingMode } from "../../session/cache-warmer";
 import type { FileEntry, SessionEntry, SessionTreeNode } from "../../session/session-entries";
 import type { AvailableSlashCommandSource } from "../../slash-commands/available-commands";
@@ -20,6 +28,13 @@ import type { LivePhase } from "@oh-my-pi/pi-tui/apps/live-visualizer";
 import type { RpcMessagesPage } from "./rpc-messages";
 import type { GoalModeState } from "../../goals/state";
 import type { RpcGoalOp, RpcGoalResult } from "./rpc-goal";
+import type { SessionHistoryPage } from "./rpc-session-history";
+import {
+	OWNED_JOBS_CAPABILITY,
+	QUIESCE_EXIT_CAPABILITY,
+	type QuiesceResult,
+	type WorkAttestation,
+} from "../../session/quiescence";
 
 // ============================================================================
 // RPC Commands (stdin)
@@ -32,19 +47,43 @@ export type RpcCommand =
 	// Protocol
 	| { id?: string; type: "negotiate_protocol"; protocolVersion: number }
 
-	// Prompting
-	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
-	| { id?: string; type: "steer"; message: string; images?: ImageContent[] }
-	| { id?: string; type: "follow_up"; message: string; images?: ImageContent[] }
+	// Prompting. `literal: true` delivers `message` verbatim as the user's text:
+	// no slash/skill/builtin/extension/custom command dispatch, template or
+	// model-mention expansion (capability `literal-input/1`).
+	| {
+			id?: string;
+			type: "prompt";
+			message: string;
+			images?: ImageContent[];
+			streamingBehavior?: "steer" | "followUp";
+			literal?: boolean;
+	  }
+	| { id?: string; type: "steer"; message: string; images?: ImageContent[]; literal?: boolean }
+	| { id?: string; type: "follow_up"; message: string; images?: ImageContent[]; literal?: boolean }
 	| { id?: string; type: "remove_queued_message"; message: string; queue: "steering" | "followUp" }
 	| { id?: string; type: "promote_queued_message"; message: string }
 	| { id?: string; type: "abort" }
-	| { id?: string; type: "abort_and_prompt"; message: string; images?: ImageContent[] }
+	| { id?: string; type: "abort_and_prompt"; message: string; images?: ImageContent[]; literal?: boolean }
 	| { id?: string; type: "new_session"; parentSession?: string }
 	| { id?: string; type: "open_session"; sessionDir: string }
 
+	// External delivery (`external-delivery/1`): never parsed as a prompt (no slash/extension commands)
+	| { id?: string; type: "deliver"; record: CustomMessagePayload; options: DeliveryOptions }
+	| { id?: string; type: "cancel_delivery"; deliveryId: string }
+
 	// State
 	| { id?: string; type: "get_state" }
+	| {
+			id?: string;
+			type: "get_session_history";
+			readId: string;
+			expectedSessionId: string;
+			expectedSessionPath: string;
+			before: number;
+			limit: number;
+			expiresAt: number;
+	  }
+	| { id?: string; type: "cancel_session_history"; readId: string }
 	| { id?: string; type: "set_fast_mode"; enabled: boolean }
 	| {
 			id?: string;
@@ -53,7 +92,7 @@ export type RpcCommand =
 			objective?: string;
 			token_budget?: number;
 	  }
-	| { id?: string; type: "set_ask_dialog"; enabled: boolean }
+	| { id?: string; type: "set_ask_dialog"; enabled: boolean; rich?: boolean }
 	| { id?: string; type: "get_available_commands" }
 	| { id?: string; type: "get_entries"; since?: string }
 	| { id?: string; type: "get_tree" }
@@ -129,6 +168,20 @@ export type RpcCommand =
 			cursor: number;
 			suggestion: string;
 			accepted: boolean;
+	  }
+
+	// Quiescence (dispatched on receipt, ahead of queued commands)
+	| { id?: string; type: "attest"; operationId: string; nonce: string }
+	| {
+			id?: string;
+			type: "quiesce_and_exit";
+			operationId: string;
+			completeness: "strict" | "attested";
+			attempt: number;
+			epoch: number;
+			instanceId: string;
+			sessionId: string;
+			deadline: number;
 	  };
 
 // ============================================================================
@@ -161,6 +214,10 @@ export interface RpcSessionState {
 	 *  (and the `queue_update` event) instead of tracking chips independently. */
 	queuedMessages: { steering: string[]; followUp: string[] };
 	todoPhases: TodoPhase[];
+	/** Engine capabilities a host may negotiate on before issuing an effectful command; same list as the ready frame. */
+	capabilities: string[];
+	/** External records held by the session (`external-delivery/1`), queued or accepted but unsettled. */
+	externalDeliveries: ExternalDeliveryListing[];
 	/** For session dump / export (plain-text parity with /dump). */
 	systemPrompt?: string[];
 	dumpTools?: Array<{ name: string; description: string; parameters: unknown; examples?: readonly ToolExample[] }>;
@@ -218,7 +275,30 @@ export interface RpcPromptResultFrame {
 	 * When false, a {@link RpcSessionSettledFrame} follows once that work is done.
 	 */
 	sessionSettled: boolean;
+	/**
+	 * Engine-local ordinal of the run whose yield answered this prompt (capability
+	 * `reply-attribution/1`). A run spans retries and continuations up to its
+	 * yield. Prompts reported with the same `run` were answered together, e.g. a
+	 * follow-up folded into a live turn. Absent when no run answered.
+	 */
+	run?: number;
+	/** Session entry id of this prompt's persisted user message, when it could be identified. */
+	promptEntryId?: string;
+	/**
+	 * Session entry ids of the assistant messages that followed this prompt's
+	 * user message up to the next user message, in order; the last is the reply.
+	 * Empty when the prompt's message could not be identified: a non-literal
+	 * prompt in a run that delivered several messages, identical literal texts
+	 * answered together, or a session or branch change during the run. Any
+	 * persisted user message (including host steers and extension messages),
+	 * external delivery or goal-mode context
+	 * ends the preceding reply.
+	 */
+	replyEntryIds?: string[];
 }
+
+/** Ready-frame capability: `prompt_result` carries `run`, `promptEntryId` and `replyEntryIds`. */
+export const REPLY_ATTRIBUTION_CAPABILITY = "reply-attribution/1";
 
 /**
  * Emitted when the session goes quiet after agent activity: the last run yielded
@@ -271,13 +351,42 @@ export interface RpcOpenSessionResult {
 	sessionFile?: string;
 }
 
+/** Ready-frame capability: `prompt`/`steer`/`follow_up`/`abort_and_prompt` accept `literal: true`. */
+export const LITERAL_INPUT_CAPABILITY = "literal-input/1";
+
 export interface RpcReadyFrame {
 	type: "ready";
 	protocolVersion: 1;
 	supportedProtocolVersions: [1, 2];
 	maxFrameBytes: number;
 	maxReassembledFrameBytes: number;
+	/** Optional engine capabilities a host may rely on. Absent on older engines. */
+	capabilities: string[];
 }
+
+/** Ready-frame capability: tool-approval selects carry an `approval` binding and interrupts cancel them. */
+export const TOOL_APPROVAL_BINDING_CAPABILITY = "tool-approval-binding/1";
+
+/** Opt-in extension of upstream's ask dialog for notes, images and chat redirects in RPC UI. */
+export const RICH_ASK_CAPABILITY = "rich-ask/2";
+
+/** Read-only, bounded native committed journal projection. */
+export const SESSION_HISTORY_CAPABILITY = "session_history_v1";
+
+/**
+ * Capabilities the engine always supports, one versioned name per feature
+ * (`name/major`). Features that change what a host receives also require the
+ * host to opt in; the entry only says the engine supports them.
+ */
+export const RPC_ENGINE_CAPABILITIES: readonly string[] = [
+	LITERAL_INPUT_CAPABILITY,
+	TOOL_APPROVAL_BINDING_CAPABILITY,
+	REPLY_ATTRIBUTION_CAPABILITY,
+	EXTERNAL_DELIVERY_CAPABILITY,
+	QUIESCE_EXIT_CAPABILITY,
+	OWNED_JOBS_CAPABILITY,
+	SESSION_HISTORY_CAPABILITY,
+];
 
 export interface RpcChunkFrame {
 	type: "rpc_chunk";
@@ -343,9 +452,30 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "abort_and_prompt"; success: true }
 	| { id?: string; type: "response"; command: "new_session"; success: true; data: { cancelled: boolean } }
 	| { id?: string; type: "response"; command: "open_session"; success: true; data: RpcOpenSessionResult }
+	// External delivery: the engine-minted id rides at the top level (contract shape) and in `data`.
+	| {
+			id?: string;
+			type: "response";
+			command: "deliver";
+			success: true;
+			deliveryId: string;
+			data: { deliveryId: string };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "cancel_delivery";
+			success: true;
+			cancelled: boolean;
+			data: { cancelled: boolean };
+	  }
 
 	// State
 	| { id?: string; type: "response"; command: "get_state"; success: true; data: RpcSessionState }
+	| { id?: string; type: "response"; command: "get_session_history"; success: true; data: SessionHistoryPage }
+	| { id?: string; type: "response"; command: "cancel_session_history"; success: true }
+	| { id?: string; type: "response"; command: "attest"; success: true; data: WorkAttestation }
+	| { id?: string; type: "response"; command: "quiesce_and_exit"; success: true; data: QuiesceResult }
 	| {
 			id?: string;
 			type: "response";
@@ -354,7 +484,13 @@ export type RpcResponse =
 			data: { enabled: boolean; active: boolean };
 	  }
 	| { id?: string; type: "response"; command: "goal"; success: true; data: RpcGoalResult }
-	| { id?: string; type: "response"; command: "set_ask_dialog"; success: true; data: { enabled: boolean } }
+	| {
+			id?: string;
+			type: "response";
+			command: "set_ask_dialog";
+			success: true;
+			data: { enabled: boolean; rich?: boolean };
+	  }
 	| {
 			id?: string;
 			type: "response";
@@ -545,6 +681,17 @@ export interface RpcSubagentEventFrame {
 
 export type RpcSubagentFrame = RpcSubagentLifecycleFrame | RpcSubagentProgressFrame | RpcSubagentEventFrame;
 
+// ============================================================================
+// External delivery events (stdout)
+// ============================================================================
+
+/** Receipts for `deliver`, correlated by the engine-minted `deliveryId` (never by the command `id`). */
+export type RpcDeliveryEventFrame =
+	| ({ type: "delivery_accepted"; deliveryId: string } & DeliveryAcceptance)
+	| ({ type: "delivery_settled"; deliveryId: string } & DeliverySettlement)
+	| { type: "delivery_discarded"; deliveryId: string; reason: string }
+	| { type: "delivery_cancelled"; deliveryId: string };
+
 /** Message lifecycle event kinds that RPC mode stamps with a `messageId`. */
 export type RpcMessageEventType = "message_start" | "message_update" | "message_end";
 
@@ -604,6 +751,8 @@ export type RpcExtensionUIRequest =
 			title: string;
 			options: string[];
 			optionDetails?: RpcExtensionUISelectOptionDetail[];
+			/** Tool-approval selects only (capability `tool-approval-binding/1`): the exact call being decided. */
+			approval?: { toolCallId: string; toolName: string; arguments: unknown; reason?: string };
 			timeout?: number;
 	  }
 	| { type: "extension_ui_request"; id: string; method: "confirm"; title: string; message: string; timeout?: number }
@@ -629,6 +778,8 @@ export type RpcExtensionUIRequest =
 			id: string;
 			method: "ask";
 			questions: RpcAskDialogQuestion[];
+			/** Present only when the host opted in to rich-ask/2. */
+			acceptImages?: boolean;
 			timeout?: number;
 	  }
 	| { type: "extension_ui_request"; id: string; method: "cancel"; targetId: string }
@@ -785,8 +936,17 @@ export type RpcExtensionUIResponse =
 	| {
 			type: "extension_ui_response";
 			id: string;
-			answers: Array<{ id: string; selectedOptions: string[]; customInput?: string }>;
-	  };
+			answers: Array<{
+				id: string;
+				selectedOptions: string[];
+				customInput?: string;
+				customInputImages?: ImageContent[];
+				note?: string;
+				noteImages?: ImageContent[];
+			}>;
+	  }
+	/** Rich ask host redirects the tool to chat. */
+	| { type: "extension_ui_response"; id: string; chat: true };
 
 // ============================================================================
 // Helper type for extracting command types

@@ -11,6 +11,7 @@ import { getSessionSlashCommands } from "../extensibility/extensions/get-command
 import type { ExtensionError, ExtensionMode, ExtensionUIContext } from "../extensibility/extensions/types";
 import type { AgentSession } from "../session/agent-session";
 import { USER_INTERRUPT_LABEL } from "../session/messages";
+import { type QuiesceRequest, quiesceEndsProcess, quiesceExitCode } from "../session/quiescence";
 
 /** Action name for an extension-originated send failure. */
 export type ExtensionSendAction = "extension_send" | "extension_send_user";
@@ -22,6 +23,12 @@ export interface InitializeExtensionsOptions {
 	reportRuntimeError: (error: ExtensionError) => void;
 	/** Optional shutdown hook (rpc mode signals its loop; print mode is a no-op). */
 	onShutdown?: () => void;
+	/**
+	 * Exit hook for a quiesce that ends the process (`quiesced` or `exit_unattested`), with
+	 * the exit code to use. When set, extensions get `ctx.attest`/`ctx.quiesceAndExit` and the
+	 * quiesce capabilities; the hook runs after the result is returned to the caller.
+	 */
+	onQuiesced?: (exitCode: number) => void;
 	/** Pi-compatible mode exposed to extension contexts. Defaults to `"print"`. */
 	mode?: ExtensionMode;
 	/** Optional UI context (rpc supplies one; print runs headless). */
@@ -61,6 +68,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 		reportSendError,
 		reportRuntimeError,
 		onShutdown,
+		onQuiesced,
 		mode = "print",
 		uiContext,
 		markAgentInvokingMessage,
@@ -116,6 +124,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 					reportSendError("extension_send_user", e instanceof Error ? e : new Error(String(e)));
 				});
 			},
+			deliverMessage: (record, deliveryOptions) => session.deliverExternalMessage(record, deliveryOptions),
 			appendEntry: (customType, data) => {
 				session.sessionManager.appendCustomEntry(customType, data);
 			},
@@ -148,6 +157,19 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			getSystemPrompt: () => session.systemPrompt,
 			runEphemeralTurn: args => session.runEphemeralTurn(args),
 			compact: instructionsOrOptions => runExtensionCompact(session, instructionsOrOptions),
+			...(onQuiesced
+				? {
+						attest: (operationId: string, nonce: string) => session.attest(operationId, nonce),
+						quiesceAndExit: (request: QuiesceRequest) => {
+							const result = session.quiesceForExit(request);
+							if (quiesceEndsProcess(result)) {
+								const code = quiesceExitCode(result);
+								queueMicrotask(() => onQuiesced(code));
+							}
+							return result;
+						},
+					}
+				: {}),
 		},
 		// ExtensionCommandContextActions — commands invokable via prompt("/command")
 		{

@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getGlobalDaemonRuntimeDir, isEexist, isEnoent, logger, postmortem } from "@oh-my-pi/pi-utils";
 import { resolveWorkerSpawnCmd, workerEnvFromParent } from "../subprocess/worker-client";
+import { OWNER_MARKER_ENV, OwnedJobRegistry } from "../session/owned-job-registry";
 import { canonicalProjectDir, daemonBrokerEndpoint, daemonRuntimeDir } from "./paths";
 import {
 	DAEMON_BROKER_WORKER_ARG,
@@ -59,6 +60,8 @@ export interface DaemonBrokerClient {
 	): (options?: DaemonCompletionUnregisterOptions) => void;
 	/** Canonical project directory or synthetic directory identifying a global scope. */
 	readonly projectDir: string;
+	/** Runtime directory of the scope: broker lease, socket and daemon records. */
+	readonly runtimeDir: string;
 	request(operation: DaemonOperation, signal?: AbortSignal): Promise<DaemonRpcResult>;
 	close(): void;
 }
@@ -139,7 +142,7 @@ function openSocket(endpoint: string, timeoutMs: number): Promise<net.Socket> {
 
 class SocketDaemonClient implements DaemonBrokerClient {
 	readonly projectDir: string;
-	readonly #runtimeDir: string;
+	readonly runtimeDir: string;
 	readonly #endpoint: string;
 	readonly #token: string;
 	readonly #seenCompletionIds = new Set<string>();
@@ -159,7 +162,7 @@ class SocketDaemonClient implements DaemonBrokerClient {
 
 	constructor(projectDir: string, runtimeDir: string, token: string, options: DaemonBrokerClientOptions) {
 		this.projectDir = projectDir;
-		this.#runtimeDir = runtimeDir;
+		this.runtimeDir = runtimeDir;
 		this.#endpoint = daemonBrokerEndpoint(projectDir, runtimeDir);
 		this.#token = token;
 		this.#idleGraceMs = options.idleGraceMs;
@@ -310,7 +313,7 @@ class SocketDaemonClient implements DaemonBrokerClient {
 		}
 		throw new Error(
 			`Failed to start daemon broker at ${this.#endpoint} after ${CONNECT_TIMEOUT_MS / 1000}s: ` +
-				`${lastError?.message ?? "socket unavailable"}. Scope: ${this.#runtimeDir}. ` +
+				`${lastError?.message ?? "socket unavailable"}. Scope: ${this.runtimeDir}. ` +
 				"Run `omp --smoke-test` to verify broker startup, or `omp ps` to inspect supervised processes.",
 		);
 	}
@@ -319,18 +322,29 @@ class SocketDaemonClient implements DaemonBrokerClient {
 		const spawn = resolveWorkerSpawnCmd(DAEMON_BROKER_WORKER_ARG);
 		const overlay: Record<string, string> = {
 			[DAEMON_PROJECT_DIR_ENV]: this.projectDir,
-			[DAEMON_RUNTIME_DIR_ENV]: this.#runtimeDir,
+			[DAEMON_RUNTIME_DIR_ENV]: this.runtimeDir,
 		};
 		if (this.#idleGraceMs !== undefined) overlay[DAEMON_IDLE_GRACE_ENV] = String(this.#idleGraceMs);
+		const env = workerEnvFromParent(overlay);
+		// The broker is shared by every agent process in its scope and outlives any one of them:
+		// it must not carry an owner marker an enclosing agent handed to this process.
+		delete env[OWNER_MARKER_ENV];
 		const child = Bun.spawn(spawn.cmd, {
 			cwd: spawn.cwd,
-			env: workerEnvFromParent(overlay),
+			env,
 			stdin: "ignore",
 			stdout: "ignore",
 			stderr: "ignore",
 			...BROKER_SPAWN_OPTIONS,
 		});
 		child.unref();
+		// A shared engine helper, not Thread work: recorded so a consumer can identify it.
+		OwnedJobRegistry.instance()?.registerProcess({
+			kind: "internal",
+			pid: child.pid,
+			command: DAEMON_BROKER_WORKER_ARG,
+			cwd: spawn.cwd ?? null,
+		});
 	}
 
 	#bindSocket(socket: net.Socket): void {

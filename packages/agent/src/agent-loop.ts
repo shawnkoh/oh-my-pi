@@ -98,9 +98,14 @@ import type {
 	StreamFn,
 } from "./types";
 import {
+	ASIDE_MESSAGE_ADMIT,
 	ASIDE_MESSAGE_COMMIT,
+	ASIDE_MESSAGE_DEFER,
 	ASIDE_MESSAGE_DISCARD,
+	inheritAssistantMessageIdentity,
+	isOwnedAsideMessage,
 	isSoftToolRequirement,
+	markEngineInjected,
 	SPECULATIVE_STREAM_SESSION,
 } from "./types";
 import { yieldIfDue } from "./utils/yield";
@@ -412,7 +417,7 @@ function snapshotAssistantContentBlock(block: AssistantContentBlock): AssistantC
 }
 
 function snapshotAssistantMessage(message: AssistantMessage): AssistantMessage {
-	return {
+	return inheritAssistantMessageIdentity(message, {
 		...message,
 		content: message.content.map(snapshotAssistantContentBlock),
 		usage: {
@@ -421,7 +426,7 @@ function snapshotAssistantMessage(message: AssistantMessage): AssistantMessage {
 		},
 		disabledFeatures: message.disabledFeatures ? [...message.disabledFeatures] : undefined,
 		toolCallAbortMessages: message.toolCallAbortMessages ? { ...message.toolCallAbortMessages } : undefined,
-	};
+	});
 }
 
 /**
@@ -470,7 +475,7 @@ function snapshotAssistantMessageIncremental(
 			content[openIndex] = snapshotAssistantContentBlock(liveContent[openIndex]!);
 		}
 	}
-	return {
+	return inheritAssistantMessageIdentity(live, {
 		...live,
 		content,
 		usage: {
@@ -479,7 +484,7 @@ function snapshotAssistantMessageIncremental(
 		},
 		disabledFeatures: live.disabledFeatures ? [...live.disabledFeatures] : undefined,
 		toolCallAbortMessages: live.toolCallAbortMessages ? { ...live.toolCallAbortMessages } : undefined,
-	};
+	});
 }
 
 /**
@@ -616,6 +621,11 @@ function coerceToolResult(raw: unknown): { result: AgentToolResult<unknown>; mal
 /**
  * Start an agent loop with a new prompt message.
  * The prompt is added to the context and events are emitted for it.
+ *
+ * Owned prompts ({@link isOwnedAsideMessage}) are admitted before anything is
+ * appended. When every prompt is vetoed (dropped or deferred) the run makes no
+ * provider request: it emits `agent_start` then `agent_end` with no messages —
+ * no turn, no message events, no telemetry span.
  */
 export function agentLoop(
 	prompts: AgentMessage[],
@@ -628,18 +638,17 @@ export function agentLoop(
 
 	(async () => {
 		try {
-			const newMessages: AgentMessage[] = [...prompts];
-			const currentContext: AgentContext = {
-				...context,
-				messages: [...context.messages, ...prompts],
-			};
-			for (const prompt of prompts) {
-				(prompt as CommittableAsideMessage)[ASIDE_MESSAGE_COMMIT]?.();
-			}
+			const currentContext: AgentContext = { ...context, messages: [...context.messages] };
+			const admitted = admitMessages(prompts, currentContext, config);
+			const newMessages: AgentMessage[] = [...admitted];
 
 			stream.push({ type: "agent_start" });
 
-			await runLoop(currentContext, newMessages, config, signal, stream, streamFn, prompts);
+			if (prompts.length > 0 && admitted.length === 0) {
+				endAgentStream(stream, newMessages, undefined, 0);
+				return;
+			}
+			await runLoop(currentContext, newMessages, config, signal, stream, streamFn, admitted);
 		} catch (err) {
 			stream.fail(err);
 		}
@@ -909,7 +918,9 @@ export function normalizeMessagesForProvider(
 			return message;
 		}
 		const filtered = message.content.filter(block => block.type !== "thinking");
-		return filtered.length === message.content.length ? message : { ...message, content: filtered };
+		return filtered.length === message.content.length
+			? message
+			: inheritAssistantMessageIdentity(message, { ...message, content: filtered });
 	});
 }
 
@@ -1138,7 +1149,7 @@ function injectExecutionAdditionalContext(
 	additionalContext: string | undefined,
 ): AgentMessage | undefined {
 	if (additionalContext === undefined) return undefined;
-	const contextMessage = createAdditionalContextMessage(additionalContext);
+	const contextMessage = markEngineInjected(createAdditionalContextMessage(additionalContext));
 	currentContext.messages.push(contextMessage);
 	newMessages.push(contextMessage);
 	emitInputMessages(stream, [contextMessage]);
@@ -1177,6 +1188,47 @@ function discardAsides(messages: readonly AgentMessage[], error: Error): void {
 	}
 }
 
+/**
+ * Append queued records to the live context, in order. An owned record
+ * ({@link isOwnedAsideMessage}) is asked to admit itself first: `"drop"` skips
+ * it silently, `"defer"` runs its DEFER hook and hands it to
+ * {@link AgentLoopConfig.onDeferredMessages} for one host re-queue, `"admit"`
+ * appends and commits it like any other aside. Vetoed records are reported to
+ * {@link AgentLoopConfig.onVetoedMessages} so host bookkeeping forgets them.
+ * Every appended record is also pushed onto each `sink`. Returns the appended
+ * records in order.
+ */
+function admitMessages(
+	messages: readonly AgentMessage[],
+	currentContext: AgentContext,
+	config: AgentLoopConfig,
+	sinks: AgentMessage[][] = [],
+): AgentMessage[] {
+	const admitted: AgentMessage[] = [];
+	let deferred: AgentMessage[] | undefined;
+	let vetoed: AgentMessage[] | undefined;
+	for (const message of messages) {
+		if (isOwnedAsideMessage(message)) {
+			const decision = message[ASIDE_MESSAGE_ADMIT]();
+			if (decision !== "admit") {
+				(vetoed ??= []).push(message);
+				if (decision === "defer") {
+					message[ASIDE_MESSAGE_DEFER]?.();
+					(deferred ??= []).push(message);
+				}
+				continue;
+			}
+		}
+		currentContext.messages.push(message);
+		for (const sink of sinks) sink.push(message);
+		admitted.push(message);
+		(message as CommittableAsideMessage)[ASIDE_MESSAGE_COMMIT]?.();
+	}
+	if (vetoed) config.onVetoedMessages?.(vetoed);
+	if (deferred) config.onDeferredMessages?.(deferred);
+	return admitted;
+}
+
 async function runLoopBody(
 	currentContext: AgentContext,
 	newMessages: AgentMessage[],
@@ -1208,6 +1260,9 @@ async function runLoopBody(
 	let preserveSoftRequirementState = false;
 
 	let pendingMessages: AgentMessage[] = [];
+	// The outer drain re-entered the inner loop with input after a stop boundary;
+	// the fresh `hasMoreToolCalls` there no longer reflects that stop.
+	let resumedFromStop = false;
 	// Steering the provider took from the queue during the last response:
 	// `liveAccepted` reached the model inside it, `liveDeferred` did not.
 	let liveAccepted: AgentMessage[] = [];
@@ -1315,14 +1370,15 @@ async function runLoopBody(
 				const turnMessages = messagesToEmit;
 				messagesToEmit = [];
 				if (pendingMessages.length > 0) {
-					for (const message of pendingMessages) {
-						currentContext.messages.push(message);
-						newMessages.push(message);
-						turnMessages.push(message);
-						(message as CommittableAsideMessage)[ASIDE_MESSAGE_COMMIT]?.();
-					}
+					admitMessages(pendingMessages, currentContext, config, [newMessages, turnMessages]);
 					pendingMessages = [];
+					// Every queued record was vetoed at a stop boundary: the context
+					// gained nothing, so a model call would be a bare re-request.
+					// Return to the outer drain, which ends the run unless more
+					// input arrived meanwhile.
+					if ((!hasMoreToolCalls || resumedFromStop) && turnMessages.length === 0) break;
 				}
+				resumedFromStop = false;
 
 				let preparedProviderCall: PreparedProviderCall;
 				let gateResult: AgentPreModelCallResult;
@@ -1344,6 +1400,7 @@ async function runLoopBody(
 								softRequirementState.forcedToolChoice = undefined;
 								softRequirementState.escalations = 0;
 								for (const reminder of softReq.reminder) {
+									markEngineInjected(reminder);
 									currentContext.messages.push(reminder);
 									newMessages.push(reminder);
 									turnMessages.push(reminder);
@@ -1769,7 +1826,9 @@ async function runLoopBody(
 						: [...live, ...((await config.getSteeringMessages?.(signal)) || [])];
 					if (hasMoreToolCalls) {
 						// Mid-work: fold any non-interrupting asides into the next turn alongside steering.
-						const asides = signal?.aborted ? [] : resolveAsides(await config.getAsideMessages?.());
+						const asides = signal?.aborted
+							? []
+							: resolveAsides(await config.getAsideMessages?.({ atStopBoundary: false }));
 						pendingMessages = asides.length > 0 ? [...steering, ...asides] : steering;
 					} else {
 						// Stop boundary: only steering (live user input) forces another turn here. Leave
@@ -1797,11 +1856,14 @@ async function runLoopBody(
 			// above and this yield point (e.g. queued while onBeforeYield ran). Without
 			// this poll it would strand in the queue until the next manual prompt.
 			const lateSteering = signal?.aborted ? [] : (await config.getSteeringMessages?.(signal)) || [];
-			const asideMessages = signal?.aborted ? [] : resolveAsides(await config.getAsideMessages?.());
+			const asideMessages = signal?.aborted
+				? []
+				: resolveAsides(await config.getAsideMessages?.({ atStopBoundary: true }));
 			const followUpMessages = signal?.aborted ? [] : (await config.getFollowUpMessages?.(signal)) || [];
 			if (lateSteering.length > 0 || asideMessages.length > 0 || followUpMessages.length > 0) {
 				// Set as pending so the inner loop processes them before stopping.
 				pendingMessages = [...lateSteering, ...asideMessages, ...followUpMessages];
+				resumedFromStop = true;
 				continue;
 			}
 
@@ -1877,6 +1939,8 @@ export function steeringQueueState(messages: readonly AgentMessage[], count = me
  * transforms (steering envelope, redaction) — never the whole transcript.
  * Provider-context transforms rewrite images, so image-bearing steering waits
  * for the boundary rather than risk bytes the next request would not replay.
+ * Owned records ({@link isOwnedAsideMessage}) likewise wait: their owner's
+ * admission veto runs at the boundary append, never inside a live response.
  */
 function openLiveSteering(
 	config: AgentLoopConfig,
@@ -1894,6 +1958,7 @@ function openLiveSteering(
 			return messages;
 		},
 		toProvider: async (messages, signal) => {
+			if (messages.some(isOwnedAsideMessage)) return undefined;
 			const transformed = config.transformContext
 				? await config.transformContext(messages, bound(signal))
 				: messages;
@@ -2227,6 +2292,7 @@ async function streamAssistantResponse(
 								throw new HarmonyLeakInterruption(detection, removed, recovered);
 							}
 						}
+						if (partialMessage) inheritAssistantMessageIdentity(partialMessage, finalMessage);
 						finalMessage = snapshotAssistantMessage(finalMessage);
 						// Unhealed DSML tool-call markup must never reach history: replaying
 						// it teaches the model to keep writing calls as text (#10556). Strip
@@ -2351,6 +2417,9 @@ async function streamAssistantResponse(
 
 					switch (event.type) {
 						case "start":
+							if (addedPartial && partialMessage) {
+								inheritAssistantMessageIdentity(partialMessage, event.partial);
+							}
 							partialMessage = event.partial;
 							if (addedPartial) {
 								context.messages[context.messages.length - 1] = partialMessage;
@@ -2528,6 +2597,7 @@ async function streamAssistantResponse(
 				if (config.transformAssistantMessage) {
 					await config.transformAssistantMessage(trailing, requestSignal);
 				}
+				if (partialMessage) inheritAssistantMessageIdentity(partialMessage, trailing);
 				trailing = snapshotAssistantMessage(trailing);
 				const finalToolCallsCanDispatch =
 					!requestSignal?.aborted &&
@@ -2601,7 +2671,7 @@ function retainCompletedToolCalls(
 		return keep;
 	});
 	if (!droppedIncompleteToolCall) return message;
-	return {
+	return inheritAssistantMessageIdentity(message, {
 		...message,
 		content,
 		stopDetails:
@@ -2612,7 +2682,7 @@ function retainCompletedToolCalls(
 						category: message.stopDetails?.type ?? null,
 						explanation: message.stopDetails?.explanation ?? message.errorMessage ?? null,
 					},
-	};
+	});
 }
 
 function recoverTransientErrorToolTurn(
@@ -2645,7 +2715,7 @@ function recoverTransientErrorToolTurn(
 		!AIError.isTransientStreamParseError(message.stopDetails?.explanation)
 	)
 		return message;
-	return {
+	return inheritAssistantMessageIdentity(message, {
 		...message,
 		stopReason: "toolUse",
 		stopDetails:
@@ -2659,7 +2729,7 @@ function recoverTransientErrorToolTurn(
 		errorMessage: undefined,
 		errorId: undefined,
 		errorStatus: undefined,
-	};
+	});
 }
 
 function emitDiscardedHarmonyPartial(
@@ -2670,7 +2740,9 @@ function emitDiscardedHarmonyPartial(
 	if (!partialMessage) return;
 	stream.push({
 		type: "message_end",
-		message: snapshotAssistantMessage({ ...partialMessage, stopReason: "error", errorMessage }),
+		message: snapshotAssistantMessage(
+			inheritAssistantMessageIdentity(partialMessage, { ...partialMessage, stopReason: "error", errorMessage }),
+		),
 	});
 }
 
@@ -2735,7 +2807,12 @@ function emitAbortedAssistantMessage(
 			? AIError.create(AIError.Flag.Abort)
 			: AIError.classify(requestSignal?.reason) || undefined;
 	const base: AssistantMessage = partialMessage
-		? { ...partialMessage, stopReason: "aborted", errorMessage, errorId }
+		? inheritAssistantMessageIdentity(partialMessage, {
+				...partialMessage,
+				stopReason: "aborted",
+				errorMessage,
+				errorId,
+			})
 		: {
 				role: "assistant",
 				content: [],

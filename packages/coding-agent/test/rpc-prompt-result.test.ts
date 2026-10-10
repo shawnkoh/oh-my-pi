@@ -17,6 +17,31 @@ function createHarness() {
 		hasAdmittedSubmission: false,
 		queuedMessageCount: 0,
 		hasPendingAsyncWork: () => false,
+		sessionId: "s1",
+		/** Sibling moves: the id each sibling continued, keyed by the sibling's id. */
+		siblingMovedFrom: new Map<string, string>(),
+		branch: [] as Array<{
+			id: string;
+			type: string;
+			message?: { role: string; content?: string };
+			customType?: string;
+			details?: unknown;
+		}>,
+		sessionManager: {
+			getLeafId: (): string | null => session.branch.at(-1)?.id ?? null,
+			getSessionId: () => session.sessionId,
+			continuesSession: (id: string) => {
+				for (
+					let current: string | undefined = session.sessionId;
+					current;
+					current = session.siblingMovedFrom.get(current)
+				) {
+					if (current === id) return true;
+				}
+				return false;
+			},
+			getBranch: () => session.branch as never,
+		},
 	};
 	const results = new RpcPromptResults(session, frame => frames.push(frame));
 	return { frames, session, results };
@@ -54,6 +79,311 @@ function agentEnd(messages: AgentMessage[], isTerminal?: boolean): AgentSessionE
 
 const agentStart: AgentSessionEvent = { type: "agent_start" };
 
+describe("RpcPromptResults reply attribution", () => {
+	const user = (id: string, content: string) => ({ id, type: "message", message: { role: "user", content } });
+	const reply = (id: string) => ({ id, type: "message", message: { role: "assistant" } });
+	const other = (id: string) => ({ id, type: "message", message: { role: "toolResult" } });
+
+	test("partitions a shared run so each literal prompt cites only its own reply", async () => {
+		const { frames, session, results } = createHarness();
+		session.branch.push(user("old-user", "earlier"), reply("old-reply"));
+		const first = results.begin("req_a", "one");
+		results.observe(agentStart);
+		session.isStreaming = true;
+		results.settle(first);
+		// A follow-up folded into the live run is answered by the same yield.
+		const second = results.begin("req_b", "two");
+		results.settle(second);
+		session.branch.push(user("u1", "one"), reply("a1"), other("t1"), reply("a2"), user("u2", "two"), reply("a3"));
+		session.isStreaming = false;
+		results.observe(agentEnd([assistant({ stopReason: "stop" })]));
+		await flushFrames();
+		expect(frames).toMatchObject([
+			{ id: "req_a", run: 1, promptEntryId: "u1", replyEntryIds: ["a1", "a2"] },
+			{ id: "req_b", run: 1, promptEntryId: "u2", replyEntryIds: ["a3"] },
+		]);
+	});
+
+	test("keeps one run across retries and continuations before the yield", async () => {
+		const { frames, session, results } = createHarness();
+		const ticket = results.begin("req_retry", "go");
+		results.observe(agentStart);
+		session.isStreaming = true;
+		results.settle(ticket);
+		session.branch.push(user("u", "go"), reply("tool-use"), other("tool-result"), reply("overloaded"));
+		results.observe(agentEnd([assistant({ stopReason: "error" })], false));
+		results.observe(agentStart); // the retry continues the same run
+		session.branch.push(reply("final"));
+		session.isStreaming = false;
+		results.observe(agentEnd([assistant({ stopReason: "stop" })]));
+		await flushFrames();
+		expect(frames).toMatchObject([
+			{ id: "req_retry", run: 1, promptEntryId: "u", replyEntryIds: ["tool-use", "overloaded", "final"] },
+		]);
+	});
+
+	test("attributes a parsed prompt only when its run delivered a single message", async () => {
+		const { frames, session, results } = createHarness();
+		const single = results.begin("req_single");
+		results.observe(agentStart);
+		results.settle(single);
+		session.branch.push(user("u1", "expanded template"), reply("a1"));
+		results.observe(agentEnd([assistant({ stopReason: "stop" })]));
+		const shared = results.begin("req_shared");
+		results.observe(agentStart);
+		session.isStreaming = true;
+		results.settle(shared);
+		session.branch.push(user("u2", "x"), reply("a2"), user("u3", "y"), reply("a3"));
+		session.isStreaming = false;
+		results.observe(agentEnd([assistant({ stopReason: "stop" })]));
+		await flushFrames();
+		expect(frames).toEqual([
+			{
+				type: "prompt_result",
+				id: "req_single",
+				agentInvoked: true,
+				status: "completed",
+				sessionSettled: true,
+				run: 1,
+				promptEntryId: "u1",
+				replyEntryIds: ["a1"],
+			},
+			{
+				type: "prompt_result",
+				id: "req_shared",
+				agentInvoked: true,
+				status: "completed",
+				sessionSettled: true,
+				run: 2,
+				replyEntryIds: [],
+			},
+		]);
+	});
+
+	test("claims nothing across a session switch or a branch that lost the run's start", async () => {
+		const { frames, session, results } = createHarness();
+		session.branch.push(user("start", "s"));
+		const moved = results.begin("req_moved", "go");
+		results.observe(agentStart);
+		results.settle(moved);
+		session.branch.splice(0, session.branch.length, user("other", "go"), reply("x"));
+		results.observe(agentEnd([assistant({ stopReason: "stop" })]));
+		const switched = results.begin("req_switched", "go");
+		results.observe(agentStart);
+		results.settle(switched);
+		session.sessionId = "s2";
+		session.branch.push(user("u", "go"), reply("y"));
+		results.observe(agentEnd([assistant({ stopReason: "stop" })]));
+		await flushFrames();
+		expect(frames).toMatchObject([
+			{ id: "req_moved", run: 1, replyEntryIds: [] },
+			{ id: "req_switched", run: 2, replyEntryIds: [] },
+		]);
+		expect(frames.some(frame => "promptEntryId" in frame)).toBe(false);
+	});
+
+	test("a sibling move mid-run keeps the run's attribution", async () => {
+		const { frames, session, results } = createHarness();
+		const ticket = results.begin("req_sibling", "go");
+		results.observe(agentStart);
+		results.settle(ticket);
+		session.branch.push(user("u", "go"), reply("a"));
+		// Another process wrote the transcript file: same transcript, new id.
+		session.siblingMovedFrom.set("s1-sibling", session.sessionId);
+		session.sessionId = "s1-sibling";
+		results.observe(agentEnd([assistant({ stopReason: "stop" })]));
+		await flushFrames();
+		expect(frames).toMatchObject([{ id: "req_sibling", run: 1, promptEntryId: "u", replyEntryIds: ["a"] }]);
+	});
+
+	test("reads entries at the yield, not when a later settle reports", async () => {
+		const { frames, session, results } = createHarness();
+		const ticket = results.begin("req_late", "go");
+		results.observe(agentStart);
+		session.branch.push(user("u", "go"), reply("a"));
+		results.observe(agentEnd([assistant({ stopReason: "stop" })]));
+		// The branch changes before the prompt's settle arrives.
+		session.branch.splice(0, session.branch.length, user("u9", "go"), reply("a9"));
+		results.settle(ticket);
+		await flushFrames();
+		expect(frames).toMatchObject([{ id: "req_late", run: 1, promptEntryId: "u", replyEntryIds: ["a"] }]);
+	});
+
+	test("claims nothing for identical literal prompts answered together, whichever reports first", async () => {
+		const { frames, session, results } = createHarness();
+		const fresh = results.begin("req_fresh", "yes");
+		results.observe(agentStart);
+		const queued = results.begin("req_queued", "yes");
+		session.isStreaming = true;
+		results.settle(queued);
+		session.branch.push(user("u1", "yes"), reply("a1"), user("u2", "yes"), reply("a2"));
+		session.isStreaming = false;
+		results.observe(agentEnd([assistant({ stopReason: "stop" })]));
+		// The fresh prompt's own settle arrives after the queued one reported.
+		results.settle(fresh);
+		await flushFrames();
+		expect(frames).toMatchObject([
+			{ id: "req_queued", run: 1, replyEntryIds: [] },
+			{ id: "req_fresh", run: 1, replyEntryIds: [] },
+		]);
+		expect(frames.some(frame => "promptEntryId" in frame)).toBe(false);
+	});
+
+	test("a session transition mid-run starts the next run afresh in the new session", async () => {
+		const { frames, session, results } = createHarness();
+		const detached = results.begin("req_detached", "one");
+		results.observe(agentStart);
+		session.isStreaming = true;
+		results.settle(detached);
+		// new_session: the detached run never yields.
+		results.abortOpen();
+		session.isStreaming = false;
+		session.sessionId = "s2";
+		session.branch.splice(0, session.branch.length);
+		const next = results.begin("req_next", "two");
+		results.observe(agentStart);
+		results.settle(next);
+		session.branch.push(user("u", "two"), reply("a"));
+		results.observe(agentEnd([assistant({ stopReason: "stop" })]));
+		await flushFrames();
+		expect(frames).toEqual([
+			{ type: "prompt_result", id: "req_detached", agentInvoked: true, status: "aborted", sessionSettled: true },
+			{
+				type: "prompt_result",
+				id: "req_next",
+				agentInvoked: true,
+				status: "completed",
+				sessionSettled: true,
+				run: 2,
+				promptEntryId: "u",
+				replyEntryIds: ["a"],
+			},
+		]);
+	});
+
+	test("a delivery or goal context during the run ends the prompt's reply without counting as a prompt", async () => {
+		const { frames, session, results } = createHarness();
+		const custom = (id: string, customType: string, details?: unknown) => ({
+			id,
+			type: "custom_message",
+			customType,
+			details,
+		});
+		const ticket = results.begin("req_p");
+		results.observe(agentStart);
+		session.isStreaming = true;
+		results.settle(ticket);
+		session.branch.push(
+			user("u", "P"),
+			reply("a1"),
+			custom("todo", "todo-reminder"),
+			reply("a2"),
+			custom("d", "external-card", { "omp.llm": { role: "user", content: "D" } }),
+			reply("a3"),
+			custom("g", "goal-mode-context"),
+			reply("a4"),
+		);
+		session.isStreaming = false;
+		results.observe(agentEnd([assistant({ stopReason: "stop" })]));
+		await flushFrames();
+		// A context reminder does not end the reply; a delivery does. The prompt is still the run's only user message.
+		expect(frames).toMatchObject([{ id: "req_p", run: 1, promptEntryId: "u", replyEntryIds: ["a1", "a2"] }]);
+	});
+
+	test("a command's own run replaces a wake that ran while its handler worked", async () => {
+		const { frames, session, results } = createHarness();
+		const command = results.begin("req_cmd");
+		// A delivery wake runs and yields while the command's handler is still working.
+		results.observe(agentStart);
+		session.branch.push(user("w", "wake"), reply("wa"));
+		results.observe(agentEnd([assistant({ stopReason: "error" })]));
+		// The handler now schedules agent work from idle.
+		results.rebase(command);
+		results.observe(agentStart);
+		session.branch.push(user("c", "from-command"), reply("ca"));
+		results.observe(agentEnd([assistant({ stopReason: "stop" })]));
+		results.settle(command);
+		await flushFrames();
+		expect(frames).toEqual([
+			{
+				type: "prompt_result",
+				id: "req_cmd",
+				agentInvoked: true,
+				status: "completed",
+				sessionSettled: true,
+				run: 2,
+				promptEntryId: "c",
+				replyEntryIds: ["ca"],
+			},
+		]);
+	});
+
+	test("a command's send into a later live run drops the outcome of a run that already yielded", async () => {
+		const { frames, session, results } = createHarness();
+		const command = results.begin("req_cmd");
+		// A wake run W starts and yields while the command's handler still works.
+		results.observe(agentStart);
+		session.branch.push(user("w", "wake"), reply("wa"));
+		results.observe(agentEnd([assistant({ stopReason: "stop" })]));
+		// A different run L is live when the command sends: its work is queued into L.
+		results.observe(agentStart);
+		session.isStreaming = true;
+		results.rebase(command);
+		session.branch.push(user("l", "slow L"), reply("la"), user("c", "from-command"), reply("ca"));
+		results.settle(command);
+		await flushFrames();
+		expect(frames).toEqual([]);
+		session.isStreaming = false;
+		results.observe(agentEnd([assistant({ stopReason: "error" })]));
+		await flushFrames();
+		// Reported at L's yield with L's outcome, not W's earlier "completed".
+		expect(frames).toMatchObject([{ id: "req_cmd", run: 2, status: "error" }]);
+	});
+
+	test("a command's send into a live run after a session change is not reported as the detached run's abort", async () => {
+		const { frames, session, results } = createHarness();
+		const command = results.begin("req_cmd");
+		// Another run starts, then a session change detaches it (pre-marking the command aborted).
+		results.observe(agentStart);
+		session.isStreaming = true;
+		results.abortOpen();
+		// A new run L is live when the command sends into it.
+		results.observe(agentStart);
+		results.rebase(command);
+		session.branch.push(user("c", "from-command"), reply("ca"));
+		results.settle(command);
+		await flushFrames();
+		expect(frames).toEqual([]);
+		session.isStreaming = false;
+		results.observe(agentEnd([assistant({ stopReason: "stop" })]));
+		await flushFrames();
+		expect(frames).toMatchObject([{ id: "req_cmd", status: "completed" }]);
+	});
+
+	test("work a command queues into a live run leaves ownership unchanged", async () => {
+		const { frames, session, results } = createHarness();
+		const command = results.begin("req_live");
+		results.observe(agentStart);
+		session.isStreaming = true;
+		results.rebase(command);
+		session.branch.push(user("x", "X"), reply("xa"));
+		session.isStreaming = false;
+		results.observe(agentEnd([assistant({ stopReason: "stop" })]));
+		results.settle(command);
+		await flushFrames();
+		expect(frames).toMatchObject([{ id: "req_live", run: 1, status: "completed" }]);
+	});
+
+	test("a local-only command carries no run or reply", async () => {
+		const { frames, results } = createHarness();
+		results.completeLocal(results.begin("req_local"));
+		await flushFrames();
+		expect(frames).toEqual([
+			{ type: "prompt_result", id: "req_local", agentInvoked: false, status: "completed", sessionSettled: true },
+		]);
+	});
+});
+
 describe("RpcPromptResults", () => {
 	test("reports a joined prompt only at the terminal agent_end, not a non-terminal settle", async () => {
 		const { frames, session, results } = createHarness();
@@ -70,7 +400,15 @@ describe("RpcPromptResults", () => {
 		results.observe(agentEnd([assistant({ stopReason: "stop" })]));
 		await flushFrames();
 		expect(frames).toEqual([
-			{ type: "prompt_result", id: "req_1", agentInvoked: true, status: "completed", sessionSettled: true },
+			{
+				type: "prompt_result",
+				id: "req_1",
+				agentInvoked: true,
+				status: "completed",
+				sessionSettled: true,
+				run: 1,
+				replyEntryIds: [],
+			},
 		]);
 	});
 
@@ -85,7 +423,15 @@ describe("RpcPromptResults", () => {
 		await flushFrames();
 
 		expect(frames).toEqual([
-			{ type: "prompt_result", id: "req_2", agentInvoked: true, status: "completed", sessionSettled: true },
+			{
+				type: "prompt_result",
+				id: "req_2",
+				agentInvoked: true,
+				status: "completed",
+				sessionSettled: true,
+				run: 1,
+				replyEntryIds: [],
+			},
 		]);
 	});
 
@@ -102,7 +448,15 @@ describe("RpcPromptResults", () => {
 		results.observe(agentEnd([assistant({ stopReason: "aborted" })]));
 		await flushFrames();
 		expect(frames).toEqual([
-			{ type: "prompt_result", id: "req_3", agentInvoked: true, status: "aborted", sessionSettled: true },
+			{
+				type: "prompt_result",
+				id: "req_3",
+				agentInvoked: true,
+				status: "aborted",
+				sessionSettled: true,
+				run: 1,
+				replyEntryIds: [],
+			},
 		]);
 	});
 
@@ -122,7 +476,15 @@ describe("RpcPromptResults", () => {
 		await flushFrames();
 
 		expect(frames).toEqual([
-			{ type: "prompt_result", id: "req_bg", agentInvoked: true, status: "completed", sessionSettled: false },
+			{
+				type: "prompt_result",
+				id: "req_bg",
+				agentInvoked: true,
+				status: "completed",
+				sessionSettled: false,
+				run: 1,
+				replyEntryIds: [],
+			},
 		]);
 	});
 
@@ -207,8 +569,24 @@ describe("RpcPromptResults", () => {
 		await flushFrames();
 
 		expect(frames).toEqual([
-			{ type: "prompt_result", id: "req_old", agentInvoked: true, status: "aborted", sessionSettled: true },
-			{ type: "prompt_result", id: "req_new", agentInvoked: true, status: "completed", sessionSettled: true },
+			{
+				type: "prompt_result",
+				id: "req_old",
+				agentInvoked: true,
+				status: "aborted",
+				sessionSettled: true,
+				run: 1,
+				replyEntryIds: [],
+			},
+			{
+				type: "prompt_result",
+				id: "req_new",
+				agentInvoked: true,
+				status: "completed",
+				sessionSettled: true,
+				run: 2,
+				replyEntryIds: [],
+			},
 		]);
 	});
 
@@ -234,7 +612,18 @@ describe("RpcPromptResults", () => {
 	test("writes prompt_result after output queued synchronously with the settle", async () => {
 		const frames: object[] = [];
 		const results = new RpcPromptResults(
-			{ isStreaming: false, hasAdmittedSubmission: false, queuedMessageCount: 0, hasPendingAsyncWork: () => false },
+			{
+				isStreaming: false,
+				hasAdmittedSubmission: false,
+				queuedMessageCount: 0,
+				hasPendingAsyncWork: () => false,
+				sessionManager: {
+					getLeafId: () => null,
+					getBranch: () => [],
+					getSessionId: () => "s",
+					continuesSession: (id: string) => id === "s",
+				},
+			},
 			frame => frames.push(frame),
 		);
 		results.completeLocal(results.begin("req_6"));
@@ -296,7 +685,15 @@ describe("reportPromptResult", () => {
 		results.observe(agentEnd([assistant({ stopReason: "stop" })]));
 		await flushFrames();
 		expect(frames).toEqual([
-			{ type: "prompt_result", id: "req_1", agentInvoked: true, status: "completed", sessionSettled: true },
+			{
+				type: "prompt_result",
+				id: "req_1",
+				agentInvoked: true,
+				status: "completed",
+				sessionSettled: true,
+				run: 1,
+				replyEntryIds: [],
+			},
 		]);
 	});
 
@@ -421,6 +818,7 @@ describe("reportPromptResult", () => {
 					agentInvoked: testCase.startsTurn,
 					status: "completed",
 					sessionSettled: true,
+					...(testCase.startsTurn ? { run: 1, replyEntryIds: [] } : {}),
 				},
 			]);
 		}

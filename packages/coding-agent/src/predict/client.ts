@@ -17,6 +17,7 @@ import { getAgentDir, logger, ptree, VERSION } from "@oh-my-pi/pi-utils";
 import { daemonClientForGlobal } from "../launch/client";
 import { describeQuietly, stopQuietly, waitReady } from "../launch/ensure";
 import { resolveWorkerSpawnCmd, SMOKE_TEST_TIMEOUT_MS, workerEnvFromParent } from "../subprocess/worker-client";
+import { OwnedJobRegistry } from "../session/owned-job-registry";
 import { connectJsonlSocket, LineParser, writeJsonLine } from "../tiny/jsonl-socket";
 import { prefetchSmolLmWeights } from "./smollm-weights";
 import {
@@ -56,6 +57,16 @@ export function resolveTextPredictMethod(method: WordCompletionEngine): TextPred
 export interface TextPrediction {
 	engine: TextPredictMethod;
 	suggestion: PredictedWord | null;
+}
+
+/** Options for {@link requestTextPrediction}. */
+export interface TextPredictionRequestOptions {
+	/**
+	 * Answer only over a daemon connection this process already holds: never start the
+	 * broker or the daemon and never fetch SmolLM's weights. Without one there is no
+	 * suggestion. For a session that is exiting.
+	 */
+	connectedOnly?: boolean;
 }
 
 interface PendingRequest {
@@ -161,7 +172,7 @@ async function ensureDaemon(agentDir: string): Promise<DaemonConnection> {
 			continue;
 		}
 		try {
-			await broker.request({
+			const started = await broker.request({
 				op: "start",
 				spec: {
 					name,
@@ -176,6 +187,15 @@ async function ensureDaemon(agentDir: string): Promise<DaemonConnection> {
 					detached: false,
 				},
 			});
+			// A shared engine helper, not Thread work: recorded so a consumer can identify it.
+			if (started.op === "start" && started.daemon.pid !== undefined) {
+				OwnedJobRegistry.instance()?.registerProcess({
+					kind: "internal",
+					pid: started.daemon.pid,
+					command: TEXT_PREDICT_WORKER_ARG,
+					cwd: spawn.cwd ?? broker.projectDir,
+				});
+			}
 		} catch (error) {
 			// Lost a cross-process start race; the next round adopts the winner.
 			logger.debug("text-predict: daemon start contention", { name, error: String(error) });
@@ -228,10 +248,19 @@ class TextPredictionClient {
 	 * @throws when the daemon is unreachable or the engine reports an error
 	 * (e.g. it failed to load).
 	 */
-	async complete(engine: TextPredictMethod, before: string, prefix: string): Promise<TextPrediction> {
-		// SmolLM's weights download here, in the interactive process (shown in the
-		// download HUD), only once the user has chosen SmolLM.
-		if (engine === "smollm") prefetchSmolLmWeights();
+	async complete(
+		engine: TextPredictMethod,
+		before: string,
+		prefix: string,
+		options: TextPredictionRequestOptions = {},
+	): Promise<TextPrediction> {
+		if (options.connectedOnly) {
+			if (!this.connected) return { engine, suggestion: null };
+		} else if (engine === "smollm") {
+			// SmolLM's weights download here, in the interactive process (shown in the
+			// download HUD), only once the user has chosen SmolLM.
+			prefetchSmolLmWeights();
+		}
 		const response = await this.#request(
 			id => ({ id, op: "complete", method: engine, before, prefix }),
 			COMPLETE_TIMEOUT_MS,
@@ -239,6 +268,11 @@ class TextPredictionClient {
 		if (!response.ok) throw new Error(response.error);
 		if (response.op !== "complete") throw new Error(`text-predict: unexpected ${response.op} response`);
 		return { engine, suggestion: response.suggestion };
+	}
+
+	/** Whether this process holds an open daemon connection, so a request starts nothing. */
+	get connected(): boolean {
+		return this.#connection !== undefined && !this.#connection.closed;
 	}
 
 	/**
@@ -298,9 +332,15 @@ export function requestTextPrediction(
 	method: WordCompletionEngine,
 	before: string,
 	prefix: string,
+	options?: TextPredictionRequestOptions,
 ): Promise<TextPrediction> {
 	sharedClient ??= new TextPredictionClient();
-	return sharedClient.complete(resolveTextPredictMethod(method), before, prefix);
+	return sharedClient.complete(resolveTextPredictMethod(method), before, prefix, options);
+}
+
+/** Whether this process holds an open daemon connection: a request over it starts no helper. */
+export function hasTextPredictionConnection(): boolean {
+	return sharedClient?.connected ?? false;
 }
 
 /**
