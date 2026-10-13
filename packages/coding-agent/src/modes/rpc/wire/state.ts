@@ -53,7 +53,10 @@ export const stateDefs = {
 	},
 	QuiesceRequest: {
 		operationId: "string",
-		completeness: "'strict' | 'attested'",
+		"completeness?": doc(
+			"'strict' | 'attested'",
+			"`quiesce-exit/2`: `strict` also requires complete owned-work coverage; `attested` counts only. Omitted: `quiesce-exit/1`, counts only.",
+		),
 		attempt: "number",
 		epoch: "number",
 		instanceId: "string",

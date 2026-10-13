@@ -499,6 +499,7 @@ export class Agent {
 	#onTurnEnd?: (messages: AgentMessage[], signal?: AbortSignal, context?: AgentTurnEndContext) => Promise<void> | void;
 	#onModelCallSystemPrompt?: (systemPrompt: string[]) => void;
 	#beforeModelCall?: AgentBeforeModelCall;
+	#runScope?: <T>(run: () => Promise<T>) => Promise<T>;
 	#additionalBeforeModelCalls = new Set<AgentBeforeModelCall>();
 	#asideMessageProvider?: (boundary: { atStopBoundary: boolean }) => AsideMessage[] | Promise<AsideMessage[]>;
 	#telemetry?: AgentLoopConfig["telemetry"];
@@ -1205,6 +1206,15 @@ export class Agent {
 	}
 
 	/**
+	 * Install or remove the scope every run starts in: {@link prompt} and {@link continue}
+	 * call `scope(run)` and the run, with everything it schedules, executes inside it (e.g.
+	 * to start runs outside the caller's async context). `scope` must call `run` synchronously.
+	 */
+	setRunScope(scope: (<T>(run: () => Promise<T>) => Promise<T>) | undefined): void {
+		this.#runScope = scope;
+	}
+
+	/**
 	 * Install or replace the host pre-model-call gate; pass `undefined` to
 	 * remove it. Gates are sampled when a run starts: installing the first
 	 * gate while a run is in flight takes effect on the next run.
@@ -1676,7 +1686,8 @@ export class Agent {
 			promptOptions = imagesOrOptions as AgentPromptOptions | undefined;
 		}
 
-		await this.#runLoop(msgs, promptOptions);
+		const run = () => this.#runLoop(msgs, promptOptions);
+		await (this.#runScope ? this.#runScope(run) : run());
 	}
 
 	/**
@@ -1700,7 +1711,12 @@ export class Agent {
 		return signals.length === 1 ? signals[0] : AbortSignal.any(signals);
 	}
 
-	async continue(signal?: AbortSignal) {
+	continue(signal?: AbortSignal): Promise<void> {
+		const run = () => this.#continue(signal);
+		return this.#runScope ? this.#runScope(run) : run();
+	}
+
+	async #continue(signal?: AbortSignal): Promise<void> {
 		if (this.#state.isStreaming) {
 			throw new AgentBusyError();
 		}

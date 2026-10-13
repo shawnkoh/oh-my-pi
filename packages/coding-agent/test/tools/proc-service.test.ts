@@ -643,6 +643,8 @@ describe("bash services via proc://", () => {
 		const logs = Promise.withResolvers<DaemonRpcResult>();
 		const client = {
 			projectDir: process.cwd(),
+			// No broker lease lives here: the owned-job record just names no broker pid.
+			runtimeDir: path.join(process.cwd(), ".no-broker-runtime"),
 			onCompletion: () => () => {},
 			close() {},
 			async request(operation: DaemonOperation): Promise<DaemonRpcResult> {

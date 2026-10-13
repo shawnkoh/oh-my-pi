@@ -3609,16 +3609,17 @@ class WireClient:
         params["nonce"] = nonce
         return parse_work_attestation(self._command("attest", params), "attest")
 
-    def quiesce_and_exit(self, operation_id: str, completeness: Literal["strict", "attested"], attempt: float, epoch: float, instance_id: str, session_id: str, deadline: float) -> QuiesceResult:
-        """Close admission and exit with a terminal attestation if the attested state is unchanged; requires explicit `strict` or `attested` completeness."""
+    def quiesce_and_exit(self, operation_id: str, attempt: float, epoch: float, instance_id: str, session_id: str, deadline: float, *, completeness: Literal["strict", "attested"] | None = None) -> QuiesceResult:
+        """Close admission and exit with a terminal attestation if the attested state is unchanged; `quiesce-exit/2` takes `strict` or `attested` completeness; without it the request is `quiesce-exit/1` (counts only)."""
         params: dict[str, object] = {}
         params["operationId"] = operation_id
-        params["completeness"] = completeness
         params["attempt"] = attempt
         params["epoch"] = epoch
         params["instanceId"] = instance_id
         params["sessionId"] = session_id
         params["deadline"] = deadline
+        if completeness is not None:
+            params["completeness"] = completeness
         return parse_quiesce_result(self._command("quiesce_and_exit", params), "quiesce_and_exit")
 
     def steer(self, message: str, *, images: Sequence[ImageContent] | None = None, literal: bool | None = None) -> None:

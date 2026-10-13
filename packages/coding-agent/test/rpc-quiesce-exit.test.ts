@@ -70,12 +70,21 @@ function sha256OfFile(file: string): string {
 	return new Bun.CryptoHasher("sha256").update(fs.readFileSync(file)).digest("hex");
 }
 
+/**
+ * Both quiesce protocols the engine advertises: `quiesce-exit/1` (the shipped fork build's,
+ * still sent by older Juiz runtimes) has no `completeness`; `quiesce-exit/2` sends it.
+ */
+const PROTOCOLS: Array<[protocol: string, completeness: "attested" | undefined]> = [
+	["quiesce-exit/1", undefined],
+	["quiesce-exit/2", "attested"],
+];
+
 /** The request fields that bind a quiesce to the attestation it was built from. */
-function boundTo(attest: Frame): Record<string, unknown> {
+function boundTo(attest: Frame, completeness: "attested" | undefined = "attested"): Record<string, unknown> {
 	const data = attest.data ?? {};
 	const session = data.session;
 	return {
-		completeness: "attested",
+		...(completeness ? { completeness } : {}),
 		epoch: data.epoch,
 		instanceId: data.instanceId,
 		sessionId: isRecord(session) ? session.id : undefined,
@@ -106,7 +115,7 @@ describe.skipIf(process.platform === "win32").each(MODES)("RPC quiesce_and_exit 
 		return String(state.data?.sessionFile);
 	}
 
-	it.each([undefined, "unknown"])(
+	it.each(["unknown", null])(
 		"rejects completeness %j over the wire without consuming the attempt",
 		async completeness => {
 			const attest = await rpc.request({ id: "a-invalid", type: "attest", operationId: "invalid", nonce: "n" });
@@ -126,73 +135,117 @@ describe.skipIf(process.platform === "win32").each(MODES)("RPC quiesce_and_exit 
 		30_000,
 	);
 
-	it("advertises the capabilities and exits after a passed quiesce with the attestation on disk", async () => {
-		const state = await rpc.request({ id: "s1", type: "get_state" });
-		// One capability list: the ready frame advertises quiesce support and get_state repeats it.
-		const ready = await rpc.waitFor(frame => frame.type === "ready", "ready");
-		expect(ready.capabilities).toEqual(expect.arrayContaining(["quiesce-exit/2", "owned-jobs/1"]));
-		expect(state.data?.capabilities).toEqual(ready.capabilities);
-		const file = String(state.data?.sessionFile);
+	it.each(PROTOCOLS)(
+		"advertises the capabilities and exits after a passed %s quiesce with the attestation on disk",
+		async (_protocol, completeness) => {
+			const state = await rpc.request({ id: "s1", type: "get_state" });
+			// One capability list: the ready frame advertises quiesce support and get_state repeats it.
+			const ready = await rpc.waitFor(frame => frame.type === "ready", "ready");
+			expect(ready.capabilities).toEqual(
+				expect.arrayContaining(["quiesce-exit/1", "quiesce-exit/2", "owned-jobs/1"]),
+			);
+			expect(state.data?.capabilities).toEqual(ready.capabilities);
+			const file = String(state.data?.sessionFile);
 
-		const attest = await rpc.request({ id: "a1", type: "attest", operationId: "op-1", nonce: "n-1" });
-		expect(attest.data).toMatchObject({ operationId: "op-1", nonce: "n-1", admission: "open" });
-		const epoch = Number(attest.data?.epoch);
+			const attest = await rpc.request({ id: "a1", type: "attest", operationId: "op-1", nonce: "n-1" });
+			expect(attest.data).toMatchObject({ operationId: "op-1", nonce: "n-1", admission: "open" });
+			const epoch = Number(attest.data?.epoch);
 
-		const quiesce = await rpc.request({
-			id: "q1",
-			type: "quiesce_and_exit",
-			operationId: "op-1",
-			attempt: 1,
-			...boundTo(attest),
-			deadline: Date.now() + 30_000,
-		});
-		expect(quiesce).toMatchObject({
-			command: "quiesce_and_exit",
-			success: true,
-			data: { status: "quiesced", operationId: "op-1", attempt: 1 },
-		});
-		expect(await withTimeout(rpc.child.exited, 15_000, "RPC process did not exit")).toBe(0);
-		const onDisk = JSON.parse(fs.readFileSync(terminalAttestationPath(file), "utf8"));
-		expect(onDisk).toMatchObject({ kind: "quiesce", operationId: "op-1", attempt: 1, epoch, interrupted: false });
-	}, 30_000);
+			const quiesce = await rpc.request({
+				id: "q1",
+				type: "quiesce_and_exit",
+				operationId: "op-1",
+				attempt: 1,
+				...boundTo(attest, completeness),
+				deadline: Date.now() + 30_000,
+			});
+			expect(quiesce).toMatchObject({
+				command: "quiesce_and_exit",
+				success: true,
+				data: { status: "quiesced", operationId: "op-1", attempt: 1 },
+			});
+			expect(await withTimeout(rpc.child.exited, 15_000, "RPC process did not exit")).toBe(0);
+			const onDisk = JSON.parse(fs.readFileSync(terminalAttestationPath(file), "utf8"));
+			expect(onDisk).toMatchObject({ kind: "quiesce", operationId: "op-1", attempt: 1, epoch, interrupted: false });
+		},
+		30_000,
+	);
 
-	it("refuses every mutating command after a passed quiesce and exits with the transcript as attested", async () => {
-		const file = await sessionFile();
+	it.each(PROTOCOLS)(
+		"refuses every mutating command after a passed %s quiesce and exits with the transcript as attested",
+		async (_protocol, completeness) => {
+			const file = await sessionFile();
+			await rpc.request({ id: "p0", type: "prompt", message: "materialize the transcript" });
+			await rpc.waitFor(frame => frame.type === "agent_end", "agent_end");
+			const attest = await rpc.request({ id: "a1", type: "attest", operationId: "op-3", nonce: "n-1" });
+			rpc.send(
+				{
+					id: "q1",
+					type: "quiesce_and_exit",
+					operationId: "op-3",
+					attempt: 1,
+					...boundTo(attest, completeness),
+					deadline: Date.now() + 30_000,
+				},
+				{ id: "p1", type: "prompt", message: "too late" },
+				{ id: "s1", type: "steer", message: "too late" },
+				{ id: "f1", type: "follow_up", message: "too late" },
+				{ id: "n1", type: "set_session_name", name: "renamed after exit" },
+				{ id: "n2", type: "new_session" },
+				{ id: "g1", type: "get_state" },
+			);
+			const quiesce = await rpc.waitFor(frame => frame.type === "response" && frame.id === "q1", "q1");
+			expect(quiesce.data).toMatchObject({ status: "quiesced", operationId: "op-3", attempt: 1 });
+			for (const id of ["p1", "s1", "f1", "n1", "n2"]) {
+				const refused = await rpc.waitFor(frame => frame.type === "response" && frame.id === id, id);
+				expect(refused).toMatchObject({ success: false, code: "admission_closed" });
+			}
+			// Reads still answer while the process exits.
+			expect(await rpc.waitFor(frame => frame.type === "response" && frame.id === "g1", "g1")).toMatchObject({
+				success: true,
+			});
+			expect(await withTimeout(rpc.child.exited, 15_000, "RPC process did not exit")).toBe(0);
+			// The response frame is wire JSON: its shape is the TerminalAttestation contract.
+			const result: QuiesceResult = quiesce.data as unknown as QuiesceResult;
+			if (result.status !== "quiesced") throw new Error("expected quiesced");
+			expect(sha256OfFile(file)).toBe(result.attestation.session.sha256 ?? "");
+			expect(fs.statSync(file).size).toBe(result.attestation.session.size ?? -1);
+		},
+		30_000,
+	);
+
+	it("refuses an external delivery sent in the same read as a passing quiesce", async () => {
 		await rpc.request({ id: "p0", type: "prompt", message: "materialize the transcript" });
 		await rpc.waitFor(frame => frame.type === "agent_end", "agent_end");
-		const attest = await rpc.request({ id: "a1", type: "attest", operationId: "op-3", nonce: "n-1" });
+		const attest = await rpc.request({ id: "a1", type: "attest", operationId: "op-d", nonce: "n-1" });
+		const record = {
+			customType: "external-card",
+			content: "[card late]",
+			display: true,
+			details: { "omp.llm": { role: "user", content: "late" }, "omp.llm.source": "src-late" },
+		};
 		rpc.send(
 			{
 				id: "q1",
 				type: "quiesce_and_exit",
-				operationId: "op-3",
+				operationId: "op-d",
 				attempt: 1,
 				...boundTo(attest),
 				deadline: Date.now() + 30_000,
 			},
-			{ id: "p1", type: "prompt", message: "too late" },
-			{ id: "s1", type: "steer", message: "too late" },
-			{ id: "f1", type: "follow_up", message: "too late" },
-			{ id: "n1", type: "set_session_name", name: "renamed after exit" },
-			{ id: "n2", type: "new_session" },
-			{ id: "g1", type: "get_state" },
+			{ id: "d1", type: "deliver", record, options: { mode: "steer" } },
+			{ id: "c1", type: "cancel_delivery", deliveryId: "delivery_1" },
 		);
 		const quiesce = await rpc.waitFor(frame => frame.type === "response" && frame.id === "q1", "q1");
-		expect(quiesce.data).toMatchObject({ status: "quiesced", operationId: "op-3", attempt: 1 });
-		for (const id of ["p1", "s1", "f1", "n1", "n2"]) {
+		expect(quiesce.data).toMatchObject({ status: "quiesced", operationId: "op-d" });
+		for (const id of ["d1", "c1"]) {
 			const refused = await rpc.waitFor(frame => frame.type === "response" && frame.id === id, id);
 			expect(refused).toMatchObject({ success: false, code: "admission_closed" });
 		}
-		// Reads still answer while the process exits.
-		expect(await rpc.waitFor(frame => frame.type === "response" && frame.id === "g1", "g1")).toMatchObject({
-			success: true,
-		});
 		expect(await withTimeout(rpc.child.exited, 15_000, "RPC process did not exit")).toBe(0);
-		// The response frame is wire JSON: its shape is the TerminalAttestation contract.
-		const result: QuiesceResult = quiesce.data as unknown as QuiesceResult;
-		if (result.status !== "quiesced") throw new Error("expected quiesced");
-		expect(sha256OfFile(file)).toBe(result.attestation.session.sha256 ?? "");
-		expect(fs.statSync(file).size).toBe(result.attestation.session.size ?? -1);
+		expect(rpc.frames.some(frame => typeof frame.type === "string" && frame.type.startsWith("delivery_"))).toBe(
+			false,
+		);
 	}, 30_000);
 
 	it("refuses when a prompt shares the read with the quiesce, runs the prompt, and exits on a fresh attempt", async () => {
@@ -294,6 +347,113 @@ describe.skipIf(process.platform === "win32")("RPC hang-up capture order", () =>
 	}, 30_000);
 });
 
+describe.skipIf(process.platform === "win32")("RPC quiesce with input in the ordered input gate", () => {
+	it("refuses while an acknowledged abort_and_prompt is still in its input hook, then runs it before exiting", async () => {
+		using tempDir = TempDir.createSync("@omp-rpc-quiesce-gate-");
+		const rpc = new RpcProcess([process.execPath, path.join(import.meta.dir, "fixtures", "quiesce-rpc-agent.ts")], {
+			cwd: tempDir.path(),
+			env: {
+				...process.env,
+				PI_CODING_AGENT_DIR: tempDir.path(),
+				PI_NO_TITLE: "1",
+				QUIESCE_FIXTURE_INPUT_HOOK: "1",
+			},
+		});
+		try {
+			await rpc.waitFor(frame => frame.type === "ready", "ready");
+			const state = await rpc.request({ id: "s1", type: "get_state" });
+			const file = String(state.data?.sessionFile);
+			await rpc.request({ id: "p0", type: "prompt", message: "materialize the transcript" });
+			await rpc.waitFor(frame => frame.type === "agent_end", "agent_end");
+			// `abort_and_prompt` is answered once the abort is done, while its prompt is still in
+			// the input hook: no command is pending, yet the prompt has not reached the session.
+			const answered = await rpc.request({ id: "ap1", type: "abort_and_prompt", message: "gate-wait" });
+			expect(answered).toMatchObject({ success: true });
+			const attest = await rpc.request({ id: "a1", type: "attest", operationId: "op-g", nonce: "n-1" });
+			expect(attest.data?.counts).toMatchObject({ queuedInput: 1 });
+			const refused = await rpc.request({
+				id: "q1",
+				type: "quiesce_and_exit",
+				operationId: "op-g",
+				attempt: 1,
+				...boundTo(attest),
+				deadline: Date.now() + 30_000,
+			});
+			expect(refused.data).toMatchObject({ status: "refused", reason: "work_active" });
+
+			// The acknowledged prompt is not lost: once its hook returns it runs and reports.
+			fs.writeFileSync(path.join(tempDir.path(), "gate-release"), "");
+			const result = await rpc.waitFor(frame => frame.type === "prompt_result" && frame.id === "ap1", "ap1 result");
+			expect(result).toMatchObject({ status: "completed" });
+			const reattest = await rpc.request({ id: "a2", type: "attest", operationId: "op-g", nonce: "n-2" });
+			const quiesce = await rpc.request({
+				id: "q2",
+				type: "quiesce_and_exit",
+				operationId: "op-g",
+				attempt: 2,
+				...boundTo(reattest),
+				deadline: Date.now() + 30_000,
+			});
+			expect(quiesce.data).toMatchObject({ status: "quiesced", attempt: 2 });
+			expect(await withTimeout(rpc.child.exited, 15_000, "RPC process did not exit")).toBe(0);
+			expect(fs.readFileSync(file, "utf8")).toContain("gate-wait");
+		} finally {
+			rpc.child.kill("SIGKILL");
+			await rpc.child.exited;
+		}
+	}, 30_000);
+});
+
+describe.skipIf(process.platform === "win32")("RPC quiesce with a read-only command in flight", () => {
+	it("does not count a pending predict_word as work, answers it, and keeps later predictions off the daemon", async () => {
+		using tempDir = TempDir.createSync("@omp-rpc-quiesce-predict-");
+		const rpc = new RpcProcess([process.execPath, path.join(import.meta.dir, "fixtures", "quiesce-rpc-agent.ts")], {
+			cwd: tempDir.path(),
+			env: {
+				...process.env,
+				PI_CODING_AGENT_DIR: tempDir.path(),
+				PI_NO_TITLE: "1",
+				QUIESCE_FIXTURE_PREDICT: "1",
+			},
+		});
+		try {
+			await rpc.waitFor(frame => frame.type === "ready", "ready");
+			// The fixture's engine answers only once admission has closed: still pending at the attest.
+			rpc.send({ id: "w1", type: "predict_word", text: "the weath", cursor: 9 });
+			const attest = await rpc.request({ id: "a1", type: "attest", operationId: "op-w", nonce: "n-1" });
+			expect(rpc.frames.some(frame => frame.type === "response" && frame.id === "w1")).toBe(false);
+			expect(attest.data?.counts).toMatchObject({ queuedInput: 0 });
+			rpc.send(
+				{
+					id: "q1",
+					type: "quiesce_and_exit",
+					operationId: "op-w",
+					attempt: 1,
+					...boundTo(attest),
+					deadline: Date.now() + 30_000,
+				},
+				{ id: "w2", type: "predict_word", text: "the weath", cursor: 9 },
+			);
+			const quiesce = await rpc.waitFor(frame => frame.type === "response" && frame.id === "q1", "q1");
+			expect(quiesce.data).toMatchObject({ status: "quiesced", operationId: "op-w" });
+			// The prediction started before the pass still answers before the process exits.
+			expect(await rpc.waitFor(frame => frame.type === "response" && frame.id === "w1", "w1")).toMatchObject({
+				success: true,
+				data: { suffix: "er" },
+			});
+			// One read after the pass asks only over an open daemon connection, and there is none.
+			expect(await rpc.waitFor(frame => frame.type === "response" && frame.id === "w2", "w2")).toMatchObject({
+				success: true,
+				data: { suffix: null },
+			});
+			expect(await withTimeout(rpc.child.exited, 15_000, "RPC process did not exit")).toBe(0);
+		} finally {
+			rpc.child.kill("SIGKILL");
+			await rpc.child.exited;
+		}
+	}, 30_000);
+});
+
 // The real CLI entry in each protocol mode: proves the wiring main.ts does for `--mode rpc-ui`
 // (tool UI context, hasUI) keeps the same command table, capability advertisement and gate.
 describe.skipIf(process.platform === "win32").each(MODES)("CLI --mode %s quiesce_and_exit", mode => {
@@ -341,7 +501,7 @@ describe.skipIf(process.platform === "win32").each(MODES)("CLI --mode %s quiesce
 	it("advertises capabilities, refuses later input and exits 0 with the attestation on disk", async () => {
 		const state = await rpc.request({ id: "s1", type: "get_state" });
 		const ready = await rpc.waitFor(frame => frame.type === "ready", "ready");
-		expect(ready.capabilities).toEqual(expect.arrayContaining(["quiesce-exit/2", "owned-jobs/1"]));
+		expect(ready.capabilities).toEqual(expect.arrayContaining(["quiesce-exit/1", "quiesce-exit/2", "owned-jobs/1"]));
 		expect(state.data?.capabilities).toEqual(ready.capabilities);
 		const attest = await rpc.request({ id: "a1", type: "attest", operationId: "cli", nonce: "n" });
 		expect(attest.data).toMatchObject({ operationId: "cli", nonce: "n", admission: "open" });

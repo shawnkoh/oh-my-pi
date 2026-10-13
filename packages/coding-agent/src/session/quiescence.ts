@@ -13,12 +13,21 @@ import * as path from "node:path";
 import { isEnoent, logger } from "@oh-my-pi/pi-utils";
 import { fsyncDirectory, type InvocationIdentity, type OwnerScanSummary, stripJsonl } from "./owned-job-registry";
 
-/** Capability: `attest` + `quiesce_and_exit` with a terminal attestation file. */
+/**
+ * Capability: `attest` + `quiesce_and_exit` with a terminal attestation file; a request
+ * without `completeness` is counts-only.
+ */
+export const QUIESCE_EXIT_V1_CAPABILITY = "quiesce-exit/1";
+/** Capability: `quiesce-exit/1` plus `completeness` (`strict` or `attested`) on `quiesce_and_exit`. */
 export const QUIESCE_EXIT_CAPABILITY = "quiesce-exit/2";
 /** Capability: durable owned-job registry next to the session file. */
 export const OWNED_JOBS_CAPABILITY = "owned-jobs/1";
 /** Capabilities advertised by hosts that wire quiesce-and-exit (RPC `get_state`, extension `ctx.capabilities`). */
-export const SESSION_CAPABILITIES: readonly string[] = Object.freeze([QUIESCE_EXIT_CAPABILITY, OWNED_JOBS_CAPABILITY]);
+export const SESSION_CAPABILITIES: readonly string[] = Object.freeze([
+	QUIESCE_EXIT_V1_CAPABILITY,
+	QUIESCE_EXIT_CAPABILITY,
+	OWNED_JOBS_CAPABILITY,
+]);
 
 export const TERMINAL_ATTESTATION_VERSION = 1;
 export const WORK_ATTESTATION_VERSION = 1;
@@ -164,8 +173,11 @@ export interface WorkAttestation {
 
 export interface QuiesceRequest {
 	operationId: string;
-	/** Strict requires complete work coverage; attested preserves counts-only retirement. */
-	completeness: "strict" | "attested";
+	/**
+	 * `quiesce-exit/2`: strict requires complete work coverage; attested preserves counts-only
+	 * retirement. Omitted (`quiesce-exit/1`): counts-only, exactly as `attested`.
+	 */
+	completeness?: "strict" | "attested";
 	/** Non-negative integer; each new attempt for an operation must use a higher number. */
 	attempt: number;
 	/** The epoch from the attestation the caller based its decision on. */
