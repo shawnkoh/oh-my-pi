@@ -75,11 +75,28 @@ pub trait ExternalCommandOutputMarker: Send + Sync {
 ///
 /// It is not called for reparented launches (`detach_reparent`): those
 /// deliberately escape the shell's descendant tree (e.g. `nohup cmd &`) and
-/// must survive teardown, so they are intentionally left unowned.
+/// must survive teardown, so they are intentionally left unowned. Those are
+/// reported separately through [`SpawnObserver::on_reparented_spawn`].
 pub trait SpawnObserver: Send + Sync {
 	/// Reports a freshly spawned external child. `pgid` is the child's process
 	/// group id when known (always its own pid under `NewProcessGroup`).
 	fn on_spawn(&self, pid: i32, pgid: Option<i32>);
+
+	/// Reports the real process of a reparented launch (`detach_reparent`,
+	/// e.g. `nohup cmd &`): on Unix the double-forked descendant that `exec`s
+	/// the operand, not the short-lived intermediate the shell waits on, with
+	/// `pgid` its detached session/process-group id. A launch that did not
+	/// detach (terminal stdin, `nohup cmd </dev/tty &`) and platforms without
+	/// a reparenting primitive report the operand process itself. These
+	/// processes are informational, not owned: they must not join the run's
+	/// teardown set.
+	fn on_reparented_spawn(&self, _pid: i32, _pgid: Option<i32>) {}
+
+	/// Reports a launch whose real process could not be named: a reparented
+	/// launch whose report never arrived (report channel unavailable or
+	/// clobbered), or a spawn whose pid could not be read. Embedders should
+	/// treat their record of the run's processes as incomplete.
+	fn on_unreported_spawn(&self) {}
 }
 
 /// Parameters for execution.

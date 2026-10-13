@@ -954,6 +954,20 @@ export class SessionAdvisors {
 		await Promise.allSettled(this.#pendingAdvisorCardEvents);
 	}
 
+	/**
+	 * Advisor work that can still change the session: card events persisting and reviews
+	 * queued or running. A primary boundary parked on a sync catch-up wait
+	 * (`advisor.syncBacklog` strict or numeric) needs no count here: the wait runs inside the
+	 * agent loop's turn-end callback, so the session still reports it as streaming. Deltas
+	 * held back by review cadence are not work: nothing reviews them until a later boundary
+	 * schedules a review.
+	 */
+	pendingWork(): number {
+		let pending = this.#pendingAdvisorCardEvents.size;
+		for (const advisor of this.#advisors) pending += advisor.runtime.pendingWork;
+		return pending;
+	}
+
 	// Advisor runtime lifecycle
 	// -------------------------------------------------------------------------
 	#advisorImmuneTurnLimit(): number {

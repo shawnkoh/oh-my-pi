@@ -35,6 +35,8 @@ import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import { type Theme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { AsyncJobSnapshot, SendUserMessageOptions } from "../../session/agent-session";
+import { EXTERNAL_DELIVERY_CAPABILITY } from "../../session/external-delivery";
+import { SESSION_CAPABILITIES } from "../../session/quiescence";
 import { MAIN_AGENT_ID } from "../../registry/agent-registry";
 import type { SessionManager } from "../../session/session-manager";
 import { addFileDeleteFallback, addFileWriteFallback } from "../../tools/file-write-fallback";
@@ -515,6 +517,8 @@ export class ExtensionRunner {
 	#compactFn: (instructionsOrOptions?: string | CompactOptions) => Promise<void> = async () => {};
 	#getSystemPromptFn: () => string[] = () => [];
 	#runEphemeralTurnFn?: ExtensionContextActions["runEphemeralTurn"];
+	#attestFn?: ExtensionContextActions["attest"];
+	#quiesceAndExitFn?: ExtensionContextActions["quiesceAndExit"];
 	#ephemeralTurnBlocker = new AsyncLocalStorage<string | undefined>();
 	#getAsyncJobSnapshotFn: () => AsyncJobSnapshot | null = () => null;
 	#newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
@@ -787,6 +791,9 @@ export class ExtensionRunner {
 		// Copy actions into the shared runtime (all extension APIs reference this)
 		this.runtime.sendMessage = actions.sendMessage;
 		this.runtime.sendUserMessage = actions.sendUserMessage;
+		this.runtime.deliverMessage = actions.deliverMessage;
+		if (actions.deliverMessage) this.runtime.capabilities.add(EXTERNAL_DELIVERY_CAPABILITY);
+		else this.runtime.capabilities.delete(EXTERNAL_DELIVERY_CAPABILITY);
 		this.runtime.appendEntry = actions.appendEntry;
 		this.runtime.getActiveTools = actions.getActiveTools;
 		this.runtime.getAllTools = actions.getAllTools;
@@ -820,6 +827,8 @@ export class ExtensionRunner {
 		this.#compactFn = contextActions.compact;
 		this.#getSystemPromptFn = contextActions.getSystemPrompt;
 		this.#runEphemeralTurnFn = contextActions.runEphemeralTurn;
+		this.#attestFn = contextActions.attest;
+		this.#quiesceAndExitFn = contextActions.quiesceAndExit;
 
 		// Command context actions (optional, only for interactive mode)
 		if (commandContextActions) {
@@ -1274,9 +1283,11 @@ export class ExtensionRunner {
 	}
 
 	emitError(error: ExtensionError): void {
-		for (const listener of this.#errorListeners) {
-			listener(error);
-		}
+		this.eventScope(() => {
+			for (const listener of this.#errorListeners) {
+				listener(error);
+			}
+		});
 	}
 
 	hasHandlers(eventType: string): boolean {
@@ -1399,6 +1410,15 @@ export class ExtensionRunner {
 			abort: () => this.#abortFn(),
 			hasPendingMessages: () => this.#hasPendingMessagesFn(),
 			shutdown: () => this.#shutdownHandler(),
+			capabilities: this.#quiesceAndExitFn ? SESSION_CAPABILITIES : [],
+			attest: (operationId, nonce) => {
+				if (!this.#attestFn) throw new Error("attest is not available in this mode");
+				return this.#attestFn(operationId, nonce);
+			},
+			quiesceAndExit: request => {
+				if (!this.#quiesceAndExitFn) throw new Error("quiesceAndExit is not available in this mode");
+				return this.#quiesceAndExitFn(request);
+			},
 			getSystemPrompt: () => this.#getSystemPromptFn(),
 			runEphemeralTurn: runEphemeralTurn
 				? async options => {
@@ -1505,7 +1525,24 @@ export class ExtensionRunner {
 	#isSessionShutdownEvent(event: RunnerEmitEvent): event is Extract<RunnerEmitEvent, { type: "session_shutdown" }> {
 		return event.type === "session_shutdown";
 	}
-	async #runHandlerWithTimeout<TEvent extends { type: string }, R>(
+	/** Host-owned dispatch boundary. Input handlers retain their caller's admission scope. */
+	eventScope: <T>(dispatch: () => T) => T = dispatch => dispatch();
+
+	#runHandlerWithTimeout<TEvent extends { type: string }, R>(
+		handler: (event: TEvent, ctx: ExtensionContext) => Promise<R | undefined> | R | undefined,
+		event: TEvent,
+		ctx: ExtensionContext,
+		ext: Extension,
+		timeoutMs: number,
+		onFailure?: (kind: "timeout" | "error", message: string) => R,
+		outerSignal?: AbortSignal,
+	): Promise<R | undefined> {
+		const dispatch = () =>
+			this.#dispatchHandlerWithTimeout(handler, event, ctx, ext, timeoutMs, onFailure, outerSignal);
+		return event.type === "input" ? dispatch() : this.eventScope(dispatch);
+	}
+
+	async #dispatchHandlerWithTimeout<TEvent extends { type: string }, R>(
 		handler: (event: TEvent, ctx: ExtensionContext) => Promise<R | undefined> | R | undefined,
 		event: TEvent,
 		ctx: ExtensionContext,

@@ -600,10 +600,10 @@ class RustEmitter {
 		let output = "()";
 		let decode = "\t\tlet _ = data;\n\t\tOk(())";
 		if (command.result) {
-			const result = this.#object(command.result);
 			let project = "";
 			output = command.result;
 			if (command.unwrap) {
+				const result = this.#object(command.result);
 				const plan = this.#planFields(result, result.fields).find(
 					candidate => candidate.field.key === command.unwrap,
 				);

@@ -21,6 +21,7 @@ import {
 } from "../../tools/approval";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import { withFileMutationSession } from "../../tools/file-write-fallback";
+import { ToolAbortError } from "../../tools/tool-errors";
 import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
 import { applyToolProxy } from "../tool-proxy";
 import type { ExtensionRunner } from "./runner";
@@ -407,11 +408,28 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					: basePrompt;
 			let choice: string | undefined;
 			try {
-				choice = await uiContext.select(safetyPrompt, ["Approve", "Deny"]);
+				// The signal lets an interrupt close the pending dialog (RPC hosts get a
+				// `cancel` for it); `approval` binds the answer to exactly this call.
+				choice = await uiContext.select(safetyPrompt, ["Approve", "Deny"], {
+					signal,
+					approval: {
+						toolCallId,
+						toolName: this.tool.name,
+						arguments: resolvedArgs,
+						...(approvalCheck.reason ? { reason: approvalCheck.reason } : {}),
+					},
+				});
 			} catch (err) {
 				await emitApprovalResolved(false, err instanceof Error ? err.message : "approval aborted");
 				cancelPreflight();
 				throw err;
+			}
+			// An approval that arrives after the call was aborted (a late answer, or a UI
+			// that ignored the signal) must never run it.
+			if (signal?.aborted) {
+				await emitApprovalResolved(false, "aborted");
+				cancelPreflight();
+				throw new ToolAbortError();
 			}
 			const approved = choice === "Approve";
 			await emitApprovalResolved(approved, approved ? undefined : "denied by user");
@@ -425,6 +443,12 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					throw new Error("Provider safety approval context is unavailable");
 				}
 				context.providerSafetyApproved = true;
+			}
+			// Approval handlers above may await; an abort that landed meanwhile must not reach
+			// execute, whether or not the tool checks its signal. No await follows this check.
+			if (signal?.aborted) {
+				cancelPreflight();
+				throw new ToolAbortError();
 			}
 		}
 

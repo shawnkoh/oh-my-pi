@@ -10,6 +10,28 @@
 		"inbound": "RpcInbound",
 		"commands": [
 			{
+				"name": "attest",
+				"doc": "Snapshot identity, activity epoch, work counts and owned-job registry soundness (`quiesce-exit/2`).",
+				"params": "AttestParams",
+				"result": "WorkAttestation",
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
+				"name": "quiesce_and_exit",
+				"doc": "Close admission and exit with a terminal attestation if the attested state is unchanged; `quiesce-exit/2` takes `strict` or `attested` completeness; without it the request is `quiesce-exit/1` (counts only).",
+				"params": "QuiesceRequest",
+				"result": "QuiesceResult",
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
 				"name": "negotiate_protocol",
 				"doc": "Switch the connection to a protocol version advertised by `ready`.",
 				"params": "NegotiateProtocolParams",
@@ -124,6 +146,28 @@
 				"doc": "Continue the newest non-empty session in a directory, or start a fresh one there. Give provider and modelId together to override the saved model; otherwise an unavailable saved model fails the request.",
 				"params": "OpenSessionParams",
 				"result": "OpenSessionResult",
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
+				"name": "deliver",
+				"doc": "Deliver a directed external record (`external-delivery/1`); never parsed as a prompt. Receipts arrive as `delivery_*` frames keyed by the returned `deliveryId`.",
+				"params": "DeliverParams",
+				"result": "DeliverResult",
+				"nullable": false,
+				"unwrap": "deliveryId",
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
+				"name": "cancel_delivery",
+				"doc": "Cancel a still-queued external record; `cancelled` is false once it was accepted or retired.",
+				"params": "CancelDeliveryParams",
+				"result": "CancellationResult",
 				"nullable": false,
 				"unwrap": null,
 				"timeoutMs": null,
@@ -2144,6 +2188,519 @@
 			],
 			"description": "Model descriptor: the client-relevant subset of the server's model record."
 		},
+		"WorkCounts": {
+			"type": "object",
+			"properties": {
+				"streaming": {
+					"type": "number"
+				},
+				"queuedInput": {
+					"type": "number"
+				},
+				"asyncJobs": {
+					"type": "number"
+				},
+				"subagents": {
+					"type": "number"
+				},
+				"retainedJobs": {
+					"type": "number"
+				},
+				"detachedJobs": {
+					"type": "number"
+				},
+				"compacting": {
+					"type": "number"
+				},
+				"handoff": {
+					"type": "number"
+				},
+				"goalContinuationScheduled": {
+					"type": "number"
+				},
+				"scheduledTurns": {
+					"type": "number"
+				}
+			},
+			"required": [
+				"streaming",
+				"queuedInput",
+				"asyncJobs",
+				"subagents",
+				"retainedJobs",
+				"detachedJobs",
+				"compacting",
+				"handoff",
+				"goalContinuationScheduled",
+				"scheduledTurns"
+			]
+		},
+		"InvocationIdentity": {
+			"type": "object",
+			"properties": {
+				"pid": {
+					"type": "number"
+				},
+				"startId": {
+					"anyOf": [
+						{
+							"type": "string"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"startTime": {
+					"anyOf": [
+						{
+							"type": "number"
+						},
+						{
+							"type": "null"
+						}
+					]
+				}
+			},
+			"required": [
+				"pid",
+				"startId",
+				"startTime"
+			]
+		},
+		"AttestedSessionIdentity": {
+			"type": "object",
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"file": {
+					"anyOf": [
+						{
+							"type": "string"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"size": {
+					"anyOf": [
+						{
+							"type": "number"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"sha256": {
+					"anyOf": [
+						{
+							"type": "string"
+						},
+						{
+							"type": "null"
+						}
+					]
+				}
+			},
+			"required": [
+				"id",
+				"file"
+			]
+		},
+		"OpaqueOwnedProcess": {
+			"type": "object",
+			"properties": {
+				"pid": {
+					"type": "number"
+				},
+				"command": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"pid",
+				"command"
+			]
+		},
+		"OwnerScanSummary": {
+			"type": "object",
+			"properties": {
+				"supported": {
+					"type": "boolean"
+				},
+				"sound": {
+					"type": "boolean"
+				},
+				"scanned": {
+					"type": "number"
+				},
+				"discovered": {
+					"type": "number"
+				},
+				"opaque": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/OpaqueOwnedProcess"
+					}
+				}
+			},
+			"required": [
+				"supported",
+				"sound",
+				"scanned",
+				"discovered",
+				"opaque"
+			]
+		},
+		"OwnedJobRegistryState": {
+			"type": "object",
+			"properties": {
+				"path": {
+					"anyOf": [
+						{
+							"type": "string"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"complete": {
+					"type": "boolean"
+				},
+				"ownerScan": {
+					"anyOf": [
+						{
+							"$ref": "#/$defs/OwnerScanSummary"
+						},
+						{
+							"type": "null"
+						}
+					]
+				}
+			},
+			"required": [
+				"path",
+				"complete",
+				"ownerScan"
+			]
+		},
+		"WorkAttestation": {
+			"type": "object",
+			"properties": {
+				"version": {
+					"type": "number",
+					"description": "Attestation format version; currently 1."
+				},
+				"operationId": {
+					"type": "string"
+				},
+				"nonce": {
+					"type": "string"
+				},
+				"epoch": {
+					"type": "number"
+				},
+				"instanceId": {
+					"type": "string"
+				},
+				"session": {
+					"$ref": "#/$defs/AttestedSessionIdentity"
+				},
+				"invocation": {
+					"$ref": "#/$defs/InvocationIdentity"
+				},
+				"counts": {
+					"$ref": "#/$defs/WorkCounts"
+				},
+				"admission": {
+					"enum": [
+						"open",
+						"closed"
+					],
+					"type": "string"
+				},
+				"registry": {
+					"$ref": "#/$defs/OwnedJobRegistryState"
+				},
+				"observedAt": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"version",
+				"operationId",
+				"nonce",
+				"epoch",
+				"instanceId",
+				"session",
+				"invocation",
+				"counts",
+				"admission",
+				"registry",
+				"observedAt"
+			]
+		},
+		"QuiesceRequest": {
+			"type": "object",
+			"properties": {
+				"operationId": {
+					"type": "string"
+				},
+				"attempt": {
+					"type": "number"
+				},
+				"epoch": {
+					"type": "number"
+				},
+				"instanceId": {
+					"type": "string"
+				},
+				"sessionId": {
+					"type": "string"
+				},
+				"deadline": {
+					"type": "number"
+				},
+				"completeness": {
+					"enum": [
+						"strict",
+						"attested"
+					],
+					"type": "string",
+					"description": "`quiesce-exit/2`: `strict` also requires complete owned-work coverage; `attested` counts only. Omitted: `quiesce-exit/1`, counts only."
+				}
+			},
+			"required": [
+				"operationId",
+				"attempt",
+				"epoch",
+				"instanceId",
+				"sessionId",
+				"deadline"
+			]
+		},
+		"QuiesceRefusalReason": {
+			"enum": [
+				"invalid_request",
+				"invocation_mismatch",
+				"session_mismatch",
+				"stale_attempt",
+				"admission_closed",
+				"deadline_expired",
+				"epoch_mismatch",
+				"work_active",
+				"completeness_unknown",
+				"attestation_unavailable"
+			],
+			"type": "string"
+		},
+		"TerminalAttestation": {
+			"type": "object",
+			"properties": {
+				"version": {
+					"type": "number",
+					"description": "Terminal attestation format version; currently 1."
+				},
+				"kind": {
+					"enum": [
+						"quiesce",
+						"hangup"
+					],
+					"type": "string"
+				},
+				"session": {
+					"$ref": "#/$defs/AttestedSessionIdentity"
+				},
+				"invocation": {
+					"$ref": "#/$defs/InvocationIdentity"
+				},
+				"instanceId": {
+					"type": "string"
+				},
+				"epoch": {
+					"type": "number"
+				},
+				"counts": {
+					"$ref": "#/$defs/WorkCounts"
+				},
+				"interrupted": {
+					"type": "boolean"
+				},
+				"registryComplete": {
+					"type": "boolean"
+				},
+				"registryPath": {
+					"anyOf": [
+						{
+							"type": "string"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"ownerScan": {
+					"anyOf": [
+						{
+							"$ref": "#/$defs/OwnerScanSummary"
+						},
+						{
+							"type": "null"
+						}
+					]
+				},
+				"writtenAt": {
+					"type": "string"
+				},
+				"operationId": {
+					"type": "string"
+				},
+				"attempt": {
+					"type": "number"
+				},
+				"signal": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"version",
+				"kind",
+				"session",
+				"invocation",
+				"instanceId",
+				"epoch",
+				"counts",
+				"interrupted",
+				"registryComplete",
+				"registryPath",
+				"ownerScan",
+				"writtenAt"
+			]
+		},
+		"QuiesceSnapshot": {
+			"type": "object",
+			"properties": {
+				"epoch": {
+					"type": "number"
+				},
+				"counts": {
+					"$ref": "#/$defs/WorkCounts"
+				},
+				"observedAt": {
+					"type": "string"
+				},
+				"registry": {
+					"$ref": "#/$defs/OwnedJobRegistryState"
+				}
+			},
+			"required": [
+				"epoch",
+				"counts",
+				"observedAt"
+			]
+		},
+		"QuiescedResult": {
+			"type": "object",
+			"properties": {
+				"status": {
+					"const": "quiesced"
+				},
+				"operationId": {
+					"type": "string"
+				},
+				"attempt": {
+					"type": "number"
+				},
+				"attestation": {
+					"$ref": "#/$defs/TerminalAttestation"
+				},
+				"path": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"status",
+				"operationId",
+				"attempt",
+				"attestation",
+				"path"
+			]
+		},
+		"QuiesceRefusedResult": {
+			"type": "object",
+			"properties": {
+				"status": {
+					"const": "refused"
+				},
+				"operationId": {
+					"type": "string"
+				},
+				"attempt": {
+					"type": "number"
+				},
+				"reason": {
+					"$ref": "#/$defs/QuiesceRefusalReason"
+				},
+				"snapshot": {
+					"$ref": "#/$defs/QuiesceSnapshot"
+				}
+			},
+			"required": [
+				"status",
+				"operationId",
+				"attempt",
+				"reason",
+				"snapshot"
+			]
+		},
+		"QuiesceUnattestedResult": {
+			"type": "object",
+			"properties": {
+				"status": {
+					"const": "exit_unattested"
+				},
+				"operationId": {
+					"type": "string"
+				},
+				"attempt": {
+					"type": "number"
+				},
+				"reason": {
+					"const": "attestation_unavailable"
+				},
+				"error": {
+					"type": "string"
+				},
+				"snapshot": {
+					"$ref": "#/$defs/QuiesceSnapshot"
+				}
+			},
+			"required": [
+				"status",
+				"operationId",
+				"attempt",
+				"reason",
+				"error",
+				"snapshot"
+			]
+		},
+		"QuiesceResult": {
+			"anyOf": [
+				{
+					"$ref": "#/$defs/QuiescedResult"
+				},
+				{
+					"$ref": "#/$defs/QuiesceRefusedResult"
+				},
+				{
+					"$ref": "#/$defs/QuiesceUnattestedResult"
+				}
+			]
+		},
 		"QueueMode": {
 			"enum": [
 				"all",
@@ -2667,10 +3224,174 @@
 					],
 					"description": "Current goal mode; null when the session has no goal.",
 					"default": null
+				},
+				"capabilities": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"description": "Engine capabilities (for example `external-delivery/1`); same list as the ready frame.",
+					"default": []
+				},
+				"externalDeliveries": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/ExternalDeliveryListing"
+					},
+					"description": "External records held by the session: queued or accepted but unsettled.",
+					"default": []
 				}
 			},
 			"required": [
 				"sessionId"
+			]
+		},
+		"DeliveryMode": {
+			"enum": [
+				"aside",
+				"steer"
+			],
+			"type": "string",
+			"description": "`aside` never interrupts; `steer` forces the next turn."
+		},
+		"DeliveryMechanism": {
+			"enum": [
+				"wake",
+				"aside",
+				"steer-boundary"
+			],
+			"type": "string",
+			"description": "Scheduling branch an external record took before the loop admitted it."
+		},
+		"DeliveryOptions": {
+			"type": "object",
+			"properties": {
+				"mode": {
+					"$ref": "#/$defs/DeliveryMode"
+				},
+				"quiet": {
+					"type": "boolean",
+					"description": "Advisory: the deliverer expects a quiet completion."
+				},
+				"wakeAfterInterrupt": {
+					"type": "boolean",
+					"description": "Idle after an operator interrupt still wakes (the latch stays set)."
+				},
+				"wakeInPlanMode": {
+					"type": "boolean",
+					"description": "Idle in plan mode still wakes."
+				}
+			},
+			"required": [
+				"mode"
+			],
+			"x-open": true
+		},
+		"DeliveryRecord": {
+			"type": "object",
+			"properties": {
+				"customType": {
+					"type": "string"
+				},
+				"content": {
+					"$ref": "#/$defs/MessageContent"
+				},
+				"details": {
+					"type": "object",
+					"properties": {},
+					"additionalProperties": {},
+					"description": "Must carry `\"omp.llm\"` (`{ role: \"user\", content }`, the provider view) and `\"omp.llm.source\"`."
+				},
+				"display": {
+					"type": "boolean"
+				}
+			},
+			"required": [
+				"customType",
+				"content",
+				"details"
+			],
+			"description": "Custom message payload delivered by `deliver`; it enters context only through the loop's admission.",
+			"x-open": true
+		},
+		"ExternalDeliveryListing": {
+			"type": "object",
+			"properties": {
+				"deliveryId": {
+					"type": "string"
+				},
+				"state": {
+					"enum": [
+						"queued",
+						"accepted"
+					],
+					"type": "string"
+				},
+				"mode": {
+					"$ref": "#/$defs/DeliveryMode"
+				}
+			},
+			"required": [
+				"deliveryId",
+				"state",
+				"mode"
+			]
+		},
+		"DeliveryAcceptance": {
+			"type": "object",
+			"properties": {
+				"at": {
+					"type": "number"
+				},
+				"mode": {
+					"$ref": "#/$defs/DeliveryMode"
+				},
+				"mechanism": {
+					"$ref": "#/$defs/DeliveryMechanism"
+				}
+			},
+			"required": [
+				"at",
+				"mode",
+				"mechanism"
+			]
+		},
+		"DeliverySettlement": {
+			"type": "object",
+			"properties": {
+				"outcome": {
+					"enum": [
+						"quiet",
+						"text",
+						"refused",
+						"error",
+						"aborted"
+					],
+					"type": "string"
+				},
+				"included": {
+					"type": "boolean",
+					"description": "Exactly one stamped projection reached a completed main request."
+				},
+				"requests": {
+					"type": "integer",
+					"description": "Main provider requests observed while the record was in context."
+				},
+				"sole": {
+					"type": "boolean",
+					"description": "No other admitted input joined the owning evaluation."
+				},
+				"interactive": {
+					"type": "boolean",
+					"description": "An interactive input joined the owning evaluation."
+				}
+			},
+			"required": [
+				"outcome",
+				"included",
+				"requests",
+				"sole",
+				"interactive"
 			]
 		},
 		"BashResult": {
@@ -4295,12 +5016,126 @@
 				},
 				"maxReassembledFrameBytes": {
 					"type": "integer"
+				},
+				"capabilities": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"description": "Versioned engine capabilities (`name/major`) the host may rely on; same list as `get_state.capabilities`."
 				}
 			},
 			"required": [
 				"type"
 			],
 			"description": "First frame after startup; transport fields are absent on servers without protocol v2."
+		},
+		"DeliveryAcceptedEvent": {
+			"type": "object",
+			"properties": {
+				"type": {
+					"const": "delivery_accepted"
+				},
+				"deliveryId": {
+					"type": "string"
+				},
+				"at": {
+					"type": "number"
+				},
+				"mode": {
+					"$ref": "#/$defs/DeliveryMode"
+				},
+				"mechanism": {
+					"$ref": "#/$defs/DeliveryMechanism"
+				}
+			},
+			"required": [
+				"type",
+				"deliveryId",
+				"at",
+				"mode",
+				"mechanism"
+			],
+			"description": "The loop admitted a delivered record into context (never when a prompt merely resolves)."
+		},
+		"DeliverySettledEvent": {
+			"type": "object",
+			"properties": {
+				"type": {
+					"const": "delivery_settled"
+				},
+				"deliveryId": {
+					"type": "string"
+				},
+				"outcome": {
+					"enum": [
+						"quiet",
+						"text",
+						"refused",
+						"error",
+						"aborted"
+					],
+					"type": "string"
+				},
+				"included": {
+					"type": "boolean"
+				},
+				"requests": {
+					"type": "integer"
+				},
+				"sole": {
+					"type": "boolean"
+				},
+				"interactive": {
+					"type": "boolean"
+				}
+			},
+			"required": [
+				"type",
+				"deliveryId",
+				"outcome",
+				"included",
+				"requests",
+				"sole",
+				"interactive"
+			],
+			"description": "The evaluation an accepted record joined settled; always after `delivery_accepted`."
+		},
+		"DeliveryDiscardedEvent": {
+			"type": "object",
+			"properties": {
+				"type": {
+					"const": "delivery_discarded"
+				},
+				"deliveryId": {
+					"type": "string"
+				},
+				"reason": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"type",
+				"deliveryId",
+				"reason"
+			],
+			"description": "A never-accepted record was dropped at a committed session transition or disposal."
+		},
+		"DeliveryCancelledEvent": {
+			"type": "object",
+			"properties": {
+				"type": {
+					"const": "delivery_cancelled"
+				},
+				"deliveryId": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"type",
+				"deliveryId"
+			],
+			"description": "`cancel_delivery` withdrew a still-queued record."
 		},
 		"PromptStatus": {
 			"enum": [
@@ -4357,6 +5192,21 @@
 				},
 				"error": {
 					"$ref": "#/$defs/PromptError"
+				},
+				"run": {
+					"type": "integer",
+					"description": "`reply-attribution/1`: engine-local ordinal of the run whose yield answered the prompt; shared by prompts answered together."
+				},
+				"promptEntryId": {
+					"type": "string",
+					"description": "Session entry id of the prompt's persisted user message, when identified."
+				},
+				"replyEntryIds": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"description": "Assistant entries that followed the prompt's user message, in order; the last is the reply. Present whenever `run` is."
 				}
 			},
 			"required": [
@@ -4875,6 +5725,10 @@
 						"$ref": "#/$defs/SelectOptionDetail"
 					}
 				},
+				"approval": {
+					"$ref": "#/$defs/ToolApprovalBinding",
+					"description": "Tool-approval selects only (`tool-approval-binding/1`)."
+				},
 				"timeout": {
 					"type": "integer"
 				}
@@ -4886,6 +5740,29 @@
 				"title",
 				"options"
 			]
+		},
+		"ToolApprovalBinding": {
+			"type": "object",
+			"properties": {
+				"toolCallId": {
+					"type": "string"
+				},
+				"toolName": {
+					"type": "string"
+				},
+				"arguments": {
+					"description": "The arguments the approval policy evaluated."
+				},
+				"reason": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"toolCallId",
+				"toolName",
+				"arguments"
+			],
+			"description": "The exact tool call a tool-approval dialog decides; `(toolCallId, toolName)` identifies the decision."
 		},
 		"ConfirmUiRequest": {
 			"type": "object",
@@ -4992,6 +5869,10 @@
 					"items": {
 						"$ref": "#/$defs/AskQuestion"
 					}
+				},
+				"acceptImages": {
+					"type": "boolean",
+					"description": "`rich-ask/2` opt-in only: answers may attach images."
 				},
 				"timeout": {
 					"type": "integer"
@@ -5244,6 +6125,24 @@
 				},
 				"customInput": {
 					"type": "string"
+				},
+				"customInputImages": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/ImageContent"
+					},
+					"description": "`rich-ask/2` with `acceptImages` only."
+				},
+				"note": {
+					"type": "string",
+					"description": "`rich-ask/2` only."
+				},
+				"noteImages": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/ImageContent"
+					},
+					"description": "`rich-ask/2` with `acceptImages` only."
 				}
 			},
 			"required": [
@@ -5338,6 +6237,26 @@
 			],
 			"description": "Answers an `ask` request: one `AskAnswer` per question, in question order."
 		},
+		"ChatUiResponse": {
+			"type": "object",
+			"properties": {
+				"type": {
+					"const": "extension_ui_response"
+				},
+				"id": {
+					"type": "string"
+				},
+				"chat": {
+					"const": true
+				}
+			},
+			"required": [
+				"type",
+				"id",
+				"chat"
+			],
+			"description": "`rich-ask/2` only: redirects an `ask` request to chat."
+		},
 		"ExtensionUiResponse": {
 			"anyOf": [
 				{
@@ -5351,6 +6270,9 @@
 				},
 				{
 					"$ref": "#/$defs/AnswersUiResponse"
+				},
+				{
+					"$ref": "#/$defs/ChatUiResponse"
 				}
 			],
 			"description": "Host reply to an extension UI request; variants share `type` and differ by their payload key."
@@ -5758,6 +6680,18 @@
 					"$ref": "#/$defs/RpcFrameErrorEvent"
 				},
 				{
+					"$ref": "#/$defs/DeliveryAcceptedEvent"
+				},
+				{
+					"$ref": "#/$defs/DeliverySettledEvent"
+				},
+				{
+					"$ref": "#/$defs/DeliveryDiscardedEvent"
+				},
+				{
+					"$ref": "#/$defs/DeliveryCancelledEvent"
+				},
+				{
 					"$ref": "#/$defs/RpcAgentEvent"
 				}
 			],
@@ -5776,6 +6710,21 @@
 				}
 			],
 			"description": "Any frame the server writes to stdout (after reassembling `rpc_chunk` sequences), discriminated by `type`."
+		},
+		"AttestParams": {
+			"type": "object",
+			"properties": {
+				"operationId": {
+					"type": "string"
+				},
+				"nonce": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"operationId",
+				"nonce"
+			]
 		},
 		"NegotiateProtocolParams": {
 			"type": "object",
@@ -5814,6 +6763,10 @@
 				},
 				"streamingBehavior": {
 					"$ref": "#/$defs/StreamingBehavior"
+				},
+				"literal": {
+					"type": "boolean",
+					"description": "`literal-input/1`: after input hooks, admit the text as plain user text (no command, template or mention expansion)."
 				}
 			},
 			"required": [
@@ -5832,6 +6785,10 @@
 						"$ref": "#/$defs/ImageContent"
 					},
 					"description": "Images attached to the message."
+				},
+				"literal": {
+					"type": "boolean",
+					"description": "`literal-input/1`: after input hooks, admit the text as plain user text (no command, template or mention expansion)."
 				}
 			},
 			"required": [
@@ -5850,6 +6807,10 @@
 						"$ref": "#/$defs/ImageContent"
 					},
 					"description": "Images attached to the message."
+				},
+				"literal": {
+					"type": "boolean",
+					"description": "`literal-input/1`: after input hooks, admit the text as plain user text (no command, template or mention expansion)."
 				}
 			},
 			"required": [
@@ -5894,6 +6855,10 @@
 						"$ref": "#/$defs/ImageContent"
 					},
 					"description": "Images attached to the message."
+				},
+				"literal": {
+					"type": "boolean",
+					"description": "`literal-input/1`: after input hooks, admit the text as plain user text (no command, template or mention expansion)."
 				}
 			},
 			"required": [
@@ -5923,6 +6888,43 @@
 			},
 			"required": [
 				"sessionDir"
+			]
+		},
+		"DeliverParams": {
+			"type": "object",
+			"properties": {
+				"record": {
+					"$ref": "#/$defs/DeliveryRecord"
+				},
+				"options": {
+					"$ref": "#/$defs/DeliveryOptions"
+				}
+			},
+			"required": [
+				"record",
+				"options"
+			]
+		},
+		"DeliverResult": {
+			"type": "object",
+			"properties": {
+				"deliveryId": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"deliveryId"
+			]
+		},
+		"CancelDeliveryParams": {
+			"type": "object",
+			"properties": {
+				"deliveryId": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"deliveryId"
 			]
 		},
 		"SetFastModeParams": {
@@ -5980,6 +6982,10 @@
 			"properties": {
 				"enabled": {
 					"type": "boolean"
+				},
+				"rich": {
+					"type": "boolean",
+					"description": "Also opt in to `rich-ask/2` (`--mode rpc-ui` only)."
 				}
 			},
 			"required": [
@@ -5991,6 +6997,10 @@
 			"properties": {
 				"enabled": {
 					"type": "boolean"
+				},
+				"rich": {
+					"type": "boolean",
+					"description": "Whether `rich-ask/2` is active; present only when `rich` was requested."
 				}
 			},
 			"required": [

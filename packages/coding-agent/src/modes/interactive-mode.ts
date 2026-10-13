@@ -136,6 +136,7 @@ import { setWordPredictionHost } from "@oh-my-pi/pi-tui/prompt/word-completion";
 import { USER_INTERRUPT_LABEL } from "../session/messages";
 import { resolveMarkdownLinkHrefs } from "../internal-urls/hyperlink-targets";
 import type { ResolveContext } from "../internal-urls/index";
+import { type GoalContinuationReservation, QUIESCE_EXIT_DEADLINE_MS } from "../session/quiescence";
 import { modelMentionDisplayName } from "@oh-my-pi/pi-tui/prompt/model-mention-syntax";
 import { modelMentionChipLabel, shiftImageMarkers } from "@oh-my-pi/pi-tui/prompt/composer-attachments";
 import type { SessionContext } from "../session/session-context";
@@ -392,7 +393,7 @@ import { cfgWorktreeOnExit, cfgWorktreeOnStart } from "../task/settings";
 import { cfgExpandThinkingBlocks, cfgProseOnlyThinking } from "../session/settings";
 import { cfgHideThinkingBlock } from "../session/settings";
 import { cfgCycleOrder, cfgModelRoles } from "../config/model-settings";
-import { cfgGoalContinuationModes, cfgGoalEnabled } from "../goals/settings";
+import { cfgGoalContinuationModes, cfgGoalEnabled, cfgGoalToolDefault } from "../goals/settings";
 import { goalContinuationActivity, goalFromModeData } from "../goals/state";
 import { cfgPlanDefaultOnStartup, cfgPlanEnabled } from "../plan-mode/settings";
 import { cfgStreamRedactPatterns } from "../stream/settings";
@@ -1465,6 +1466,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * escape hatch: exit without writing the session log.
 	 */
 	#teardownFailed = false;
+	/** A passed quiesce requested exit: the process must end even if teardown fails. */
+	#exitAfterQuiesce: number | undefined;
 	/** True once a graceful `shutdown()` teardown failed at the memoized
 	 *  dispose stage. Surfaced to the input controller so the next single
 	 *  Ctrl+C skips the double-tap gate and runs `shutdown()` — which
@@ -1515,6 +1518,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	#headerAfter: readonly Component[] = [];
 	#planModePreviousToolPresentation: { enabled: string[]; mounted: string[] } | undefined;
 	#goalModePreviousTools: string[] | undefined;
+	/** Whether `goal` was in the launch tool set (`--tools=...,goal`), read once at {@link init}. */
+	#goalToolInitiallyEnabled = false;
 	// True from `/guided-goal` kickoff until the interview ends: a goal record
 	// appears, a turn makes tool calls (the interview itself is tool-free, so
 	// tool use means it was abandoned for real work), the kickoff fails, or the
@@ -1538,6 +1543,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	#vibeSkillInFlight = 0;
 	#vibeScopeSuspendedForSwitch = false;
 	#goalContinuationTimer: NodeJS.Timeout | undefined;
+	/** Counts the scheduled continuation as pending session work until it is submitted or dropped. */
+	#goalContinuationReservation: GoalContinuationReservation | undefined;
 	/** Submitted continuation turns awaiting their asynchronously delivered `agent_end`. */
 	#pendingGoalContinuationTurns = 0;
 	#previousGoalContinuationActivity: string | undefined;
@@ -2049,6 +2056,9 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	async init(options: InteractiveModeInitOptions = {}): Promise<void> {
 		if (this.isInitialized) return;
+		// Read before any goal can add the tool, so a later exit can tell a requested
+		// `goal` tool (kept) from one goal mode added (removed again).
+		this.#goalToolInitiallyEnabled = this.session.getEnabledToolNames().includes("goal");
 
 		// Fresh dialog lifetime: a previous stop (if this mode is ever
 		// re-initialized) left the old controller aborted, and approvals queued
@@ -2072,7 +2082,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// signal arriving mid-Ctrl+C no-ops instead of racing a second dispose.
 		this.#signalTeardown = createSessionTeardown({
 			getDraftText: () => this.#inputController.getDraftText(),
-			beginDispose: () => this.session.beginDispose(),
+			beginDispose: reason => this.session.beginDispose(reason),
 			saveDraft: text => this.sessionManager.saveDraft(text),
 			disposeSession: async reason => {
 				await this.#btwController.dispose();
@@ -2088,6 +2098,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		// after the AgentSession constructor's `agent-session:<id>` recorder) runs
 		// FIRST and its dispose() would otherwise persist the generic "dispose".
 		this.#cleanupUnsubscribe = postmortem.register("session-teardown", reason => this.#signalTeardown!(reason));
+		// Host-owned pending work the session cannot see: a submitted editor input not yet
+		// dispatched. (A scheduled goal continuation holds a session reservation instead.)
+		this.session.registerWorkSource({ kind: "queuedInput", count: () => (this.hasPendingSubmission() ? 1 : 0) });
 
 		// Wire the report_tool_issue consent gate to the Yes/No dialog popup.
 		// The handler is process-global — subagent tools (which can't reach
@@ -2860,8 +2873,15 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (!state?.enabled || state.goal.status !== "active") return;
 		const prompt = this.session.goalRuntime.buildContinuationPrompt();
 		if (!prompt) return;
+		// Refused while admission is closed (the session is exiting).
+		const reservation = this.session.reserveGoalContinuation();
+		if (!reservation) return;
+		this.#goalContinuationReservation = reservation;
 		this.#goalContinuationTimer = setTimeout(() => {
 			this.#goalContinuationTimer = undefined;
+			this.#goalContinuationReservation = undefined;
+			// Released in the same step as the submission below admits it (or the tick drops).
+			reservation.release();
 			if (!this.onInputCallback) return;
 			if (!this.goalModeEnabled || this.goalModePaused) return;
 			// The 800ms timer can outlive the idle window that scheduled it: a
@@ -2906,6 +2926,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			clearTimeout(this.#goalContinuationTimer);
 			this.#goalContinuationTimer = undefined;
 		}
+		this.#goalContinuationReservation?.release();
+		this.#goalContinuationReservation = undefined;
 	}
 
 	cancelGoalContinuation(): void {
@@ -4600,6 +4622,13 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#vibeScopeSuspendedForSwitch = true;
 	}
 
+	#previousGoalTools(): string[] {
+		const tools = this.session.getEnabledToolNames();
+		return cfgGoalToolDefault.get(this.session.settings) || this.#goalToolInitiallyEnabled
+			? tools
+			: tools.filter(name => name !== "goal");
+	}
+
 	#updateGoalModeStatus(): void {
 		const status =
 			this.goalModeEnabled || this.goalModePaused
@@ -4632,6 +4661,9 @@ export class InteractiveMode implements InteractiveModeContext {
 			return;
 		}
 		if (event.type === "goal_updated") {
+			if (event.state?.enabled && this.#goalModePreviousTools === undefined && !this.goalModeEnabled) {
+				this.#goalModePreviousTools = this.#previousGoalTools();
+			}
 			if (event.state) this.#guidedGoalInterviewActive = false;
 			// Handle drop before clearing goalModeEnabled so #exitGoalMode can
 			// still restore the previous tool set while the flag is true.
@@ -4884,10 +4916,10 @@ export class InteractiveMode implements InteractiveModeContext {
 			});
 			this.goalModeEnabled = restored?.enabled === true;
 			this.goalModePaused = restored?.enabled !== true && restored?.goal.status === "paused";
-			// sdk.ts excludes "goal" from the initial active tool set unconditionally.
-			// Re-add it now so the agent can call resume, complete, or drop on this goal.
+			// Restore the current toolset after the goal exits, retaining an opt-in
+			// goal tool if it was active before this goal was resumed.
 			if (restored?.goal) {
-				const previousTools = this.session.getEnabledToolNames().filter(name => name !== "goal");
+				const previousTools = this.#previousGoalTools();
 				this.#goalModePreviousTools = previousTools;
 				await this.session.setActiveToolsByName([...new Set([...previousTools, "goal"])]);
 			}
@@ -5174,7 +5206,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.showWarning("Exit vibe mode first.");
 			return;
 		}
-		const previousTools = this.session.getEnabledToolNames().filter(name => name !== "goal");
+		const previousTools = this.#previousGoalTools();
 		const goalTools = [...new Set([...previousTools, "goal"])];
 		this.#goalModePreviousTools = previousTools;
 		this.goalModePaused = false;
@@ -5202,7 +5234,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		reason?: "completed" | "paused" | "dropped";
 	}): Promise<void> {
 		const previousTools = this.#goalModePreviousTools;
-		if (this.goalModeEnabled && previousTools) {
+		if (previousTools) {
 			await this.session.setActiveToolsByName(previousTools);
 		}
 		const currentState = this.session.getGoalModeState();
@@ -6188,11 +6220,10 @@ export class InteractiveMode implements InteractiveModeContext {
 			}
 
 			// Expose the goal tool for the interview so the agent can finish by
-			// calling `goal create`. Record the pre-interview toolset first: the
-			// tool-driven create flips goalModeEnabled via `goal_updated`, and the
-			// eventual goal exit restores this set (dropping the goal tool again).
+			// calling `goal create`. Preserve the pre-interview toolset on exit,
+			// including an opt-in goal tool already active before the interview.
 			const enabledTools = this.session.getEnabledToolNames();
-			this.#goalModePreviousTools = enabledTools.filter(name => name !== "goal");
+			this.#goalModePreviousTools = this.#previousGoalTools();
 			if (!enabledTools.includes("goal")) {
 				await this.session.setActiveToolsByName([...enabledTools, "goal"]);
 			}
@@ -6886,10 +6917,49 @@ export class InteractiveMode implements InteractiveModeContext {
 			process.stderr.write(`\n${chalk.dim("Resume this session with")}\n${chalk.dim(resumeCommand(sessionId))}\n`);
 		}
 
-		await postmortem.quit(0);
+		await postmortem.quit(this.#exitAfterQuiesce ?? 0);
+	}
+
+	/** See {@link InteractiveModeContext.exitAfterQuiesce}. */
+	async exitAfterQuiesce(code: number): Promise<void> {
+		if (this.#exitAfterQuiesce !== undefined) return;
+		this.#exitAfterQuiesce = code;
+		// Whatever teardown does (hangs, or a restart in flight that would exec a new image),
+		// the process ends by this deadline.
+		setTimeout(() => {
+			logger.error("Exit after quiesce exceeded its deadline; exiting now", { code });
+			postmortem.exitProcess(code);
+		}, QUIESCE_EXIT_DEADLINE_MS);
+		// A shutdown or restart already in flight ends the process when its teardown settles
+		// (restart checks the flag instead of relaunching); on failure #handleTeardownError sees
+		// the flag and exits instead of leaving the process up.
+		if (this.#isShuttingDown) return;
+		this.#isShuttingDown = true;
+		let exitCode = code;
+		try {
+			await this.#teardown();
+		} catch (error) {
+			logger.error("Teardown after a quiesce failed; exiting anyway", { error: String(error) });
+			exitCode = 1;
+		}
+		await this.#forceQuit(exitCode);
+	}
+
+	async #forceQuit(code: number): Promise<void> {
+		try {
+			await postmortem.quit(code);
+		} catch {
+			// Extension/hook loading temporarily guards process.exit; bypass it for this host exit.
+			postmortem.exitProcess(code);
+		}
 	}
 
 	#handleTeardownError(action: "close" | "restart", error: unknown): void {
+		if (this.#exitAfterQuiesce !== undefined) {
+			logger.error("Teardown after a quiesce failed; exiting anyway", { action, error: String(error) });
+			void this.#forceQuit(1);
+			return;
+		}
 		this.#isShuttingDown = false;
 		const detail = error instanceof Error ? error.message : String(error);
 		// Arm the escape hatch only once dispose() has begun: its promise is
@@ -6948,7 +7018,12 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#handleTeardownError("restart", error);
 			return;
 		}
-
+		// A quiesce passed while this restart tore down: the session is attested as exited,
+		// so the process must end, not relaunch.
+		if (this.#exitAfterQuiesce !== undefined) {
+			await this.#forceQuit(this.#exitAfterQuiesce);
+			return;
+		}
 		const cmd = [...resolveCliEntryCmd(), ...restartArgv(process.argv.slice(2), this.#resumableSessionId())];
 		await postmortem.cleanup();
 		await postmortem.drainStdout();

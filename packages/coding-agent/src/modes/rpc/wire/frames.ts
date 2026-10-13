@@ -15,8 +15,42 @@ export const frameDefs = {
 			"supportedProtocolVersions?": "number.integer[]",
 			"maxFrameBytes?": "number.integer",
 			"maxReassembledFrameBytes?": "number.integer",
+			"capabilities?": doc(
+				"string[]",
+				"Versioned engine capabilities (`name/major`) the host may rely on; same list as `get_state.capabilities`.",
+			),
 		},
 		"First frame after startup; transport fields are absent on servers without protocol v2.",
+	),
+	DeliveryAcceptedEvent: doc(
+		{
+			type: "'delivery_accepted'",
+			deliveryId: "string",
+			at: "number",
+			mode: "DeliveryMode",
+			mechanism: "DeliveryMechanism",
+		},
+		"The loop admitted a delivered record into context (never when a prompt merely resolves).",
+	),
+	DeliverySettledEvent: doc(
+		{
+			type: "'delivery_settled'",
+			deliveryId: "string",
+			outcome: "'quiet' | 'text' | 'refused' | 'error' | 'aborted'",
+			included: "boolean",
+			requests: "number.integer",
+			sole: "boolean",
+			interactive: "boolean",
+		},
+		"The evaluation an accepted record joined settled; always after `delivery_accepted`.",
+	),
+	DeliveryDiscardedEvent: doc(
+		{ type: "'delivery_discarded'", deliveryId: "string", reason: "string" },
+		"A never-accepted record was dropped at a committed session transition or disposal.",
+	),
+	DeliveryCancelledEvent: doc(
+		{ type: "'delivery_cancelled'", deliveryId: "string" },
+		"`cancel_delivery` withdrew a still-queued record.",
 	),
 	PromptStatus: "'completed' | 'aborted' | 'error'",
 	PromptError: doc(
@@ -36,6 +70,15 @@ export const frameDefs = {
 			agentInvoked: "boolean",
 			status: "PromptStatus",
 			"error?": "PromptError",
+			"run?": doc(
+				"number.integer",
+				"`reply-attribution/1`: engine-local ordinal of the run whose yield answered the prompt; shared by prompts answered together.",
+			),
+			"promptEntryId?": doc("string", "Session entry id of the prompt's persisted user message, when identified."),
+			"replyEntryIds?": doc(
+				"string[]",
+				"Assistant entries that followed the prompt's user message, in order; the last is the reply. Present whenever `run` is.",
+			),
 			sessionSettled: doc(
 				"boolean",
 				"Nothing will wake the session again; when false a `session_settled` follows once background work drains.",
@@ -146,8 +189,18 @@ export const frameDefs = {
 		title: "string",
 		options: "string[]",
 		"optionDetails?": "SelectOptionDetail[]",
+		"approval?": doc("ToolApprovalBinding", "Tool-approval selects only (`tool-approval-binding/1`)."),
 		"timeout?": "number.integer",
 	},
+	ToolApprovalBinding: doc(
+		{
+			toolCallId: "string",
+			toolName: "string",
+			arguments: doc("unknown", "The arguments the approval policy evaluated."),
+			"reason?": "string",
+		},
+		"The exact tool call a tool-approval dialog decides; `(toolCallId, toolName)` identifies the decision.",
+	),
 	ConfirmUiRequest: {
 		type: UI,
 		id: "string",
@@ -173,7 +226,14 @@ export const frameDefs = {
 		"promptStyle?": "boolean",
 	},
 	AskUiRequest: doc(
-		{ type: UI, id: "string", method: "'ask'", questions: "AskQuestion[]", "timeout?": "number.integer" },
+		{
+			type: UI,
+			id: "string",
+			method: "'ask'",
+			questions: "AskQuestion[]",
+			"acceptImages?": doc("boolean", "`rich-ask/2` opt-in only: answers may attach images."),
+			"timeout?": "number.integer",
+		},
 		"Every question of one `ask` tool call; sent only after `set_ask_dialog` enables it.",
 	),
 	CancelUiRequest: doc(
@@ -217,7 +277,14 @@ export const frameDefs = {
 		"Extension UI request, discriminated by `method`.",
 	),
 	AskAnswer: doc(
-		{ id: "string", selectedOptions: "string[]", "customInput?": "string" },
+		{
+			id: "string",
+			selectedOptions: "string[]",
+			"customInput?": "string",
+			"customInputImages?": doc("ImageContent[]", "`rich-ask/2` with `acceptImages` only."),
+			"note?": doc("string", "`rich-ask/2` only."),
+			"noteImages?": doc("ImageContent[]", "`rich-ask/2` with `acceptImages` only."),
+		},
 		"Answer to one `ask` question: exact option labels, plus optional free text.",
 	),
 	ValueUiResponse: doc(
@@ -236,8 +303,12 @@ export const frameDefs = {
 		{ type: "'extension_ui_response'", id: "string", answers: "AskAnswer[]" },
 		"Answers an `ask` request: one `AskAnswer` per question, in question order.",
 	),
+	ChatUiResponse: doc(
+		{ type: "'extension_ui_response'", id: "string", chat: "true" },
+		"`rich-ask/2` only: redirects an `ask` request to chat.",
+	),
 	ExtensionUiResponse: doc(
-		"ValueUiResponse | ConfirmUiResponse | CancelUiResponse | AnswersUiResponse",
+		"ValueUiResponse | ConfirmUiResponse | CancelUiResponse | AnswersUiResponse | ChatUiResponse",
 		"Host reply to an extension UI request; variants share `type` and differ by their payload key.",
 	),
 

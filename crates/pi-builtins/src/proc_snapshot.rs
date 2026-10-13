@@ -117,15 +117,37 @@ pub mod sys {
 			.filter_map(|entry| entry.file_name().to_str()?.parse().ok())
 	}
 
+	/// Why `pidfd_open` gave no descriptor.
+	pub enum PidfdError {
+		/// No such process (`ESRCH`), or the pid names a thread rather than a
+		/// process (`EINVAL`).
+		NoProcess,
+		/// The call is unavailable or refused (`ENOSYS` on old kernels and under
+		/// sandboxes such as `OpenShell`'s seccomp filter, `EPERM` from a seccomp
+		/// or LSM policy) or out of descriptors: the process may exist, and is
+		/// pinned by start time instead.
+		Unavailable,
+	}
+
 	/// Opens a pidfd on whichever process holds `pid` now; callers pin identity
 	/// by re-checking [`start_time`] after the open.
 	pub fn open_pidfd(pid: i32) -> Option<OwnedFd> {
+		try_open_pidfd(pid).ok()
+	}
+
+	/// [`open_pidfd`], telling a missing process apart from missing pidfd
+	/// support.
+	pub fn try_open_pidfd(pid: i32) -> Result<OwnedFd, PidfdError> {
 		// SAFETY: pidfd_open takes scalar arguments and returns a new owned fd.
 		let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-		(fd >= 0).then(|| {
-			// SAFETY: a successful pidfd_open returned a uniquely owned descriptor.
-			unsafe { OwnedFd::from_raw_fd(fd as i32) }
-		})
+		if fd < 0 {
+			return Err(match std::io::Error::last_os_error().raw_os_error() {
+				Some(libc::ESRCH | libc::EINVAL) => PidfdError::NoProcess,
+				_ => PidfdError::Unavailable,
+			});
+		}
+		// SAFETY: a successful pidfd_open returned a uniquely owned descriptor.
+		Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
 	}
 
 	/// Sends `signal` through `pidfd`, which can never reach a recycled pid.
@@ -146,7 +168,7 @@ pub mod sys {
 	/// The fields of a `/proc/<pid>/stat` line from `state` (field 3) on. The
 	/// command name before them may itself contain spaces and parentheses, so
 	/// the split starts after the *last* `)`.
-	pub(crate) fn stat_fields(stat: &str) -> Option<SplitWhitespace<'_>> {
+	pub fn stat_fields(stat: &str) -> Option<SplitWhitespace<'_>> {
 		Some(stat[stat.rfind(')')? + 1..].split_whitespace())
 	}
 
@@ -183,7 +205,12 @@ pub mod sys {
 
 #[cfg(target_os = "linux")]
 mod proc_snapshot {
-	use std::{collections::HashMap, fs, os::fd::AsFd, time::Duration};
+	use std::{
+		collections::HashMap,
+		fs,
+		os::fd::{AsFd, OwnedFd},
+		time::Duration,
+	};
 
 	use super::{ProcessStatus, ThreadInfo, sys};
 
@@ -342,16 +369,36 @@ mod proc_snapshot {
 			}
 		}
 
+		/// Sends `signal` (with `queue` as `sigqueue` data) to this process only
+		/// while its pid still names the process this snapshot saw. Through a
+		/// pidfd where `pidfd_open` works; otherwise (kernels before 5.3, or a
+		/// seccomp sandbox that fails the call, as OpenShell's does with
+		/// `ENOSYS`) by pid, after re-checking the start time and refusing a
+		/// zombie, whose pid could be recycled the moment it is reaped.
 		pub fn signal(&self, signal: i32, queue: Option<i32>) -> bool {
 			let alive = || sys::start_time(self.pid) == Some(self.stat.start_time);
 			if signal == 0 {
 				return alive();
 			}
-			let Some(pidfd) = sys::open_pidfd(self.pid) else {
-				return false;
+			self.signal_through(sys::try_open_pidfd(self.pid), signal, queue)
+		}
+
+		fn signal_through(
+			&self,
+			pidfd: Result<OwnedFd, sys::PidfdError>,
+			signal: i32,
+			queue: Option<i32>,
+		) -> bool {
+			let pidfd = match pidfd {
+				Ok(pidfd) => Some(pidfd),
+				Err(sys::PidfdError::Unavailable) => None,
+				Err(sys::PidfdError::NoProcess) => return false,
 			};
-			if !alive() {
-				return false;
+			match read_stat(self.pid) {
+				Some(stat)
+					if stat.start_time == self.stat.start_time
+						&& (pidfd.is_some() || stat.state != 'Z') => {},
+				_ => return false,
 			}
 			if let Some(value) = queue {
 				let mut value_arg = libc::sigval { sival_ptr: std::ptr::null_mut() };
@@ -362,6 +409,10 @@ mod proc_snapshot {
 					return libc::sigqueue(self.pid, signal, value_arg) == 0;
 				}
 			}
+			let Some(pidfd) = pidfd else {
+				// SAFETY: `kill` takes integers by value and touches no caller memory.
+				return unsafe { libc::kill(self.pid, signal) } == 0;
+			};
 			sys::pidfd_send_signal(pidfd.as_fd(), signal)
 		}
 
@@ -387,6 +438,7 @@ mod proc_snapshot {
 			Some(self.stat.nice)
 		}
 	}
+
 
 	/// Lists every thread of each process, main thread first.
 	pub fn threads_by_pid(processes: &[ProcInfo]) -> HashMap<i32, Vec<ThreadInfo>> {
@@ -494,6 +546,62 @@ mod proc_snapshot {
 			.ok()
 			.filter(|v| *v > 0)
 	}
+
+	#[cfg(test)]
+	mod tests {
+		use std::{os::unix::process::ExitStatusExt as _, process::Command, time::Duration};
+
+		use super::{ProcInfo, read_stat, sys::PidfdError};
+
+		/// Without a pidfd a snapshot signals its process by pid, and only while
+		/// that pid still names the process it saw: never a pid whose start time
+		/// differs (a recycled pid), never a zombie.
+		#[test]
+		fn signals_without_pidfd_only_the_process_it_saw() {
+			let unavailable = || Err(PidfdError::Unavailable);
+			let mut child = Command::new("sleep")
+				.arg("7541")
+				.spawn()
+				.expect("spawn sleep");
+			let pid = i32::try_from(child.id()).expect("child pid fits in i32");
+			let mut recycled = ProcInfo::from_pid(pid).expect("snapshot of a live child");
+			recycled.stat.start_time += 1;
+			let delivered_to_recycled = recycled.signal_through(unavailable(), libc::SIGKILL, None);
+			std::thread::sleep(Duration::from_millis(50));
+			let survived = child.try_wait().expect("child status").is_none();
+			let current = ProcInfo::from_pid(pid).expect("snapshot of a live child");
+			let delivered = current.signal_through(unavailable(), libc::SIGTERM, None);
+			// Bounded: if nothing was delivered the sleep is killed here instead.
+			let deadline = std::time::Instant::now() + Duration::from_secs(5);
+			while child.try_wait().expect("child status").is_none()
+				&& std::time::Instant::now() < deadline
+			{
+				std::thread::sleep(Duration::from_millis(5));
+			}
+			let _ = child.kill();
+			let status = child.wait().expect("reap child");
+
+			let mut exits = Command::new("sleep")
+				.arg("7542")
+				.spawn()
+				.expect("spawn sleep");
+			let zombie = i32::try_from(exits.id()).expect("child pid fits in i32");
+			let snapshot = ProcInfo::from_pid(zombie).expect("snapshot of a live child");
+			exits.kill().expect("kill child");
+			let deadline = std::time::Instant::now() + Duration::from_secs(5);
+			while read_stat(zombie).is_some_and(|stat| stat.state != 'Z') {
+				assert!(std::time::Instant::now() < deadline, "child never became a zombie");
+				std::thread::sleep(Duration::from_millis(5));
+			}
+			let delivered_to_zombie = snapshot.signal_through(unavailable(), libc::SIGTERM, None);
+			let _ = exits.wait();
+
+			assert!(!delivered_to_recycled && survived, "a pid with another start time was signalled");
+			assert!(delivered, "the process the snapshot saw must be signalled");
+			assert_eq!(status.signal(), Some(libc::SIGTERM));
+			assert!(!delivered_to_zombie, "a zombie must never be signalled by pid");
+		}
+	}
 }
 
 /// macOS process primitives: libproc and `KERN_PROCARGS2`.
@@ -537,6 +645,13 @@ pub mod sys {
 		if pid <= 0 {
 			return None;
 		}
+		bsdinfo_with(pid, false).ok()
+	}
+
+	/// `PROC_PIDTBSDINFO` for `pid`; errors carry the errno. With `zombies` the
+	/// lookup also finds zombies (xnu's `findzomb`), which the plain one
+	/// reports as missing (`ESRCH`).
+	pub fn bsdinfo_with(pid: i32, zombies: bool) -> Result<libc::proc_bsdinfo, i32> {
 		// SAFETY: proc_bsdinfo is a C integer record valid when zeroed.
 		let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
 		// SAFETY: info is writable for the exact supplied size.
@@ -544,12 +659,43 @@ pub mod sys {
 			libc::proc_pidinfo(
 				pid,
 				libc::PROC_PIDTBSDINFO,
-				0,
+				u64::from(zombies),
 				(&raw mut info).cast(),
 				size_of::<libc::proc_bsdinfo>() as i32,
 			)
 		};
-		(actual >= size_of::<libc::proc_bsdinfo>() as i32).then_some(info)
+		if actual < size_of::<libc::proc_bsdinfo>() as i32 {
+			return Err(if actual <= 0 { last_errno() } else { libc::EIO });
+		}
+		Ok(info)
+	}
+
+	/// `PROC_PIDT_SHORTBSDINFO` for `pid`, zombies included; errors carry the
+	/// errno. Unlike [`bsdinfo`], the kernel answers it for other users'
+	/// processes too.
+	pub fn shortinfo(pid: i32) -> Result<libc::proc_bsdshortinfo, i32> {
+		// SAFETY: proc_bsdshortinfo is a C integer record valid when zeroed.
+		let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdshortinfo>() };
+		// SAFETY: info is writable for the exact supplied size.
+		let actual = unsafe {
+			libc::proc_pidinfo(
+				pid,
+				libc::PROC_PIDT_SHORTBSDINFO,
+				0,
+				(&raw mut info).cast(),
+				size_of::<libc::proc_bsdshortinfo>() as i32,
+			)
+		};
+		if actual < size_of::<libc::proc_bsdshortinfo>() as i32 {
+			return Err(if actual <= 0 { last_errno() } else { libc::EIO });
+		}
+		Ok(info)
+	}
+
+	fn last_errno() -> i32 {
+		std::io::Error::last_os_error()
+			.raw_os_error()
+			.unwrap_or(libc::EIO)
 	}
 
 	/// The executable path libproc reports for `pid`, read into `buffer`.
@@ -563,17 +709,33 @@ pub mod sys {
 
 	/// The argument vector of `pid` from `KERN_PROCARGS2`; empty when unreadable.
 	pub fn args(pid: i32) -> Vec<String> {
+		let mut buffer = Vec::new();
+		match procargs(pid, &mut buffer) {
+			Ok(len) => super::parse_procargs2(&buffer[..len]),
+			Err(_) => Vec::new(),
+		}
+	}
+
+	/// Reads the raw `KERN_PROCARGS2` block of `pid` into the front of `buffer`
+	/// (grown as needed, never shrunk, so a scan can reuse one allocation) and
+	/// returns its length. Errors carry the `sysctl` errno.
+	pub fn procargs(pid: i32, buffer: &mut Vec<u8>) -> Result<usize, i32> {
 		let mut mib = [libc::CTL_KERN, KERN_PROCARGS2, pid];
 		let mut size = 0usize;
 		// SAFETY: a null old-value buffer is the sysctl sizing form.
 		if unsafe {
 			libc::sysctl(mib.as_mut_ptr(), 3, ptr::null_mut(), &raw mut size, ptr::null_mut(), 0)
-		} != 0 || size <= size_of::<libc::c_int>()
+		} != 0
 		{
-			return Vec::new();
+			return Err(last_errno());
 		}
-		let mut buffer = vec![0u8; size];
-		// SAFETY: buffer is writable for size bytes.
+		if size <= size_of::<libc::c_int>() {
+			return Err(libc::EINVAL);
+		}
+		if buffer.len() < size {
+			buffer.resize(size, 0);
+		}
+		// SAFETY: buffer is writable for at least size bytes.
 		if unsafe {
 			libc::sysctl(
 				mib.as_mut_ptr(),
@@ -585,10 +747,9 @@ pub mod sys {
 			)
 		} != 0
 		{
-			return Vec::new();
+			return Err(last_errno());
 		}
-		buffer.truncate(size);
-		super::parse_procargs2(&buffer)
+		Ok(size)
 	}
 }
 

@@ -30,8 +30,24 @@ export interface RpcCommandSpec {
 }
 
 const IMAGES = doc("ImageContent[]", "Images attached to the message.");
+const LITERAL = doc(
+	"boolean",
+	"`literal-input/1`: after input hooks, admit the text as plain user text (no command, template or mention expansion).",
+);
 
 export const rpcCommands: readonly RpcCommandSpec[] = [
+	{
+		name: "attest",
+		doc: "Snapshot identity, activity epoch, work counts and owned-job registry soundness (`quiesce-exit/2`).",
+		params: { operationId: "string", nonce: "string" },
+		result: "WorkAttestation",
+	},
+	{
+		name: "quiesce_and_exit",
+		doc: "Close admission and exit with a terminal attestation if the attested state is unchanged; `quiesce-exit/2` takes `strict` or `attested` completeness; without it the request is `quiesce-exit/1` (counts only).",
+		params: "QuiesceRequest",
+		result: "QuiesceResult",
+	},
 	{
 		name: "negotiate_protocol",
 		doc: "Switch the connection to a protocol version advertised by `ready`.",
@@ -41,12 +57,20 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 	{
 		name: "prompt",
 		doc: "Submit a prompt; acknowledged once admitted, completed by its `prompt_result`.",
-		params: { message: "string", "images?": IMAGES, "streamingBehavior?": "StreamingBehavior" },
+		params: { message: "string", "images?": IMAGES, "streamingBehavior?": "StreamingBehavior", "literal?": LITERAL },
 		result: "PromptAck",
 		completion: "prompt_result",
 	},
-	{ name: "steer", doc: "Queue a steering message.", params: { message: "string", "images?": IMAGES } },
-	{ name: "follow_up", doc: "Queue a follow-up message.", params: { message: "string", "images?": IMAGES } },
+	{
+		name: "steer",
+		doc: "Queue a steering message.",
+		params: { message: "string", "images?": IMAGES, "literal?": LITERAL },
+	},
+	{
+		name: "follow_up",
+		doc: "Queue a follow-up message.",
+		params: { message: "string", "images?": IMAGES, "literal?": LITERAL },
+	},
 	{
 		name: "remove_queued_message",
 		doc: "Remove one pending queued message by its queue-chip text.",
@@ -63,7 +87,7 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 	{
 		name: "abort_and_prompt",
 		doc: "Abort the current run and submit a prompt; completed by its `prompt_result`.",
-		params: { message: "string", "images?": IMAGES },
+		params: { message: "string", "images?": IMAGES, "literal?": LITERAL },
 		completion: "prompt_result",
 	},
 	{
@@ -82,6 +106,19 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 		doc: "Continue the newest non-empty session in a directory, or start a fresh one there. Give provider and modelId together to override the saved model; otherwise an unavailable saved model fails the request.",
 		params: { sessionDir: "string", "provider?": "string", "modelId?": "string" },
 		result: "OpenSessionResult",
+	},
+	{
+		name: "deliver",
+		doc: "Deliver a directed external record (`external-delivery/1`); never parsed as a prompt. Receipts arrive as `delivery_*` frames keyed by the returned `deliveryId`.",
+		params: { record: "DeliveryRecord", options: "DeliveryOptions" },
+		result: { deliveryId: "string" },
+		unwrap: "deliveryId",
+	},
+	{
+		name: "cancel_delivery",
+		doc: "Cancel a still-queued external record; `cancelled` is false once it was accepted or retired.",
+		params: { deliveryId: "string" },
+		result: "CancellationResult",
 	},
 
 	{ name: "get_state", doc: "Snapshot the session state.", result: "SessionState" },
@@ -107,8 +144,14 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 	{
 		name: "set_ask_dialog",
 		doc: "Opt in to `ask` UI requests; returns the applied setting.",
-		params: { enabled: "boolean" },
-		result: { enabled: "boolean" },
+		params: {
+			enabled: "boolean",
+			"rich?": doc("boolean", "Also opt in to `rich-ask/2` (`--mode rpc-ui` only)."),
+		},
+		result: {
+			enabled: "boolean",
+			"rich?": doc("boolean", "Whether `rich-ask/2` is active; present only when `rich` was requested."),
+		},
 		unwrap: "enabled",
 	},
 	{

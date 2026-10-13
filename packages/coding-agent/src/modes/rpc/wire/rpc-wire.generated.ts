@@ -366,6 +366,132 @@ export interface ModelInfo {
 	compat?: Record<string, unknown>;
 }
 
+export interface WorkCounts {
+	streaming: number;
+	queuedInput: number;
+	asyncJobs: number;
+	subagents: number;
+	retainedJobs: number;
+	detachedJobs: number;
+	compacting: number;
+	handoff: number;
+	goalContinuationScheduled: number;
+	scheduledTurns: number;
+}
+
+export interface InvocationIdentity {
+	pid: number;
+	startId: string | null;
+	startTime: number | null;
+}
+
+export interface AttestedSessionIdentity {
+	id: string;
+	file: string | null;
+	size?: number | null;
+	sha256?: string | null;
+}
+
+export interface OpaqueOwnedProcess {
+	pid: number;
+	command: string;
+}
+
+export interface OwnerScanSummary {
+	supported: boolean;
+	sound: boolean;
+	scanned: number;
+	discovered: number;
+	opaque: OpaqueOwnedProcess[];
+}
+
+export interface OwnedJobRegistryState {
+	path: string | null;
+	complete: boolean;
+	ownerScan: OwnerScanSummary | null;
+}
+
+export interface WorkAttestation {
+	/** Attestation format version; currently 1. */
+	version: number;
+	operationId: string;
+	nonce: string;
+	epoch: number;
+	instanceId: string;
+	session: AttestedSessionIdentity;
+	invocation: InvocationIdentity;
+	counts: WorkCounts;
+	admission: "open" | "closed";
+	registry: OwnedJobRegistryState;
+	observedAt: string;
+}
+
+export interface QuiesceRequest {
+	operationId: string;
+	attempt: number;
+	epoch: number;
+	instanceId: string;
+	sessionId: string;
+	deadline: number;
+	/** `quiesce-exit/2`: `strict` also requires complete owned-work coverage; `attested` counts only. Omitted: `quiesce-exit/1`, counts only. */
+	completeness?: "strict" | "attested";
+}
+
+export type QuiesceRefusalReason = "invalid_request" | "invocation_mismatch" | "session_mismatch" | "stale_attempt" | "admission_closed" | "deadline_expired" | "epoch_mismatch" | "work_active" | "completeness_unknown" | "attestation_unavailable";
+
+export interface TerminalAttestation {
+	/** Terminal attestation format version; currently 1. */
+	version: number;
+	kind: "quiesce" | "hangup";
+	session: AttestedSessionIdentity;
+	invocation: InvocationIdentity;
+	instanceId: string;
+	epoch: number;
+	counts: WorkCounts;
+	interrupted: boolean;
+	registryComplete: boolean;
+	registryPath: string | null;
+	ownerScan: OwnerScanSummary | null;
+	writtenAt: string;
+	operationId?: string;
+	attempt?: number;
+	signal?: string;
+}
+
+export interface QuiesceSnapshot {
+	epoch: number;
+	counts: WorkCounts;
+	observedAt: string;
+	registry?: OwnedJobRegistryState;
+}
+
+export interface QuiescedResult {
+	status: "quiesced";
+	operationId: string;
+	attempt: number;
+	attestation: TerminalAttestation;
+	path: string;
+}
+
+export interface QuiesceRefusedResult {
+	status: "refused";
+	operationId: string;
+	attempt: number;
+	reason: QuiesceRefusalReason;
+	snapshot: QuiesceSnapshot;
+}
+
+export interface QuiesceUnattestedResult {
+	status: "exit_unattested";
+	operationId: string;
+	attempt: number;
+	reason: "attestation_unavailable";
+	error: string;
+	snapshot: QuiesceSnapshot;
+}
+
+export type QuiesceResult = QuiescedResult | QuiesceRefusedResult | QuiesceUnattestedResult;
+
 export type QueueMode = "all" | "one-at-a-time";
 
 export type InterruptMode = "immediate" | "wait";
@@ -516,6 +642,59 @@ export interface SessionState {
 	contextUsage?: ContextUsage;
 	/** Current goal mode; null when the session has no goal. */
 	goal?: GoalModeState | null;
+	/** Engine capabilities (for example `external-delivery/1`); same list as the ready frame. */
+	capabilities?: string[];
+	/** External records held by the session: queued or accepted but unsettled. */
+	externalDeliveries?: ExternalDeliveryListing[];
+}
+
+/** `aside` never interrupts; `steer` forces the next turn. */
+export type DeliveryMode = "aside" | "steer";
+
+/** Scheduling branch an external record took before the loop admitted it. */
+export type DeliveryMechanism = "wake" | "aside" | "steer-boundary";
+
+export interface DeliveryOptions {
+	mode: DeliveryMode;
+	/** Advisory: the deliverer expects a quiet completion. */
+	quiet?: boolean;
+	/** Idle after an operator interrupt still wakes (the latch stays set). */
+	wakeAfterInterrupt?: boolean;
+	/** Idle in plan mode still wakes. */
+	wakeInPlanMode?: boolean;
+}
+
+/** Custom message payload delivered by `deliver`; it enters context only through the loop's admission. */
+export interface DeliveryRecord {
+	customType: string;
+	content: MessageContent;
+	/** Must carry `"omp.llm"` (`{ role: "user", content }`, the provider view) and `"omp.llm.source"`. */
+	details: Record<string, unknown>;
+	display?: boolean;
+}
+
+export interface ExternalDeliveryListing {
+	deliveryId: string;
+	state: "queued" | "accepted";
+	mode: DeliveryMode;
+}
+
+export interface DeliveryAcceptance {
+	at: number;
+	mode: DeliveryMode;
+	mechanism: DeliveryMechanism;
+}
+
+export interface DeliverySettlement {
+	outcome: "quiet" | "text" | "refused" | "error" | "aborted";
+	/** Exactly one stamped projection reached a completed main request. */
+	included: boolean;
+	/** Main provider requests observed while the record was in context. */
+	requests: number;
+	/** No other admitted input joined the owning evaluation. */
+	sole: boolean;
+	/** An interactive input joined the owning evaluation. */
+	interactive: boolean;
 }
 
 export interface BashResult {
@@ -1001,6 +1180,41 @@ export interface ReadyEvent {
 	supportedProtocolVersions?: number[];
 	maxFrameBytes?: number;
 	maxReassembledFrameBytes?: number;
+	/** Versioned engine capabilities (`name/major`) the host may rely on; same list as `get_state.capabilities`. */
+	capabilities?: string[];
+}
+
+/** The loop admitted a delivered record into context (never when a prompt merely resolves). */
+export interface DeliveryAcceptedEvent {
+	type: "delivery_accepted";
+	deliveryId: string;
+	at: number;
+	mode: DeliveryMode;
+	mechanism: DeliveryMechanism;
+}
+
+/** The evaluation an accepted record joined settled; always after `delivery_accepted`. */
+export interface DeliverySettledEvent {
+	type: "delivery_settled";
+	deliveryId: string;
+	outcome: "quiet" | "text" | "refused" | "error" | "aborted";
+	included: boolean;
+	requests: number;
+	sole: boolean;
+	interactive: boolean;
+}
+
+/** A never-accepted record was dropped at a committed session transition or disposal. */
+export interface DeliveryDiscardedEvent {
+	type: "delivery_discarded";
+	deliveryId: string;
+	reason: string;
+}
+
+/** `cancel_delivery` withdrew a still-queued record. */
+export interface DeliveryCancelledEvent {
+	type: "delivery_cancelled";
+	deliveryId: string;
 }
 
 export type PromptStatus = "completed" | "aborted" | "error";
@@ -1024,6 +1238,12 @@ export interface PromptResultEvent {
 	sessionSettled: boolean;
 	id?: string;
 	error?: PromptError;
+	/** `reply-attribution/1`: engine-local ordinal of the run whose yield answered the prompt; shared by prompts answered together. */
+	run?: number;
+	/** Session entry id of the prompt's persisted user message, when identified. */
+	promptEntryId?: string;
+	/** Assistant entries that followed the prompt's user message, in order; the last is the reply. Present whenever `run` is. */
+	replyEntryIds?: string[];
 }
 
 /** The session went quiet: the last run yielded and no background work can wake it. */
@@ -1197,7 +1417,18 @@ export interface SelectUiRequest {
 	title: string;
 	options: string[];
 	optionDetails?: SelectOptionDetail[];
+	/** Tool-approval selects only (`tool-approval-binding/1`). */
+	approval?: ToolApprovalBinding;
 	timeout?: number;
+}
+
+/** The exact tool call a tool-approval dialog decides; `(toolCallId, toolName)` identifies the decision. */
+export interface ToolApprovalBinding {
+	toolCallId: string;
+	toolName: string;
+	/** The arguments the approval policy evaluated. */
+	arguments: unknown;
+	reason?: string;
 }
 
 export interface ConfirmUiRequest {
@@ -1233,6 +1464,8 @@ export interface AskUiRequest {
 	id: string;
 	method: "ask";
 	questions: AskQuestion[];
+	/** `rich-ask/2` opt-in only: answers may attach images. */
+	acceptImages?: boolean;
 	timeout?: number;
 }
 
@@ -1301,6 +1534,12 @@ export interface AskAnswer {
 	id: string;
 	selectedOptions: string[];
 	customInput?: string;
+	/** `rich-ask/2` with `acceptImages` only. */
+	customInputImages?: ImageContent[];
+	/** `rich-ask/2` only. */
+	note?: string;
+	/** `rich-ask/2` with `acceptImages` only. */
+	noteImages?: ImageContent[];
 }
 
 /** Answers a `select`, `input`, or `editor` request. */
@@ -1332,8 +1571,15 @@ export interface AnswersUiResponse {
 	answers: AskAnswer[];
 }
 
+/** `rich-ask/2` only: redirects an `ask` request to chat. */
+export interface ChatUiResponse {
+	type: "extension_ui_response";
+	id: string;
+	chat: true;
+}
+
 /** Host reply to an extension UI request; variants share `type` and differ by their payload key. */
-export type ExtensionUiResponse = ValueUiResponse | ConfirmUiResponse | CancelUiResponse | AnswersUiResponse;
+export type ExtensionUiResponse = ValueUiResponse | ConfirmUiResponse | CancelUiResponse | AnswersUiResponse | ChatUiResponse;
 
 export interface HostToolCallRequest {
 	type: "host_tool_call";
@@ -1444,10 +1690,15 @@ export interface HostUriSchemeDefinition {
 }
 
 /** Unsolicited outbound frame (everything except responses and host tool/URI requests), discriminated by `type`. */
-export type RpcNotification = ReadyEvent | PromptResultEvent | SessionSettledEvent | ExtensionError | ExtensionUiRequest | AvailableCommandsUpdateEvent | SubagentLifecycleEvent | SubagentProgressEvent | SubagentEvent | LivePhaseEvent | LiveLevelsEvent | LiveTranscriptEvent | LiveEndEvent | BtwDeltaEvent | BtwRecordEvent | CommandOutputEvent | SessionInfoUpdateEvent | ConfigUpdateEvent | RpcFrameErrorEvent | RpcAgentEvent;
+export type RpcNotification = ReadyEvent | PromptResultEvent | SessionSettledEvent | ExtensionError | ExtensionUiRequest | AvailableCommandsUpdateEvent | SubagentLifecycleEvent | SubagentProgressEvent | SubagentEvent | LivePhaseEvent | LiveLevelsEvent | LiveTranscriptEvent | LiveEndEvent | BtwDeltaEvent | BtwRecordEvent | CommandOutputEvent | SessionInfoUpdateEvent | ConfigUpdateEvent | RpcFrameErrorEvent | DeliveryAcceptedEvent | DeliverySettledEvent | DeliveryDiscardedEvent | DeliveryCancelledEvent | RpcAgentEvent;
 
 /** Any frame the server writes to stdout (after reassembling `rpc_chunk` sequences), discriminated by `type`. */
 export type RpcServerFrame = RpcResponse | RpcHostRequest | RpcNotification;
+
+export interface AttestParams {
+	operationId: string;
+	nonce: string;
+}
 
 export interface NegotiateProtocolParams {
 	protocolVersion: number;
@@ -1462,18 +1713,24 @@ export interface PromptParams {
 	/** Images attached to the message. */
 	images?: ImageContent[];
 	streamingBehavior?: StreamingBehavior;
+	/** `literal-input/1`: after input hooks, admit the text as plain user text (no command, template or mention expansion). */
+	literal?: boolean;
 }
 
 export interface SteerParams {
 	message: string;
 	/** Images attached to the message. */
 	images?: ImageContent[];
+	/** `literal-input/1`: after input hooks, admit the text as plain user text (no command, template or mention expansion). */
+	literal?: boolean;
 }
 
 export interface FollowUpParams {
 	message: string;
 	/** Images attached to the message. */
 	images?: ImageContent[];
+	/** `literal-input/1`: after input hooks, admit the text as plain user text (no command, template or mention expansion). */
+	literal?: boolean;
 }
 
 export interface RemoveQueuedMessageParams {
@@ -1489,6 +1746,8 @@ export interface AbortAndPromptParams {
 	message: string;
 	/** Images attached to the message. */
 	images?: ImageContent[];
+	/** `literal-input/1`: after input hooks, admit the text as plain user text (no command, template or mention expansion). */
+	literal?: boolean;
 }
 
 export interface NewSessionParams {
@@ -1499,6 +1758,19 @@ export interface OpenSessionParams {
 	sessionDir: string;
 	provider?: string;
 	modelId?: string;
+}
+
+export interface DeliverParams {
+	record: DeliveryRecord;
+	options: DeliveryOptions;
+}
+
+export interface DeliverResult {
+	deliveryId: string;
+}
+
+export interface CancelDeliveryParams {
+	deliveryId: string;
 }
 
 export interface SetFastModeParams {
@@ -1521,10 +1793,14 @@ export interface GoalParams {
 
 export interface SetAskDialogParams {
 	enabled: boolean;
+	/** Also opt in to `rich-ask/2` (`--mode rpc-ui` only). */
+	rich?: boolean;
 }
 
 export interface SetAskDialogResult {
 	enabled: boolean;
+	/** Whether `rich-ask/2` is active; present only when `rich` was requested. */
+	rich?: boolean;
 }
 
 export interface GetAvailableCommandsResult {
@@ -1785,6 +2061,8 @@ export interface GetBtwHistoryResult {
 
 /** Every RPC command's parameters and successful response `data`. */
 export interface RpcWireCommands {
+	attest: { params: AttestParams; result: WorkAttestation };
+	quiesce_and_exit: { params: QuiesceRequest; result: QuiesceResult };
 	negotiate_protocol: { params: NegotiateProtocolParams; result: NegotiateProtocolResult };
 	prompt: { params: PromptParams; result: PromptAck };
 	steer: { params: SteerParams; result: undefined };
@@ -1796,6 +2074,8 @@ export interface RpcWireCommands {
 	abort_and_restore_queue: { params: undefined; result: AbortAndRestoreQueueResult };
 	new_session: { params: NewSessionParams; result: CancellationResult };
 	open_session: { params: OpenSessionParams; result: OpenSessionResult };
+	deliver: { params: DeliverParams; result: DeliverResult };
+	cancel_delivery: { params: CancelDeliveryParams; result: CancellationResult };
 	get_state: { params: undefined; result: SessionState };
 	set_fast_mode: { params: SetFastModeParams; result: FastModeResult };
 	set_slow_mode: { params: SetSlowModeParams; result: SetSlowModeResult };
