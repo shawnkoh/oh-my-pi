@@ -62,6 +62,11 @@ _CONFIGURED_THINKING_LEVEL_VALUES: Final[frozenset[str]] = frozenset({"auto", "i
 _decode_configured_thinking_level = cast("Decoder[ConfiguredThinkingLevel]", literal(_CONFIGURED_THINKING_LEVEL_VALUES))
 
 
+QuiesceRefusalReason: TypeAlias = Literal["invalid_request", "invocation_mismatch", "session_mismatch", "stale_attempt", "admission_closed", "deadline_expired", "epoch_mismatch", "work_active", "completeness_unknown", "attestation_unavailable"]
+_QUIESCE_REFUSAL_REASON_VALUES: Final[frozenset[str]] = frozenset({"invalid_request", "invocation_mismatch", "session_mismatch", "stale_attempt", "admission_closed", "deadline_expired", "epoch_mismatch", "work_active", "completeness_unknown", "attestation_unavailable"})
+_decode_quiesce_refusal_reason = cast("Decoder[QuiesceRefusalReason]", literal(_QUIESCE_REFUSAL_REASON_VALUES))
+
+
 QueueMode: TypeAlias = Literal["all", "one-at-a-time"]
 _QUEUE_MODE_VALUES: Final[frozenset[str]] = frozenset({"all", "one-at-a-time"})
 _decode_queue_mode = cast("Decoder[QueueMode]", literal(_QUEUE_MODE_VALUES))
@@ -575,6 +580,129 @@ class ModelInfo:
     priority: int | None = None
     thinking: ThinkingConfig | None = None
     compat: JsonObject | None = None
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class WorkCounts:
+    streaming: float
+    queued_input: float
+    async_jobs: float
+    subagents: float
+    retained_jobs: float
+    detached_jobs: float
+    compacting: float
+    handoff: float
+    goal_continuation_scheduled: float
+    scheduled_turns: float
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class InvocationIdentity:
+    pid: float
+    start_id: str | None
+    start_time: float | None
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class AttestedSessionIdentity:
+    id: str
+    file: str | None
+    size: float | None = None
+    sha256: str | None = None
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class OpaqueOwnedProcess:
+    pid: float
+    command: str
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class OwnerScanSummary:
+    supported: bool
+    sound: bool
+    scanned: float
+    discovered: float
+    opaque: tuple[OpaqueOwnedProcess, ...]
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class OwnedJobRegistryState:
+    path: str | None
+    complete: bool
+    owner_scan: OwnerScanSummary | None
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class WorkAttestation:
+    version: float
+    """Attestation format version; currently 1."""
+    operation_id: str
+    nonce: str
+    epoch: float
+    instance_id: str
+    session: AttestedSessionIdentity
+    invocation: InvocationIdentity
+    counts: WorkCounts
+    admission: Literal["open", "closed"]
+    registry: OwnedJobRegistryState
+    observed_at: str
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class TerminalAttestation:
+    version: float
+    """Terminal attestation format version; currently 1."""
+    kind: Literal["quiesce", "hangup"]
+    session: AttestedSessionIdentity
+    invocation: InvocationIdentity
+    instance_id: str
+    epoch: float
+    counts: WorkCounts
+    interrupted: bool
+    registry_complete: bool
+    registry_path: str | None
+    owner_scan: OwnerScanSummary | None
+    written_at: str
+    operation_id: str | None = None
+    attempt: float | None = None
+    signal: str | None = None
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class QuiesceSnapshot:
+    epoch: float
+    counts: WorkCounts
+    observed_at: str
+    registry: OwnedJobRegistryState | None = None
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class QuiescedResult:
+    status: Literal["quiesced"] = "quiesced"
+    operation_id: str
+    attempt: float
+    attestation: TerminalAttestation
+    path: str
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class QuiesceRefusedResult:
+    status: Literal["refused"] = "refused"
+    operation_id: str
+    attempt: float
+    reason: QuiesceRefusalReason
+    snapshot: QuiesceSnapshot
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class QuiesceUnattestedResult:
+    status: Literal["exit_unattested"] = "exit_unattested"
+    operation_id: str
+    attempt: float
+    reason: Literal["attestation_unavailable"] = "attestation_unavailable"
+    error: str
+    snapshot: QuiesceSnapshot
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -1707,6 +1835,9 @@ AssistantMessageEvent: TypeAlias = AssistantStartEvent | AssistantTextStartEvent
 """Streaming update for one assistant message, discriminated by `type`."""
 
 
+QuiesceResult: TypeAlias = QuiescedResult | QuiesceRefusedResult | QuiesceUnattestedResult
+
+
 UsageLimitState: TypeAlias = UsageLimitLowPriority | UsageLimitWrapUp
 """Provider-neutral state of an account past its usage limit, discriminated by `stage`."""
 
@@ -1933,6 +2064,151 @@ def parse_model_info(value: object, path: str = "ModelInfo") -> ModelInfo:
         priority=optional(payload, "priority", decode_int, path),
         thinking=optional(payload, "thinking", parse_thinking_config, path),
         compat=optional(payload, "compat", decode_json_object, path),
+    )
+
+
+def parse_work_counts(value: object, path: str = "WorkCounts") -> WorkCounts:
+    payload = expect_object(value, path)
+    return WorkCounts(
+        streaming=required(payload, "streaming", decode_float, path),
+        queued_input=required(payload, "queuedInput", decode_float, path),
+        async_jobs=required(payload, "asyncJobs", decode_float, path),
+        subagents=required(payload, "subagents", decode_float, path),
+        retained_jobs=required(payload, "retainedJobs", decode_float, path),
+        detached_jobs=required(payload, "detachedJobs", decode_float, path),
+        compacting=required(payload, "compacting", decode_float, path),
+        handoff=required(payload, "handoff", decode_float, path),
+        goal_continuation_scheduled=required(payload, "goalContinuationScheduled", decode_float, path),
+        scheduled_turns=required(payload, "scheduledTurns", decode_float, path),
+    )
+
+
+def parse_invocation_identity(value: object, path: str = "InvocationIdentity") -> InvocationIdentity:
+    payload = expect_object(value, path)
+    return InvocationIdentity(
+        pid=required(payload, "pid", decode_float, path),
+        start_id=required(payload, "startId", nullable(decode_str), path),
+        start_time=required(payload, "startTime", nullable(decode_float), path),
+    )
+
+
+def parse_attested_session_identity(value: object, path: str = "AttestedSessionIdentity") -> AttestedSessionIdentity:
+    payload = expect_object(value, path)
+    return AttestedSessionIdentity(
+        id=required(payload, "id", decode_str, path),
+        file=required(payload, "file", nullable(decode_str), path),
+        size=optional(payload, "size", nullable(decode_float), path),
+        sha256=optional(payload, "sha256", nullable(decode_str), path),
+    )
+
+
+def parse_opaque_owned_process(value: object, path: str = "OpaqueOwnedProcess") -> OpaqueOwnedProcess:
+    payload = expect_object(value, path)
+    return OpaqueOwnedProcess(
+        pid=required(payload, "pid", decode_float, path),
+        command=required(payload, "command", decode_str, path),
+    )
+
+
+def parse_owner_scan_summary(value: object, path: str = "OwnerScanSummary") -> OwnerScanSummary:
+    payload = expect_object(value, path)
+    return OwnerScanSummary(
+        supported=required(payload, "supported", decode_bool, path),
+        sound=required(payload, "sound", decode_bool, path),
+        scanned=required(payload, "scanned", decode_float, path),
+        discovered=required(payload, "discovered", decode_float, path),
+        opaque=required(payload, "opaque", array(parse_opaque_owned_process), path),
+    )
+
+
+def parse_owned_job_registry_state(value: object, path: str = "OwnedJobRegistryState") -> OwnedJobRegistryState:
+    payload = expect_object(value, path)
+    return OwnedJobRegistryState(
+        path=required(payload, "path", nullable(decode_str), path),
+        complete=required(payload, "complete", decode_bool, path),
+        owner_scan=required(payload, "ownerScan", nullable(parse_owner_scan_summary), path),
+    )
+
+
+def parse_work_attestation(value: object, path: str = "WorkAttestation") -> WorkAttestation:
+    payload = expect_object(value, path)
+    return WorkAttestation(
+        version=required(payload, "version", decode_float, path),
+        operation_id=required(payload, "operationId", decode_str, path),
+        nonce=required(payload, "nonce", decode_str, path),
+        epoch=required(payload, "epoch", decode_float, path),
+        instance_id=required(payload, "instanceId", decode_str, path),
+        session=required(payload, "session", parse_attested_session_identity, path),
+        invocation=required(payload, "invocation", parse_invocation_identity, path),
+        counts=required(payload, "counts", parse_work_counts, path),
+        admission=required(payload, "admission", cast('Decoder[Literal["open", "closed"]]', literal(frozenset({"open", "closed"}))), path),
+        registry=required(payload, "registry", parse_owned_job_registry_state, path),
+        observed_at=required(payload, "observedAt", decode_str, path),
+    )
+
+
+def parse_terminal_attestation(value: object, path: str = "TerminalAttestation") -> TerminalAttestation:
+    payload = expect_object(value, path)
+    return TerminalAttestation(
+        version=required(payload, "version", decode_float, path),
+        kind=required(payload, "kind", cast('Decoder[Literal["quiesce", "hangup"]]', literal(frozenset({"quiesce", "hangup"}))), path),
+        session=required(payload, "session", parse_attested_session_identity, path),
+        invocation=required(payload, "invocation", parse_invocation_identity, path),
+        instance_id=required(payload, "instanceId", decode_str, path),
+        epoch=required(payload, "epoch", decode_float, path),
+        counts=required(payload, "counts", parse_work_counts, path),
+        interrupted=required(payload, "interrupted", decode_bool, path),
+        registry_complete=required(payload, "registryComplete", decode_bool, path),
+        registry_path=required(payload, "registryPath", nullable(decode_str), path),
+        owner_scan=required(payload, "ownerScan", nullable(parse_owner_scan_summary), path),
+        written_at=required(payload, "writtenAt", decode_str, path),
+        operation_id=optional(payload, "operationId", decode_str, path),
+        attempt=optional(payload, "attempt", decode_float, path),
+        signal=optional(payload, "signal", decode_str, path),
+    )
+
+
+def parse_quiesce_snapshot(value: object, path: str = "QuiesceSnapshot") -> QuiesceSnapshot:
+    payload = expect_object(value, path)
+    return QuiesceSnapshot(
+        epoch=required(payload, "epoch", decode_float, path),
+        counts=required(payload, "counts", parse_work_counts, path),
+        observed_at=required(payload, "observedAt", decode_str, path),
+        registry=optional(payload, "registry", parse_owned_job_registry_state, path),
+    )
+
+
+def parse_quiesced_result(value: object, path: str = "QuiescedResult") -> QuiescedResult:
+    payload = expect_object(value, path)
+    required(payload, "status", cast('Decoder[Literal["quiesced"]]', literal(frozenset({"quiesced"}))), path)
+    return QuiescedResult(
+        operation_id=required(payload, "operationId", decode_str, path),
+        attempt=required(payload, "attempt", decode_float, path),
+        attestation=required(payload, "attestation", parse_terminal_attestation, path),
+        path=required(payload, "path", decode_str, path),
+    )
+
+
+def parse_quiesce_refused_result(value: object, path: str = "QuiesceRefusedResult") -> QuiesceRefusedResult:
+    payload = expect_object(value, path)
+    required(payload, "status", cast('Decoder[Literal["refused"]]', literal(frozenset({"refused"}))), path)
+    return QuiesceRefusedResult(
+        operation_id=required(payload, "operationId", decode_str, path),
+        attempt=required(payload, "attempt", decode_float, path),
+        reason=required(payload, "reason", _decode_quiesce_refusal_reason, path),
+        snapshot=required(payload, "snapshot", parse_quiesce_snapshot, path),
+    )
+
+
+def parse_quiesce_unattested_result(value: object, path: str = "QuiesceUnattestedResult") -> QuiesceUnattestedResult:
+    payload = expect_object(value, path)
+    required(payload, "status", cast('Decoder[Literal["exit_unattested"]]', literal(frozenset({"exit_unattested"}))), path)
+    required(payload, "reason", cast('Decoder[Literal["attestation_unavailable"]]', literal(frozenset({"attestation_unavailable"}))), path)
+    return QuiesceUnattestedResult(
+        operation_id=required(payload, "operationId", decode_str, path),
+        attempt=required(payload, "attempt", decode_float, path),
+        error=required(payload, "error", decode_str, path),
+        snapshot=required(payload, "snapshot", parse_quiesce_snapshot, path),
     )
 
 
@@ -3186,6 +3462,10 @@ def parse_logout_result(value: object, path: str = "LogoutResult") -> LogoutResu
     )
 
 
+def parse_quiesce_result(value: object, path: str = "QuiesceResult") -> QuiesceResult:
+    return dispatch("status", _QUIESCE_RESULT_CASES)(value, path)
+
+
 def parse_usage_limit_state(value: object, path: str = "UsageLimitState") -> UsageLimitState:
     return dispatch("stage", _USAGE_LIMIT_STATE_CASES)(value, path)
 
@@ -3201,6 +3481,13 @@ def parse_notification(value: object, path: str = "notification") -> RpcNotifica
     if not isinstance(tag, str) or tag not in _RPC_NOTIFICATION_CASES:
         return UnknownNotification(decode_json_object(payload, path))
     return _RPC_NOTIFICATION_CASES[tag](payload, tag)
+
+
+_QUIESCE_RESULT_CASES: Final[dict[str, Decoder[QuiesceResult]]] = {
+        "quiesced": parse_quiesced_result,
+        "refused": parse_quiesce_refused_result,
+        "exit_unattested": parse_quiesce_unattested_result,
+}
 
 
 _USAGE_LIMIT_STATE_CASES: Final[dict[str, Decoder[UsageLimitState]]] = {
@@ -3312,6 +3599,25 @@ class WireClient:
 
     def _listen(self, frame_type: str, listener: Callable[..., None]) -> Callable[[], None]:
         raise NotImplementedError
+
+    def attest(self, operation_id: str, nonce: str) -> WorkAttestation:
+        """Snapshot identity, activity epoch, work counts and owned-job registry soundness (`quiesce-exit/2`)."""
+        params: dict[str, object] = {}
+        params["operationId"] = operation_id
+        params["nonce"] = nonce
+        return parse_work_attestation(self._command("attest", params), "attest")
+
+    def quiesce_and_exit(self, operation_id: str, completeness: Literal["strict", "attested"], attempt: float, epoch: float, instance_id: str, session_id: str, deadline: float) -> QuiesceResult:
+        """Close admission and exit with a terminal attestation if the attested state is unchanged; requires explicit `strict` or `attested` completeness."""
+        params: dict[str, object] = {}
+        params["operationId"] = operation_id
+        params["completeness"] = completeness
+        params["attempt"] = attempt
+        params["epoch"] = epoch
+        params["instanceId"] = instance_id
+        params["sessionId"] = session_id
+        params["deadline"] = deadline
+        return parse_quiesce_result(self._command("quiesce_and_exit", params), "quiesce_and_exit")
 
     def steer(self, message: str, *, images: Sequence[ImageContent] | None = None, literal: bool | None = None) -> None:
         """Queue a steering message."""
@@ -3968,6 +4274,7 @@ __all__ = [
     "AssistantToolCallDeltaEvent",
     "AssistantToolCallEndEvent",
     "AssistantToolCallStartEvent",
+    "AttestedSessionIdentity",
     "Attribution",
     "AutoCompactionAction",
     "AutoCompactionEndEvent",
@@ -4035,6 +4342,7 @@ __all__ = [
     "ImageContent",
     "InputUiRequest",
     "InterruptMode",
+    "InvocationIdentity",
     "IrcMessageEvent",
     "LiveEndEvent",
     "LiveLevelsEvent",
@@ -4059,8 +4367,11 @@ __all__ = [
     "NoticeEvent",
     "NotifyType",
     "NotifyUiRequest",
+    "OpaqueOwnedProcess",
     "OpenSessionResult",
     "OpenUrlUiRequest",
+    "OwnedJobRegistryState",
+    "OwnerScanSummary",
     "PromoteQueuedMessageResult",
     "PromptAck",
     "PromptError",
@@ -4071,6 +4382,12 @@ __all__ = [
     "QueueUpdateEvent",
     "QueuedMessageQueue",
     "QueuedMessagesState",
+    "QuiesceRefusalReason",
+    "QuiesceRefusedResult",
+    "QuiesceResult",
+    "QuiesceSnapshot",
+    "QuiesceUnattestedResult",
+    "QuiescedResult",
     "ReadyEvent",
     "RedactedThinkingContent",
     "RemoveQueuedMessageResult",
@@ -4110,6 +4427,7 @@ __all__ = [
     "SubagentSnapshot",
     "SubagentStatus",
     "SubagentSubscriptionLevel",
+    "TerminalAttestation",
     "TextContent",
     "ThinkingConfig",
     "ThinkingContent",
@@ -4142,6 +4460,8 @@ __all__ = [
     "UserContent",
     "UserMessage",
     "WidgetPlacement",
+    "WorkAttestation",
+    "WorkCounts",
     "parse_abort_and_restore_queue_result",
     "parse_advisor_cost_changed_event",
     "parse_advisor_yielded_event",
@@ -4169,6 +4489,7 @@ __all__ = [
     "parse_assistant_tool_call_delta_event",
     "parse_assistant_tool_call_end_event",
     "parse_assistant_tool_call_start_event",
+    "parse_attested_session_identity",
     "parse_auto_compaction_end_event",
     "parse_auto_compaction_start_event",
     "parse_auto_retry_end_event",
@@ -4221,6 +4542,7 @@ __all__ = [
     "parse_host_uri_scheme_definition",
     "parse_image_content",
     "parse_input_ui_request",
+    "parse_invocation_identity",
     "parse_irc_message_event",
     "parse_live_end_event",
     "parse_live_levels_event",
@@ -4241,8 +4563,11 @@ __all__ = [
     "parse_notice_event",
     "parse_notification",
     "parse_notify_ui_request",
+    "parse_opaque_owned_process",
     "parse_open_session_result",
     "parse_open_url_ui_request",
+    "parse_owned_job_registry_state",
+    "parse_owner_scan_summary",
     "parse_promote_queued_message_result",
     "parse_prompt_ack",
     "parse_prompt_error",
@@ -4250,6 +4575,11 @@ __all__ = [
     "parse_python_execution_message",
     "parse_queue_update_event",
     "parse_queued_messages_state",
+    "parse_quiesce_refused_result",
+    "parse_quiesce_result",
+    "parse_quiesce_snapshot",
+    "parse_quiesce_unattested_result",
+    "parse_quiesced_result",
     "parse_ready_event",
     "parse_redacted_thinking_content",
     "parse_remove_queued_message_result",
@@ -4281,6 +4611,7 @@ __all__ = [
     "parse_subagent_progress_event",
     "parse_subagent_progress_payload",
     "parse_subagent_snapshot",
+    "parse_terminal_attestation",
     "parse_text_content",
     "parse_thinking_config",
     "parse_thinking_content",
@@ -4309,4 +4640,6 @@ __all__ = [
     "parse_usage_limit_wrap_up",
     "parse_user_content",
     "parse_user_message",
+    "parse_work_attestation",
+    "parse_work_counts",
 ]

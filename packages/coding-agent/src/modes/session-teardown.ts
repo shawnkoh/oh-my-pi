@@ -19,8 +19,10 @@ export interface SessionTeardownDeps {
 	 * Synchronously mark the session as disposing before any awaited teardown
 	 * work. This closes the async gap where deferred jobs could otherwise start
 	 * after a signal requested shutdown but before `disposeSession()` begins.
+	 * Receives the teardown reason so a hang-up can be recorded before any state
+	 * is cleared.
 	 */
-	beginDispose: () => void;
+	beginDispose: (reason?: postmortem.Reason) => void;
 	/**
 	 * Persist the snapshotted draft. Called even for an empty string so a
 	 * previously-persisted draft sidecar is cleared on a clean exit.
@@ -67,7 +69,7 @@ export function createSessionTeardown(deps: SessionTeardownDeps): SessionTeardow
 	let pending: Promise<void> | undefined;
 	const run = async (reason?: postmortem.Reason): Promise<void> => {
 		const draftText = deps.getDraftText();
-		deps.beginDispose();
+		deps.beginDispose(reason);
 		try {
 			await deps.saveDraft(draftText);
 		} catch (err) {

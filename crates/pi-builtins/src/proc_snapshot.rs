@@ -146,7 +146,7 @@ pub mod sys {
 	/// The fields of a `/proc/<pid>/stat` line from `state` (field 3) on. The
 	/// command name before them may itself contain spaces and parentheses, so
 	/// the split starts after the *last* `)`.
-	pub(crate) fn stat_fields(stat: &str) -> Option<SplitWhitespace<'_>> {
+	pub fn stat_fields(stat: &str) -> Option<SplitWhitespace<'_>> {
 		Some(stat[stat.rfind(')')? + 1..].split_whitespace())
 	}
 
@@ -537,6 +537,13 @@ pub mod sys {
 		if pid <= 0 {
 			return None;
 		}
+		bsdinfo_with(pid, false).ok()
+	}
+
+	/// `PROC_PIDTBSDINFO` for `pid`; errors carry the errno. With `zombies` the
+	/// lookup also finds zombies (xnu's `findzomb`), which the plain one
+	/// reports as missing (`ESRCH`).
+	pub fn bsdinfo_with(pid: i32, zombies: bool) -> Result<libc::proc_bsdinfo, i32> {
 		// SAFETY: proc_bsdinfo is a C integer record valid when zeroed.
 		let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
 		// SAFETY: info is writable for the exact supplied size.
@@ -544,12 +551,43 @@ pub mod sys {
 			libc::proc_pidinfo(
 				pid,
 				libc::PROC_PIDTBSDINFO,
-				0,
+				u64::from(zombies),
 				(&raw mut info).cast(),
 				size_of::<libc::proc_bsdinfo>() as i32,
 			)
 		};
-		(actual >= size_of::<libc::proc_bsdinfo>() as i32).then_some(info)
+		if actual < size_of::<libc::proc_bsdinfo>() as i32 {
+			return Err(if actual <= 0 { last_errno() } else { libc::EIO });
+		}
+		Ok(info)
+	}
+
+	/// `PROC_PIDT_SHORTBSDINFO` for `pid`, zombies included; errors carry the
+	/// errno. Unlike [`bsdinfo`], the kernel answers it for other users'
+	/// processes too.
+	pub fn shortinfo(pid: i32) -> Result<libc::proc_bsdshortinfo, i32> {
+		// SAFETY: proc_bsdshortinfo is a C integer record valid when zeroed.
+		let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdshortinfo>() };
+		// SAFETY: info is writable for the exact supplied size.
+		let actual = unsafe {
+			libc::proc_pidinfo(
+				pid,
+				libc::PROC_PIDT_SHORTBSDINFO,
+				0,
+				(&raw mut info).cast(),
+				size_of::<libc::proc_bsdshortinfo>() as i32,
+			)
+		};
+		if actual < size_of::<libc::proc_bsdshortinfo>() as i32 {
+			return Err(if actual <= 0 { last_errno() } else { libc::EIO });
+		}
+		Ok(info)
+	}
+
+	fn last_errno() -> i32 {
+		std::io::Error::last_os_error()
+			.raw_os_error()
+			.unwrap_or(libc::EIO)
 	}
 
 	/// The executable path libproc reports for `pid`, read into `buffer`.
@@ -563,17 +601,33 @@ pub mod sys {
 
 	/// The argument vector of `pid` from `KERN_PROCARGS2`; empty when unreadable.
 	pub fn args(pid: i32) -> Vec<String> {
+		let mut buffer = Vec::new();
+		match procargs(pid, &mut buffer) {
+			Ok(len) => super::parse_procargs2(&buffer[..len]),
+			Err(_) => Vec::new(),
+		}
+	}
+
+	/// Reads the raw `KERN_PROCARGS2` block of `pid` into the front of `buffer`
+	/// (grown as needed, never shrunk, so a scan can reuse one allocation) and
+	/// returns its length. Errors carry the `sysctl` errno.
+	pub fn procargs(pid: i32, buffer: &mut Vec<u8>) -> Result<usize, i32> {
 		let mut mib = [libc::CTL_KERN, KERN_PROCARGS2, pid];
 		let mut size = 0usize;
 		// SAFETY: a null old-value buffer is the sysctl sizing form.
 		if unsafe {
 			libc::sysctl(mib.as_mut_ptr(), 3, ptr::null_mut(), &raw mut size, ptr::null_mut(), 0)
-		} != 0 || size <= size_of::<libc::c_int>()
+		} != 0
 		{
-			return Vec::new();
+			return Err(last_errno());
 		}
-		let mut buffer = vec![0u8; size];
-		// SAFETY: buffer is writable for size bytes.
+		if size <= size_of::<libc::c_int>() {
+			return Err(libc::EINVAL);
+		}
+		if buffer.len() < size {
+			buffer.resize(size, 0);
+		}
+		// SAFETY: buffer is writable for at least size bytes.
 		if unsafe {
 			libc::sysctl(
 				mib.as_mut_ptr(),
@@ -585,10 +639,9 @@ pub mod sys {
 			)
 		} != 0
 		{
-			return Vec::new();
+			return Err(last_errno());
 		}
-		buffer.truncate(size);
-		super::parse_procargs2(&buffer)
+		Ok(size)
 	}
 }
 
