@@ -141,6 +141,98 @@ describe.skipIf(process.platform === "win32")("Shell spawnedProcesses", () => {
 		expect(result.spawnedProcesses).toEqual([]);
 		expect(result.spawnedComplete).toBe(true);
 	});
+
+	it("finishes a run after the host itself spawned a subprocess", async () => {
+		// Without pidfd_open (OpenShell) a child is reaped on SIGCHLD; once Bun has spawned a
+		// process of its own that signal can be lost, and the run must still complete.
+		Bun.spawnSync(["/bin/sh", "-c", "true"]);
+		const result = await new Shell({}).run({ command: "/bin/sh -c 'exit 3'" });
+		expect(result.exitCode).toBe(3);
+	});
+
+	/**
+	 * A script that makes itself non-dumpable (its environment unreadable to us), then writes
+	 * its pid to the file named by its first argument and stays up.
+	 */
+	async function writeHiddenSleeper(dir: string): Promise<string> {
+		const script = path.join(dir, "hidden.ts");
+		await fs.writeFile(
+			script,
+			[
+				`import { dlopen, FFIType } from "bun:ffi";`,
+				`import { writeFileSync } from "node:fs";`,
+				`const libc = dlopen("libc.so.6", { prctl: { args: [FFIType.i32, FFIType.u64, FFIType.u64, FFIType.u64, FFIType.u64], returns: FFIType.i32 } });`,
+				"if (libc.symbols.prctl(4, 0, 0, 0, 0) !== 0) process.exit(3);",
+				"writeFileSync(process.argv[2], String(process.pid));",
+				"setInterval(() => {}, 1 << 30);",
+			].join("\n"),
+		);
+		return script;
+	}
+
+	async function waitForFile(file: string): Promise<number> {
+		const deadline = Date.now() + 10_000;
+		for (;;) {
+			const text = await fs.readFile(file, "utf8").catch(() => "");
+			if (text) return Number(text);
+			if (Date.now() > deadline) throw new Error(`${file} was never written`);
+			const { promise, resolve } = Promise.withResolvers<void>();
+			setTimeout(resolve, 10);
+			await promise;
+		}
+	}
+
+	it.skipIf(process.platform !== "linux")(
+		"stays complete next to an unrelated process whose environment it cannot read",
+		async () => {
+			const dir = await fs.mkdtemp(path.join(os.tmpdir(), "natives-unrelated-"));
+			const ready = path.join(dir, "pid");
+			const unrelated = Bun.spawn([process.execPath, await writeHiddenSleeper(dir), ready], {
+				stdio: ["ignore", "ignore", "inherit"],
+			});
+			try {
+				expect(await waitForFile(ready)).toBe(unrelated.pid);
+				const { result, bang } = await runWithBang(
+					'/bin/sh -c \'/bin/sleep 7471 >/dev/null 2>&1 & printf "bang=%s\\n" "$!"\'',
+				);
+				const spawned = result.spawnedProcesses ?? [];
+				try {
+					expect(result.spawnedComplete).toBe(true);
+					expect(spawned.map(entry => entry.pid)).toEqual([bang]);
+				} finally {
+					killReported(spawned.map(entry => entry.pid));
+				}
+			} finally {
+				unrelated.kill("SIGKILL");
+				await unrelated.exited;
+				await fs.rm(dir, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(process.platform !== "linux")(
+		"reports a process left in the run's group with its identity even when its environment is unreadable",
+		async () => {
+			const dir = await fs.mkdtemp(path.join(os.tmpdir(), "natives-member-"));
+			const script = await writeHiddenSleeper(dir);
+			const ready = path.join(dir, "pid");
+			// The sh waits until its child is non-dumpable, then exits, leaving it in the group.
+			const { result, bang } = await runWithBang(
+				`/bin/sh -c '${process.execPath} ${script} ${ready} >/dev/null 2>&1 & ` +
+					`while [ ! -s ${ready} ]; do sleep 0.01; done; printf "bang=%s\\n" "$!"'`,
+			);
+			const spawned = result.spawnedProcesses ?? [];
+			try {
+				expect(result.spawnedComplete).toBe(true);
+				const member = spawned.find(entry => entry.pid === bang);
+				expect(member?.groupMember).toBe(true);
+				expect(member?.startId).toBe(processIdentity(bang).startId!);
+			} finally {
+				killReported(spawned.map(entry => entry.pid));
+				await fs.rm(dir, { recursive: true, force: true });
+			}
+		},
+	);
 });
 
 describe.skipIf(process.platform === "win32")("processIdentity", () => {

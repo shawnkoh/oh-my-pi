@@ -2667,7 +2667,6 @@ pub struct WorkAttestation {
 pub struct QuiesceRequest {
 	#[serde(rename = "operationId")]
 	pub operation_id: String,
-	pub completeness: QuiesceRequestCompleteness,
 	pub attempt: f64,
 	pub epoch: f64,
 	#[serde(rename = "instanceId")]
@@ -2675,6 +2674,9 @@ pub struct QuiesceRequest {
 	#[serde(rename = "sessionId")]
 	pub session_id: String,
 	pub deadline: f64,
+	/// `quiesce-exit/2`: `strict` also requires complete owned-work coverage; `attested` counts only. Omitted: `quiesce-exit/1`, counts only.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub completeness: Option<QuiesceRequestCompleteness>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -6621,12 +6623,11 @@ impl Command for AttestCommand {
 	}
 }
 
-/// Close admission and exit with a terminal attestation if the attested state is unchanged; requires explicit `strict` or `attested` completeness.
+/// Close admission and exit with a terminal attestation if the attested state is unchanged; `quiesce-exit/2` takes `strict` or `attested` completeness; without it the request is `quiesce-exit/1` (counts only).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QuiesceAndExitCommand {
 	#[serde(rename = "operationId")]
 	pub operation_id: String,
-	pub completeness: QuiesceRequestCompleteness,
 	pub attempt: f64,
 	pub epoch: f64,
 	#[serde(rename = "instanceId")]
@@ -6634,6 +6635,9 @@ pub struct QuiesceAndExitCommand {
 	#[serde(rename = "sessionId")]
 	pub session_id: String,
 	pub deadline: f64,
+	/// `quiesce-exit/2`: `strict` also requires complete owned-work coverage; `attested` counts only. Omitted: `quiesce-exit/1`, counts only.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub completeness: Option<QuiesceRequestCompleteness>,
 }
 
 impl Command for QuiesceAndExitCommand {

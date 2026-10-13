@@ -8267,16 +8267,17 @@ func (c Commands) Attest(ctx context.Context, p AttestCommand) (WorkAttestation,
 
 // QuiesceAndExitCommand holds the parameters of "quiesce_and_exit".
 type QuiesceAndExitCommand struct {
-	OperationID  string                            `json:"operationId"`
-	Completeness QuiesceAndExitCommandCompleteness `json:"completeness"`
-	Attempt      float64                           `json:"attempt"`
-	Epoch        float64                           `json:"epoch"`
-	InstanceID   string                            `json:"instanceId"`
-	SessionID    string                            `json:"sessionId"`
-	Deadline     float64                           `json:"deadline"`
+	OperationID string  `json:"operationId"`
+	Attempt     float64 `json:"attempt"`
+	Epoch       float64 `json:"epoch"`
+	InstanceID  string  `json:"instanceId"`
+	SessionID   string  `json:"sessionId"`
+	Deadline    float64 `json:"deadline"`
+	// `quiesce-exit/2`: `strict` also requires complete owned-work coverage; `attested` counts only. Omitted: `quiesce-exit/1`, counts only.
+	Completeness *QuiesceAndExitCommandCompleteness `json:"completeness,omitempty"`
 }
 
-// QuiesceAndExit sends "quiesce_and_exit": Close admission and exit with a terminal attestation if the attested state is unchanged; requires explicit `strict` or `attested` completeness.
+// QuiesceAndExit sends "quiesce_and_exit": Close admission and exit with a terminal attestation if the attested state is unchanged; `quiesce-exit/2` takes `strict` or `attested` completeness; without it the request is `quiesce-exit/1` (counts only).
 func (c Commands) QuiesceAndExit(ctx context.Context, p QuiesceAndExitCommand) (QuiesceResult, error) {
 	var out QuiesceResult
 	err := c.call(ctx, "quiesce_and_exit", p, 0, &out)

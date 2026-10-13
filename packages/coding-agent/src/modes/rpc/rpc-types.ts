@@ -35,6 +35,7 @@ import type { BtwHistoryRecord } from "../../session/btw-history";
 import {
 	OWNED_JOBS_CAPABILITY,
 	QUIESCE_EXIT_CAPABILITY,
+	QUIESCE_EXIT_V1_CAPABILITY,
 	type QuiesceResult,
 	type WorkAttestation,
 } from "../../session/quiescence";
@@ -177,7 +178,8 @@ export type RpcCommand =
 			id?: string;
 			type: "quiesce_and_exit";
 			operationId: string;
-			completeness: "strict" | "attested";
+			/** `quiesce-exit/2`; omitted for `quiesce-exit/1` (counts-only, as `attested`). */
+			completeness?: "strict" | "attested";
 			attempt: number;
 			epoch: number;
 			instanceId: string;
@@ -413,6 +415,8 @@ export const RPC_ENGINE_CAPABILITIES: readonly string[] = [
 	TOOL_APPROVAL_BINDING_CAPABILITY,
 	REPLY_ATTRIBUTION_CAPABILITY,
 	EXTERNAL_DELIVERY_CAPABILITY,
+	// Both quiesce protocols: `quiesce_and_exit` without `completeness` is `quiesce-exit/1`.
+	QUIESCE_EXIT_V1_CAPABILITY,
 	QUIESCE_EXIT_CAPABILITY,
 	OWNED_JOBS_CAPABILITY,
 ];
@@ -525,7 +529,14 @@ export type RpcResponse =
 	  }
 	| { id?: string; type: "response"; command: "set_slow_mode"; success: true; data: { enabled: boolean } }
 	| { id?: string; type: "response"; command: "goal"; success: true; data: RpcGoalResult }
-	| { id?: string; type: "response"; command: "set_ask_dialog"; success: true; data: { enabled: boolean } }
+	| {
+			id?: string;
+			type: "response";
+			command: "set_ask_dialog";
+			success: true;
+			/** `rich` is present only when the request sent `rich: true` (`rich-ask/2`); true iff negotiated. */
+			data: { enabled: boolean; rich?: boolean };
+	  }
 	| {
 			id?: string;
 			type: "response";
