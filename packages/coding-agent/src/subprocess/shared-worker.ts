@@ -13,6 +13,7 @@ import * as path from "node:path";
 import type { Subprocess } from "bun";
 import { IpcConnection, ipcEndpoint } from "@oh-my-pi/pi-natives";
 import { logger } from "@oh-my-pi/pi-utils";
+import { OWNER_MARKER_ENV, OwnedJobRegistry } from "../session/owned-job-registry";
 import type { RefCountedWorkerHandle } from "./worker-client";
 
 const CONNECT_TIMEOUT_MS = 3_000;
@@ -228,7 +229,13 @@ async function probeSharedWorker(endpoint: string, tag: string): Promise<ProbeRe
 	return { kind: "absent" };
 }
 
-/** Detach a worker so it outlives this omp process; its output goes to `logPath`. */
+/**
+ * Detach a worker so it outlives this omp process; its output goes to `logPath`.
+ *
+ * The worker serves every omp process on the machine, so it is no Session's work: it never
+ * carries an owner marker (one an enclosing agent handed this process would make that
+ * agent's quiesce wait on a machine-shared server), and it is recorded as `internal`.
+ */
 export function spawnDetached(
 	cmd: string[],
 	cwd: string | undefined,
@@ -237,10 +244,12 @@ export function spawnDetached(
 ): SpawnedWorker {
 	const log = fs.openSync(logPath, "w");
 	try {
+		const workerEnv = { ...env };
+		delete workerEnv[OWNER_MARKER_ENV];
 		const proc = Bun.spawn({
 			cmd,
 			cwd,
-			env,
+			env: workerEnv,
 			detached: true,
 			stdin: "ignore",
 			stdout: log,
@@ -248,6 +257,12 @@ export function spawnDetached(
 			windowsHide: true,
 		});
 		proc.unref();
+		OwnedJobRegistry.instance()?.registerProcess({
+			kind: "internal",
+			pid: proc.pid,
+			command: cmd.find(arg => arg.startsWith("__omp_worker_")) ?? cmd.join(" "),
+			cwd: cwd ?? null,
+		});
 		return { proc, logPath };
 	} finally {
 		fs.closeSync(log);

@@ -53,6 +53,11 @@ export class IrcBridge {
 		return this.#interrupts.some(counts) || this.#asides.some(counts) || this.#deferredWakes.some(counts);
 	}
 
+	/** Number of undelivered IRC records (interrupts, asides, deferred wakes). */
+	pendingCount(): number {
+		return this.#interrupts.length + this.#asides.length + this.#deferredWakes.length;
+	}
+
 	/** Waits until every in-flight wake-turn relay has settled. */
 	async waitForReplies(): Promise<void> {
 		while (this.#pendingReplies.size > 0) {
