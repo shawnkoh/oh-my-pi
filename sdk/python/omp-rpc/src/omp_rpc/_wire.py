@@ -1247,7 +1247,7 @@ class ReadyEvent:
     max_frame_bytes: int | None = None
     max_reassembled_frame_bytes: int | None = None
     capabilities: tuple[str, ...] | None = None
-    """Optional engine capabilities the host may rely on (for example `external-delivery/1`)."""
+    """Versioned engine capabilities (`name/major`) the host may rely on; same list as `get_state.capabilities`."""
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -1308,6 +1308,12 @@ class PromptResultEvent:
     """Nothing will wake the session again; when false a `session_settled` follows once background work drains."""
     id: str | None = None
     error: PromptError | None = None
+    run: int | None = None
+    """`reply-attribution/1`: engine-local ordinal of the run whose yield answered the prompt; shared by prompts answered together."""
+    prompt_entry_id: str | None = None
+    """Session entry id of the prompt's persisted user message, when identified."""
+    reply_entry_ids: tuple[str, ...] | None = None
+    """Assistant entries that followed the prompt's user message, in order; the last is the reply. Present whenever `run` is."""
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -1490,7 +1496,19 @@ class SelectUiRequest:
     title: str
     options: tuple[str, ...]
     option_details: tuple[SelectOptionDetail, ...] | None = None
+    approval: ToolApprovalBinding | None = None
+    """Tool-approval selects only (`tool-approval-binding/1`)."""
     timeout: int | None = None
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class ToolApprovalBinding:
+    """The exact tool call a tool-approval dialog decides; `(toolCallId, toolName)` identifies the decision."""
+    tool_call_id: str
+    tool_name: str
+    arguments: JsonValue
+    """The arguments the approval policy evaluated."""
+    reason: str | None = None
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -1530,6 +1548,8 @@ class AskUiRequest:
     id: str
     method: Literal["ask"] = "ask"
     questions: tuple[AskQuestion, ...]
+    accept_images: bool | None = None
+    """`rich-ask/2` opt-in only: answers may attach images."""
     timeout: int | None = None
 
 
@@ -1606,12 +1626,16 @@ class ExtensionUiRequest(ExtensionUiRequestMixin):
     title: str | None = None
     options: tuple[str, ...] | None = None
     option_details: tuple[SelectOptionDetail, ...] | None = None
+    approval: ToolApprovalBinding | None = None
+    """Tool-approval selects only (`tool-approval-binding/1`)."""
     timeout: int | None = None
     message: str | None = None
     placeholder: str | None = None
     prefill: str | None = None
     prompt_style: bool | None = None
     questions: tuple[AskQuestion, ...] | None = None
+    accept_images: bool | None = None
+    """`rich-ask/2` opt-in only: answers may attach images."""
     target_id: str | None = None
     notify_type: NotifyType | None = None
     status_key: str | None = None
@@ -1632,6 +1656,12 @@ class AskAnswer:
     id: str
     selected_options: tuple[str, ...]
     custom_input: str | None = None
+    custom_input_images: tuple[ImageContent, ...] | None = None
+    """`rich-ask/2` with `acceptImages` only."""
+    note: str | None = None
+    """`rich-ask/2` only."""
+    note_images: tuple[ImageContent, ...] | None = None
+    """`rich-ask/2` with `acceptImages` only."""
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -2726,6 +2756,9 @@ def parse_prompt_result_event(value: object, path: str = "PromptResultEvent") ->
         session_settled=required(payload, "sessionSettled", decode_bool, path),
         id=optional(payload, "id", decode_str, path),
         error=optional(payload, "error", parse_prompt_error, path),
+        run=optional(payload, "run", decode_int, path),
+        prompt_entry_id=optional(payload, "promptEntryId", decode_str, path),
+        reply_entry_ids=optional(payload, "replyEntryIds", array(decode_str), path),
     )
 
 
@@ -2934,7 +2967,18 @@ def parse_select_ui_request(value: object, path: str = "SelectUiRequest") -> Sel
         title=required(payload, "title", decode_str, path),
         options=required(payload, "options", array(decode_str), path),
         option_details=optional(payload, "optionDetails", array(parse_select_option_detail), path),
+        approval=optional(payload, "approval", parse_tool_approval_binding, path),
         timeout=optional(payload, "timeout", decode_int, path),
+    )
+
+
+def parse_tool_approval_binding(value: object, path: str = "ToolApprovalBinding") -> ToolApprovalBinding:
+    payload = expect_object(value, path)
+    return ToolApprovalBinding(
+        tool_call_id=required(payload, "toolCallId", decode_str, path),
+        tool_name=required(payload, "toolName", decode_str, path),
+        arguments=required(payload, "arguments", decode_json, path),
+        reason=optional(payload, "reason", decode_str, path),
     )
 
 
@@ -2981,6 +3025,7 @@ def parse_ask_ui_request(value: object, path: str = "AskUiRequest") -> AskUiRequ
     return AskUiRequest(
         id=required(payload, "id", decode_str, path),
         questions=required(payload, "questions", array(parse_ask_question), path),
+        accept_images=optional(payload, "acceptImages", decode_bool, path),
         timeout=optional(payload, "timeout", decode_int, path),
     )
 
@@ -3070,12 +3115,14 @@ def parse_extension_ui_request(value: object, path: str = "ExtensionUiRequest") 
         title=optional(payload, "title", decode_str, path),
         options=optional(payload, "options", array(decode_str), path),
         option_details=optional(payload, "optionDetails", array(parse_select_option_detail), path),
+        approval=optional(payload, "approval", parse_tool_approval_binding, path),
         timeout=optional(payload, "timeout", decode_int, path),
         message=optional(payload, "message", decode_str, path),
         placeholder=optional(payload, "placeholder", decode_str, path),
         prefill=optional(payload, "prefill", decode_str, path),
         prompt_style=optional(payload, "promptStyle", decode_bool, path),
         questions=optional(payload, "questions", array(parse_ask_question), path),
+        accept_images=optional(payload, "acceptImages", decode_bool, path),
         target_id=optional(payload, "targetId", decode_str, path),
         notify_type=optional(payload, "notifyType", _decode_notify_type, path),
         status_key=optional(payload, "statusKey", decode_str, path),
@@ -3096,6 +3143,9 @@ def parse_ask_answer(value: object, path: str = "AskAnswer") -> AskAnswer:
         id=required(payload, "id", decode_str, path),
         selected_options=required(payload, "selectedOptions", array(decode_str), path),
         custom_input=optional(payload, "customInput", decode_str, path),
+        custom_input_images=optional(payload, "customInputImages", array(parse_image_content), path),
+        note=optional(payload, "note", decode_str, path),
+        note_images=optional(payload, "noteImages", array(parse_image_content), path),
     )
 
 
@@ -3263,20 +3313,24 @@ class WireClient:
     def _listen(self, frame_type: str, listener: Callable[..., None]) -> Callable[[], None]:
         raise NotImplementedError
 
-    def steer(self, message: str, *, images: Sequence[ImageContent] | None = None) -> None:
+    def steer(self, message: str, *, images: Sequence[ImageContent] | None = None, literal: bool | None = None) -> None:
         """Queue a steering message."""
         params: dict[str, object] = {}
         params["message"] = message
         if images is not None:
             params["images"] = list(images)
+        if literal is not None:
+            params["literal"] = literal
         self._command("steer", params)
 
-    def follow_up(self, message: str, *, images: Sequence[ImageContent] | None = None) -> None:
+    def follow_up(self, message: str, *, images: Sequence[ImageContent] | None = None, literal: bool | None = None) -> None:
         """Queue a follow-up message."""
         params: dict[str, object] = {}
         params["message"] = message
         if images is not None:
             params["images"] = list(images)
+        if literal is not None:
+            params["literal"] = literal
         self._command("follow_up", params)
 
     def remove_queued_message(self, message: str, queue: QueuedMessageQueue) -> RemoveQueuedMessageResult:
@@ -3359,10 +3413,12 @@ class WireClient:
             params["token_budget"] = token_budget
         return parse_goal_result(self._command("goal", params), "goal")
 
-    def set_ask_dialog(self, enabled: bool) -> bool:
+    def set_ask_dialog(self, *, enabled: bool, rich: bool | None = None) -> bool:
         """Opt in to `ask` UI requests; returns the applied setting."""
         params: dict[str, object] = {}
         params["enabled"] = enabled
+        if rich is not None:
+            params["rich"] = rich
         return required(expect_object(self._command("set_ask_dialog", params), "set_ask_dialog"), "enabled", decode_bool, "set_ask_dialog")
 
     def get_available_commands(self) -> tuple[AvailableSlashCommand, ...]:
@@ -4066,6 +4122,7 @@ __all__ = [
     "TodoReminderEvent",
     "TodoStatus",
     "TokenUsage",
+    "ToolApprovalBinding",
     "ToolCall",
     "ToolDescriptor",
     "ToolExecutionEndEvent",
@@ -4234,6 +4291,7 @@ __all__ = [
     "parse_todo_phase",
     "parse_todo_reminder_event",
     "parse_token_usage",
+    "parse_tool_approval_binding",
     "parse_tool_call",
     "parse_tool_descriptor",
     "parse_tool_execution_end_event",

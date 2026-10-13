@@ -108,7 +108,15 @@ async function approvePreludeInvocation(
 		);
 	}
 	const choice = await untilAborted(context.signal, () =>
-		ui.select(formatApprovalPrompt(subject, parameters, resolved.reason), ["Approve", "Deny"]),
+		ui.select(formatApprovalPrompt(subject, parameters, resolved.reason), ["Approve", "Deny"], {
+			signal: context.signal,
+			approval: {
+				toolCallId: context.toolCallId,
+				toolName: definition.name,
+				arguments: parameters,
+				...(resolved.reason ? { reason: resolved.reason } : {}),
+			},
+		}),
 	);
 	if (choice !== "Approve") throw new Error(`Eval prelude call denied by user: ${definition.name}`);
 }

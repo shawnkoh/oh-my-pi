@@ -32,6 +32,7 @@ const extension = await loadExtensionFromFactory(
 			if (event.source !== "rpc") throw new Error(`unexpected input source ${event.source}`);
 			if (event.text.startsWith("consume:")) return { handled: true };
 			if (event.text.startsWith("transform:")) return { text: "  transformed by hook\n" };
+			if (event.text === "command:") return { text: "/fast on" };
 			if (event.text.startsWith("slow:")) await ioDetour();
 			return undefined;
 		});
