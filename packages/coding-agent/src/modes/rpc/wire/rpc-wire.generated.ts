@@ -428,12 +428,13 @@ export interface WorkAttestation {
 
 export interface QuiesceRequest {
 	operationId: string;
-	completeness: "strict" | "attested";
 	attempt: number;
 	epoch: number;
 	instanceId: string;
 	sessionId: string;
 	deadline: number;
+	/** `quiesce-exit/2`: `strict` also requires complete owned-work coverage; `attested` counts only. Omitted: `quiesce-exit/1`, counts only. */
+	completeness?: "strict" | "attested";
 }
 
 export type QuiesceRefusalReason = "invalid_request" | "invocation_mismatch" | "session_mismatch" | "stale_attempt" | "admission_closed" | "deadline_expired" | "epoch_mismatch" | "work_active" | "completeness_unknown" | "attestation_unavailable";
