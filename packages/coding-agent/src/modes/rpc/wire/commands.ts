@@ -30,6 +30,10 @@ export interface RpcCommandSpec {
 }
 
 const IMAGES = doc("ImageContent[]", "Images attached to the message.");
+const LITERAL = doc(
+	"boolean",
+	"`literal-input/1`: after input hooks, admit the text as plain user text (no command, template or mention expansion).",
+);
 
 export const rpcCommands: readonly RpcCommandSpec[] = [
 	{
@@ -41,12 +45,20 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 	{
 		name: "prompt",
 		doc: "Submit a prompt; acknowledged once admitted, completed by its `prompt_result`.",
-		params: { message: "string", "images?": IMAGES, "streamingBehavior?": "StreamingBehavior" },
+		params: { message: "string", "images?": IMAGES, "streamingBehavior?": "StreamingBehavior", "literal?": LITERAL },
 		result: "PromptAck",
 		completion: "prompt_result",
 	},
-	{ name: "steer", doc: "Queue a steering message.", params: { message: "string", "images?": IMAGES } },
-	{ name: "follow_up", doc: "Queue a follow-up message.", params: { message: "string", "images?": IMAGES } },
+	{
+		name: "steer",
+		doc: "Queue a steering message.",
+		params: { message: "string", "images?": IMAGES, "literal?": LITERAL },
+	},
+	{
+		name: "follow_up",
+		doc: "Queue a follow-up message.",
+		params: { message: "string", "images?": IMAGES, "literal?": LITERAL },
+	},
 	{
 		name: "remove_queued_message",
 		doc: "Remove one pending queued message by its queue-chip text.",
@@ -63,7 +75,7 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 	{
 		name: "abort_and_prompt",
 		doc: "Abort the current run and submit a prompt; completed by its `prompt_result`.",
-		params: { message: "string", "images?": IMAGES },
+		params: { message: "string", "images?": IMAGES, "literal?": LITERAL },
 		completion: "prompt_result",
 	},
 	{
@@ -120,8 +132,14 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 	{
 		name: "set_ask_dialog",
 		doc: "Opt in to `ask` UI requests; returns the applied setting.",
-		params: { enabled: "boolean" },
-		result: { enabled: "boolean" },
+		params: {
+			enabled: "boolean",
+			"rich?": doc("boolean", "Also opt in to `rich-ask/2` (`--mode rpc-ui` only)."),
+		},
+		result: {
+			enabled: "boolean",
+			"rich?": doc("boolean", "Whether `rich-ask/2` is active; present only when `rich` was requested."),
+		},
 		unwrap: "enabled",
 	},
 	{

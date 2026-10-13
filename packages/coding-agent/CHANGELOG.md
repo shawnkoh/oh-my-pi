@@ -6,6 +6,15 @@
 
 - Added the default-off `goal.toolDefault` setting, which lets agents start goal mode themselves in ordinary sessions; an explicit `--tools=...,goal` now also exposes the tool while the default stays hidden ([#13877](https://github.com/can1357/oh-my-pi/pull/13877) by [@shawnkoh](https://github.com/shawnkoh))
 - External delivery (`external-delivery/1`): RPC hosts can hand the session a record authored by another actor with `deliver` (`mode: "aside" | "steer"`) and withdraw it with `cancel_delivery`; the engine reports `delivery_accepted`, `delivery_settled`, `delivery_discarded` and `delivery_cancelled` receipts, lists held records in `get_state.externalDeliveries`, and advertises the capability in `ready.capabilities` and `get_state.capabilities`. Extensions get the same surface as `ExtensionAPI.deliverMessage` with `ExtensionAPI.capabilities`. Records declare their provider view in `details["omp.llm"]` and are rejected without one; delivery-owned evaluations may complete quietly (see `docs/rpc.md#external-delivery`).
+- The RPC ready frame and `get_state` advertise one versioned engine capability list (`literal-input/1`, `tool-approval-binding/1`, `reply-attribution/1`, `external-delivery/1`, plus `rich-ask/2` in `--mode rpc-ui`); the TypeScript `RpcClient` exposes it as `capabilities`.
+- RPC hosts can send `literal: true` on `prompt`, `steer`, `follow_up` and `abort_and_prompt`: RPC input hooks run first, then the resulting text is admitted as a plain user message without slash, skill, builtin, extension/custom command dispatch, prompt-template expansion or model-mention rewriting; a non-boolean `literal` is refused.
+- Tool-approval dialogs sent to RPC hosts carry `approval: { toolCallId, toolName, arguments, reason? }`, binding the answer to the exact call that will run (`tool-approval-binding/1`).
+- In `--mode rpc-ui`, hosts may opt in with `set_ask_dialog {enabled:true,rich:true}` (`rich-ask/2`) to extend ask `answers[]` with notes, pasted images when `acceptImages` is true, and `chat:true` redirects; without the opt-in the ask contract is unchanged.
+- RPC `prompt_result` frames carry `run`, `promptEntryId` and `replyEntryIds` so hosts settle replies by entry identity (`reply-attribution/1`).
+
+### Fixed
+
+- Interrupting a turn while a tool approval is pending now closes the dialog (RPC hosts receive `cancel`), and an approval answered after the call was aborted no longer runs the tool.
 
 ## [18.10.3] - 2026-10-12
 
