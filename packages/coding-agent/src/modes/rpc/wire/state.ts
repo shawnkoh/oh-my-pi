@@ -143,6 +143,51 @@ export const stateDefs = {
 		dumpTools: absentAs("ToolDescriptor[]", []),
 		"contextUsage?": "ContextUsage",
 		goal: absentAs(doc("GoalModeState | null", "Current goal mode; null when the session has no goal."), null),
+		capabilities: absentAs(
+			doc("string[]", "Engine capabilities (for example `external-delivery/1`); same list as the ready frame."),
+			[],
+		),
+		externalDeliveries: absentAs(
+			doc("ExternalDeliveryListing[]", "External records held by the session: queued or accepted but unsettled."),
+			[],
+		),
+	},
+
+	DeliveryMode: doc("'aside' | 'steer'", "`aside` never interrupts; `steer` forces the next turn."),
+	DeliveryMechanism: doc(
+		"'wake' | 'aside' | 'steer-boundary'",
+		"Scheduling branch an external record took before the loop admitted it.",
+	),
+	DeliveryOptions: {
+		mode: "DeliveryMode",
+		"quiet?": doc("boolean", "Advisory: the deliverer expects a quiet completion."),
+		"wakeAfterInterrupt?": doc("boolean", "Idle after an operator interrupt still wakes (the latch stays set)."),
+		"wakeInPlanMode?": doc("boolean", "Idle in plan mode still wakes."),
+	},
+	DeliveryRecord: doc(
+		{
+			customType: "string",
+			content: "MessageContent",
+			"display?": "boolean",
+			details: doc(
+				JSON_OBJECT,
+				'Must carry `"omp.llm"` (`{ role: "user", content }`, the provider view) and `"omp.llm.source"`.',
+			),
+		},
+		"Custom message payload delivered by `deliver`; it enters context only through the loop's admission.",
+	),
+	ExternalDeliveryListing: {
+		deliveryId: "string",
+		state: "'queued' | 'accepted'",
+		mode: "DeliveryMode",
+	},
+	DeliveryAcceptance: { at: "number", mode: "DeliveryMode", mechanism: "DeliveryMechanism" },
+	DeliverySettlement: {
+		outcome: "'quiet' | 'text' | 'refused' | 'error' | 'aborted'",
+		included: doc("boolean", "Exactly one stamped projection reached a completed main request."),
+		requests: doc("number.integer", "Main provider requests observed while the record was in context."),
+		sole: doc("boolean", "No other admitted input joined the owning evaluation."),
+		interactive: doc("boolean", "An interactive input joined the owning evaluation."),
 	},
 
 	BashResult: {

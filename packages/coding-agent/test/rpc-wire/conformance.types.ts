@@ -27,6 +27,7 @@ import type {
 	RpcBtwDeltaFrame,
 	RpcBtwRecordFrame,
 	RpcCommand,
+	RpcDeliveryEventFrame,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
 	RpcHostToolCallRequest,
@@ -58,6 +59,7 @@ import type {
 import type * as Wire from "@oh-my-pi/pi-coding-agent/modes/rpc/wire/rpc-wire.generated";
 import type { RestoredQueuedMessage } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import type { SessionStats } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { ExternalDeliveryListing } from "@oh-my-pi/pi-coding-agent/session/external-delivery";
 import type { BtwHistoryRecord, BtwHistoryTurn } from "@oh-my-pi/pi-coding-agent/session/btw-history";
 import type { UsageLimitState } from "@oh-my-pi/pi-coding-agent/session/usage-limit";
 import type { ContextUsage } from "@oh-my-pi/pi-tui/status-line/types";
@@ -230,6 +232,22 @@ export type Frames = Assert<
 		uiCancel: Inbound<Wire.CancelUiResponse, Extract<RpcExtensionUIResponse, { cancelled: unknown }>>;
 		uiAnswers: Inbound<Wire.AnswersUiResponse, Extract<RpcExtensionUIResponse, { answers: unknown }>>;
 		responseFailure: Outbound<Extract<RpcResponse, { success: false }>, Wire.RpcResponse>;
+		deliveryAccepted: Outbound<
+			Extract<RpcDeliveryEventFrame, { type: "delivery_accepted" }>,
+			Wire.DeliveryAcceptedEvent
+		>;
+		deliverySettled: Outbound<
+			Extract<RpcDeliveryEventFrame, { type: "delivery_settled" }>,
+			Wire.DeliverySettledEvent
+		>;
+		deliveryDiscarded: Outbound<
+			Extract<RpcDeliveryEventFrame, { type: "delivery_discarded" }>,
+			Wire.DeliveryDiscardedEvent
+		>;
+		deliveryCancelled: Outbound<
+			Extract<RpcDeliveryEventFrame, { type: "delivery_cancelled" }>,
+			Wire.DeliveryCancelledEvent
+		>;
 	}>
 >;
 /** Every inbound frame type the server reads is a wire inbound frame. */
@@ -266,6 +284,7 @@ export type State = Assert<
 		messagesPage: Outbound<RpcMessagesPage, Wire.MessagesPage>;
 		openSession: Outbound<RpcOpenSessionResult, Wire.OpenSessionResult>;
 		abortAndRestoreQueue: Outbound<RpcAbortAndRestoreQueueResult, Wire.AbortAndRestoreQueueResult>;
+		externalDelivery: Outbound<ExternalDeliveryListing, Wire.ExternalDeliveryListing>;
 		restoredQueuedMessage: Outbound<RestoredQueuedMessage, Wire.RestoredQueuedMessage>;
 		slashCommand: Outbound<RpcAvailableSlashCommand, Wire.AvailableSlashCommand>;
 		slashSubcommand: Outbound<NonNullable<RpcAvailableSlashCommand["subcommands"]>[number], Wire.SlashSubcommand>;

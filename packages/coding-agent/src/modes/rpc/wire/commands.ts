@@ -83,6 +83,19 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 		params: { sessionDir: "string", "provider?": "string", "modelId?": "string" },
 		result: "OpenSessionResult",
 	},
+	{
+		name: "deliver",
+		doc: "Deliver a directed external record (`external-delivery/1`); never parsed as a prompt. Receipts arrive as `delivery_*` frames keyed by the returned `deliveryId`.",
+		params: { record: "DeliveryRecord", options: "DeliveryOptions" },
+		result: { deliveryId: "string" },
+		unwrap: "deliveryId",
+	},
+	{
+		name: "cancel_delivery",
+		doc: "Cancel a still-queued external record; `cancelled` is false once it was accepted or retired.",
+		params: { deliveryId: "string" },
+		result: "CancellationResult",
+	},
 
 	{ name: "get_state", doc: "Snapshot the session state.", result: "SessionState" },
 	{

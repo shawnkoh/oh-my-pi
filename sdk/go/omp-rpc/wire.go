@@ -2533,6 +2533,10 @@ type SessionState struct {
 	ContextUsage *ContextUsage    `json:"contextUsage,omitempty"`
 	// Current goal mode; null when the session has no goal.
 	Goal *GoalModeState `json:"goal"`
+	// Engine capabilities (for example `external-delivery/1`); same list as the ready frame.
+	Capabilities []string `json:"capabilities"`
+	// External records held by the session: queued or accepted but unsettled.
+	ExternalDeliveries []ExternalDeliveryListing `json:"externalDeliveries"`
 }
 
 func (v *SessionState) UnmarshalJSON(data []byte) error {
@@ -2571,11 +2575,172 @@ func (v *SessionState) decodeFrom(raw map[string]json.RawMessage) error {
 	d.defaulted("dumpTools", &out.DumpTools, `[]`)
 	d.optional("contextUsage", &out.ContextUsage)
 	d.defaulted("goal", &out.Goal, `null`)
+	d.defaulted("capabilities", &out.Capabilities, `[]`)
+	d.defaulted("externalDeliveries", &out.ExternalDeliveries, `[]`)
 	if d.err != nil {
 		return d.err
 	}
 	*v = out
 	return nil
+}
+
+// `aside` never interrupts; `steer` forces the next turn.
+type DeliveryMode string
+
+const (
+	DeliveryModeAside DeliveryMode = "aside"
+	DeliveryModeSteer DeliveryMode = "steer"
+)
+
+func (v *DeliveryMode) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "DeliveryMode")
+	if err != nil {
+		return err
+	}
+	switch value := DeliveryMode(s); value {
+	case DeliveryModeAside, DeliveryModeSteer:
+		*v = value
+		return nil
+	}
+	return unknownValue("DeliveryMode", s)
+}
+
+// Scheduling branch an external record took before the loop admitted it.
+type DeliveryMechanism string
+
+const (
+	DeliveryMechanismWake          DeliveryMechanism = "wake"
+	DeliveryMechanismAside         DeliveryMechanism = "aside"
+	DeliveryMechanismSteerBoundary DeliveryMechanism = "steer-boundary"
+)
+
+func (v *DeliveryMechanism) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "DeliveryMechanism")
+	if err != nil {
+		return err
+	}
+	switch value := DeliveryMechanism(s); value {
+	case DeliveryMechanismWake, DeliveryMechanismAside, DeliveryMechanismSteerBoundary:
+		*v = value
+		return nil
+	}
+	return unknownValue("DeliveryMechanism", s)
+}
+
+type DeliveryOptions struct {
+	Mode DeliveryMode `json:"mode"`
+	// Advisory: the deliverer expects a quiet completion.
+	Quiet *bool `json:"quiet,omitempty"`
+	// Idle after an operator interrupt still wakes (the latch stays set).
+	WakeAfterInterrupt *bool `json:"wakeAfterInterrupt,omitempty"`
+	// Idle in plan mode still wakes.
+	WakeInPlanMode *bool `json:"wakeInPlanMode,omitempty"`
+	// Extra holds undeclared keys and declared keys whose value did not decode (that field stays zero).
+	// Encoding writes them back, over a declared field with the same key.
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+func (v *DeliveryOptions) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "DeliveryOptions", v.decodeFrom)
+}
+
+func (v *DeliveryOptions) decodeFrom(raw map[string]json.RawMessage) error {
+	var out DeliveryOptions
+	d := fieldDecoder{raw: raw, owner: "DeliveryOptions", open: true}
+	d.required("mode", &out.Mode)
+	d.optional("quiet", &out.Quiet)
+	d.optional("wakeAfterInterrupt", &out.WakeAfterInterrupt)
+	d.optional("wakeInPlanMode", &out.WakeInPlanMode)
+	out.Extra = d.rest()
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v DeliveryOptions) MarshalJSON() ([]byte, error) {
+	type plain DeliveryOptions
+	return encodeObject(plain(v), "", v.Extra)
+}
+
+// Custom message payload delivered by `deliver`; it enters context only through the loop's admission.
+type DeliveryRecord struct {
+	CustomType string         `json:"customType"`
+	Content    MessageContent `json:"content"`
+	// Must carry `"omp.llm"` (`{ role: "user", content }`, the provider view) and `"omp.llm.source"`.
+	Details map[string]json.RawMessage `json:"details"`
+	Display *bool                      `json:"display,omitempty"`
+	// Extra holds undeclared keys and declared keys whose value did not decode (that field stays zero).
+	// Encoding writes them back, over a declared field with the same key.
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+func (v *DeliveryRecord) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "DeliveryRecord", v.decodeFrom)
+}
+
+func (v *DeliveryRecord) decodeFrom(raw map[string]json.RawMessage) error {
+	var out DeliveryRecord
+	d := fieldDecoder{raw: raw, owner: "DeliveryRecord", open: true}
+	d.required("customType", &out.CustomType)
+	d.required("content", &out.Content)
+	d.required("details", &out.Details)
+	d.optional("display", &out.Display)
+	out.Extra = d.rest()
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v DeliveryRecord) MarshalJSON() ([]byte, error) {
+	type plain DeliveryRecord
+	return encodeObject(plain(v), "", v.Extra)
+}
+
+type ExternalDeliveryListing struct {
+	DeliveryID string                       `json:"deliveryId"`
+	State      ExternalDeliveryListingState `json:"state"`
+	Mode       DeliveryMode                 `json:"mode"`
+}
+
+func (v *ExternalDeliveryListing) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "ExternalDeliveryListing", v.decodeFrom)
+}
+
+func (v *ExternalDeliveryListing) decodeFrom(raw map[string]json.RawMessage) error {
+	var out ExternalDeliveryListing
+	d := fieldDecoder{raw: raw, owner: "ExternalDeliveryListing"}
+	d.required("deliveryId", &out.DeliveryID)
+	d.required("state", &out.State)
+	d.required("mode", &out.Mode)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+type ExternalDeliveryListingState string
+
+const (
+	ExternalDeliveryListingStateQueued   ExternalDeliveryListingState = "queued"
+	ExternalDeliveryListingStateAccepted ExternalDeliveryListingState = "accepted"
+)
+
+func (v *ExternalDeliveryListingState) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "ExternalDeliveryListingState")
+	if err != nil {
+		return err
+	}
+	switch value := ExternalDeliveryListingState(s); value {
+	case ExternalDeliveryListingStateQueued, ExternalDeliveryListingStateAccepted:
+		*v = value
+		return nil
+	}
+	return unknownValue("ExternalDeliveryListingState", s)
 }
 
 type BashResult struct {
@@ -4542,6 +4707,8 @@ type ReadyEvent struct {
 	SupportedProtocolVersions []int64 `json:"supportedProtocolVersions,omitempty"`
 	MaxFrameBytes             *int64  `json:"maxFrameBytes,omitempty"`
 	MaxReassembledFrameBytes  *int64  `json:"maxReassembledFrameBytes,omitempty"`
+	// Optional engine capabilities the host may rely on (for example `external-delivery/1`).
+	Capabilities []string `json:"capabilities,omitempty"`
 }
 
 func (v *ReadyEvent) UnmarshalJSON(data []byte) error {
@@ -4556,6 +4723,7 @@ func (v *ReadyEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	d.optional("supportedProtocolVersions", &out.SupportedProtocolVersions)
 	d.optional("maxFrameBytes", &out.MaxFrameBytes)
 	d.optional("maxReassembledFrameBytes", &out.MaxReassembledFrameBytes)
+	d.optional("capabilities", &out.Capabilities)
 	if d.err != nil {
 		return d.err
 	}
@@ -4566,6 +4734,151 @@ func (v *ReadyEvent) decodeFrom(raw map[string]json.RawMessage) error {
 func (v ReadyEvent) MarshalJSON() ([]byte, error) {
 	type plain ReadyEvent
 	return encodeObject(plain(v), `"type":"ready"`, nil)
+}
+
+// The loop admitted a delivered record into context (never when a prompt merely resolves).
+type DeliveryAcceptedEvent struct {
+	DeliveryID string            `json:"deliveryId"`
+	At         float64           `json:"at"`
+	Mode       DeliveryMode      `json:"mode"`
+	Mechanism  DeliveryMechanism `json:"mechanism"`
+}
+
+func (v *DeliveryAcceptedEvent) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "DeliveryAcceptedEvent", v.decodeFrom)
+}
+
+func (v *DeliveryAcceptedEvent) decodeFrom(raw map[string]json.RawMessage) error {
+	var out DeliveryAcceptedEvent
+	d := fieldDecoder{raw: raw, owner: "DeliveryAcceptedEvent"}
+	d.constant("type", "delivery_accepted")
+	d.required("deliveryId", &out.DeliveryID)
+	d.required("at", &out.At)
+	d.required("mode", &out.Mode)
+	d.required("mechanism", &out.Mechanism)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v DeliveryAcceptedEvent) MarshalJSON() ([]byte, error) {
+	type plain DeliveryAcceptedEvent
+	return encodeObject(plain(v), `"type":"delivery_accepted"`, nil)
+}
+
+// The evaluation an accepted record joined settled; always after `delivery_accepted`.
+type DeliverySettledEvent struct {
+	DeliveryID  string                      `json:"deliveryId"`
+	Outcome     DeliverySettledEventOutcome `json:"outcome"`
+	Included    bool                        `json:"included"`
+	Requests    int64                       `json:"requests"`
+	Sole        bool                        `json:"sole"`
+	Interactive bool                        `json:"interactive"`
+}
+
+func (v *DeliverySettledEvent) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "DeliverySettledEvent", v.decodeFrom)
+}
+
+func (v *DeliverySettledEvent) decodeFrom(raw map[string]json.RawMessage) error {
+	var out DeliverySettledEvent
+	d := fieldDecoder{raw: raw, owner: "DeliverySettledEvent"}
+	d.constant("type", "delivery_settled")
+	d.required("deliveryId", &out.DeliveryID)
+	d.required("outcome", &out.Outcome)
+	d.required("included", &out.Included)
+	d.required("requests", &out.Requests)
+	d.required("sole", &out.Sole)
+	d.required("interactive", &out.Interactive)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v DeliverySettledEvent) MarshalJSON() ([]byte, error) {
+	type plain DeliverySettledEvent
+	return encodeObject(plain(v), `"type":"delivery_settled"`, nil)
+}
+
+type DeliverySettledEventOutcome string
+
+const (
+	DeliverySettledEventOutcomeQuiet   DeliverySettledEventOutcome = "quiet"
+	DeliverySettledEventOutcomeText    DeliverySettledEventOutcome = "text"
+	DeliverySettledEventOutcomeRefused DeliverySettledEventOutcome = "refused"
+	DeliverySettledEventOutcomeError   DeliverySettledEventOutcome = "error"
+	DeliverySettledEventOutcomeAborted DeliverySettledEventOutcome = "aborted"
+)
+
+func (v *DeliverySettledEventOutcome) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "DeliverySettledEventOutcome")
+	if err != nil {
+		return err
+	}
+	switch value := DeliverySettledEventOutcome(s); value {
+	case DeliverySettledEventOutcomeQuiet, DeliverySettledEventOutcomeText, DeliverySettledEventOutcomeRefused, DeliverySettledEventOutcomeError, DeliverySettledEventOutcomeAborted:
+		*v = value
+		return nil
+	}
+	return unknownValue("DeliverySettledEventOutcome", s)
+}
+
+// A never-accepted record was dropped at a committed session transition or disposal.
+type DeliveryDiscardedEvent struct {
+	DeliveryID string `json:"deliveryId"`
+	Reason     string `json:"reason"`
+}
+
+func (v *DeliveryDiscardedEvent) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "DeliveryDiscardedEvent", v.decodeFrom)
+}
+
+func (v *DeliveryDiscardedEvent) decodeFrom(raw map[string]json.RawMessage) error {
+	var out DeliveryDiscardedEvent
+	d := fieldDecoder{raw: raw, owner: "DeliveryDiscardedEvent"}
+	d.constant("type", "delivery_discarded")
+	d.required("deliveryId", &out.DeliveryID)
+	d.required("reason", &out.Reason)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v DeliveryDiscardedEvent) MarshalJSON() ([]byte, error) {
+	type plain DeliveryDiscardedEvent
+	return encodeObject(plain(v), `"type":"delivery_discarded"`, nil)
+}
+
+// `cancel_delivery` withdrew a still-queued record.
+type DeliveryCancelledEvent struct {
+	DeliveryID string `json:"deliveryId"`
+}
+
+func (v *DeliveryCancelledEvent) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "DeliveryCancelledEvent", v.decodeFrom)
+}
+
+func (v *DeliveryCancelledEvent) decodeFrom(raw map[string]json.RawMessage) error {
+	var out DeliveryCancelledEvent
+	d := fieldDecoder{raw: raw, owner: "DeliveryCancelledEvent"}
+	d.constant("type", "delivery_cancelled")
+	d.required("deliveryId", &out.DeliveryID)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v DeliveryCancelledEvent) MarshalJSON() ([]byte, error) {
+	type plain DeliveryCancelledEvent
+	return encodeObject(plain(v), `"type":"delivery_cancelled"`, nil)
 }
 
 type PromptStatus string
@@ -6448,6 +6761,10 @@ func (CommandOutputEvent) isRpcNotification()           {}
 func (SessionInfoUpdateEvent) isRpcNotification()       {}
 func (ConfigUpdateEvent) isRpcNotification()            {}
 func (RpcFrameErrorEvent) isRpcNotification()           {}
+func (DeliveryAcceptedEvent) isRpcNotification()        {}
+func (DeliverySettledEvent) isRpcNotification()         {}
+func (DeliveryDiscardedEvent) isRpcNotification()       {}
+func (DeliveryCancelledEvent) isRpcNotification()       {}
 func (AgentStartEvent) isRpcNotification()              {}
 func (AgentEndEvent) isRpcNotification()                {}
 func (TurnStartEvent) isRpcNotification()               {}
@@ -6531,6 +6848,14 @@ func (v *RpcNotification) UnmarshalJSON(data []byte) error {
 		value, err = decodeVariant[ConfigUpdateEvent](raw)
 	case "rpc_frame_error":
 		value, err = decodeVariant[RpcFrameErrorEvent](raw)
+	case "delivery_accepted":
+		value, err = decodeVariant[DeliveryAcceptedEvent](raw)
+	case "delivery_settled":
+		value, err = decodeVariant[DeliverySettledEvent](raw)
+	case "delivery_discarded":
+		value, err = decodeVariant[DeliveryDiscardedEvent](raw)
+	case "delivery_cancelled":
+		value, err = decodeVariant[DeliveryCancelledEvent](raw)
 	case "agent_start":
 		value, err = decodeVariant[AgentStartEvent](raw)
 	case "agent_end":
@@ -6638,6 +6963,10 @@ func (CommandOutputEvent) isRpcServerFrame()           {}
 func (SessionInfoUpdateEvent) isRpcServerFrame()       {}
 func (ConfigUpdateEvent) isRpcServerFrame()            {}
 func (RpcFrameErrorEvent) isRpcServerFrame()           {}
+func (DeliveryAcceptedEvent) isRpcServerFrame()        {}
+func (DeliverySettledEvent) isRpcServerFrame()         {}
+func (DeliveryDiscardedEvent) isRpcServerFrame()       {}
+func (DeliveryCancelledEvent) isRpcServerFrame()       {}
 func (AgentStartEvent) isRpcServerFrame()              {}
 func (AgentEndEvent) isRpcServerFrame()                {}
 func (TurnStartEvent) isRpcServerFrame()               {}
@@ -6731,6 +7060,14 @@ func (v *RpcServerFrame) UnmarshalJSON(data []byte) error {
 		value, err = decodeVariant[ConfigUpdateEvent](raw)
 	case "rpc_frame_error":
 		value, err = decodeVariant[RpcFrameErrorEvent](raw)
+	case "delivery_accepted":
+		value, err = decodeVariant[DeliveryAcceptedEvent](raw)
+	case "delivery_settled":
+		value, err = decodeVariant[DeliverySettledEvent](raw)
+	case "delivery_discarded":
+		value, err = decodeVariant[DeliveryDiscardedEvent](raw)
+	case "delivery_cancelled":
+		value, err = decodeVariant[DeliveryCancelledEvent](raw)
 	case "agent_start":
 		value, err = decodeVariant[AgentStartEvent](raw)
 	case "agent_end":
@@ -6815,6 +7152,25 @@ func (v *NegotiateProtocolResult) decodeFrom(raw map[string]json.RawMessage) err
 	var out NegotiateProtocolResult
 	d := fieldDecoder{raw: raw, owner: "NegotiateProtocolResult"}
 	d.required("protocolVersion", &out.ProtocolVersion)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+type DeliverResult struct {
+	DeliveryID string `json:"deliveryId"`
+}
+
+func (v *DeliverResult) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "DeliverResult", v.decodeFrom)
+}
+
+func (v *DeliverResult) decodeFrom(raw map[string]json.RawMessage) error {
+	var out DeliverResult
+	d := fieldDecoder{raw: raw, owner: "DeliverResult"}
+	d.required("deliveryId", &out.DeliveryID)
 	if d.err != nil {
 		return d.err
 	}
@@ -7462,6 +7818,31 @@ type OpenSessionCommand struct {
 func (c Commands) OpenSession(ctx context.Context, p OpenSessionCommand) (OpenSessionResult, error) {
 	var out OpenSessionResult
 	err := c.call(ctx, "open_session", p, 0, &out)
+	return out, err
+}
+
+// DeliverCommand holds the parameters of "deliver".
+type DeliverCommand struct {
+	Record  DeliveryRecord  `json:"record"`
+	Options DeliveryOptions `json:"options"`
+}
+
+// Deliver sends "deliver": Deliver a directed external record (`external-delivery/1`); never parsed as a prompt. Receipts arrive as `delivery_*` frames keyed by the returned `deliveryId`.
+func (c Commands) Deliver(ctx context.Context, p DeliverCommand) (string, error) {
+	var out DeliverResult
+	err := c.call(ctx, "deliver", p, 0, &out)
+	return out.DeliveryID, err
+}
+
+// CancelDeliveryCommand holds the parameters of "cancel_delivery".
+type CancelDeliveryCommand struct {
+	DeliveryID string `json:"deliveryId"`
+}
+
+// CancelDelivery sends "cancel_delivery": Cancel a still-queued external record; `cancelled` is false once it was accepted or retired.
+func (c Commands) CancelDelivery(ctx context.Context, p CancelDeliveryCommand) (CancellationResult, error) {
+	var out CancellationResult
+	err := c.call(ctx, "cancel_delivery", p, 0, &out)
 	return out, err
 }
 
