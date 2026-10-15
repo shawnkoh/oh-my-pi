@@ -131,6 +131,28 @@
 				"clientOmit": []
 			},
 			{
+				"name": "deliver",
+				"doc": "Deliver a directed external record (`external-delivery/1`); never parsed as a prompt. Receipts arrive as `delivery_*` frames keyed by the returned `deliveryId`.",
+				"params": "DeliverParams",
+				"result": "DeliverResult",
+				"nullable": false,
+				"unwrap": "deliveryId",
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
+				"name": "cancel_delivery",
+				"doc": "Cancel a still-queued external record; `cancelled` is false once it was accepted or retired.",
+				"params": "CancelDeliveryParams",
+				"result": "CancellationResult",
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
 				"name": "get_state",
 				"doc": "Snapshot the session state.",
 				"params": null,
@@ -2667,10 +2689,174 @@
 					],
 					"description": "Current goal mode; null when the session has no goal.",
 					"default": null
+				},
+				"capabilities": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"description": "Engine capabilities (for example `external-delivery/1`); same list as the ready frame.",
+					"default": []
+				},
+				"externalDeliveries": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/ExternalDeliveryListing"
+					},
+					"description": "External records held by the session: queued or accepted but unsettled.",
+					"default": []
 				}
 			},
 			"required": [
 				"sessionId"
+			]
+		},
+		"DeliveryMode": {
+			"enum": [
+				"aside",
+				"steer"
+			],
+			"type": "string",
+			"description": "`aside` never interrupts; `steer` forces the next turn."
+		},
+		"DeliveryMechanism": {
+			"enum": [
+				"wake",
+				"aside",
+				"steer-boundary"
+			],
+			"type": "string",
+			"description": "Scheduling branch an external record took before the loop admitted it."
+		},
+		"DeliveryOptions": {
+			"type": "object",
+			"properties": {
+				"mode": {
+					"$ref": "#/$defs/DeliveryMode"
+				},
+				"quiet": {
+					"type": "boolean",
+					"description": "Advisory: the deliverer expects a quiet completion."
+				},
+				"wakeAfterInterrupt": {
+					"type": "boolean",
+					"description": "Idle after an operator interrupt still wakes (the latch stays set)."
+				},
+				"wakeInPlanMode": {
+					"type": "boolean",
+					"description": "Idle in plan mode still wakes."
+				}
+			},
+			"required": [
+				"mode"
+			],
+			"x-open": true
+		},
+		"DeliveryRecord": {
+			"type": "object",
+			"properties": {
+				"customType": {
+					"type": "string"
+				},
+				"content": {
+					"$ref": "#/$defs/MessageContent"
+				},
+				"details": {
+					"type": "object",
+					"properties": {},
+					"additionalProperties": {},
+					"description": "Must carry `\"omp.llm\"` (`{ role: \"user\", content }`, the provider view) and `\"omp.llm.source\"`."
+				},
+				"display": {
+					"type": "boolean"
+				}
+			},
+			"required": [
+				"customType",
+				"content",
+				"details"
+			],
+			"description": "Custom message payload delivered by `deliver`; it enters context only through the loop's admission.",
+			"x-open": true
+		},
+		"ExternalDeliveryListing": {
+			"type": "object",
+			"properties": {
+				"deliveryId": {
+					"type": "string"
+				},
+				"state": {
+					"enum": [
+						"queued",
+						"accepted"
+					],
+					"type": "string"
+				},
+				"mode": {
+					"$ref": "#/$defs/DeliveryMode"
+				}
+			},
+			"required": [
+				"deliveryId",
+				"state",
+				"mode"
+			]
+		},
+		"DeliveryAcceptance": {
+			"type": "object",
+			"properties": {
+				"at": {
+					"type": "number"
+				},
+				"mode": {
+					"$ref": "#/$defs/DeliveryMode"
+				},
+				"mechanism": {
+					"$ref": "#/$defs/DeliveryMechanism"
+				}
+			},
+			"required": [
+				"at",
+				"mode",
+				"mechanism"
+			]
+		},
+		"DeliverySettlement": {
+			"type": "object",
+			"properties": {
+				"outcome": {
+					"enum": [
+						"quiet",
+						"text",
+						"refused",
+						"error",
+						"aborted"
+					],
+					"type": "string"
+				},
+				"included": {
+					"type": "boolean",
+					"description": "Exactly one stamped projection reached a completed main request."
+				},
+				"requests": {
+					"type": "integer",
+					"description": "Main provider requests observed while the record was in context."
+				},
+				"sole": {
+					"type": "boolean",
+					"description": "No other admitted input joined the owning evaluation."
+				},
+				"interactive": {
+					"type": "boolean",
+					"description": "An interactive input joined the owning evaluation."
+				}
+			},
+			"required": [
+				"outcome",
+				"included",
+				"requests",
+				"sole",
+				"interactive"
 			]
 		},
 		"BashResult": {
@@ -4298,12 +4484,126 @@
 				},
 				"maxReassembledFrameBytes": {
 					"type": "integer"
+				},
+				"capabilities": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"description": "Optional engine capabilities the host may rely on (for example `external-delivery/1`)."
 				}
 			},
 			"required": [
 				"type"
 			],
 			"description": "First frame after startup; transport fields are absent on servers without protocol v2."
+		},
+		"DeliveryAcceptedEvent": {
+			"type": "object",
+			"properties": {
+				"type": {
+					"const": "delivery_accepted"
+				},
+				"deliveryId": {
+					"type": "string"
+				},
+				"at": {
+					"type": "number"
+				},
+				"mode": {
+					"$ref": "#/$defs/DeliveryMode"
+				},
+				"mechanism": {
+					"$ref": "#/$defs/DeliveryMechanism"
+				}
+			},
+			"required": [
+				"type",
+				"deliveryId",
+				"at",
+				"mode",
+				"mechanism"
+			],
+			"description": "The loop admitted a delivered record into context (never when a prompt merely resolves)."
+		},
+		"DeliverySettledEvent": {
+			"type": "object",
+			"properties": {
+				"type": {
+					"const": "delivery_settled"
+				},
+				"deliveryId": {
+					"type": "string"
+				},
+				"outcome": {
+					"enum": [
+						"quiet",
+						"text",
+						"refused",
+						"error",
+						"aborted"
+					],
+					"type": "string"
+				},
+				"included": {
+					"type": "boolean"
+				},
+				"requests": {
+					"type": "integer"
+				},
+				"sole": {
+					"type": "boolean"
+				},
+				"interactive": {
+					"type": "boolean"
+				}
+			},
+			"required": [
+				"type",
+				"deliveryId",
+				"outcome",
+				"included",
+				"requests",
+				"sole",
+				"interactive"
+			],
+			"description": "The evaluation an accepted record joined settled; always after `delivery_accepted`."
+		},
+		"DeliveryDiscardedEvent": {
+			"type": "object",
+			"properties": {
+				"type": {
+					"const": "delivery_discarded"
+				},
+				"deliveryId": {
+					"type": "string"
+				},
+				"reason": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"type",
+				"deliveryId",
+				"reason"
+			],
+			"description": "A never-accepted record was dropped at a committed session transition or disposal."
+		},
+		"DeliveryCancelledEvent": {
+			"type": "object",
+			"properties": {
+				"type": {
+					"const": "delivery_cancelled"
+				},
+				"deliveryId": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"type",
+				"deliveryId"
+			],
+			"description": "`cancel_delivery` withdrew a still-queued record."
 		},
 		"PromptStatus": {
 			"enum": [
@@ -5761,6 +6061,18 @@
 					"$ref": "#/$defs/RpcFrameErrorEvent"
 				},
 				{
+					"$ref": "#/$defs/DeliveryAcceptedEvent"
+				},
+				{
+					"$ref": "#/$defs/DeliverySettledEvent"
+				},
+				{
+					"$ref": "#/$defs/DeliveryDiscardedEvent"
+				},
+				{
+					"$ref": "#/$defs/DeliveryCancelledEvent"
+				},
+				{
 					"$ref": "#/$defs/RpcAgentEvent"
 				}
 			],
@@ -5926,6 +6238,43 @@
 			},
 			"required": [
 				"sessionDir"
+			]
+		},
+		"DeliverParams": {
+			"type": "object",
+			"properties": {
+				"record": {
+					"$ref": "#/$defs/DeliveryRecord"
+				},
+				"options": {
+					"$ref": "#/$defs/DeliveryOptions"
+				}
+			},
+			"required": [
+				"record",
+				"options"
+			]
+		},
+		"DeliverResult": {
+			"type": "object",
+			"properties": {
+				"deliveryId": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"deliveryId"
+			]
+		},
+		"CancelDeliveryParams": {
+			"type": "object",
+			"properties": {
+				"deliveryId": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"deliveryId"
 			]
 		},
 		"SetFastModeParams": {

@@ -15,8 +15,42 @@ export const frameDefs = {
 			"supportedProtocolVersions?": "number.integer[]",
 			"maxFrameBytes?": "number.integer",
 			"maxReassembledFrameBytes?": "number.integer",
+			"capabilities?": doc(
+				"string[]",
+				"Optional engine capabilities the host may rely on (for example `external-delivery/1`).",
+			),
 		},
 		"First frame after startup; transport fields are absent on servers without protocol v2.",
+	),
+	DeliveryAcceptedEvent: doc(
+		{
+			type: "'delivery_accepted'",
+			deliveryId: "string",
+			at: "number",
+			mode: "DeliveryMode",
+			mechanism: "DeliveryMechanism",
+		},
+		"The loop admitted a delivered record into context (never when a prompt merely resolves).",
+	),
+	DeliverySettledEvent: doc(
+		{
+			type: "'delivery_settled'",
+			deliveryId: "string",
+			outcome: "'quiet' | 'text' | 'refused' | 'error' | 'aborted'",
+			included: "boolean",
+			requests: "number.integer",
+			sole: "boolean",
+			interactive: "boolean",
+		},
+		"The evaluation an accepted record joined settled; always after `delivery_accepted`.",
+	),
+	DeliveryDiscardedEvent: doc(
+		{ type: "'delivery_discarded'", deliveryId: "string", reason: "string" },
+		"A never-accepted record was dropped at a committed session transition or disposal.",
+	),
+	DeliveryCancelledEvent: doc(
+		{ type: "'delivery_cancelled'", deliveryId: "string" },
+		"`cancel_delivery` withdrew a still-queued record.",
 	),
 	PromptStatus: "'completed' | 'aborted' | 'error'",
 	PromptError: doc(

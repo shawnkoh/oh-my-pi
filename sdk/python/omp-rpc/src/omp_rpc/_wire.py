@@ -135,6 +135,18 @@ _SLOW_MODE_SCOPE_VALUES: Final[frozenset[str]] = frozenset({"session", "global"}
 _decode_slow_mode_scope = cast("Decoder[SlowModeScope]", literal(_SLOW_MODE_SCOPE_VALUES))
 
 
+DeliveryMode: TypeAlias = Literal["aside", "steer"]
+"""`aside` never interrupts; `steer` forces the next turn."""
+_DELIVERY_MODE_VALUES: Final[frozenset[str]] = frozenset({"aside", "steer"})
+_decode_delivery_mode = cast("Decoder[DeliveryMode]", literal(_DELIVERY_MODE_VALUES))
+
+
+DeliveryMechanism: TypeAlias = Literal["wake", "aside", "steer-boundary"]
+"""Scheduling branch an external record took before the loop admitted it."""
+_DELIVERY_MECHANISM_VALUES: Final[frozenset[str]] = frozenset({"wake", "aside", "steer-boundary"})
+_decode_delivery_mechanism = cast("Decoder[DeliveryMechanism]", literal(_DELIVERY_MECHANISM_VALUES))
+
+
 BtwStatus: TypeAlias = Literal["running", "complete", "cancelled", "error", "interrupted"]
 """Side-question turn lifecycle; `interrupted` marks a turn whose process died while it ran."""
 _BTW_STATUS_VALUES: Final[frozenset[str]] = frozenset({"running", "complete", "cancelled", "error", "interrupted"})
@@ -493,6 +505,25 @@ class AssistantErrorEvent(TypedDict):
     error: AssistantMessage
 
 
+class DeliveryOptions(TypedDict):
+    mode: DeliveryMode
+    quiet: NotRequired[bool]
+    """Advisory: the deliverer expects a quiet completion."""
+    wakeAfterInterrupt: NotRequired[bool]
+    """Idle after an operator interrupt still wakes (the latch stays set)."""
+    wakeInPlanMode: NotRequired[bool]
+    """Idle in plan mode still wakes."""
+
+
+class DeliveryRecord(TypedDict):
+    """Custom message payload delivered by `deliver`; it enters context only through the loop's admission."""
+    customType: str
+    content: MessageContent
+    details: JsonObject
+    """Must carry `"omp.llm"` (`{ role: "user", content }`, the provider view) and `"omp.llm.source"`."""
+    display: NotRequired[bool]
+
+
 class SelectOptionDetail(TypedDict):
     """Presentation metadata aligned positionally with `options`."""
     description: NotRequired[str]
@@ -673,6 +704,17 @@ class SessionState:
     context_usage: ContextUsage | None = None
     goal: GoalModeState | None = None
     """Current goal mode; null when the session has no goal."""
+    capabilities: tuple[str, ...] = ()
+    """Engine capabilities (for example `external-delivery/1`); same list as the ready frame."""
+    external_deliveries: tuple[ExternalDeliveryListing, ...] = ()
+    """External records held by the session: queued or accepted but unsettled."""
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class ExternalDeliveryListing:
+    delivery_id: str
+    state: Literal["queued", "accepted"]
+    mode: DeliveryMode
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -1205,6 +1247,45 @@ class ReadyEvent:
     supported_protocol_versions: tuple[int, ...] | None = None
     max_frame_bytes: int | None = None
     max_reassembled_frame_bytes: int | None = None
+    capabilities: tuple[str, ...] | None = None
+    """Optional engine capabilities the host may rely on (for example `external-delivery/1`)."""
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class DeliveryAcceptedEvent:
+    """The loop admitted a delivered record into context (never when a prompt merely resolves)."""
+    type: Literal["delivery_accepted"] = "delivery_accepted"
+    delivery_id: str
+    at: float
+    mode: DeliveryMode
+    mechanism: DeliveryMechanism
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class DeliverySettledEvent:
+    """The evaluation an accepted record joined settled; always after `delivery_accepted`."""
+    type: Literal["delivery_settled"] = "delivery_settled"
+    delivery_id: str
+    outcome: Literal["quiet", "text", "refused", "error", "aborted"]
+    included: bool
+    requests: int
+    sole: bool
+    interactive: bool
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class DeliveryDiscardedEvent:
+    """A never-accepted record was dropped at a committed session transition or disposal."""
+    type: Literal["delivery_discarded"] = "delivery_discarded"
+    delivery_id: str
+    reason: str
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class DeliveryCancelledEvent:
+    """`cancel_delivery` withdrew a still-queued record."""
+    type: Literal["delivery_cancelled"] = "delivery_cancelled"
+    delivery_id: str
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -1605,7 +1686,7 @@ RpcAgentEvent: TypeAlias = AgentStartEvent | AgentEndEvent | TurnStartEvent | Tu
 """A session event, discriminated by `type`; `set_event_filter` selects which are sent."""
 
 
-RpcNotification: TypeAlias = ReadyEvent | PromptResultEvent | SessionSettledEvent | ExtensionError | ExtensionUiRequest | AvailableCommandsUpdateEvent | SubagentLifecycleEvent | SubagentProgressEvent | SubagentEvent | LivePhaseEvent | LiveLevelsEvent | LiveTranscriptEvent | LiveEndEvent | BtwDeltaEvent | BtwRecordEvent | CommandOutputEvent | SessionInfoUpdateEvent | ConfigUpdateEvent | RpcFrameErrorEvent | RpcAgentEvent | UnknownNotification
+RpcNotification: TypeAlias = ReadyEvent | PromptResultEvent | SessionSettledEvent | ExtensionError | ExtensionUiRequest | AvailableCommandsUpdateEvent | SubagentLifecycleEvent | SubagentProgressEvent | SubagentEvent | LivePhaseEvent | LiveLevelsEvent | LiveTranscriptEvent | LiveEndEvent | BtwDeltaEvent | BtwRecordEvent | CommandOutputEvent | SessionInfoUpdateEvent | ConfigUpdateEvent | RpcFrameErrorEvent | DeliveryAcceptedEvent | DeliverySettledEvent | DeliveryDiscardedEvent | DeliveryCancelledEvent | RpcAgentEvent | UnknownNotification
 """Unsolicited outbound frame (everything except responses and host tool/URI requests), discriminated by `type`."""
 
 
@@ -1747,6 +1828,14 @@ parse_assistant_done_event = cast("Decoder[AssistantDoneEvent]", open_record("ty
 
 parse_assistant_error_event = cast("Decoder[AssistantErrorEvent]", open_record("type", frozenset({"error"})))
 """Decodes a `AssistantErrorEvent` open record: checks the discriminator and keeps every key."""
+
+
+parse_delivery_options = cast("Decoder[DeliveryOptions]", open_record(None, None))
+"""Decodes a `DeliveryOptions` open record: checks the discriminator and keeps every key."""
+
+
+parse_delivery_record = cast("Decoder[DeliveryRecord]", open_record(None, None))
+"""Decodes a `DeliveryRecord` open record: checks the discriminator and keeps every key."""
 
 
 parse_select_option_detail = cast("Decoder[SelectOptionDetail]", open_record(None, None))
@@ -1946,6 +2035,17 @@ def parse_session_state(value: object, path: str = "SessionState") -> SessionSta
         dump_tools=defaulted(payload, "dumpTools", array(parse_tool_descriptor), path, ()),
         context_usage=optional(payload, "contextUsage", parse_context_usage, path),
         goal=defaulted(payload, "goal", nullable(parse_goal_mode_state), path, None),
+        capabilities=defaulted(payload, "capabilities", array(decode_str), path, ()),
+        external_deliveries=defaulted(payload, "externalDeliveries", array(parse_external_delivery_listing), path, ()),
+    )
+
+
+def parse_external_delivery_listing(value: object, path: str = "ExternalDeliveryListing") -> ExternalDeliveryListing:
+    payload = expect_object(value, path)
+    return ExternalDeliveryListing(
+        delivery_id=required(payload, "deliveryId", decode_str, path),
+        state=required(payload, "state", cast('Decoder[Literal["queued", "accepted"]]', literal(frozenset({"queued", "accepted"}))), path),
+        mode=required(payload, "mode", _decode_delivery_mode, path),
     )
 
 
@@ -2563,6 +2663,48 @@ def parse_ready_event(value: object, path: str = "ReadyEvent") -> ReadyEvent:
         supported_protocol_versions=optional(payload, "supportedProtocolVersions", array(decode_int), path),
         max_frame_bytes=optional(payload, "maxFrameBytes", decode_int, path),
         max_reassembled_frame_bytes=optional(payload, "maxReassembledFrameBytes", decode_int, path),
+        capabilities=optional(payload, "capabilities", array(decode_str), path),
+    )
+
+
+def parse_delivery_accepted_event(value: object, path: str = "DeliveryAcceptedEvent") -> DeliveryAcceptedEvent:
+    payload = expect_object(value, path)
+    required(payload, "type", cast('Decoder[Literal["delivery_accepted"]]', literal(frozenset({"delivery_accepted"}))), path)
+    return DeliveryAcceptedEvent(
+        delivery_id=required(payload, "deliveryId", decode_str, path),
+        at=required(payload, "at", decode_float, path),
+        mode=required(payload, "mode", _decode_delivery_mode, path),
+        mechanism=required(payload, "mechanism", _decode_delivery_mechanism, path),
+    )
+
+
+def parse_delivery_settled_event(value: object, path: str = "DeliverySettledEvent") -> DeliverySettledEvent:
+    payload = expect_object(value, path)
+    required(payload, "type", cast('Decoder[Literal["delivery_settled"]]', literal(frozenset({"delivery_settled"}))), path)
+    return DeliverySettledEvent(
+        delivery_id=required(payload, "deliveryId", decode_str, path),
+        outcome=required(payload, "outcome", cast('Decoder[Literal["quiet", "text", "refused", "error", "aborted"]]', literal(frozenset({"quiet", "text", "refused", "error", "aborted"}))), path),
+        included=required(payload, "included", decode_bool, path),
+        requests=required(payload, "requests", decode_int, path),
+        sole=required(payload, "sole", decode_bool, path),
+        interactive=required(payload, "interactive", decode_bool, path),
+    )
+
+
+def parse_delivery_discarded_event(value: object, path: str = "DeliveryDiscardedEvent") -> DeliveryDiscardedEvent:
+    payload = expect_object(value, path)
+    required(payload, "type", cast('Decoder[Literal["delivery_discarded"]]', literal(frozenset({"delivery_discarded"}))), path)
+    return DeliveryDiscardedEvent(
+        delivery_id=required(payload, "deliveryId", decode_str, path),
+        reason=required(payload, "reason", decode_str, path),
+    )
+
+
+def parse_delivery_cancelled_event(value: object, path: str = "DeliveryCancelledEvent") -> DeliveryCancelledEvent:
+    payload = expect_object(value, path)
+    required(payload, "type", cast('Decoder[Literal["delivery_cancelled"]]', literal(frozenset({"delivery_cancelled"}))), path)
+    return DeliveryCancelledEvent(
+        delivery_id=required(payload, "deliveryId", decode_str, path),
     )
 
 
@@ -3074,6 +3216,10 @@ _RPC_NOTIFICATION_CASES: Final[dict[str, Decoder[RpcNotification]]] = {
         "session_info_update": parse_session_info_update_event,
         "config_update": parse_config_update_event,
         "rpc_frame_error": parse_rpc_frame_error_event,
+        "delivery_accepted": parse_delivery_accepted_event,
+        "delivery_settled": parse_delivery_settled_event,
+        "delivery_discarded": parse_delivery_discarded_event,
+        "delivery_cancelled": parse_delivery_cancelled_event,
         "agent_start": parse_rpc_agent_event,
         "agent_end": parse_rpc_agent_event,
         "turn_start": parse_rpc_agent_event,
@@ -3174,6 +3320,19 @@ class WireClient:
         if model_id is not None:
             params["modelId"] = model_id
         return parse_open_session_result(self._command("open_session", params), "open_session")
+
+    def deliver(self, record: DeliveryRecord, options: DeliveryOptions) -> str:
+        """Deliver a directed external record (`external-delivery/1`); never parsed as a prompt. Receipts arrive as `delivery_*` frames keyed by the returned `deliveryId`."""
+        params: dict[str, object] = {}
+        params["record"] = record
+        params["options"] = options
+        return required(expect_object(self._command("deliver", params), "deliver"), "deliveryId", decode_str, "deliver")
+
+    def cancel_delivery(self, delivery_id: str) -> CancellationResult:
+        """Cancel a still-queued external record; `cancelled` is false once it was accepted or retired."""
+        params: dict[str, object] = {}
+        params["deliveryId"] = delivery_id
+        return parse_cancellation_result(self._command("cancel_delivery", params), "cancel_delivery")
 
     def get_state(self) -> SessionState:
         """Snapshot the session state."""
@@ -3585,6 +3744,22 @@ class WireClient:
         """Subscribe to `rpc_frame_error`: An event could not fit within the transport limits and was dropped."""
         return self._listen("rpc_frame_error", listener)
 
+    def on_delivery_accepted(self, listener: Callable[[DeliveryAcceptedEvent], None]) -> Callable[[], None]:
+        """Subscribe to `delivery_accepted`: The loop admitted a delivered record into context (never when a prompt merely resolves)."""
+        return self._listen("delivery_accepted", listener)
+
+    def on_delivery_settled(self, listener: Callable[[DeliverySettledEvent], None]) -> Callable[[], None]:
+        """Subscribe to `delivery_settled`: The evaluation an accepted record joined settled; always after `delivery_accepted`."""
+        return self._listen("delivery_settled", listener)
+
+    def on_delivery_discarded(self, listener: Callable[[DeliveryDiscardedEvent], None]) -> Callable[[], None]:
+        """Subscribe to `delivery_discarded`: A never-accepted record was dropped at a committed session transition or disposal."""
+        return self._listen("delivery_discarded", listener)
+
+    def on_delivery_cancelled(self, listener: Callable[[DeliveryCancelledEvent], None]) -> Callable[[], None]:
+        """Subscribe to `delivery_cancelled`: `cancel_delivery` withdrew a still-queued record."""
+        return self._listen("delivery_cancelled", listener)
+
     def on_agent_start(self, listener: Callable[[AgentStartEvent], None]) -> Callable[[], None]:
         """Subscribe to `agent_start` frames."""
         return self._listen("agent_start", listener)
@@ -3774,12 +3949,21 @@ __all__ = [
     "ConfirmUiRequest",
     "ContextUsage",
     "CustomMessage",
+    "DeliveryAcceptedEvent",
+    "DeliveryCancelledEvent",
+    "DeliveryDiscardedEvent",
+    "DeliveryMechanism",
+    "DeliveryMode",
+    "DeliveryOptions",
+    "DeliveryRecord",
+    "DeliverySettledEvent",
     "DeveloperMessage",
     "EditorUiRequest",
     "Effort",
     "ExtensionError",
     "ExtensionUiMethod",
     "ExtensionUiRequest",
+    "ExternalDeliveryListing",
     "FallbackContent",
     "FastModeResult",
     "FileMentionItem",
@@ -3957,10 +4141,17 @@ __all__ = [
     "parse_confirm_ui_request",
     "parse_context_usage",
     "parse_custom_message",
+    "parse_delivery_accepted_event",
+    "parse_delivery_cancelled_event",
+    "parse_delivery_discarded_event",
+    "parse_delivery_options",
+    "parse_delivery_record",
+    "parse_delivery_settled_event",
     "parse_developer_message",
     "parse_editor_ui_request",
     "parse_extension_error",
     "parse_extension_ui_request",
+    "parse_external_delivery_listing",
     "parse_fallback_content",
     "parse_fast_mode_result",
     "parse_file_mention_item",

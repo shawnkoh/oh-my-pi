@@ -81,6 +81,10 @@ const notificationDefs = {
 			"SessionInfoUpdateEvent",
 			"ConfigUpdateEvent",
 			"RpcFrameErrorEvent",
+			"DeliveryAcceptedEvent",
+			"DeliverySettledEvent",
+			"DeliveryDiscardedEvent",
+			"DeliveryCancelledEvent",
 			"RpcAgentEvent",
 		].join(" | "),
 		"Unsolicited outbound frame (everything except responses and host tool/URI requests), discriminated by `type`.",
@@ -166,7 +170,9 @@ export function buildRpcWireBundle(): RpcWireBundle {
 		...frameDefs,
 		...notificationDefs,
 	};
-	const open = new Set([...Object.keys(messageDefs), "SelectOptionDetail"]);
+	// `deliver` params are caller-built records the server validates itself; open
+	// records keep generated clients from narrowing what a host may hand over.
+	const open = new Set([...Object.keys(messageDefs), "SelectOptionDetail", "DeliveryRecord", "DeliveryOptions"]);
 	const commands = collectCommands(defs);
 	const exported = type.scope(defs).export() as Record<string, { toJsonSchema(): Record<string, unknown> }>;
 

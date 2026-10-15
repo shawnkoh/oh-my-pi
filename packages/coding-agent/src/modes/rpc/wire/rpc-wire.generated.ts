@@ -516,6 +516,59 @@ export interface SessionState {
 	contextUsage?: ContextUsage;
 	/** Current goal mode; null when the session has no goal. */
 	goal?: GoalModeState | null;
+	/** Engine capabilities (for example `external-delivery/1`); same list as the ready frame. */
+	capabilities?: string[];
+	/** External records held by the session: queued or accepted but unsettled. */
+	externalDeliveries?: ExternalDeliveryListing[];
+}
+
+/** `aside` never interrupts; `steer` forces the next turn. */
+export type DeliveryMode = "aside" | "steer";
+
+/** Scheduling branch an external record took before the loop admitted it. */
+export type DeliveryMechanism = "wake" | "aside" | "steer-boundary";
+
+export interface DeliveryOptions {
+	mode: DeliveryMode;
+	/** Advisory: the deliverer expects a quiet completion. */
+	quiet?: boolean;
+	/** Idle after an operator interrupt still wakes (the latch stays set). */
+	wakeAfterInterrupt?: boolean;
+	/** Idle in plan mode still wakes. */
+	wakeInPlanMode?: boolean;
+}
+
+/** Custom message payload delivered by `deliver`; it enters context only through the loop's admission. */
+export interface DeliveryRecord {
+	customType: string;
+	content: MessageContent;
+	/** Must carry `"omp.llm"` (`{ role: "user", content }`, the provider view) and `"omp.llm.source"`. */
+	details: Record<string, unknown>;
+	display?: boolean;
+}
+
+export interface ExternalDeliveryListing {
+	deliveryId: string;
+	state: "queued" | "accepted";
+	mode: DeliveryMode;
+}
+
+export interface DeliveryAcceptance {
+	at: number;
+	mode: DeliveryMode;
+	mechanism: DeliveryMechanism;
+}
+
+export interface DeliverySettlement {
+	outcome: "quiet" | "text" | "refused" | "error" | "aborted";
+	/** Exactly one stamped projection reached a completed main request. */
+	included: boolean;
+	/** Main provider requests observed while the record was in context. */
+	requests: number;
+	/** No other admitted input joined the owning evaluation. */
+	sole: boolean;
+	/** An interactive input joined the owning evaluation. */
+	interactive: boolean;
 }
 
 export interface BashResult {
@@ -1002,6 +1055,41 @@ export interface ReadyEvent {
 	supportedProtocolVersions?: number[];
 	maxFrameBytes?: number;
 	maxReassembledFrameBytes?: number;
+	/** Optional engine capabilities the host may rely on (for example `external-delivery/1`). */
+	capabilities?: string[];
+}
+
+/** The loop admitted a delivered record into context (never when a prompt merely resolves). */
+export interface DeliveryAcceptedEvent {
+	type: "delivery_accepted";
+	deliveryId: string;
+	at: number;
+	mode: DeliveryMode;
+	mechanism: DeliveryMechanism;
+}
+
+/** The evaluation an accepted record joined settled; always after `delivery_accepted`. */
+export interface DeliverySettledEvent {
+	type: "delivery_settled";
+	deliveryId: string;
+	outcome: "quiet" | "text" | "refused" | "error" | "aborted";
+	included: boolean;
+	requests: number;
+	sole: boolean;
+	interactive: boolean;
+}
+
+/** A never-accepted record was dropped at a committed session transition or disposal. */
+export interface DeliveryDiscardedEvent {
+	type: "delivery_discarded";
+	deliveryId: string;
+	reason: string;
+}
+
+/** `cancel_delivery` withdrew a still-queued record. */
+export interface DeliveryCancelledEvent {
+	type: "delivery_cancelled";
+	deliveryId: string;
 }
 
 export type PromptStatus = "completed" | "aborted" | "error";
@@ -1445,7 +1533,7 @@ export interface HostUriSchemeDefinition {
 }
 
 /** Unsolicited outbound frame (everything except responses and host tool/URI requests), discriminated by `type`. */
-export type RpcNotification = ReadyEvent | PromptResultEvent | SessionSettledEvent | ExtensionError | ExtensionUiRequest | AvailableCommandsUpdateEvent | SubagentLifecycleEvent | SubagentProgressEvent | SubagentEvent | LivePhaseEvent | LiveLevelsEvent | LiveTranscriptEvent | LiveEndEvent | BtwDeltaEvent | BtwRecordEvent | CommandOutputEvent | SessionInfoUpdateEvent | ConfigUpdateEvent | RpcFrameErrorEvent | RpcAgentEvent;
+export type RpcNotification = ReadyEvent | PromptResultEvent | SessionSettledEvent | ExtensionError | ExtensionUiRequest | AvailableCommandsUpdateEvent | SubagentLifecycleEvent | SubagentProgressEvent | SubagentEvent | LivePhaseEvent | LiveLevelsEvent | LiveTranscriptEvent | LiveEndEvent | BtwDeltaEvent | BtwRecordEvent | CommandOutputEvent | SessionInfoUpdateEvent | ConfigUpdateEvent | RpcFrameErrorEvent | DeliveryAcceptedEvent | DeliverySettledEvent | DeliveryDiscardedEvent | DeliveryCancelledEvent | RpcAgentEvent;
 
 /** Any frame the server writes to stdout (after reassembling `rpc_chunk` sequences), discriminated by `type`. */
 export type RpcServerFrame = RpcResponse | RpcHostRequest | RpcNotification;
@@ -1500,6 +1588,19 @@ export interface OpenSessionParams {
 	sessionDir: string;
 	provider?: string;
 	modelId?: string;
+}
+
+export interface DeliverParams {
+	record: DeliveryRecord;
+	options: DeliveryOptions;
+}
+
+export interface DeliverResult {
+	deliveryId: string;
+}
+
+export interface CancelDeliveryParams {
+	deliveryId: string;
 }
 
 export interface SetFastModeParams {
@@ -1797,6 +1898,8 @@ export interface RpcWireCommands {
 	abort_and_restore_queue: { params: undefined; result: AbortAndRestoreQueueResult };
 	new_session: { params: NewSessionParams; result: CancellationResult };
 	open_session: { params: OpenSessionParams; result: OpenSessionResult };
+	deliver: { params: DeliverParams; result: DeliverResult };
+	cancel_delivery: { params: CancelDeliveryParams; result: CancellationResult };
 	get_state: { params: undefined; result: SessionState };
 	set_fast_mode: { params: SetFastModeParams; result: FastModeResult };
 	set_slow_mode: { params: SetSlowModeParams; result: SetSlowModeResult };

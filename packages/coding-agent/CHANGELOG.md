@@ -86,6 +86,7 @@
 ### Added
 
 - Added the default-off `goal.toolDefault` setting, which lets agents start goal mode themselves in ordinary sessions; an explicit `--tools=...,goal` now also exposes the tool while the default stays hidden ([#13877](https://github.com/can1357/oh-my-pi/pull/13877) by [@shawnkoh](https://github.com/shawnkoh))
+- External delivery (`external-delivery/1`): RPC hosts can hand the session a record authored by another actor with `deliver` (`mode: "aside" | "steer"`) and withdraw it with `cancel_delivery`; the engine reports `delivery_accepted`, `delivery_settled`, `delivery_discarded` and `delivery_cancelled` receipts, lists held records in `get_state.externalDeliveries`, and advertises the capability in `ready.capabilities` and `get_state.capabilities`. Extensions get the same surface as `ExtensionAPI.deliverMessage` with `ExtensionAPI.capabilities`. Records declare their provider view in `details["omp.llm"]` and are rejected without one; delivery-owned evaluations may complete quietly (see `docs/rpc.md#external-delivery`).
 
 ## [18.10.3] - 2026-10-12
 

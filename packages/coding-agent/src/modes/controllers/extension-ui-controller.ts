@@ -216,6 +216,7 @@ export class ExtensionUiController {
 		const actions: ExtensionActions = {
 			sendMessage: this.#sendExtensionMessage,
 			sendUserMessage: this.#sendExtensionUserMessage,
+			deliverMessage: (record, options) => this.ctx.session.deliverExternalMessage(record, options),
 			appendEntry: (customType, data) => {
 				this.ctx.sessionManager.appendCustomEntry(customType, data);
 			},
@@ -447,6 +448,7 @@ export class ExtensionUiController {
 		const actions: ExtensionActions = {
 			sendMessage: this.#sendExtensionMessage,
 			sendUserMessage: this.#sendExtensionUserMessage,
+			deliverMessage: (record, options) => this.ctx.session.deliverExternalMessage(record, options),
 			appendEntry: (customType, data) => {
 				this.ctx.sessionManager.appendCustomEntry(customType, data);
 			},
