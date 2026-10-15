@@ -105,7 +105,17 @@ async function approvePreludeInvocation(
 				`Set tools.approval.${definition.name}: allow or use an interactive UI to approve the call.`,
 		);
 	}
-	const approved = await untilAborted(context.signal, () => requestApproval(ui, subject, parameters, resolved.reason));
+	const approved = await untilAborted(context.signal, () =>
+		requestApproval(ui, subject, parameters, resolved.reason, [], {
+			signal: context.signal,
+			approval: {
+				toolCallId: context.toolCallId,
+				toolName: definition.name,
+				arguments: parameters,
+				...(resolved.reason ? { reason: resolved.reason } : {}),
+			},
+		}),
+	);
 	if (!approved) throw new Error(`Eval prelude call denied by user: ${definition.name}`);
 }
 

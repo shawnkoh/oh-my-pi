@@ -4709,7 +4709,7 @@ type ReadyEvent struct {
 	SupportedProtocolVersions []int64 `json:"supportedProtocolVersions,omitempty"`
 	MaxFrameBytes             *int64  `json:"maxFrameBytes,omitempty"`
 	MaxReassembledFrameBytes  *int64  `json:"maxReassembledFrameBytes,omitempty"`
-	// Optional engine capabilities the host may rely on (for example `external-delivery/1`).
+	// Versioned engine capabilities (`name/major`) the host may rely on; same list as `get_state.capabilities`.
 	Capabilities []string `json:"capabilities,omitempty"`
 }
 
@@ -4941,6 +4941,12 @@ type PromptResultEvent struct {
 	SessionSettled bool         `json:"sessionSettled"`
 	ID             *string      `json:"id,omitempty"`
 	Error          *PromptError `json:"error,omitempty"`
+	// `reply-attribution/1`: engine-local ordinal of the run whose yield answered the prompt; shared by prompts answered together.
+	Run *int64 `json:"run,omitempty"`
+	// Session entry id of the prompt's persisted user message, when identified.
+	PromptEntryID *string `json:"promptEntryId,omitempty"`
+	// Assistant entries that followed the prompt's user message, in order; the last is the reply. Present whenever `run` is.
+	ReplyEntryIds []string `json:"replyEntryIds,omitempty"`
 }
 
 func (v *PromptResultEvent) UnmarshalJSON(data []byte) error {
@@ -4956,6 +4962,9 @@ func (v *PromptResultEvent) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("sessionSettled", &out.SessionSettled)
 	d.optional("id", &out.ID)
 	d.optional("error", &out.Error)
+	d.optional("run", &out.Run)
+	d.optional("promptEntryId", &out.PromptEntryID)
+	d.optional("replyEntryIds", &out.ReplyEntryIds)
 	if d.err != nil {
 		return d.err
 	}
@@ -5666,7 +5675,9 @@ type SelectUiRequest struct {
 	Title         string               `json:"title"`
 	Options       []string             `json:"options"`
 	OptionDetails []SelectOptionDetail `json:"optionDetails,omitempty"`
-	Timeout       *int64               `json:"timeout,omitempty"`
+	// Tool-approval selects only (`tool-approval-binding/1`).
+	Approval *ToolApprovalBinding `json:"approval,omitempty"`
+	Timeout  *int64               `json:"timeout,omitempty"`
 }
 
 func (v *SelectUiRequest) UnmarshalJSON(data []byte) error {
@@ -5682,6 +5693,7 @@ func (v *SelectUiRequest) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("title", &out.Title)
 	d.required("options", &out.Options)
 	d.optional("optionDetails", &out.OptionDetails)
+	d.optional("approval", &out.Approval)
 	d.optional("timeout", &out.Timeout)
 	if d.err != nil {
 		return d.err
@@ -5693,6 +5705,33 @@ func (v *SelectUiRequest) decodeFrom(raw map[string]json.RawMessage) error {
 func (v SelectUiRequest) MarshalJSON() ([]byte, error) {
 	type plain SelectUiRequest
 	return encodeObject(plain(v), `"type":"extension_ui_request","method":"select"`, nil)
+}
+
+// The exact tool call a tool-approval dialog decides; `(toolCallId, toolName)` identifies the decision.
+type ToolApprovalBinding struct {
+	ToolCallID string `json:"toolCallId"`
+	ToolName   string `json:"toolName"`
+	// The arguments the approval policy evaluated.
+	Arguments json.RawMessage `json:"arguments"`
+	Reason    *string         `json:"reason,omitempty"`
+}
+
+func (v *ToolApprovalBinding) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "ToolApprovalBinding", v.decodeFrom)
+}
+
+func (v *ToolApprovalBinding) decodeFrom(raw map[string]json.RawMessage) error {
+	var out ToolApprovalBinding
+	d := fieldDecoder{raw: raw, owner: "ToolApprovalBinding"}
+	d.required("toolCallId", &out.ToolCallID)
+	d.required("toolName", &out.ToolName)
+	d.required("arguments", &out.Arguments)
+	d.optional("reason", &out.Reason)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
 }
 
 type ConfirmUiRequest struct {
@@ -5795,7 +5834,9 @@ func (v EditorUiRequest) MarshalJSON() ([]byte, error) {
 type AskUiRequest struct {
 	ID        string        `json:"id"`
 	Questions []AskQuestion `json:"questions"`
-	Timeout   *int64        `json:"timeout,omitempty"`
+	// `rich-ask/2` opt-in only: answers may attach images.
+	AcceptImages *bool  `json:"acceptImages,omitempty"`
+	Timeout      *int64 `json:"timeout,omitempty"`
 }
 
 func (v *AskUiRequest) UnmarshalJSON(data []byte) error {
@@ -5809,6 +5850,7 @@ func (v *AskUiRequest) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("id", &out.ID)
 	d.constant("method", "ask")
 	d.required("questions", &out.Questions)
+	d.optional("acceptImages", &out.AcceptImages)
 	d.optional("timeout", &out.Timeout)
 	if d.err != nil {
 		return d.err
@@ -6110,6 +6152,12 @@ type AskAnswer struct {
 	ID              string   `json:"id"`
 	SelectedOptions []string `json:"selectedOptions"`
 	CustomInput     *string  `json:"customInput,omitempty"`
+	// `rich-ask/2` with `acceptImages` only.
+	CustomInputImages []ImageContent `json:"customInputImages,omitempty"`
+	// `rich-ask/2` only.
+	Note *string `json:"note,omitempty"`
+	// `rich-ask/2` with `acceptImages` only.
+	NoteImages []ImageContent `json:"noteImages,omitempty"`
 }
 
 func (v *AskAnswer) UnmarshalJSON(data []byte) error {
@@ -6122,6 +6170,9 @@ func (v *AskAnswer) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("id", &out.ID)
 	d.required("selectedOptions", &out.SelectedOptions)
 	d.optional("customInput", &out.CustomInput)
+	d.optional("customInputImages", &out.CustomInputImages)
+	d.optional("note", &out.Note)
+	d.optional("noteImages", &out.NoteImages)
 	if d.err != nil {
 		return d.err
 	}
@@ -6242,6 +6293,33 @@ func (v AnswersUiResponse) MarshalJSON() ([]byte, error) {
 	return encodeObject(plain(v), `"type":"extension_ui_response"`, nil)
 }
 
+// `rich-ask/2` only: redirects an `ask` request to chat.
+type ChatUiResponse struct {
+	ID string `json:"id"`
+}
+
+func (v *ChatUiResponse) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "ChatUiResponse", v.decodeFrom)
+}
+
+func (v *ChatUiResponse) decodeFrom(raw map[string]json.RawMessage) error {
+	var out ChatUiResponse
+	d := fieldDecoder{raw: raw, owner: "ChatUiResponse"}
+	d.constant("type", "extension_ui_response")
+	d.required("id", &out.ID)
+	d.constant("chat", true)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+func (v ChatUiResponse) MarshalJSON() ([]byte, error) {
+	type plain ChatUiResponse
+	return encodeObject(plain(v), `"type":"extension_ui_response","chat":true`, nil)
+}
+
 // Host reply to an extension UI request; variants share `type` and differ by their payload key.
 type ExtensionUiResponse struct {
 	// Value holds one variant. Encode-only: no discriminator tells the variants apart.
@@ -6257,6 +6335,7 @@ func (ValueUiResponse) isExtensionUiResponse()   {}
 func (ConfirmUiResponse) isExtensionUiResponse() {}
 func (CancelUiResponse) isExtensionUiResponse()  {}
 func (AnswersUiResponse) isExtensionUiResponse() {}
+func (ChatUiResponse) isExtensionUiResponse()    {}
 
 func (v ExtensionUiResponse) MarshalJSON() ([]byte, error) {
 	return encodeVariant("ExtensionUiResponse", v.Value)
@@ -6609,6 +6688,7 @@ func (ValueUiResponse) isRpcInbound()   {}
 func (ConfirmUiResponse) isRpcInbound() {}
 func (CancelUiResponse) isRpcInbound()  {}
 func (AnswersUiResponse) isRpcInbound() {}
+func (ChatUiResponse) isRpcInbound()    {}
 func (HostToolUpdate) isRpcInbound()    {}
 func (HostToolResult) isRpcInbound()    {}
 func (HostUriResult) isRpcInbound()     {}
@@ -7201,6 +7281,8 @@ func (v *SetSlowModeResult) decodeFrom(raw map[string]json.RawMessage) error {
 
 type SetAskDialogResult struct {
 	Enabled bool `json:"enabled"`
+	// Whether `rich-ask/2` is active; present only when `rich` was requested.
+	Rich *bool `json:"rich,omitempty"`
 }
 
 func (v *SetAskDialogResult) UnmarshalJSON(data []byte) error {
@@ -7211,6 +7293,7 @@ func (v *SetAskDialogResult) decodeFrom(raw map[string]json.RawMessage) error {
 	var out SetAskDialogResult
 	d := fieldDecoder{raw: raw, owner: "SetAskDialogResult"}
 	d.required("enabled", &out.Enabled)
+	d.optional("rich", &out.Rich)
 	if d.err != nil {
 		return d.err
 	}
@@ -7713,6 +7796,8 @@ type PromptCommand struct {
 	// Images attached to the message.
 	Images            []ImageContent     `json:"images,omitempty"`
 	StreamingBehavior *StreamingBehavior `json:"streamingBehavior,omitempty"`
+	// `literal-input/1`: after input hooks, admit the text as plain user text (no command, template or mention expansion).
+	Literal *bool `json:"literal,omitempty"`
 }
 
 // Prompt sends "prompt": Submit a prompt; acknowledged once admitted, completed by its `prompt_result`.
@@ -7728,6 +7813,8 @@ type SteerCommand struct {
 	Message string `json:"message"`
 	// Images attached to the message.
 	Images []ImageContent `json:"images,omitempty"`
+	// `literal-input/1`: after input hooks, admit the text as plain user text (no command, template or mention expansion).
+	Literal *bool `json:"literal,omitempty"`
 }
 
 // Steer sends "steer": Queue a steering message.
@@ -7740,6 +7827,8 @@ type FollowUpCommand struct {
 	Message string `json:"message"`
 	// Images attached to the message.
 	Images []ImageContent `json:"images,omitempty"`
+	// `literal-input/1`: after input hooks, admit the text as plain user text (no command, template or mention expansion).
+	Literal *bool `json:"literal,omitempty"`
 }
 
 // FollowUp sends "follow_up": Queue a follow-up message.
@@ -7782,6 +7871,8 @@ type AbortAndPromptCommand struct {
 	Message string `json:"message"`
 	// Images attached to the message.
 	Images []ImageContent `json:"images,omitempty"`
+	// `literal-input/1`: after input hooks, admit the text as plain user text (no command, template or mention expansion).
+	Literal *bool `json:"literal,omitempty"`
 }
 
 // AbortAndPrompt sends "abort_and_prompt": Abort the current run and submit a prompt; completed by its `prompt_result`.
@@ -7896,6 +7987,8 @@ func (c Commands) Goal(ctx context.Context, p GoalCommand) (GoalResult, error) {
 // SetAskDialogCommand holds the parameters of "set_ask_dialog".
 type SetAskDialogCommand struct {
 	Enabled bool `json:"enabled"`
+	// Also opt in to `rich-ask/2` (`--mode rpc-ui` only).
+	Rich *bool `json:"rich,omitempty"`
 }
 
 // SetAskDialog sends "set_ask_dialog": Opt in to `ask` UI requests; returns the applied setting.

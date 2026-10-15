@@ -4185,7 +4185,7 @@ pub struct ReadyEvent {
 	pub max_frame_bytes: Option<i64>,
 	#[serde(rename = "maxReassembledFrameBytes", default, skip_serializing_if = "Option::is_none")]
 	pub max_reassembled_frame_bytes: Option<i64>,
-	/// Optional engine capabilities the host may rely on (for example `external-delivery/1`).
+	/// Versioned engine capabilities (`name/major`) the host may rely on; same list as `get_state.capabilities`.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub capabilities: Option<Vec<String>>,
 }
@@ -4275,6 +4275,15 @@ pub struct PromptResultEvent {
 	pub id: Option<String>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub error: Option<PromptError>,
+	/// `reply-attribution/1`: engine-local ordinal of the run whose yield answered the prompt; shared by prompts answered together.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub run: Option<i64>,
+	/// Session entry id of the prompt's persisted user message, when identified.
+	#[serde(rename = "promptEntryId", default, skip_serializing_if = "Option::is_none")]
+	pub prompt_entry_id: Option<String>,
+	/// Assistant entries that followed the prompt's user message, in order; the last is the reply. Present whenever `run` is.
+	#[serde(rename = "replyEntryIds", default, skip_serializing_if = "Option::is_none")]
+	pub reply_entry_ids: Option<Vec<String>>,
 }
 
 /// The session went quiet: the last run yielded and no background work can wake it.
@@ -4590,8 +4599,25 @@ pub struct SelectUiRequest {
 	pub options: Vec<String>,
 	#[serde(rename = "optionDetails", default, skip_serializing_if = "Option::is_none")]
 	pub option_details: Option<Vec<SelectOptionDetail>>,
+	/// Tool-approval selects only (`tool-approval-binding/1`).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub approval: Option<ToolApprovalBinding>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub timeout: Option<i64>,
+}
+
+/// The exact tool call a tool-approval dialog decides; `(toolCallId, toolName)` identifies the decision.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolApprovalBinding {
+	#[serde(rename = "toolCallId")]
+	pub tool_call_id: String,
+	#[serde(rename = "toolName")]
+	pub tool_name: String,
+	/// The arguments the approval policy evaluated.
+	#[serde(deserialize_with = "Deserialize::deserialize")]
+	pub arguments: Value,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -4628,6 +4654,9 @@ pub struct EditorUiRequest {
 pub struct AskUiRequest {
 	pub id: String,
 	pub questions: Vec<AskQuestion>,
+	/// `rich-ask/2` opt-in only: answers may attach images.
+	#[serde(rename = "acceptImages", default, skip_serializing_if = "Option::is_none")]
+	pub accept_images: Option<bool>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub timeout: Option<i64>,
 }
@@ -4767,6 +4796,15 @@ pub struct AskAnswer {
 	pub selected_options: Vec<String>,
 	#[serde(rename = "customInput", default, skip_serializing_if = "Option::is_none")]
 	pub custom_input: Option<String>,
+	/// `rich-ask/2` with `acceptImages` only.
+	#[serde(rename = "customInputImages", default, skip_serializing_if = "Option::is_none")]
+	pub custom_input_images: Option<Vec<ImageContent>>,
+	/// `rich-ask/2` only.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub note: Option<String>,
+	/// `rich-ask/2` with `acceptImages` only.
+	#[serde(rename = "noteImages", default, skip_serializing_if = "Option::is_none")]
+	pub note_images: Option<Vec<ImageContent>>,
 }
 
 /// Answers a `select`, `input`, or `editor` request.
@@ -4799,6 +4837,13 @@ pub struct AnswersUiResponse {
 	pub answers: Vec<AskAnswer>,
 }
 
+/// `rich-ask/2` only: redirects an `ask` request to chat.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatUiResponse {
+	pub id: String,
+	pub chat: LitTrue,
+}
+
 /// Host reply to an extension UI request; variants share `type` and differ by their payload key.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExtensionUiResponse {
@@ -4810,6 +4855,8 @@ pub enum ExtensionUiResponse {
 	CancelUiResponse(CancelUiResponse),
 	/// Answers an `ask` request: one `AskAnswer` per question, in question order.
 	AnswersUiResponse(AnswersUiResponse),
+	/// `rich-ask/2` only: redirects an `ask` request to chat.
+	ChatUiResponse(ChatUiResponse),
 }
 
 impl ExtensionUiResponse {
@@ -4827,6 +4874,9 @@ impl ExtensionUiResponse {
 		if let Ok(member) = AnswersUiResponse::deserialize(&value) {
 			return Ok(Self::AnswersUiResponse(member));
 		}
+		if let Ok(member) = ChatUiResponse::deserialize(&value) {
+			return Ok(Self::ChatUiResponse(member));
+		}
 		Err(serde_json::Error::custom("no ExtensionUiResponse variant matches"))
 	}
 }
@@ -4838,6 +4888,7 @@ impl Serialize for ExtensionUiResponse {
 			Self::ConfirmUiResponse(member) => serialize_tagged(member, &[("type", "extension_ui_response")], serializer),
 			Self::CancelUiResponse(member) => serialize_tagged(member, &[("type", "extension_ui_response")], serializer),
 			Self::AnswersUiResponse(member) => serialize_tagged(member, &[("type", "extension_ui_response")], serializer),
+			Self::ChatUiResponse(member) => serialize_tagged(member, &[("type", "extension_ui_response")], serializer),
 		}
 	}
 }
@@ -5289,6 +5340,9 @@ pub struct PromptParams {
 	pub images: Option<Vec<ImageContent>>,
 	#[serde(rename = "streamingBehavior", default, skip_serializing_if = "Option::is_none")]
 	pub streaming_behavior: Option<StreamingBehavior>,
+	/// `literal-input/1`: after input hooks, admit the text as plain user text (no command, template or mention expansion).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub literal: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5297,6 +5351,9 @@ pub struct SteerParams {
 	/// Images attached to the message.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub images: Option<Vec<ImageContent>>,
+	/// `literal-input/1`: after input hooks, admit the text as plain user text (no command, template or mention expansion).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub literal: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5305,6 +5362,9 @@ pub struct FollowUpParams {
 	/// Images attached to the message.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub images: Option<Vec<ImageContent>>,
+	/// `literal-input/1`: after input hooks, admit the text as plain user text (no command, template or mention expansion).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub literal: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5324,6 +5384,9 @@ pub struct AbortAndPromptParams {
 	/// Images attached to the message.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub images: Option<Vec<ImageContent>>,
+	/// `literal-input/1`: after input hooks, admit the text as plain user text (no command, template or mention expansion).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub literal: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5387,11 +5450,17 @@ pub struct GoalParams {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SetAskDialogParams {
 	pub enabled: bool,
+	/// Also opt in to `rich-ask/2` (`--mode rpc-ui` only).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub rich: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SetAskDialogResult {
 	pub enabled: bool,
+	/// Whether `rich-ask/2` is active; present only when `rich` was requested.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub rich: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -6240,6 +6309,9 @@ pub struct PromptCommand {
 	pub images: Option<Vec<ImageContent>>,
 	#[serde(rename = "streamingBehavior", default, skip_serializing_if = "Option::is_none")]
 	pub streaming_behavior: Option<StreamingBehavior>,
+	/// `literal-input/1`: after input hooks, admit the text as plain user text (no command, template or mention expansion).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub literal: Option<bool>,
 }
 
 impl Command for PromptCommand {
@@ -6259,6 +6331,9 @@ pub struct SteerCommand {
 	/// Images attached to the message.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub images: Option<Vec<ImageContent>>,
+	/// `literal-input/1`: after input hooks, admit the text as plain user text (no command, template or mention expansion).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub literal: Option<bool>,
 }
 
 impl Command for SteerCommand {
@@ -6279,6 +6354,9 @@ pub struct FollowUpCommand {
 	/// Images attached to the message.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub images: Option<Vec<ImageContent>>,
+	/// `literal-input/1`: after input hooks, admit the text as plain user text (no command, template or mention expansion).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub literal: Option<bool>,
 }
 
 impl Command for FollowUpCommand {
@@ -6350,6 +6428,9 @@ pub struct AbortAndPromptCommand {
 	/// Images attached to the message.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub images: Option<Vec<ImageContent>>,
+	/// `literal-input/1`: after input hooks, admit the text as plain user text (no command, template or mention expansion).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub literal: Option<bool>,
 }
 
 impl Command for AbortAndPromptCommand {
@@ -6519,6 +6600,9 @@ impl Command for GoalCommand {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SetAskDialogCommand {
 	pub enabled: bool,
+	/// Also opt in to `rich-ask/2` (`--mode rpc-ui` only).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub rich: Option<bool>,
 }
 
 impl Command for SetAskDialogCommand {

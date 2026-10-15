@@ -1055,7 +1055,7 @@ export interface ReadyEvent {
 	supportedProtocolVersions?: number[];
 	maxFrameBytes?: number;
 	maxReassembledFrameBytes?: number;
-	/** Optional engine capabilities the host may rely on (for example `external-delivery/1`). */
+	/** Versioned engine capabilities (`name/major`) the host may rely on; same list as `get_state.capabilities`. */
 	capabilities?: string[];
 }
 
@@ -1113,6 +1113,12 @@ export interface PromptResultEvent {
 	sessionSettled: boolean;
 	id?: string;
 	error?: PromptError;
+	/** `reply-attribution/1`: engine-local ordinal of the run whose yield answered the prompt; shared by prompts answered together. */
+	run?: number;
+	/** Session entry id of the prompt's persisted user message, when identified. */
+	promptEntryId?: string;
+	/** Assistant entries that followed the prompt's user message, in order; the last is the reply. Present whenever `run` is. */
+	replyEntryIds?: string[];
 }
 
 /** The session went quiet: the last run yielded and no background work can wake it. */
@@ -1286,7 +1292,18 @@ export interface SelectUiRequest {
 	title: string;
 	options: string[];
 	optionDetails?: SelectOptionDetail[];
+	/** Tool-approval selects only (`tool-approval-binding/1`). */
+	approval?: ToolApprovalBinding;
 	timeout?: number;
+}
+
+/** The exact tool call a tool-approval dialog decides; `(toolCallId, toolName)` identifies the decision. */
+export interface ToolApprovalBinding {
+	toolCallId: string;
+	toolName: string;
+	/** The arguments the approval policy evaluated. */
+	arguments: unknown;
+	reason?: string;
 }
 
 export interface ConfirmUiRequest {
@@ -1322,6 +1339,8 @@ export interface AskUiRequest {
 	id: string;
 	method: "ask";
 	questions: AskQuestion[];
+	/** `rich-ask/2` opt-in only: answers may attach images. */
+	acceptImages?: boolean;
 	timeout?: number;
 }
 
@@ -1390,6 +1409,12 @@ export interface AskAnswer {
 	id: string;
 	selectedOptions: string[];
 	customInput?: string;
+	/** `rich-ask/2` with `acceptImages` only. */
+	customInputImages?: ImageContent[];
+	/** `rich-ask/2` only. */
+	note?: string;
+	/** `rich-ask/2` with `acceptImages` only. */
+	noteImages?: ImageContent[];
 }
 
 /** Answers a `select`, `input`, or `editor` request. */
@@ -1421,8 +1446,15 @@ export interface AnswersUiResponse {
 	answers: AskAnswer[];
 }
 
+/** `rich-ask/2` only: redirects an `ask` request to chat. */
+export interface ChatUiResponse {
+	type: "extension_ui_response";
+	id: string;
+	chat: true;
+}
+
 /** Host reply to an extension UI request; variants share `type` and differ by their payload key. */
-export type ExtensionUiResponse = ValueUiResponse | ConfirmUiResponse | CancelUiResponse | AnswersUiResponse;
+export type ExtensionUiResponse = ValueUiResponse | ConfirmUiResponse | CancelUiResponse | AnswersUiResponse | ChatUiResponse;
 
 export interface HostToolCallRequest {
 	type: "host_tool_call";
@@ -1551,18 +1583,24 @@ export interface PromptParams {
 	/** Images attached to the message. */
 	images?: ImageContent[];
 	streamingBehavior?: StreamingBehavior;
+	/** `literal-input/1`: after input hooks, admit the text as plain user text (no command, template or mention expansion). */
+	literal?: boolean;
 }
 
 export interface SteerParams {
 	message: string;
 	/** Images attached to the message. */
 	images?: ImageContent[];
+	/** `literal-input/1`: after input hooks, admit the text as plain user text (no command, template or mention expansion). */
+	literal?: boolean;
 }
 
 export interface FollowUpParams {
 	message: string;
 	/** Images attached to the message. */
 	images?: ImageContent[];
+	/** `literal-input/1`: after input hooks, admit the text as plain user text (no command, template or mention expansion). */
+	literal?: boolean;
 }
 
 export interface RemoveQueuedMessageParams {
@@ -1578,6 +1616,8 @@ export interface AbortAndPromptParams {
 	message: string;
 	/** Images attached to the message. */
 	images?: ImageContent[];
+	/** `literal-input/1`: after input hooks, admit the text as plain user text (no command, template or mention expansion). */
+	literal?: boolean;
 }
 
 export interface NewSessionParams {
@@ -1623,10 +1663,14 @@ export interface GoalParams {
 
 export interface SetAskDialogParams {
 	enabled: boolean;
+	/** Also opt in to `rich-ask/2` (`--mode rpc-ui` only). */
+	rich?: boolean;
 }
 
 export interface SetAskDialogResult {
 	enabled: boolean;
+	/** Whether `rich-ask/2` is active; present only when `rich` was requested. */
+	rich?: boolean;
 }
 
 export interface GetAvailableCommandsResult {

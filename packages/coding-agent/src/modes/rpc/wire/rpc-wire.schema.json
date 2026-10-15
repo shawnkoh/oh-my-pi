@@ -4490,7 +4490,7 @@
 					"items": {
 						"type": "string"
 					},
-					"description": "Optional engine capabilities the host may rely on (for example `external-delivery/1`)."
+					"description": "Versioned engine capabilities (`name/major`) the host may rely on; same list as `get_state.capabilities`."
 				}
 			},
 			"required": [
@@ -4660,6 +4660,21 @@
 				},
 				"error": {
 					"$ref": "#/$defs/PromptError"
+				},
+				"run": {
+					"type": "integer",
+					"description": "`reply-attribution/1`: engine-local ordinal of the run whose yield answered the prompt; shared by prompts answered together."
+				},
+				"promptEntryId": {
+					"type": "string",
+					"description": "Session entry id of the prompt's persisted user message, when identified."
+				},
+				"replyEntryIds": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"description": "Assistant entries that followed the prompt's user message, in order; the last is the reply. Present whenever `run` is."
 				}
 			},
 			"required": [
@@ -5178,6 +5193,10 @@
 						"$ref": "#/$defs/SelectOptionDetail"
 					}
 				},
+				"approval": {
+					"$ref": "#/$defs/ToolApprovalBinding",
+					"description": "Tool-approval selects only (`tool-approval-binding/1`)."
+				},
 				"timeout": {
 					"type": "integer"
 				}
@@ -5189,6 +5208,29 @@
 				"title",
 				"options"
 			]
+		},
+		"ToolApprovalBinding": {
+			"type": "object",
+			"properties": {
+				"toolCallId": {
+					"type": "string"
+				},
+				"toolName": {
+					"type": "string"
+				},
+				"arguments": {
+					"description": "The arguments the approval policy evaluated."
+				},
+				"reason": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"toolCallId",
+				"toolName",
+				"arguments"
+			],
+			"description": "The exact tool call a tool-approval dialog decides; `(toolCallId, toolName)` identifies the decision."
 		},
 		"ConfirmUiRequest": {
 			"type": "object",
@@ -5295,6 +5337,10 @@
 					"items": {
 						"$ref": "#/$defs/AskQuestion"
 					}
+				},
+				"acceptImages": {
+					"type": "boolean",
+					"description": "`rich-ask/2` opt-in only: answers may attach images."
 				},
 				"timeout": {
 					"type": "integer"
@@ -5547,6 +5593,24 @@
 				},
 				"customInput": {
 					"type": "string"
+				},
+				"customInputImages": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/ImageContent"
+					},
+					"description": "`rich-ask/2` with `acceptImages` only."
+				},
+				"note": {
+					"type": "string",
+					"description": "`rich-ask/2` only."
+				},
+				"noteImages": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/ImageContent"
+					},
+					"description": "`rich-ask/2` with `acceptImages` only."
 				}
 			},
 			"required": [
@@ -5641,6 +5705,26 @@
 			],
 			"description": "Answers an `ask` request: one `AskAnswer` per question, in question order."
 		},
+		"ChatUiResponse": {
+			"type": "object",
+			"properties": {
+				"type": {
+					"const": "extension_ui_response"
+				},
+				"id": {
+					"type": "string"
+				},
+				"chat": {
+					"const": true
+				}
+			},
+			"required": [
+				"type",
+				"id",
+				"chat"
+			],
+			"description": "`rich-ask/2` only: redirects an `ask` request to chat."
+		},
 		"ExtensionUiResponse": {
 			"anyOf": [
 				{
@@ -5654,6 +5738,9 @@
 				},
 				{
 					"$ref": "#/$defs/AnswersUiResponse"
+				},
+				{
+					"$ref": "#/$defs/ChatUiResponse"
 				}
 			],
 			"description": "Host reply to an extension UI request; variants share `type` and differ by their payload key."
@@ -6129,6 +6216,10 @@
 				},
 				"streamingBehavior": {
 					"$ref": "#/$defs/StreamingBehavior"
+				},
+				"literal": {
+					"type": "boolean",
+					"description": "`literal-input/1`: after input hooks, admit the text as plain user text (no command, template or mention expansion)."
 				}
 			},
 			"required": [
@@ -6147,6 +6238,10 @@
 						"$ref": "#/$defs/ImageContent"
 					},
 					"description": "Images attached to the message."
+				},
+				"literal": {
+					"type": "boolean",
+					"description": "`literal-input/1`: after input hooks, admit the text as plain user text (no command, template or mention expansion)."
 				}
 			},
 			"required": [
@@ -6165,6 +6260,10 @@
 						"$ref": "#/$defs/ImageContent"
 					},
 					"description": "Images attached to the message."
+				},
+				"literal": {
+					"type": "boolean",
+					"description": "`literal-input/1`: after input hooks, admit the text as plain user text (no command, template or mention expansion)."
 				}
 			},
 			"required": [
@@ -6209,6 +6308,10 @@
 						"$ref": "#/$defs/ImageContent"
 					},
 					"description": "Images attached to the message."
+				},
+				"literal": {
+					"type": "boolean",
+					"description": "`literal-input/1`: after input hooks, admit the text as plain user text (no command, template or mention expansion)."
 				}
 			},
 			"required": [
@@ -6332,6 +6435,10 @@
 			"properties": {
 				"enabled": {
 					"type": "boolean"
+				},
+				"rich": {
+					"type": "boolean",
+					"description": "Also opt in to `rich-ask/2` (`--mode rpc-ui` only)."
 				}
 			},
 			"required": [
@@ -6343,6 +6450,10 @@
 			"properties": {
 				"enabled": {
 					"type": "boolean"
+				},
+				"rich": {
+					"type": "boolean",
+					"description": "Whether `rich-ask/2` is active; present only when `rich` was requested."
 				}
 			},
 			"required": [

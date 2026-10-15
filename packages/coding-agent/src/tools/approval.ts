@@ -8,7 +8,7 @@
  */
 import type { AgentTool, ToolApprovalDecision, ToolTier } from "@oh-my-pi/pi-agent-core";
 import type { Settings } from "../config/settings";
-import type { ExtensionUIContext } from "../extensibility/extensions/types";
+import type { ExtensionUIContext, ExtensionUIDialogOptions } from "../extensibility/extensions/types";
 
 import { cfgToolsApproval, cfgToolsApprovalMode } from "./settings";
 
@@ -409,7 +409,9 @@ function approvalSummary(details: readonly string[]): string | undefined {
  * Ask the user to approve a call: the host's approval dialog when it has one (it gets the full
  * prompt and a compact one with the details summarized to a row, so the composer beneath it
  * keeps its room), else an Approve/Deny select with the full prompt (RPC, ACP, extension hosts).
- * `appendix` lines follow the prompt on both. True only for an explicit approval.
+ * `appendix` lines follow the prompt on both. `dialogOptions` reach either dialog: its `signal`
+ * closes it (RPC hosts get a `cancel`), and `approval` binds a remote answer to exactly this call.
+ * True only for an explicit approval.
  */
 export async function requestApproval(
 	ui: Pick<ExtensionUIContext, "select" | "approve">,
@@ -417,6 +419,7 @@ export async function requestApproval(
 	args: unknown,
 	reason?: string,
 	appendix: readonly string[] = [],
+	dialogOptions?: ExtensionUIDialogOptions,
 ): Promise<boolean> {
 	const header = approvalHeader(tool, reason);
 	const details = approvalDetails(tool, args);
@@ -424,7 +427,7 @@ export async function requestApproval(
 	if (ui.approve) {
 		const summary = approvalSummary(details);
 		const compact = [...header, ...(summary === undefined ? [] : [summary]), ...appendix].join("\n");
-		return (await ui.approve({ full, compact })) === true;
+		return (await ui.approve({ full, compact }, dialogOptions)) === true;
 	}
-	return (await ui.select(full, ["Approve", "Deny"])) === "Approve";
+	return (await ui.select(full, ["Approve", "Deny"], dialogOptions)) === "Approve";
 }
