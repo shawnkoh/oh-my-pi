@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed goal mode completing open-ended objectives ("speed up X", "improve Y") after the first verified gain: the completion audit now requires an opportunity ledger in which every evidence-backed candidate is applied and measured or rejected with evidence, and forbids completing when a known candidate remains or the next step awaits a user decision (the goal stays active and the agent asks instead)
+
 ## [18.11.0] - 2026-10-14
 
 ### Added
