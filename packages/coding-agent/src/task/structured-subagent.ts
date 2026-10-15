@@ -898,11 +898,14 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			{ cause: error, result: settled },
 		);
 	} finally {
+		// Kept because the result points the parent at them (salvaged output, isolation patches).
+		const retainedForRecovery =
+			retainSalvagedArtifact ||
+			(policy.isIsolated && (!policy.applyChanges || changesApplied === false || requiresRecoveryArtifacts));
 		const shouldRetainArtifacts =
 			request.detached === true ||
-			retainSalvagedArtifact ||
-			(request.retainArtifacts && (completedSuccessfully || hasValidStructuredOutput)) ||
-			(policy.isIsolated && (!policy.applyChanges || changesApplied === false || requiresRecoveryArtifacts));
+			retainedForRecovery ||
+			(request.retainArtifacts && (completedSuccessfully || hasValidStructuredOutput));
 		const shouldCleanup = lease.temporary && !shouldRetainArtifacts;
 		const cleanupArtifacts = async (): Promise<void> => {
 			await fs.rm(lease.artifactsDir, { recursive: true, force: true });
@@ -917,10 +920,17 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			} else {
 				await cleanupArtifacts();
 			}
-		} else if (lease.temporary && request.onArtifactsRetained) {
+		} else if (
+			lease.temporary &&
+			request.onArtifactsRetained &&
+			(request.detached === true || !retainedForRecovery)
+		) {
 			// Retained rather than cleaned up now: the caller (e.g. an async
 			// job body) owns disposing it once the retained handle is no
 			// longer needed, instead of it leaking for the process lifetime.
+			// An inline run's recovery artifacts stay until process exit: its
+			// owner may dispose them as soon as the call settles, before the
+			// parent has used them.
 			request.onArtifactsRetained(cleanupArtifacts);
 		}
 	}

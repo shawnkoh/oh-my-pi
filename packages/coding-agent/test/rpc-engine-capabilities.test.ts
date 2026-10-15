@@ -35,6 +35,7 @@ describe("RPC engine capabilities", () => {
 			"quiesce-exit/1",
 			"quiesce-exit/2",
 			"owned-jobs/1",
+			"approval-steer-deny/1",
 		]);
 		const state = await client.getState();
 		expect(state.capabilities).toEqual([...client.capabilities]);

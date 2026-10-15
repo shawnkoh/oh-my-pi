@@ -28,11 +28,12 @@ export type JobWaitInterrupt = { kind: "running" } | { kind: "steer" } | { kind:
  * caller's abort signal, and the turn's steering signal. Returns the job's own
  * completion when it settles first; otherwise reports why the wait ended:
  * "running" = threshold elapsed (background it), "steer" = a queued message
- * arrived mid-wait, "aborted" = the caller cancelled.
+ * arrived mid-wait, "aborted" = the caller cancelled. An undefined
+ * `thresholdMs` waits without a threshold (only settlement, abort or steer end it).
  */
 export async function raceJobSettlement<C>(
 	completion: Promise<C>,
-	thresholdMs: number,
+	thresholdMs: number | undefined,
 	signal?: AbortSignal,
 	steeringSignal?: AbortSignal,
 ): Promise<C | JobWaitInterrupt> {
@@ -49,8 +50,10 @@ export async function raceJobSettlement<C>(
 	// under fast completion rates. Settle a withResolvers promise from
 	// setTimeout so the finally can clear it regardless of which waiter wins.
 	const { promise: thresholdPromise, resolve: resolveThreshold } = Promise.withResolvers<{ kind: "running" }>();
-	const thresholdTimer = setTimeout(() => resolveThreshold({ kind: "running" }), thresholdMs);
-	const waiters: Array<Promise<C | JobWaitInterrupt>> = [completion, thresholdPromise];
+	const thresholdTimer =
+		thresholdMs === undefined ? undefined : setTimeout(() => resolveThreshold({ kind: "running" }), thresholdMs);
+	const waiters: Array<Promise<C | JobWaitInterrupt>> =
+		thresholdTimer === undefined ? [completion] : [completion, thresholdPromise];
 
 	const { promise: abortedPromise, resolve: resolveAborted } = Promise.withResolvers<{ kind: "aborted" }>();
 	const onAbort = () => resolveAborted({ kind: "aborted" });

@@ -13,6 +13,7 @@ import type { ComputerSafetyCheck, ImageContent, Static, TextContent, TSchema } 
 import { prompt, sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import nativeDelegationTemplate from "../../prompts/tools/native-delegation.md" with { type: "text" };
+import { ApprovalSteerDenial, approvalSteerDenialMessage } from "../../session/approval-steer";
 import {
 	denyError,
 	requestApproval,
@@ -410,23 +411,56 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			const uiContext = this.runner.getUIContext();
 			const safetyAppendix =
 				pendingSafetyChecks.length > 0 ? ["Provider safety checks:", ...safetyCheckLines(pendingSafetyChecks)] : [];
-			let approved: boolean;
+			// A queued steer denies the call (see `session/approval-steer.ts`): it closes the
+			// dialog like an interrupt, and the agent is told who steered instead of a bare
+			// denial. One already queued (an earlier approval of this batch) skips the dialog.
+			const steerWatch = context?.watchApprovalSteer?.();
+			const dialogSignal =
+				steerWatch && signal ? AbortSignal.any([signal, steerWatch.signal]) : (steerWatch?.signal ?? signal);
+			let approved = false;
+			let approvalError: unknown;
 			try {
 				// The signal lets an interrupt close the pending dialog (RPC hosts get a
 				// `cancel` for it); `approval` binds the answer to exactly this call.
-				approved = await requestApproval(uiContext, this.tool, resolvedArgs, approvalCheck.reason, safetyAppendix, {
-					signal,
-					approval: {
-						toolCallId,
-						toolName: this.tool.name,
-						arguments: resolvedArgs,
-						...(approvalCheck.reason ? { reason: approvalCheck.reason } : {}),
-					},
-				});
+				if (!steerWatch?.signal.aborted) {
+					approved = await requestApproval(
+						uiContext,
+						this.tool,
+						resolvedArgs,
+						approvalCheck.reason,
+						safetyAppendix,
+						{
+							signal: dialogSignal,
+							approval: {
+								toolCallId,
+								toolName: this.tool.name,
+								arguments: resolvedArgs,
+								...(approvalCheck.reason ? { reason: approvalCheck.reason } : {}),
+							},
+						},
+					);
+				}
 			} catch (err) {
-				await emitApprovalResolved(false, err instanceof Error ? err.message : "approval aborted");
+				approvalError = err;
+			} finally {
+				steerWatch?.dispose();
+			}
+			const steerDenial =
+				!signal?.aborted && steerWatch?.signal.reason instanceof ApprovalSteerDenial
+					? steerWatch.signal.reason
+					: undefined;
+			if (steerDenial) {
+				await emitApprovalResolved(false, "denied by steer");
 				cancelPreflight();
-				throw err;
+				throw new Error(approvalSteerDenialMessage(this.tool.name, steerDenial));
+			}
+			if (approvalError !== undefined) {
+				await emitApprovalResolved(
+					false,
+					approvalError instanceof Error ? approvalError.message : "approval aborted",
+				);
+				cancelPreflight();
+				throw approvalError;
 			}
 			// An approval that arrives after the call was aborted (a late answer, or a UI
 			// that ignored the signal) must never run it.

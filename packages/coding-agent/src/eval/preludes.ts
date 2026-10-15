@@ -1,5 +1,6 @@
 import type { AgentToolContext, AgentToolResult, AgentToolUpdateCallback, ToolApproval } from "@oh-my-pi/pi-agent-core";
 import { untilAborted } from "@oh-my-pi/pi-utils";
+import { ApprovalSteerDenial, approvalSteerDenialMessage } from "../session/approval-steer";
 import type { ToolSession } from "../tools";
 import { denyError, requestApproval, resolveApproval, resolveApprovalFromContext } from "../tools/approval";
 
@@ -105,17 +106,36 @@ async function approvePreludeInvocation(
 				`Set tools.approval.${definition.name}: allow or use an interactive UI to approve the call.`,
 		);
 	}
-	const approved = await untilAborted(context.signal, () =>
-		requestApproval(ui, subject, parameters, resolved.reason, [], {
-			signal: context.signal,
-			approval: {
-				toolCallId: context.toolCallId,
-				toolName: definition.name,
-				arguments: parameters,
-				...(resolved.reason ? { reason: resolved.reason } : {}),
-			},
-		}),
-	);
+	// A queued steer denies the call, as for tool approvals (see `session/approval-steer.ts`).
+	const steerWatch = context.context?.watchApprovalSteer?.();
+	const dialogSignal =
+		steerWatch && context.signal
+			? AbortSignal.any([context.signal, steerWatch.signal])
+			: (steerWatch?.signal ?? context.signal);
+	let approved = false;
+	try {
+		if (!steerWatch?.signal.aborted) {
+			approved = await untilAborted(dialogSignal, () =>
+				requestApproval(ui, subject, parameters, resolved.reason, [], {
+					signal: dialogSignal,
+					approval: {
+						toolCallId: context.toolCallId,
+						toolName: definition.name,
+						arguments: parameters,
+						...(resolved.reason ? { reason: resolved.reason } : {}),
+					},
+				}),
+			);
+		}
+	} catch (error) {
+		if (!(steerWatch?.signal.reason instanceof ApprovalSteerDenial) || context.signal?.aborted) throw error;
+	} finally {
+		steerWatch?.dispose();
+	}
+	const steerDenial = steerWatch?.signal.reason;
+	if (steerDenial instanceof ApprovalSteerDenial && !context.signal?.aborted) {
+		throw new Error(approvalSteerDenialMessage(definition.name, steerDenial));
+	}
 	if (!approved) throw new Error(`Eval prelude call denied by user: ${definition.name}`);
 }
 

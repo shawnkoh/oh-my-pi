@@ -406,6 +406,12 @@ export const TOOL_APPROVAL_BINDING_CAPABILITY = "tool-approval-binding/1";
 export const RICH_ASK_CAPABILITY = "rich-ask/2";
 
 /**
+ * Ready-frame capability: a pending tool approval is denied, with the reason told to the agent,
+ * once a steer is queued: a user-authored one, or an external delivery whose sender chose `steer`.
+ */
+export const APPROVAL_STEER_DENY_CAPABILITY = "approval-steer-deny/1";
+
+/**
  * Capabilities the engine always supports, one versioned name per feature
  * (`name/major`). Features that change what a host receives also require the
  * host to opt in; the entry only says the engine supports them.
@@ -419,6 +425,7 @@ export const RPC_ENGINE_CAPABILITIES: readonly string[] = [
 	QUIESCE_EXIT_V1_CAPABILITY,
 	QUIESCE_EXIT_CAPABILITY,
 	OWNED_JOBS_CAPABILITY,
+	APPROVAL_STEER_DENY_CAPABILITY,
 ];
 
 export interface RpcChunkFrame {

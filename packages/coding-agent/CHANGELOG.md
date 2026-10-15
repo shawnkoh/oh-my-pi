@@ -2,9 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- A steer now denies a pending tool approval outside the TUI too: a user `steer` over RPC, or an external delivery whose sender chose `mode: "steer"`, closes the approval dialog, runs nothing, and tells the agent who steered; RPC engines advertise `approval-steer-deny/1`
+
 ### Fixed
 
 - Fixed goal mode completing open-ended objectives ("speed up X", "improve Y") after the first verified gain: the completion audit now requires an opportunity ledger in which every evidence-backed candidate is applied and measured or rejected with evidence, and forbids completing when a known candidate remains or the next step awaits a user decision (the goal stays active and the agent asks instead)
+- Fixed a blocking `task` call (async off, or a `blocking: true` agent) holding a queued steer until every subagent finished; the subagents still running now continue as background jobs and the call returns at once
 
 ## [18.11.0] - 2026-10-14
 

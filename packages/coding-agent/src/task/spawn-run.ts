@@ -50,6 +50,8 @@ export class SpawnRun {
 	#lastUpdate: AgentToolResult<TaskToolDetails> | undefined;
 	#onArtifactsRetained: ((cleanup: () => Promise<void>) => void) | undefined;
 	#retainedCleanup: (() => Promise<void>) | undefined;
+	/** Unbinds the current owner's abort signal; replaced on every {@link attach}. */
+	#detachOwnerSignal: (() => void) | undefined;
 	#discarded = false;
 	/** Resolves once the permit is held; rejects with the acquire error when aborted first. */
 	readonly started: Promise<SpawnLaunchTiming>;
@@ -87,8 +89,14 @@ export class SpawnRun {
 		void this.result.catch(() => undefined);
 	}
 
-	/** Bind the adopting owner: its abort cancels the run, and buffered progress/artifacts flush to it. */
+	/**
+	 * Bind the adopting owner: its abort cancels the run, and buffered progress/artifacts flush to it.
+	 * Attaching again re-homes the run: the new owner replaces the previous one, whose abort no
+	 * longer cancels it (an inline task call moving its run to a background job on steer).
+	 */
 	attach(owner: SpawnRunOwner): void {
+		this.#detachOwnerSignal?.();
+		this.#detachOwnerSignal = undefined;
 		const signal = owner.signal;
 		if (signal?.aborted) this.#controller.abort(signal.reason);
 		else if (signal) {
@@ -97,6 +105,7 @@ export class SpawnRun {
 			// The owner signal can outlive the run (a session- or job-scoped signal that never
 			// aborts); drop the listener once the run settles so the signal does not pin it.
 			const detach = () => signal.removeEventListener("abort", onAbort);
+			this.#detachOwnerSignal = detach;
 			void this.result.then(detach, detach);
 		}
 		this.#onUpdate = owner.onUpdate;

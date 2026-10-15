@@ -19,6 +19,7 @@ import { taskSubprocessRenderer } from "@oh-my-pi/pi-tui/tools/subprocess";
 import path from "node:path";
 import type {
 	AgentTool,
+	AgentToolContext,
 	AgentToolResult,
 	AgentToolUpdateCallback,
 	ToolSpeculationPolicy,
@@ -50,6 +51,7 @@ import {
 	type TaskParams,
 	type TaskToolDetails,
 } from "@oh-my-pi/pi-tui/tools/task";
+import { raceJobSettlement } from "../async/auto-background";
 import { AsyncJobError, type AsyncJobManager } from "../async";
 import { hasResolvableTranscript } from "../internal-urls/registry-helpers";
 import { AgentRegistry } from "../registry/agent-registry";
@@ -57,7 +59,7 @@ import { type DiscoveryResult, discoverAgents } from "./discovery";
 import { createEvalCustomTools, describeEvalTools, evalToolsEnabled } from "./eval-tools";
 import { generateTaskName } from "./name-generator";
 import { AgentOutputManager } from "./output-manager";
-import { mapWithConcurrencyLimitAllSettled, Semaphore } from "./parallel";
+import { Semaphore } from "./parallel";
 import { renderResult, renderCall as renderTaskCall } from "@oh-my-pi/pi-tui/tools/task";
 import { repairTaskParams } from "@oh-my-pi/pi-tui/tools/task-repair-args";
 import {
@@ -88,6 +90,48 @@ function renderSubagentUserPrompt(assignment: string): string {
 	return prompt.render(subagentUserPromptTemplate, {
 		assignment: assignment.trim(),
 	});
+}
+
+/** A spawn's progress row before its subagent reports anything (pending, zero counters). */
+function createSpawnProgress(
+	index: number,
+	agentId: string,
+	agentType: string,
+	policy: { agent: { source: AgentProgress["agentSource"] }; modelRole?: string },
+	item: TaskItem,
+): AgentProgress {
+	const assignment = (item.task ?? "").trim();
+	return {
+		index,
+		id: agentId,
+		agent: agentType,
+		agentSource: policy.agent.source,
+		modelRole: policy.modelRole,
+		status: "pending",
+		task: renderSubagentUserPrompt(assignment),
+		assignment,
+		recentTools: [],
+		recentOutput: [],
+		toolCount: 0,
+		requests: 0,
+		tokens: 0,
+		cost: 0,
+		durationMs: 0,
+	};
+}
+
+/**
+ * What a steered call says about the spawns it moved to background jobs: the
+ * steer will be read next, and each result arrives later as a job completion.
+ */
+function renderSteeredNotice(moved: ReadonlyArray<{ agentId: string; jobId: string }>, waitTool: boolean): string {
+	const handles = moved.map(entry => `\`${entry.agentId}\` (job \`${entry.jobId}\`)`).join(", ");
+	const subject =
+		moved.length === 1
+			? "1 subagent continues as a background job"
+			: `${moved.length} subagents continue as background jobs`;
+	const waitHint = waitTool ? "; `wait` on a job to block on its result" : "";
+	return `Steered: a message arrived while this call waited, so it returned early. ${subject}: ${handles}. Each result arrives as a job completion${waitHint}.`;
 }
 
 function createUsageTotals(): Usage {
@@ -357,13 +401,91 @@ function planSpawns(rawParams: unknown, batchEnabled: boolean, defaultAgent: str
 
 /**
  * One sync-executed spawn: its item, position in the original call, (for mixed
- * calls) a pre-claimed agent id, and a run already started speculatively.
+ * calls) a pre-claimed agent id, and a run already started speculatively. A
+ * spawn a steer may move to a background job carries its id and progress row.
  */
 interface SyncSpawnRef {
 	item: TaskItem;
 	index: number;
 	run?: SpawnRun;
 	preAllocatedId?: string;
+	progress?: AgentProgress;
+}
+
+/**
+ * Lets a queued steer end an inline wait: still-running spawns move to background jobs
+ * on `manager` (job progress reaches `onUpdate`, reported through `view`) and the call
+ * returns at once.
+ */
+interface SyncSteer {
+	signal: AbortSignal;
+	manager: AsyncJobManager;
+	ircEnabled: boolean;
+	onUpdate?: AgentToolUpdateCallback<TaskToolDetails>;
+	view: MovedJobsView;
+}
+
+/**
+ * The tool-call details moved jobs report after the call returned. They must agree with
+ * the call's own result (inline results included), so the call supplies them: a mixed
+ * call its shared background-batch view, a blocking call {@link createMovedJobsView}.
+ */
+interface MovedJobsView {
+	buildDetails: () => TaskToolDetails;
+	/** A moved spawn's progress row joins the view before its job registers; `remove` undoes a refused one. */
+	add: (row: AgentProgress) => void;
+	remove: (row: AgentProgress) => void;
+	/** The job id the manager assigned (it may suffix the requested id on a collision). */
+	registered: (jobId: string) => void;
+	onSettled: (failed: boolean) => void;
+}
+
+/**
+ * Details view for a blocking call whose spawns a steer moved to jobs: the call's inline
+ * results (`inline`, filled once they merge) plus one progress row per moved job, with the
+ * jobs' aggregate state.
+ */
+function createMovedJobsView(
+	callStartedAt: number,
+	inline: () => Pick<TaskToolDetails, "projectAgentsDir" | "results" | "usage" | "outputPaths">,
+): MovedJobsView {
+	const rows: AgentProgress[] = [];
+	let settledCount = 0;
+	let failedCount = 0;
+	let primaryJobId = "";
+	return {
+		buildDetails: () => ({
+			...inline(),
+			totalDurationMs: Date.now() - callStartedAt,
+			progress: rows.map(row => ({ ...row })),
+			async: {
+				state: settledCount < rows.length ? "running" : failedCount > 0 ? "failed" : "completed",
+				jobId: primaryJobId,
+				type: "task",
+			},
+		}),
+		add: row => {
+			rows.push(row);
+		},
+		remove: row => {
+			rows.splice(rows.indexOf(row), 1);
+		},
+		registered: jobId => {
+			primaryJobId ||= jobId;
+		},
+		onSettled: failed => {
+			settledCount += 1;
+			if (failed) failedCount += 1;
+		},
+	};
+}
+
+/** Inline spawns' outcome: payloads in input order, plus the spawns a steer moved to jobs. */
+interface SyncSpawnOutcome {
+	/** `undefined` marks a spawn cancelled before it started, or one listed in `moved`. */
+	payloads: (AgentToolResult<TaskToolDetails> | undefined)[];
+	/** Positions (into the spawn list) and handles of the spawns now running as jobs. */
+	moved: Array<{ position: number; agentId: string; jobId: string }>;
 }
 
 /** Merged view of a sync spawn set's payloads: joined text plus flattened results/usage/paths. */
@@ -380,13 +502,15 @@ interface MergedSyncPayloads {
 /**
  * Merge per-spawn sync payloads into one result view. `index` is each spawn's
  * position in the original call so batch rows keep stable ordering; a missing
- * payload (cancelled before start) becomes an explanatory content line. An
+ * payload (cancelled before start) becomes an explanatory content line, except
+ * for spawns a steer `moved` to background jobs, which the steer notice lists. An
  * error payload from any spawn makes the merged view an error too, the way a
  * one-spawn call returns that payload as is.
  */
 function mergeSyncPayloads(
 	spawns: SyncSpawnRef[],
 	payloads: (AgentToolResult<TaskToolDetails> | undefined)[],
+	moved: ReadonlySet<number> = new Set(),
 ): MergedSyncPayloads {
 	const results: SingleResult[] = [];
 	const contentParts: string[] = [];
@@ -398,6 +522,7 @@ function mergeSyncPayloads(
 	for (let position = 0; position < spawns.length; position++) {
 		const payload = payloads[position];
 		const { item, index } = spawns[position];
+		if (moved.has(position)) continue;
 		if (!payload) {
 			contentParts.push(`Task ${item.name?.trim() || `#${index + 1}`}: cancelled before start.`);
 			continue;
@@ -772,7 +897,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		return manager;
 	}
 
-	/** Start one spawn's subagent run behind the session semaphore. */
+	/**
+	 * Start one spawn's subagent run behind the session semaphore. Artifacts are retained
+	 * whenever the run can end up as a background job: always when detached, and for an
+	 * inline run when a job manager exists (a steer may move it to one). An inline owner
+	 * that keeps the run cleans them up as soon as it settles.
+	 */
 	#launch(spawn: {
 		toolCallId: string;
 		params: TaskParams;
@@ -780,6 +910,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		agentId?: string;
 		detached: boolean;
 	}): SpawnRun {
+		const retainArtifacts = spawn.detached || this.session.asyncJobManager !== undefined;
 		return new SpawnRun(
 			this.#permit,
 			run =>
@@ -792,7 +923,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					spawn.index,
 					spawn.detached,
 					run.timing,
-					spawn.detached ? run.onArtifactsRetained : undefined,
+					retainArtifacts ? run.onArtifactsRetained : undefined,
 				),
 			{ agentId: spawn.agentId, detached: spawn.detached },
 		);
@@ -873,11 +1004,19 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		rawParams: unknown,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>,
+		context?: AgentToolContext,
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		const launchSession = this.#launchSessions.get(toolCallId);
 		this.#launchSessions.delete(toolCallId);
 		try {
-			return await this.#dispatch(toolCallId, rawParams, launchSession, signal, onUpdate);
+			return await this.#dispatch(
+				toolCallId,
+				rawParams,
+				launchSession,
+				signal,
+				onUpdate,
+				context?.toolCall?.steeringSignal,
+			);
 		} finally {
 			// No-op once dispatch adopted; otherwise nothing launched early may outlive the call.
 			launchSession?.discard("task call settled without adopting speculative launches");
@@ -890,6 +1029,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		launchSession: TaskLaunchSession | undefined,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>,
+		steeringSignal?: AbortSignal,
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		// Schema defaults fill `agent` for model calls, but internal callers
 		// and stale transcripts can bypass arktype. `spawnParamsFor` resolves each
@@ -987,13 +1127,36 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							this.session.getSessionSpawns?.() ?? "*",
 						),
 					});
+			// A steer can move still-running inline spawns to background jobs only when the
+			// session has a job manager; such spawns need their id and progress row up front.
+			const steerManager = steeringSignal ? this.session.asyncJobManager : undefined;
+			const syncRefs: SyncSpawnRef[] = [];
+			for (const [index, item] of spawnItems.entries()) {
+				const run = adopted.get(index);
+				if (!steerManager) {
+					syncRefs.push({ item, index, run });
+					continue;
+				}
+				const agentId =
+					run?.identity.agentId ?? (await this.#outputManager().allocate(item.name?.trim() || generateTaskName()));
+				syncRefs.push({
+					item,
+					index,
+					run,
+					preAllocatedId: agentId,
+					progress: createSpawnProgress(index, agentId, resolvedAgents[index]!, policies[index]!, item),
+				});
+			}
 			const result = await this.#executeSyncFanout(
 				toolCallId,
 				params,
-				spawnItems.map((item, index) => ({ item, index, run: adopted.get(index) })),
+				syncRefs,
 				defaultAgent,
 				signal,
 				onUpdate,
+				steerManager && steeringSignal
+					? { signal: steeringSignal, manager: steerManager, ircEnabled, onUpdate }
+					: undefined,
 			);
 			if (!advisory) return result;
 			let appended = false;
@@ -1051,36 +1214,16 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			progress: AgentProgress;
 		}> = [];
 		for (const [index, item] of spawnItems.entries()) {
-			const agentType = resolvedAgents[index]!;
-			const policy = policies[index]!;
-			const agentSource = policy.agent.source;
 			const run = adopted.get(index);
 			const agentId =
 				run?.identity.agentId ?? (await outputManager.allocate(item.name?.trim() || generateTaskName()));
-			const assignment = (item.task ?? "").trim();
 			spawns.push({
 				agentId,
 				item,
 				index,
 				blocking: itemBlocking[index],
 				run,
-				progress: {
-					index,
-					id: agentId,
-					agent: agentType,
-					agentSource,
-					modelRole: policy.modelRole,
-					status: "pending",
-					task: renderSubagentUserPrompt(assignment),
-					assignment,
-					recentTools: [],
-					recentOutput: [],
-					toolCount: 0,
-					requests: 0,
-					tokens: 0,
-					cost: 0,
-					durationMs: 0,
-				},
+				progress: createSpawnProgress(index, agentId, resolvedAgents[index]!, policies[index]!, item),
 			});
 		}
 		const asyncSpawns = spawns.filter(spawn => !spawn.blocking);
@@ -1094,6 +1237,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		// the call returns, so post-return job updates never drop them.
 		let settledCount = 0;
 		let failedCount = 0;
+		// Blocking spawns a steer moved to jobs; they settle through the same counters.
+		let movedCount = 0;
 		let primaryJobId = asyncSpawns[0].agentId;
 		const syncResults: SingleResult[] = [];
 		// oxlint-disable-next-line prefer-const -- read by buildAsyncDetails before assignment
@@ -1109,7 +1254,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			outputPaths: syncOutputPaths,
 			progress: spawns.map(spawn => ({ ...spawn.progress })),
 			async: {
-				state: settledCount < asyncSpawns.length ? "running" : failedCount > 0 ? "failed" : "completed",
+				state:
+					settledCount < asyncSpawns.length + movedCount ? "running" : failedCount > 0 ? "failed" : "completed",
 				jobId: primaryJobId,
 				type: "task",
 			},
@@ -1224,7 +1370,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			],
 			details: buildAsyncDetails(),
 		});
-		const payloads = await this.#runSyncSpawns({
+		const steerManager = steeringSignal ? this.session.asyncJobManager : undefined;
+		const { payloads, moved } = await this.#runSyncSpawns({
 			toolCallId,
 			params,
 			defaultAgent,
@@ -1234,11 +1381,38 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				index: spawn.index,
 				preAllocatedId: spawn.agentId,
 				run: spawn.run,
+				progress: spawn.progress,
 			})),
+			steer:
+				steerManager && steeringSignal
+					? {
+							signal: steeringSignal,
+							manager: steerManager,
+							ircEnabled,
+							onUpdate,
+							// A moved spawn keeps its row in `spawns` (the job updates it in place).
+							view: {
+								buildDetails: buildAsyncDetails,
+								add: () => {
+									movedCount += 1;
+								},
+								remove: () => {
+									movedCount -= 1;
+								},
+								// The mixed call's primary job stays its first background spawn.
+								registered: () => {},
+								onSettled: failed => {
+									settledCount += 1;
+									if (failed) failedCount += 1;
+								},
+							},
+						}
+					: undefined,
 			onItemProgress: onUpdate
 				? (index, progress) => {
+						// In place: a spawn moved to a job keeps this same row object.
 						const spawn = spawns.find(candidate => candidate.index === index);
-						if (spawn) spawn.progress = { ...progress, index };
+						if (spawn) Object.assign(spawn.progress, progress, { index });
 						onUpdate({
 							content: [{ type: "text", text: `Running ${syncLabel} inline...` }],
 							details: buildAsyncDetails(),
@@ -1246,9 +1420,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					}
 				: undefined,
 		});
+		const movedPositions = new Set(moved.map(entry => entry.position));
 		const merged = mergeSyncPayloads(
 			syncSpawns.map(spawn => ({ item: spawn.item, index: spawn.index })),
 			payloads,
+			movedPositions,
 		);
 		syncResults.push(...merged.results);
 		syncUsage = merged.usage;
@@ -1256,8 +1432,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		syncProjectAgentsDir = merged.projectAgentsDir;
 		// Settle the inline spawns' progress rows from their merged results so
 		// post-return job updates carry final statuses, not the last snapshot.
+		// A spawn a steer moved to a job has its row kept by that job.
 		for (let position = 0; position < syncSpawns.length; position++) {
 			const spawn = syncSpawns[position];
+			if (movedPositions.has(position)) continue;
 			const result = merged.results.find(r => r.id === spawn.agentId);
 			if (result) {
 				spawn.progress.status = result.aborted
@@ -1272,7 +1450,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		}
 
 		const spawnedSummary = started.length > 0 ? renderSpawnFeedback(true) : scheduleFailureSummary.trim();
-		const text = [merged.contentParts.join("\n\n"), spawnedSummary]
+		const steeredNotice = moved.length > 0 ? renderSteeredNotice(moved, hasWaitTool(this.session)) : "";
+		const text = [steeredNotice, merged.contentParts.join("\n\n"), spawnedSummary]
 			.filter(section => section.trim().length > 0)
 			.join("\n\n");
 		return withAdvisory({
@@ -1495,7 +1674,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	 * `blocking: true`): run every spawn to completion inline and merge the
 	 * per-spawn payloads into a single tool result, an error when any spawn's
 	 * payload is. The session-scoped semaphore still bounds concurrency across
-	 * parallel task calls.
+	 * parallel task calls. With `steer`, a queued steer ends the wait early: the
+	 * spawns still running continue as background jobs (see {@link #moveToJobs}).
 	 */
 	async #executeSyncFanout(
 		toolCallId: string,
@@ -1504,7 +1684,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		defaultAgent: string,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>,
+		steer?: Omit<SyncSteer, "view">,
 	): Promise<AgentToolResult<TaskToolDetails>> {
+		const startTime = Date.now();
 		if (spawns.length === 1) {
 			const spawn = spawns[0]!;
 			const run =
@@ -1516,11 +1698,31 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					agentId: spawn.preAllocatedId,
 					detached: false,
 				});
-			run.attach({ signal, onUpdate });
-			return await run.result;
+			let latest: AgentProgress | undefined;
+			run.attach({
+				signal,
+				onUpdate: update => {
+					latest = update.details?.progress?.[0] ?? latest;
+					return onUpdate?.(update);
+				},
+				onArtifactsRetained: cleanup => void cleanup(),
+			});
+			if (!steer) return await run.result;
+			const outcome = await raceJobSettlement(run.result, undefined, signal, steer.signal);
+			if (!("kind" in outcome)) return outcome;
+			if (outcome.kind !== "steer") return await run.result;
+			const view = createMovedJobsView(startTime, () => ({ projectAgentsDir: null, results: [] }));
+			const moved = this.#moveToJobs(toolCallId, params, defaultAgent, { ...steer, view }, [
+				{ spawn, run, latest, position: 0 },
+			]);
+			// The job manager refused the job: the run is still this call's, so keep waiting on it.
+			if (moved.length === 0) return await run.result;
+			return {
+				content: [{ type: "text", text: renderSteeredNotice(moved, hasWaitTool(this.session)) }],
+				details: view.buildDetails(),
+			};
 		}
 
-		const startTime = Date.now();
 		const latestProgress = new Map<number, AgentProgress>();
 		const emitCombined = () => {
 			onUpdate?.({
@@ -1536,12 +1738,19 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			});
 		};
 
-		const payloads = await this.#runSyncSpawns({
+		// Moved jobs report the inline results alongside their own rows once those merge.
+		let inline: Pick<TaskToolDetails, "projectAgentsDir" | "results" | "usage" | "outputPaths"> = {
+			projectAgentsDir: null,
+			results: [],
+		};
+		const view = createMovedJobsView(startTime, () => inline);
+		const { payloads, moved } = await this.#runSyncSpawns({
 			toolCallId,
 			params,
 			defaultAgent,
 			signal,
 			spawns,
+			steer: steer ? { ...steer, view } : undefined,
 			onItemProgress: onUpdate
 				? (index, progress) => {
 						latestProgress.set(index, { ...progress, index });
@@ -1550,27 +1759,33 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				: undefined,
 		});
 
-		const merged = mergeSyncPayloads(spawns, payloads);
+		const merged = mergeSyncPayloads(spawns, payloads, new Set(moved.map(entry => entry.position)));
+		inline = {
+			projectAgentsDir: merged.projectAgentsDir,
+			results: merged.results,
+			usage: merged.usage,
+			outputPaths: merged.outputPaths,
+		};
+		const contentParts =
+			moved.length > 0
+				? [renderSteeredNotice(moved, hasWaitTool(this.session)), ...merged.contentParts]
+				: merged.contentParts;
 		return {
-			content: [{ type: "text", text: merged.contentParts.join("\n\n") }],
+			content: [{ type: "text", text: contentParts.join("\n\n") }],
 			...(merged.isError ? { isError: true } : {}),
-			details: {
-				projectAgentsDir: merged.projectAgentsDir,
-				results: merged.results,
-				totalDurationMs: Date.now() - startTime,
-				usage: merged.usage,
-				outputPaths: merged.outputPaths,
-			},
+			details: moved.length > 0 ? view.buildDetails() : { ...inline, totalDurationMs: Date.now() - startTime },
 		};
 	}
 
 	/**
-	 * Run a set of spawns to completion inline, bounded by the session spawn
-	 * semaphore. `preAllocatedId` reuses an id claimed up front (mixed calls);
-	 * `index` is each item's position in the original call so progress rows and
-	 * merged results keep stable ordering. Per-item progress snapshots flow
-	 * through `onItemProgress`. Returns per-spawn payloads in input order;
-	 * `undefined` marks a spawn cancelled before it started.
+	 * Run a set of spawns inline, bounded by the session spawn semaphore.
+	 * `preAllocatedId` reuses an id claimed up front (mixed calls); `index` is
+	 * each item's position in the original call so progress rows and merged
+	 * results keep stable ordering. Per-item progress snapshots flow through
+	 * `onItemProgress`. Payloads come back in input order; `undefined` marks a
+	 * spawn cancelled before it started. With `steer`, a queued steer that
+	 * arrives before every spawn settled moves the unsettled ones to background
+	 * jobs and returns at once; those are listed in `moved` (payload `undefined`).
 	 */
 	async #runSyncSpawns(args: {
 		toolCallId: string;
@@ -1578,50 +1793,43 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		defaultAgent: string;
 		spawns: SyncSpawnRef[];
 		signal?: AbortSignal;
+		steer?: SyncSteer;
 		onItemProgress?: (index: number, progress: AgentProgress) => void;
-	}): Promise<(AgentToolResult<TaskToolDetails> | undefined)[]> {
-		const { toolCallId, params, defaultAgent, spawns, signal, onItemProgress } = args;
-		const { results } = await mapWithConcurrencyLimitAllSettled(
-			spawns,
-			spawns.length,
-			async (spawn, _position, workerSignal) => {
-				const run =
-					spawn.run ??
-					this.#launch({
-						toolCallId,
-						params: spawnParamsFor(params, spawn.item, defaultAgent),
-						index: spawn.index,
-						agentId: spawn.preAllocatedId,
-						detached: false,
-					});
-				run.attach({
-					signal: workerSignal,
-					onUpdate: onItemProgress
-						? update => {
-								const progress = update.details?.progress?.[0];
-								if (progress) onItemProgress(spawn.index, progress);
-							}
-						: undefined,
+	}): Promise<SyncSpawnOutcome> {
+		const { toolCallId, params, defaultAgent, spawns, signal, steer, onItemProgress } = args;
+		if (signal?.aborted) {
+			// Nothing started, so an adopted run was never attached to this call.
+			for (const spawn of spawns) spawn.run?.discard("task call aborted before the spawn started");
+			return { payloads: spawns.map(() => undefined), moved: [] };
+		}
+		// `null` until the spawn settles; then its payload, or `undefined` when cancelled before start.
+		const payloads: (AgentToolResult<TaskToolDetails> | undefined | null)[] = spawns.map(() => null);
+		const latest: (AgentProgress | undefined)[] = spawns.map(() => undefined);
+		const runs = spawns.map((spawn, position) => {
+			const run =
+				spawn.run ??
+				this.#launch({
+					toolCallId,
+					params: spawnParamsFor(params, spawn.item, defaultAgent),
+					index: spawn.index,
+					agentId: spawn.preAllocatedId,
+					detached: false,
 				});
-				try {
-					await run.started;
-				} catch (error) {
-					if (workerSignal.aborted) return undefined;
-					throw error;
-				}
-				return await run.result;
-			},
-			signal,
-		);
-		// A worker never invoked (call aborted first) never attached its adopted run.
-		spawns.forEach((spawn, position) => {
-			if (!results[position]) spawn.run?.discard("task call aborted before the spawn started");
+			run.attach({
+				signal,
+				onUpdate: update => {
+					const progress = update.details?.progress?.[0];
+					if (!progress) return;
+					latest[position] = progress;
+					onItemProgress?.(spawn.index, progress);
+				},
+				onArtifactsRetained: cleanup => void cleanup(),
+			});
+			return run;
 		});
-		return results.map((settled, position) => {
-			if (!settled) return undefined;
-			if (settled.status === "fulfilled") return settled.value;
-			const message = settled.reason instanceof Error ? settled.reason.message : String(settled.reason);
+		const failed = (position: number, reason: unknown): AgentToolResult<TaskToolDetails> => {
 			const item = spawns[position].item;
+			const message = reason instanceof Error ? reason.message : String(reason);
 			return {
 				content: [
 					{
@@ -1631,7 +1839,85 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				],
 				details: { projectAgentsDir: null, results: [], totalDurationMs: 0 },
 			};
-		});
+		};
+		const settled = runs.map((run, position) =>
+			run.started
+				.then(
+					() => run.result.catch(reason => failed(position, reason)),
+					reason => (signal?.aborted ? undefined : failed(position, reason)),
+				)
+				.then(payload => {
+					payloads[position] = payload;
+				}),
+		);
+		const all = Promise.all(settled);
+		if (steer) {
+			const outcome = await raceJobSettlement(all, undefined, signal, steer.signal);
+			if (!Array.isArray(outcome) && outcome.kind === "steer") {
+				const pending = spawns.flatMap((spawn, position) =>
+					payloads[position] === null ? [{ spawn, run: runs[position]!, latest: latest[position], position }] : [],
+				);
+				const moved = this.#moveToJobs(toolCallId, params, defaultAgent, steer, pending);
+				const movedPositions = new Set(moved.map(entry => entry.position));
+				// A spawn the job manager refused is still this call's: wait for it inline.
+				await Promise.all(
+					settled.filter((_, position) => payloads[position] === null && !movedPositions.has(position)),
+				);
+				return { payloads: payloads.map(payload => payload ?? undefined), moved };
+			}
+		}
+		await all;
+		return { payloads: payloads.map(payload => payload ?? undefined), moved: [] };
+	}
+
+	/**
+	 * Move inline runs a steer interrupted to background jobs on `steer.manager`.
+	 * Each run is re-homed, not restarted: the job adopts the running subagent, so
+	 * ending the turn no longer cancels it while cancelling the job still does, and
+	 * its result arrives as the job's completion. The spawn's own progress row (with
+	 * the latest snapshot merged in) becomes the job's row in `steer.view`, so the
+	 * call's result and later job updates report the same rows. A run the manager
+	 * refuses stays with its inline owner and is left out of the result.
+	 */
+	#moveToJobs(
+		toolCallId: string,
+		params: TaskParams,
+		defaultAgent: string,
+		steer: SyncSteer,
+		entries: Array<{ spawn: SyncSpawnRef; run: SpawnRun; latest?: AgentProgress; position: number }>,
+	): Array<{ position: number; agentId: string; jobId: string }> {
+		const moved: Array<{ position: number; agentId: string; jobId: string }> = [];
+		for (const { spawn, run, latest, position } of entries) {
+			const agentId = run.identity.agentId ?? spawn.preAllocatedId;
+			const progress = spawn.progress;
+			if (!agentId || !progress) continue;
+			Object.assign(progress, latest, { index: spawn.index, id: agentId });
+			// Registration replays the run's last update at once: the row must already be in the view.
+			steer.view.add(progress);
+			try {
+				const jobId = this.#registerSpawnJob({
+					manager: steer.manager,
+					toolCallId,
+					spawnParams: spawnParamsFor(params, spawn.item, defaultAgent),
+					agentId,
+					run,
+					progress,
+					ircEnabled: steer.ircEnabled,
+					buildDetails: steer.view.buildDetails,
+					onUpdate: steer.onUpdate,
+					onSettled: steer.view.onSettled,
+				});
+				steer.view.registered(jobId);
+				moved.push({ position, agentId, jobId });
+			} catch (error) {
+				steer.view.remove(progress);
+				logger.warn("task: could not move a steered subagent to a background job", {
+					agentId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+		return moved;
 	}
 
 	/** Spawn a fresh subagent and run it to completion; the body of every {@link SpawnRun}. */
@@ -1674,12 +1960,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				index: spawnIndex,
 				parentToolCallId: toolCallId,
 				detached,
-				// Detached (async) spawns advertise `agent://<id>` handles in the
-				// eventual async-result delivery, which can land well after this
-				// call returns. Without this, a temporary (in-memory session)
+				// Spawns that may deliver as a background job advertise `agent://<id>`
+				// handles in the eventual async-result delivery, which can land well
+				// after this call returns. Without this, a temporary (in-memory session)
 				// artifacts directory is deleted immediately on completion and the
 				// advertised URL 404s by the time delivery happens.
-				retainArtifacts: detached,
+				retainArtifacts: onArtifactsRetained !== undefined,
 				...(onArtifactsRetained ? { onArtifactsRetained } : {}),
 				invokedAt: launchTiming?.invokedAt,
 				acquiredAt: launchTiming?.acquiredAt,
