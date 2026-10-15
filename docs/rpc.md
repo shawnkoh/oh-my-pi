@@ -46,14 +46,16 @@ The initial ready frame uses protocol v1 and advertises the opt-in lossless tran
   "supportedProtocolVersions": [1, 2],
   "maxFrameBytes": 1048576,
   "maxReassembledFrameBytes": 67108864,
-  "capabilities": ["literal-input/1", "tool-approval-binding/1", "reply-attribution/1", "external-delivery/1", "quiesce-exit/1", "quiesce-exit/2", "owned-jobs/1", "rich-ask/2"]
+  "capabilities": ["literal-input/1", "tool-approval-binding/1", "reply-attribution/1", "external-delivery/1", "quiesce-exit/1", "quiesce-exit/2", "owned-jobs/1", "approval-steer-deny/1", "rich-ask/2"]
 }
 ```
 
 `capabilities` lists versioned engine features (`name/major`); older engines omit it.
 `rich-ask/2` is advertised only by `--mode rpc-ui`. The same list is returned by
 `get_state.capabilities`, so a host attached after startup can negotiate without
-a destructive command. Rich ask requires explicit opt-in.
+a destructive command. Rich ask requires explicit opt-in. `approval-steer-deny/1`
+means a user steer, or a delivery sent with `mode: "steer"`, denies a pending tool
+approval and cancels its dialog (see [Approval mode](approval-mode.md)).
 
 Clients that support protocol v2 SHOULD immediately send:
 
@@ -619,7 +621,8 @@ field is absent outside both stages. No event carries it, so re-read
     "external-delivery/1",
     "quiesce-exit/1",
     "quiesce-exit/2",
-    "owned-jobs/1"
+    "owned-jobs/1",
+    "approval-steer-deny/1"
   ]
 }
 ```
