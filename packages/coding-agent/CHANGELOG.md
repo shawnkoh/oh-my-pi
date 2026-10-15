@@ -83,6 +83,9 @@
 ### Removed
 
 - Removed Codex Code Mode and its `providers.openai-codex.codeMode` / `providers.openai-codex.codeModeDirectTools` settings; Codex models always use the full direct tool surface.
+### Added
+
+- Added the default-off `goal.toolDefault` setting, which lets agents start goal mode themselves in ordinary sessions; an explicit `--tools=...,goal` now also exposes the tool while the default stays hidden ([#13877](https://github.com/can1357/oh-my-pi/pull/13877) by [@shawnkoh](https://github.com/shawnkoh))
 
 ## [18.10.3] - 2026-10-12
 
