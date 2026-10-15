@@ -106,6 +106,13 @@ export interface CustomToolContext {
 	localProtocolOptions?: LocalProtocolOptions;
 	/** Whether to auto-approve all destructive tool operations (--auto-approve CLI flag) */
 	autoApprove?: boolean;
+	/**
+	 * Watch for a steer that denies a pending tool approval: user-authored steering, or an
+	 * external delivery whose sender chose `steer`. The signal aborts, with an
+	 * `ApprovalSteerDenial` reason naming the sender, once one is queued (at once if one
+	 * already is). Call `dispose` when the approval settles.
+	 */
+	watchApprovalSteer?(): { signal: AbortSignal; dispose(): void };
 }
 
 /** Session event passed to onSession callback */

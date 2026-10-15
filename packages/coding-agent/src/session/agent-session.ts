@@ -412,6 +412,7 @@ import {
 	type PrewalkCoordinatorHost,
 	type PrewalkRestartResult,
 } from "./prewalk";
+import { ApprovalSteerDenial } from "./approval-steer";
 import {
 	isAdvisorCard,
 	isDisplayableQueuedMessage,
@@ -10362,6 +10363,36 @@ export class AgentSession implements SettingsScope {
 			followUp: this.agent.peekFollowUpQueue().filter(isUserAuthoredQueuedMessage).map(queueChipText),
 			liveSteered,
 		};
+	}
+
+	/**
+	 * Watch for a steer that denies a pending tool approval (see `approval-steer.ts`): queued
+	 * user-authored steering, or an external delivery whose sender chose `steer`. The signal
+	 * aborts with an {@link ApprovalSteerDenial} naming the sender as soon as one is queued,
+	 * at once if one already is, so every later approval of the batch it interrupts is denied
+	 * too until the boundary takes it. Asides, follow-ups and agent-authored steering never deny,
+	 * nor does steering a provider already took into the streaming response (live steering):
+	 * the model read it before asking for this call.
+	 */
+	watchApprovalSteer(): { signal: AbortSignal; dispose: () => void } {
+		const controller = new AbortController();
+		const check = (): void => {
+			if (controller.signal.aborted) return;
+			for (const message of this.agent.peekSteeringQueue()) {
+				if (isUserAuthoredQueuedMessage(message)) {
+					controller.abort(new ApprovalSteerDenial("The user"));
+					return;
+				}
+				const owner = this.#externalDeliveries.ownerOf(message);
+				if (owner?.mode === "steer") {
+					controller.abort(new ApprovalSteerDenial(`An external sender (delivery ${owner.id})`));
+					return;
+				}
+			}
+		};
+		const unsubscribe = this.agent.onQueueChange(check);
+		check();
+		return { signal: controller.signal, dispose: unsubscribe };
 	}
 
 	/** Last {@link getQueuedMessages} snapshot emitted as a `queue_update` event.
