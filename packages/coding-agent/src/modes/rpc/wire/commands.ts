@@ -44,7 +44,7 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 	},
 	{
 		name: "quiesce_and_exit",
-		doc: "Close admission and exit with a terminal attestation if the attested state is unchanged; requires explicit `strict` or `attested` completeness.",
+		doc: "Close admission and exit with a terminal attestation if the attested state is unchanged; `quiesce-exit/2` takes `strict` or `attested` completeness; without it the request is `quiesce-exit/1` (counts only).",
 		params: "QuiesceRequest",
 		result: "QuiesceResult",
 	},

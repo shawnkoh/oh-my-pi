@@ -18,6 +18,8 @@ function createHarness() {
 		queuedMessageCount: 0,
 		hasPendingAsyncWork: () => false,
 		sessionId: "s1",
+		/** Sibling moves: the id each sibling continued, keyed by the sibling's id. */
+		siblingMovedFrom: new Map<string, string>(),
 		branch: [] as Array<{
 			id: string;
 			type: string;
@@ -28,6 +30,16 @@ function createHarness() {
 		sessionManager: {
 			getLeafId: (): string | null => session.branch.at(-1)?.id ?? null,
 			getSessionId: () => session.sessionId,
+			continuesSession: (id: string) => {
+				for (
+					let current: string | undefined = session.sessionId;
+					current;
+					current = session.siblingMovedFrom.get(current)
+				) {
+					if (current === id) return true;
+				}
+				return false;
+			},
 			getBranch: () => session.branch as never,
 		},
 	};
@@ -168,6 +180,20 @@ describe("RpcPromptResults reply attribution", () => {
 			{ id: "req_switched", run: 2, replyEntryIds: [] },
 		]);
 		expect(frames.some(frame => "promptEntryId" in frame)).toBe(false);
+	});
+
+	test("a sibling move mid-run keeps the run's attribution", async () => {
+		const { frames, session, results } = createHarness();
+		const ticket = results.begin("req_sibling", "go");
+		results.observe(agentStart);
+		results.settle(ticket);
+		session.branch.push(user("u", "go"), reply("a"));
+		// Another process wrote the transcript file: same transcript, new id.
+		session.siblingMovedFrom.set("s1-sibling", session.sessionId);
+		session.sessionId = "s1-sibling";
+		results.observe(agentEnd([assistant({ stopReason: "stop" })]));
+		await flushFrames();
+		expect(frames).toMatchObject([{ id: "req_sibling", run: 1, promptEntryId: "u", replyEntryIds: ["a"] }]);
 	});
 
 	test("reads entries at the yield, not when a later settle reports", async () => {
@@ -591,7 +617,12 @@ describe("RpcPromptResults", () => {
 				hasAdmittedSubmission: false,
 				queuedMessageCount: 0,
 				hasPendingAsyncWork: () => false,
-				sessionManager: { getLeafId: () => null, getBranch: () => [], getSessionId: () => "s" },
+				sessionManager: {
+					getLeafId: () => null,
+					getBranch: () => [],
+					getSessionId: () => "s",
+					continuesSession: (id: string) => id === "s",
+				},
 			},
 			frame => frames.push(frame),
 		);
