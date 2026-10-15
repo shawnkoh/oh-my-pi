@@ -366,6 +366,131 @@ export interface ModelInfo {
 	compat?: Record<string, unknown>;
 }
 
+export interface WorkCounts {
+	streaming: number;
+	queuedInput: number;
+	asyncJobs: number;
+	subagents: number;
+	retainedJobs: number;
+	detachedJobs: number;
+	compacting: number;
+	handoff: number;
+	goalContinuationScheduled: number;
+	scheduledTurns: number;
+}
+
+export interface InvocationIdentity {
+	pid: number;
+	startId: string | null;
+	startTime: number | null;
+}
+
+export interface AttestedSessionIdentity {
+	id: string;
+	file: string | null;
+	size?: number | null;
+	sha256?: string | null;
+}
+
+export interface OpaqueOwnedProcess {
+	pid: number;
+	command: string;
+}
+
+export interface OwnerScanSummary {
+	supported: boolean;
+	sound: boolean;
+	scanned: number;
+	discovered: number;
+	opaque: OpaqueOwnedProcess[];
+}
+
+export interface OwnedJobRegistryState {
+	path: string | null;
+	complete: boolean;
+	ownerScan: OwnerScanSummary | null;
+}
+
+export interface WorkAttestation {
+	/** Attestation format version; currently 1. */
+	version: number;
+	operationId: string;
+	nonce: string;
+	epoch: number;
+	instanceId: string;
+	session: AttestedSessionIdentity;
+	invocation: InvocationIdentity;
+	counts: WorkCounts;
+	admission: "open" | "closed";
+	registry: OwnedJobRegistryState;
+	observedAt: string;
+}
+
+export interface QuiesceRequest {
+	operationId: string;
+	completeness: "strict" | "attested";
+	attempt: number;
+	epoch: number;
+	instanceId: string;
+	sessionId: string;
+	deadline: number;
+}
+
+export type QuiesceRefusalReason = "invalid_request" | "invocation_mismatch" | "session_mismatch" | "stale_attempt" | "admission_closed" | "deadline_expired" | "epoch_mismatch" | "work_active" | "completeness_unknown" | "attestation_unavailable";
+
+export interface TerminalAttestation {
+	/** Terminal attestation format version; currently 1. */
+	version: number;
+	kind: "quiesce" | "hangup";
+	session: AttestedSessionIdentity;
+	invocation: InvocationIdentity;
+	instanceId: string;
+	epoch: number;
+	counts: WorkCounts;
+	interrupted: boolean;
+	registryComplete: boolean;
+	registryPath: string | null;
+	ownerScan: OwnerScanSummary | null;
+	writtenAt: string;
+	operationId?: string;
+	attempt?: number;
+	signal?: string;
+}
+
+export interface QuiesceSnapshot {
+	epoch: number;
+	counts: WorkCounts;
+	observedAt: string;
+	registry?: OwnedJobRegistryState;
+}
+
+export interface QuiescedResult {
+	status: "quiesced";
+	operationId: string;
+	attempt: number;
+	attestation: TerminalAttestation;
+	path: string;
+}
+
+export interface QuiesceRefusedResult {
+	status: "refused";
+	operationId: string;
+	attempt: number;
+	reason: QuiesceRefusalReason;
+	snapshot: QuiesceSnapshot;
+}
+
+export interface QuiesceUnattestedResult {
+	status: "exit_unattested";
+	operationId: string;
+	attempt: number;
+	reason: "attestation_unavailable";
+	error: string;
+	snapshot: QuiesceSnapshot;
+}
+
+export type QuiesceResult = QuiescedResult | QuiesceRefusedResult | QuiesceUnattestedResult;
+
 export type QueueMode = "all" | "one-at-a-time";
 
 export type InterruptMode = "immediate" | "wait";
@@ -1570,6 +1695,11 @@ export type RpcNotification = ReadyEvent | PromptResultEvent | SessionSettledEve
 /** Any frame the server writes to stdout (after reassembling `rpc_chunk` sequences), discriminated by `type`. */
 export type RpcServerFrame = RpcResponse | RpcHostRequest | RpcNotification;
 
+export interface AttestParams {
+	operationId: string;
+	nonce: string;
+}
+
 export interface NegotiateProtocolParams {
 	protocolVersion: number;
 }
@@ -1931,6 +2061,8 @@ export interface GetBtwHistoryResult {
 
 /** Every RPC command's parameters and successful response `data`. */
 export interface RpcWireCommands {
+	attest: { params: AttestParams; result: WorkAttestation };
+	quiesce_and_exit: { params: QuiesceRequest; result: QuiesceResult };
 	negotiate_protocol: { params: NegotiateProtocolParams; result: NegotiateProtocolResult };
 	prompt: { params: PromptParams; result: PromptAck };
 	steer: { params: SteerParams; result: undefined };

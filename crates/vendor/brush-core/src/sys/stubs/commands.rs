@@ -99,8 +99,19 @@ pub trait CommandSessionExt {
 	/// Arranges for the command to run in a new session with no controlling terminal.
 	fn detach_session(&mut self);
 	/// Like [`CommandSessionExt::detach_session`]. No-op on platforms without
-	/// `setsid`/`fork` reparenting.
-	fn detach_session_reparent(&mut self);
+	/// `setsid`/`fork` reparenting, so there is never a reparented pid to report.
+	fn detach_session_reparent(&mut self) -> Option<ReparentedPidReceiver>;
+}
+
+/// Receiver for a reparented launch's real pid. Uninhabited: platforms without
+/// `fork`-based reparenting never produce one.
+pub enum ReparentedPidReceiver {}
+
+impl ReparentedPidReceiver {
+	/// Returns the real reparented process' `(pid, pgid)`.
+	pub fn receive(self) -> Option<(i32, i32)> {
+		match self {}
+	}
 }
 
 impl CommandSessionExt for std::process::Command {
@@ -108,7 +119,8 @@ impl CommandSessionExt for std::process::Command {
 		// NOTE: This is a no-op on platforms without setsid support.
 	}
 
-	fn detach_session_reparent(&mut self) {
+	fn detach_session_reparent(&mut self) -> Option<ReparentedPidReceiver> {
 		// NOTE: This is a no-op on platforms without setsid/fork support.
+		None
 	}
 }

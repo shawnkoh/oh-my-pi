@@ -685,8 +685,11 @@ class GoEmitter {
 			return parts.join("\n");
 		}
 		const result = this.#def(command.result);
-		if (result.kind !== "object") throw new Error(`${command.name}: result must be an object`);
+		if (result.kind !== "object" && !this.#isUnion(command.result)) {
+			throw new Error(`${command.name}: result must be an object or a discriminated union`);
+		}
 		if (command.unwrap) {
+			if (result.kind !== "object") throw new Error(`${command.name}: only object results can be unwrapped`);
 			if (command.nullable) throw new Error(`${command.name}: nullable unwrapped results are not supported`);
 			const field = result.fields.find(candidate => candidate.key === command.unwrap);
 			if (!field) throw new Error(`${command.name}: unwrap field ${command.unwrap} not in ${command.result}`);

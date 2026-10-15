@@ -2580,6 +2580,249 @@ pub struct ModelInfo {
 	pub compat: Option<Map<String, Value>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkCounts {
+	pub streaming: f64,
+	#[serde(rename = "queuedInput")]
+	pub queued_input: f64,
+	#[serde(rename = "asyncJobs")]
+	pub async_jobs: f64,
+	pub subagents: f64,
+	#[serde(rename = "retainedJobs")]
+	pub retained_jobs: f64,
+	#[serde(rename = "detachedJobs")]
+	pub detached_jobs: f64,
+	pub compacting: f64,
+	pub handoff: f64,
+	#[serde(rename = "goalContinuationScheduled")]
+	pub goal_continuation_scheduled: f64,
+	#[serde(rename = "scheduledTurns")]
+	pub scheduled_turns: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InvocationIdentity {
+	pub pid: f64,
+	#[serde(rename = "startId", deserialize_with = "Deserialize::deserialize")]
+	pub start_id: Option<String>,
+	#[serde(rename = "startTime", deserialize_with = "Deserialize::deserialize")]
+	pub start_time: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttestedSessionIdentity {
+	pub id: String,
+	#[serde(deserialize_with = "Deserialize::deserialize")]
+	pub file: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub size: Option<f64>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OpaqueOwnedProcess {
+	pub pid: f64,
+	pub command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OwnerScanSummary {
+	pub supported: bool,
+	pub sound: bool,
+	pub scanned: f64,
+	pub discovered: f64,
+	pub opaque: Vec<OpaqueOwnedProcess>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OwnedJobRegistryState {
+	#[serde(deserialize_with = "Deserialize::deserialize")]
+	pub path: Option<String>,
+	pub complete: bool,
+	#[serde(rename = "ownerScan", deserialize_with = "Deserialize::deserialize")]
+	pub owner_scan: Option<OwnerScanSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkAttestation {
+	/// Attestation format version; currently 1.
+	pub version: f64,
+	#[serde(rename = "operationId")]
+	pub operation_id: String,
+	pub nonce: String,
+	pub epoch: f64,
+	#[serde(rename = "instanceId")]
+	pub instance_id: String,
+	pub session: AttestedSessionIdentity,
+	pub invocation: InvocationIdentity,
+	pub counts: WorkCounts,
+	pub admission: WorkAttestationAdmission,
+	pub registry: OwnedJobRegistryState,
+	#[serde(rename = "observedAt")]
+	pub observed_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QuiesceRequest {
+	#[serde(rename = "operationId")]
+	pub operation_id: String,
+	pub completeness: QuiesceRequestCompleteness,
+	pub attempt: f64,
+	pub epoch: f64,
+	#[serde(rename = "instanceId")]
+	pub instance_id: String,
+	#[serde(rename = "sessionId")]
+	pub session_id: String,
+	pub deadline: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum QuiesceRefusalReason {
+	#[serde(rename = "invalid_request")]
+	InvalidRequest,
+	#[serde(rename = "invocation_mismatch")]
+	InvocationMismatch,
+	#[serde(rename = "session_mismatch")]
+	SessionMismatch,
+	#[serde(rename = "stale_attempt")]
+	StaleAttempt,
+	#[serde(rename = "admission_closed")]
+	AdmissionClosed,
+	#[serde(rename = "deadline_expired")]
+	DeadlineExpired,
+	#[serde(rename = "epoch_mismatch")]
+	EpochMismatch,
+	#[serde(rename = "work_active")]
+	WorkActive,
+	#[serde(rename = "completeness_unknown")]
+	CompletenessUnknown,
+	#[serde(rename = "attestation_unavailable")]
+	AttestationUnavailable,
+}
+
+impl QuiesceRefusalReason {
+	/// Wire value.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::InvalidRequest => "invalid_request",
+			Self::InvocationMismatch => "invocation_mismatch",
+			Self::SessionMismatch => "session_mismatch",
+			Self::StaleAttempt => "stale_attempt",
+			Self::AdmissionClosed => "admission_closed",
+			Self::DeadlineExpired => "deadline_expired",
+			Self::EpochMismatch => "epoch_mismatch",
+			Self::WorkActive => "work_active",
+			Self::CompletenessUnknown => "completeness_unknown",
+			Self::AttestationUnavailable => "attestation_unavailable",
+		}
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TerminalAttestation {
+	/// Terminal attestation format version; currently 1.
+	pub version: f64,
+	pub kind: TerminalAttestationKind,
+	pub session: AttestedSessionIdentity,
+	pub invocation: InvocationIdentity,
+	#[serde(rename = "instanceId")]
+	pub instance_id: String,
+	pub epoch: f64,
+	pub counts: WorkCounts,
+	pub interrupted: bool,
+	#[serde(rename = "registryComplete")]
+	pub registry_complete: bool,
+	#[serde(rename = "registryPath", deserialize_with = "Deserialize::deserialize")]
+	pub registry_path: Option<String>,
+	#[serde(rename = "ownerScan", deserialize_with = "Deserialize::deserialize")]
+	pub owner_scan: Option<OwnerScanSummary>,
+	#[serde(rename = "writtenAt")]
+	pub written_at: String,
+	#[serde(rename = "operationId", default, skip_serializing_if = "Option::is_none")]
+	pub operation_id: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub attempt: Option<f64>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub signal: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QuiesceSnapshot {
+	pub epoch: f64,
+	pub counts: WorkCounts,
+	#[serde(rename = "observedAt")]
+	pub observed_at: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub registry: Option<OwnedJobRegistryState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QuiescedResult {
+	#[serde(rename = "operationId")]
+	pub operation_id: String,
+	pub attempt: f64,
+	pub attestation: TerminalAttestation,
+	pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QuiesceRefusedResult {
+	#[serde(rename = "operationId")]
+	pub operation_id: String,
+	pub attempt: f64,
+	pub reason: QuiesceRefusalReason,
+	pub snapshot: QuiesceSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QuiesceUnattestedResult {
+	#[serde(rename = "operationId")]
+	pub operation_id: String,
+	pub attempt: f64,
+	pub reason: LitAttestationUnavailable,
+	pub error: String,
+	pub snapshot: QuiesceSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum QuiesceResult {
+	Quiesced(QuiescedResult),
+	Refused(QuiesceRefusedResult),
+	ExitUnattested(QuiesceUnattestedResult),
+}
+
+impl QuiesceResult {
+	/// Decodes from JSON, dispatching on `status`.
+	pub fn from_value(value: Value) -> Result<Self, serde_json::Error> {
+		let decode: fn(Value) -> Result<Self, serde_json::Error> = match value.get("status").and_then(Value::as_str) {
+			Some("quiesced") => |value| serde_json::from_value(value).map(Self::Quiesced),
+			Some("refused") => |value| serde_json::from_value(value).map(Self::Refused),
+			Some("exit_unattested") => |value| serde_json::from_value(value).map(Self::ExitUnattested),
+			other => {
+				return Err(serde_json::Error::custom(format!("unknown QuiesceResult status {other:?}")));
+			}
+		};
+		decode(value)
+	}
+}
+
+impl Serialize for QuiesceResult {
+	fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		match self {
+			Self::Quiesced(member) => serialize_tagged(member, &[("status", "quiesced")], serializer),
+			Self::Refused(member) => serialize_tagged(member, &[("status", "refused")], serializer),
+			Self::ExitUnattested(member) => serialize_tagged(member, &[("status", "exit_unattested")], serializer),
+		}
+	}
+}
+
+impl<'de> Deserialize<'de> for QuiesceResult {
+	fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+		Self::from_value(Value::deserialize(deserializer)?).map_err(D::Error::custom)
+	}
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum QueueMode {
 	#[serde(rename = "all")]
@@ -5321,6 +5564,13 @@ impl<'de> Deserialize<'de> for RpcServerFrame {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttestParams {
+	#[serde(rename = "operationId")]
+	pub operation_id: String,
+	pub nonce: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NegotiateProtocolParams {
 	#[serde(rename = "protocolVersion")]
 	pub protocol_version: i64,
@@ -6002,6 +6252,81 @@ impl AssistantErrorEventReason {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum WorkAttestationAdmission {
+	#[serde(rename = "open")]
+	Open,
+	#[serde(rename = "closed")]
+	Closed,
+}
+
+impl WorkAttestationAdmission {
+	/// Wire value.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Open => "open",
+			Self::Closed => "closed",
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum QuiesceRequestCompleteness {
+	#[serde(rename = "strict")]
+	Strict,
+	#[serde(rename = "attested")]
+	Attested,
+}
+
+impl QuiesceRequestCompleteness {
+	/// Wire value.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Strict => "strict",
+			Self::Attested => "attested",
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TerminalAttestationKind {
+	#[serde(rename = "quiesce")]
+	Quiesce,
+	#[serde(rename = "hangup")]
+	Hangup,
+}
+
+impl TerminalAttestationKind {
+	/// Wire value.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Quiesce => "quiesce",
+			Self::Hangup => "hangup",
+		}
+	}
+}
+
+/// The constant `"attestation_unavailable"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct LitAttestationUnavailable;
+
+impl Serialize for LitAttestationUnavailable {
+	fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		serializer.serialize_str("attestation_unavailable")
+	}
+}
+
+impl<'de> Deserialize<'de> for LitAttestationUnavailable {
+	fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+		let value = Value::deserialize(deserializer)?;
+		if value.as_str() == Some("attestation_unavailable") {
+			Ok(Self)
+		} else {
+			Err(D::Error::custom(format!("expected \"attestation_unavailable\", got {value}")))
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum GoalModeStateMode {
 	#[serde(rename = "active")]
 	Active,
@@ -6278,6 +6603,49 @@ fn default_queue_update_event_live_steered() -> i64 {
 
 fn default_ask_question_multi() -> bool {
 	serde_json::from_str("false").expect("valid wire default")
+}
+
+/// Snapshot identity, activity epoch, work counts and owned-job registry soundness (`quiesce-exit/2`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttestCommand {
+	#[serde(rename = "operationId")]
+	pub operation_id: String,
+	pub nonce: String,
+}
+
+impl Command for AttestCommand {
+	const NAME: &'static str = "attest";
+	const TIMEOUT_MS: Option<u64> = None;
+	type Output = WorkAttestation;
+
+	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
+		serde_json::from_value::<WorkAttestation>(data.unwrap_or_else(|| Value::Object(Map::new())))
+	}
+}
+
+/// Close admission and exit with a terminal attestation if the attested state is unchanged; requires explicit `strict` or `attested` completeness.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QuiesceAndExitCommand {
+	#[serde(rename = "operationId")]
+	pub operation_id: String,
+	pub completeness: QuiesceRequestCompleteness,
+	pub attempt: f64,
+	pub epoch: f64,
+	#[serde(rename = "instanceId")]
+	pub instance_id: String,
+	#[serde(rename = "sessionId")]
+	pub session_id: String,
+	pub deadline: f64,
+}
+
+impl Command for QuiesceAndExitCommand {
+	const NAME: &'static str = "quiesce_and_exit";
+	const TIMEOUT_MS: Option<u64> = None;
+	type Output = QuiesceResult;
+
+	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
+		serde_json::from_value::<QuiesceResult>(data.unwrap_or_else(|| Value::Object(Map::new())))
+	}
 }
 
 /// Switch the connection to a protocol version advertised by `ready`.

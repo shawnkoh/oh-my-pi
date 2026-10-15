@@ -292,6 +292,23 @@ describe("postmortem expected cleanup errors", () => {
 		expect(result.stdout).toContain('["after-keepalive","cleanup"]');
 	});
 
+	it("runs first-phase callbacks before callbacks registered after them", async () => {
+		const result = await runPostmortemProbe(`
+			import { postmortem } from "${postmortemModuleUrl}";
+
+			let pending = 1;
+			const seen = [];
+			// A capture that must count work before a later-registered owner clears it.
+			postmortem.register("capture", () => { seen.push(\`capture:\${pending}\`); }, { first: true });
+			postmortem.register("clear", () => { pending = 0; seen.push("clear"); });
+			await postmortem.cleanup();
+			console.log(JSON.stringify(seen));
+		`);
+
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout).toContain('["capture:1","clear"]');
+	});
+
 	it("awaits an async callback registered mid-pass before cleanup() settles", async () => {
 		const result = await runPostmortemProbe(`
 			import { postmortem } from "${postmortemModuleUrl}";

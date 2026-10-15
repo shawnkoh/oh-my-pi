@@ -37,6 +37,18 @@ const LITERAL = doc(
 
 export const rpcCommands: readonly RpcCommandSpec[] = [
 	{
+		name: "attest",
+		doc: "Snapshot identity, activity epoch, work counts and owned-job registry soundness (`quiesce-exit/2`).",
+		params: { operationId: "string", nonce: "string" },
+		result: "WorkAttestation",
+	},
+	{
+		name: "quiesce_and_exit",
+		doc: "Close admission and exit with a terminal attestation if the attested state is unchanged; requires explicit `strict` or `attested` completeness.",
+		params: "QuiesceRequest",
+		result: "QuiesceResult",
+	},
+	{
 		name: "negotiate_protocol",
 		doc: "Switch the connection to a protocol version advertised by `ready`.",
 		params: { protocolVersion: "number.integer" },
