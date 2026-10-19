@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added `omp session yield <sessionId> [--timeout S]`: a capable live holder waits for idle, displays a continuation notice and its unsent TUI draft, releases its session lease, and exits. Holder lock metadata and RPC capabilities advertise `session-yield/1`; old holders remain unsupported and are never signalled.
 - A steer now denies a pending tool approval outside the TUI too: a user `steer` over RPC, or an external delivery whose sender chose `mode: "steer"`, closes the approval dialog, runs nothing, and tells the agent who steered; RPC engines advertise `approval-steer-deny/1`
 
 ### Fixed
