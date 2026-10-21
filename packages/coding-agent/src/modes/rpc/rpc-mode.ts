@@ -3039,12 +3039,6 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		kind: "queuedInput",
 		count: () => inputDispatcher.pendingCount + shutdownCoordinator.pendingCount + inputGate.pendingCount,
 	});
-	session.setSessionBeforeSwitchReconciler(async () => {
-		disposeSessionYield?.();
-	});
-	session.setSessionSwitchReconciler(async () => {
-		bindSessionYieldHolder();
-	});
 	yieldHostReady = true;
 
 	// Keep the stdin reader moving: side-channel frames dispatch immediately,

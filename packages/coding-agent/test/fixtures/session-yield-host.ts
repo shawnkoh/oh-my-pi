@@ -66,6 +66,17 @@ if (process.env.YIELD_FIXTURE_LAZY !== "1") {
 	// User-only appends intentionally remain lazy; force the real write that acquires the OS lease.
 	await sessionManager.ensureOnDisk();
 }
+if (process.env.YIELD_FIXTURE_FAIL_SWITCH_FLUSH === "1") {
+	const flush = sessionManager.flush.bind(sessionManager);
+	sessionManager.flush = async () => {
+		const marker = path.join(process.cwd(), "fail-switch-flush");
+		if (fs.existsSync(marker)) {
+			fs.unlinkSync(marker);
+			throw new Error("Fixture outgoing flush failure");
+		}
+		await flush();
+	};
+}
 const session = new AgentSession({
 	agent,
 	sessionManager,
@@ -145,6 +156,20 @@ if (process.env.YIELD_FIXTURE_MODE !== "tui") {
 				if (command && typeof command === "object" && "fork" in command && command.fork === true) {
 					await session.fork();
 					process.stdout.write(`${JSON.stringify({ type: "fixture_forked", sessionId: session.sessionId })}\n`);
+				}
+				if (command && typeof command === "object" && "switch" in command && command.switch === true) {
+					try {
+						await session.switchSession(session.sessionFile!);
+						throw new Error("Expected fixture switch to fail");
+					} catch (error) {
+						process.stdout.write(
+							`${JSON.stringify({
+								type: "fixture_switch_failed",
+								error: String(error),
+								sessionId: session.sessionId,
+							})}\n`,
+						);
+					}
 				}
 				if (command && typeof command === "object" && "text" in command && typeof command.text === "string") {
 					terminal.sendInput(command.text);

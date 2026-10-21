@@ -206,6 +206,35 @@ describe.skipIf(process.platform === "win32")("actual session yield hosts", () =
 		expect(await rpc.yield(newId)).toBe(0);
 	}, 30_000);
 
+	it.each(["rpc", "tui"])(
+		"keeps %s yield available after an outgoing switch flush fails",
+		async mode => {
+			const holder = launch(mode, { YIELD_FIXTURE_FAIL_SWITCH_FLUSH: "1" });
+			const ready = await holder.waitFor(frame => frame.type === (mode === "rpc" ? "ready" : "fixture_ready"));
+			const state = mode === "rpc" ? await holder.request("before", { type: "get_state" }) : ready;
+			const id = mode === "rpc" ? sessionId(state) : String(state.sessionId);
+			fs.writeFileSync(temp.join("fail-switch-flush"), "fail once");
+			if (mode === "rpc") {
+				if (!isRecord(state.data)) throw new Error("Missing session state");
+				const failed = await holder.request("switch", {
+					type: "switch_session",
+					sessionPath: state.data.sessionFile,
+				});
+				expect(failed).toMatchObject({ success: false });
+				expect(String(failed.error)).toContain("Fixture outgoing flush failure");
+				expect(sessionId(await holder.request("after", { type: "get_state" }))).toBe(id);
+			} else {
+				holder.send({ switch: true });
+				const failed = await holder.waitFor(frame => frame.type === "fixture_switch_failed");
+				expect(failed.sessionId).toBe(id);
+				expect(String(failed.error)).toContain("Fixture outgoing flush failure");
+			}
+			expect(await holder.yield(id)).toBe(0);
+			expect(await holder.child.exited).toBe(0);
+		},
+		30_000,
+	);
+
 	it("follows a whole-session RPC fork without accepting the old holder's request", async () => {
 		const rpc = launch();
 		await rpc.waitFor(frame => frame.type === "ready");

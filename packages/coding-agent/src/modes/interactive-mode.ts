@@ -2408,17 +2408,11 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		// Restore mode from session (e.g. plan mode on resume)
 		this.session.setSessionBeforeSwitchReconciler?.(async () => {
-			this.#disposeSessionYield?.();
-			this.#disposeSessionYield = undefined;
 			await this.#liveCommandController.stop();
 			await this.#quiesceVibeForSessionSwitch();
 		});
 		this.session.setSessionSwitchReconciler?.(async () => {
-			try {
-				await this.#reconcileModeFromSession({ preserveActiveGoal: true });
-			} finally {
-				this.#bindSessionYieldHolder();
-			}
+			await this.#reconcileModeFromSession({ preserveActiveGoal: true });
 		});
 		await logger.time("InteractiveMode.init:reconcileMode", () => this.#reconcileModeFromSession());
 

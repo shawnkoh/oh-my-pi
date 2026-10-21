@@ -68,7 +68,8 @@ Supporting holders publish `capabilities: ["session-yield/1"]` in the existing
 RPC `ready`/`get_state`. An unmaterialized session has no lease and advertises no
 yield capability until it acquires one (`get_state` reflects that transition).
 The hook follows identity changes, including whole-session forks and
-persistence-conflict recovery into a sibling session. The outgoing capability
+persistence-conflict recovery into a sibling session, and remains available if
+an attempted switch fails while retaining the original lease. The outgoing capability
 is revoked before its final lease release, even if the process continues under
 another session ID. Rich TUI asks and approvals, including queued dialogs and
 answers reopened outside an agent turn, count as outstanding work.
