@@ -123,6 +123,7 @@ describe.skipIf(process.platform === "win32")("actual session yield hosts", () =
 			...process.env,
 			PI_CODING_AGENT_DIR: temp.path(),
 			PI_NO_TITLE: "1",
+			PI_TEST_SESSION_OWNERS_DIR: temp.join("owners"),
 			YIELD_FIXTURE_MODE: mode,
 			...extra,
 		});
@@ -203,6 +204,121 @@ describe.skipIf(process.platform === "win32")("actual session yield hosts", () =
 		expect(newId).not.toBe(oldId);
 		expect(await rpc.yield(oldId)).toBe(3);
 		expect(await rpc.yield(newId)).toBe(0);
+	}, 30_000);
+
+	it("follows a whole-session RPC fork without accepting the old holder's request", async () => {
+		const rpc = launch();
+		await rpc.waitFor(frame => frame.type === "ready");
+		const oldId = sessionId(await rpc.request("old", { type: "get_state" }));
+		const oldMetadata = JSON.parse(fs.readFileSync(temp.join(`owners/${oldId}.lock`), "utf8"));
+		expect(await rpc.request("fork", { type: "fork" })).toMatchObject({ success: true });
+		const state = await rpc.request("fork-state", { type: "get_state" });
+		const newId = sessionId(state);
+		expect(newId).not.toBe(oldId);
+		expect(isRecord(state.data) ? state.data.capabilities : undefined).toContain("session-yield/1");
+		const newMetadata = JSON.parse(fs.readFileSync(temp.join(`owners/${newId}.lock`), "utf8"));
+		expect(newMetadata.holderId).not.toBe(oldMetadata.holderId);
+		expect(JSON.parse(fs.readFileSync(temp.join(`owners/${oldId}.lock`), "utf8")).capabilities).not.toContain(
+			"session-yield/1",
+		);
+		// Keep an outgoing request live while the new identity accepts and exits.
+		fs.writeFileSync(
+			temp.join(`owners/${oldId}.yield-request.json`),
+			JSON.stringify({
+				holderId: oldMetadata.holderId,
+				requestId: "stale-fork-request",
+				deadline: Date.now() + 60_000,
+			}),
+		);
+		expect(await rpc.request("alive-after-replay", { type: "get_state" })).toMatchObject({ success: true });
+		expect(await rpc.yield(oldId)).toBe(3);
+		expect(await rpc.yield(newId)).toBe(0);
+		expect(fs.existsSync(temp.join(`owners/${oldId}.yield-ack.json`))).toBe(false);
+	}, 30_000);
+
+	it("follows a whole-session TUI fork", async () => {
+		const tui = launch("tui");
+		const ready = await tui.waitFor(frame => frame.type === "fixture_ready");
+		tui.send({ fork: true });
+		const forked = await tui.waitFor(frame => frame.type === "fixture_forked");
+		expect(forked.sessionId).not.toBe(ready.sessionId);
+		expect(await tui.yield(String(ready.sessionId))).toBe(3);
+		expect(await tui.yield(String(forked.sessionId))).toBe(0);
+	}, 30_000);
+
+	it("follows a persistence-driven sibling after an external transcript replacement", async () => {
+		const rpc = launch("rpc", { YIELD_FIXTURE_REWRITE: "1" });
+		await rpc.waitFor(frame => frame.type === "ready");
+		const state = await rpc.request("before-replacement", { type: "get_state" });
+		const oldId = sessionId(state);
+		if (!isRecord(state.data) || typeof state.data.sessionFile !== "string") throw new Error("Missing transcript");
+		const foreign = `${JSON.stringify({
+			type: "session",
+			version: 3,
+			id: "foreign-replacement",
+			timestamp: new Date().toISOString(),
+			cwd: temp.path(),
+		})}\n`;
+		await rpc.request("prompt", { type: "prompt", message: "persist into a sibling" });
+		await rpc.waitFor(frame => frame.type === "fixture_rewrite_ready");
+		fs.writeFileSync(state.data.sessionFile, foreign);
+		fs.writeFileSync(temp.join("rewrite"), "release the full rewrite");
+		await rpc.waitFor(frame => frame.type === "agent_end");
+		const sibling = await rpc.request("sibling-state", { type: "get_state" });
+		const newId = sessionId(sibling);
+		expect(newId).not.toBe(oldId);
+		expect(fs.readFileSync(state.data.sessionFile, "utf8")).toBe(foreign);
+		expect(isRecord(sibling.data) ? sibling.data.capabilities : undefined).toContain("session-yield/1");
+		expect(await rpc.yield(oldId)).toBe(3);
+		expect(await rpc.yield(newId)).toBe(0);
+	}, 30_000);
+
+	it("revokes before last release while the predecessor stays alive and a legacy successor holds the lease", async () => {
+		const predecessor = launch("release");
+		const ready = await predecessor.waitFor(frame => frame.type === "fixture_ready");
+		const id = String(ready.sessionId);
+		const metadataPath = temp.join(`owners/${id}.lock`);
+		const before = fs.statSync(metadataPath);
+		const metadata = JSON.parse(fs.readFileSync(metadataPath, "utf8"));
+		fs.writeFileSync(
+			metadataPath,
+			JSON.stringify({
+				...metadata,
+				unrelated: "preserved",
+				capabilities: [...metadata.capabilities, "other/1"],
+			}),
+		);
+		predecessor.send({ release: true });
+		await predecessor.waitFor(frame => frame.type === "fixture_released");
+		expect(predecessor.child.exitCode).toBeNull();
+		expect(fs.statSync(metadataPath).ino).toBe(before.ino);
+		expect(JSON.parse(fs.readFileSync(metadataPath, "utf8"))).toMatchObject({
+			unrelated: "preserved",
+			capabilities: ["other/1"],
+		});
+		const successor = new YieldHost(temp.path(), {
+			...predecessor.env,
+			YIELD_FIXTURE_MODE: "legacy",
+			YIELD_FIXTURE_LEGACY_ID: id,
+		});
+		try {
+			await successor.waitFor(frame => frame.type === "fixture_ready");
+			const successorMetadata = fs.readFileSync(metadataPath, "utf8");
+			expect(await predecessor.yield(id, 150)).toBe(5);
+			expect(predecessor.child.exitCode).toBeNull();
+			expect(successor.child.exitCode).toBeNull();
+			expect(fs.statSync(metadataPath).ino).toBe(before.ino);
+			expect(fs.readFileSync(metadataPath, "utf8")).toBe(successorMetadata);
+			// Disposing the predecessor's old hook after takeover must not mutate successor metadata.
+			predecessor.child.stdin.end();
+			await predecessor.child.exited;
+			await predecessor.finishedReading;
+			expect(fs.readFileSync(metadataPath, "utf8")).toBe(successorMetadata);
+		} finally {
+			successor.child.stdin.end();
+			await successor.child.exited;
+			await successor.finishedReading;
+		}
 	}, 30_000);
 
 	it("preserves and visibly prints unsent composer text before the TUI exits", async () => {

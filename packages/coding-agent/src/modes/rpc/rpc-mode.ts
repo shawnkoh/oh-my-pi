@@ -87,7 +87,7 @@ import { QUIESCE_EXIT_DEADLINE_MS, quiesceEndsProcess, quiesceExitCode } from ".
 import {
 	SESSION_YIELD_CAPABILITY,
 	type SessionYieldHolder,
-	startSessionYieldHolder,
+	followSessionYieldHolder,
 } from "../../session/session-yield";
 import { fenceSessionYield, isSessionYieldIdle, SESSION_YIELD_NOTICE } from "../session-yield-host";
 import { RpcSubagentRegistry, readRpcSubagentTranscript, resolveOwnedLiveSubagent } from "./rpc-subagents";
@@ -1519,12 +1519,10 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	let disposeSessionYield: SessionYieldHolder | undefined;
 	const bindSessionYieldHolder = (): void => {
 		disposeSessionYield?.();
-		const sessionId = session.sessionId;
-		disposeSessionYield = startSessionYieldHolder({
-			sessionId,
+		disposeSessionYield = followSessionYieldHolder({
+			sessionManager: session.sessionManager,
 			isIdle: () =>
 				yieldHostReady &&
-				session.sessionId === sessionId &&
 				!shutdownState.requested &&
 				pendingExtensionRequests.size === 0 &&
 				isSessionYieldIdle(session),

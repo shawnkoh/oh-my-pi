@@ -518,7 +518,7 @@ function isPidAlive(pid: number): boolean {
  * when its process exits, so a crashed owner never blocks a later claim.
  */
 const sessionLeases = new Map<string, { lease: FileLockHandle; holders: number; identity: string }>();
-const sessionLeaseListeners = new Map<string, Set<(identity: string) => void>>();
+const sessionLeaseListeners = new Map<string, Set<(identity: string | undefined) => void>>();
 
 const TEST_SESSION_OWNERS_DIR_ENV = "PI_TEST_SESSION_OWNERS_DIR";
 
@@ -601,8 +601,8 @@ export function getHeldSessionLeaseIdentity(sessionId: string): string | undefin
 	return sessionLeases.get(sessionId)?.identity;
 }
 
-/** Activate pending host hooks synchronously when a lazy session claim succeeds. */
-export function onSessionLeaseAcquired(sessionId: string, listener: (identity: string) => void): () => void {
+/** Observe acquisition and revoke hooks before the actual last lease release. */
+export function onSessionLeaseChanged(sessionId: string, listener: (identity: string | undefined) => void): () => void {
 	let listeners = sessionLeaseListeners.get(sessionId);
 	if (!listeners) {
 		listeners = new Set();
@@ -1310,6 +1310,13 @@ export class FileSessionStorage implements SessionStorage {
 			if (released) return;
 			released = true;
 			if (--claim.holders > 0) return;
+			for (const listener of sessionLeaseListeners.get(sessionId) ?? []) {
+				try {
+					listener(undefined);
+				} catch (error) {
+					logger.warn("Session ownership hook unavailable", { sessionId, error: toError(error).message });
+				}
+			}
 			sessionLeases.delete(sessionId);
 			claim.lease.release();
 		};

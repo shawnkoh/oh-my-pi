@@ -4,9 +4,10 @@ import * as logger from "@oh-my-pi/pi-utils/logger";
 import {
 	getHeldSessionLeaseIdentity,
 	getSessionOwnerPath,
-	onSessionLeaseAcquired,
+	onSessionLeaseChanged,
 	tryAcquireSessionLease,
 } from "./session-storage";
+import type { SessionManager } from "./session-manager";
 
 export const SESSION_YIELD_CAPABILITY = "session-yield/1";
 const POLL_MS = 25;
@@ -99,6 +100,33 @@ function publishRecord(file: string, record: YieldRequest): void {
 	}
 }
 
+/** Keep a host bound to the manager's real identity, not only explicit UI switches. */
+export function followSessionYieldHolder(options: {
+	sessionManager: Pick<SessionManager, "getSessionId" | "onSessionIdentityChanged">;
+	isIdle: () => boolean;
+	yield: () => Promise<void>;
+}): SessionYieldHolder {
+	let holder: SessionYieldHolder | undefined;
+	const bind = () => {
+		holder?.();
+		const sessionId = options.sessionManager.getSessionId();
+		holder = startSessionYieldHolder({
+			sessionId,
+			isIdle: () => options.sessionManager.getSessionId() === sessionId && options.isIdle(),
+			yield: options.yield,
+		});
+	};
+	const unsubscribe = options.sessionManager.onSessionIdentityChanged(bind);
+	bind();
+	const dispose = () => {
+		unsubscribe();
+		holder?.();
+	};
+	return Object.defineProperty(dispose, "active", {
+		get: () => holder?.active ?? false,
+	}) as SessionYieldHolder;
+}
+
 /** Pending hooks activate synchronously on a real lease claim; metadata never grants ownership. */
 export function startSessionYieldHolder(options: {
 	sessionId: string;
@@ -114,7 +142,20 @@ export function startSessionYieldHolder(options: {
 	let disposed = false;
 	let yielding = false;
 	let handledRequestId: string | undefined;
-	const unsubscribe = onSessionLeaseAcquired(options.sessionId, identity => {
+	const revoke = () => {
+		if (!holder || getHeldSessionLeaseIdentity(options.sessionId) !== leaseIdentity) return;
+		const current = readRecord(metadataPath);
+		if (isHolder(current) && current.holderId === holder.holderId) {
+			writeMetadata(metadataPath, { ...holder, capabilities: [] });
+		}
+	};
+	const unsubscribe = onSessionLeaseChanged(options.sessionId, identity => {
+		if (identity === undefined) {
+			revoke();
+			holder = undefined;
+			leaseIdentity = undefined;
+			return;
+		}
 		const record: HolderRecord = {
 			pid: process.pid,
 			holderId: crypto.randomUUID(),
@@ -178,11 +219,7 @@ export function startSessionYieldHolder(options: {
 		disposed = true;
 		unsubscribe();
 		clearInterval(timer);
-		if (!holder || getHeldSessionLeaseIdentity(options.sessionId) !== leaseIdentity) return;
-		const current = readRecord(metadataPath);
-		if (isHolder(current) && current.holderId === holder.holderId) {
-			writeMetadata(metadataPath, { ...holder, capabilities: [] });
-		}
+		revoke();
 	};
 	return Object.defineProperty(dispose, "active", {
 		get: () => !disposed && !yielding && !!holder && getHeldSessionLeaseIdentity(options.sessionId) === leaseIdentity,

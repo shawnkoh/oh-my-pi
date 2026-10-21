@@ -67,6 +67,11 @@ Supporting holders publish `capabilities: ["session-yield/1"]` in the existing
 `~/.omp/run/session-owners/<sessionId>.lock` JSON and advertise the capability in
 RPC `ready`/`get_state`. An unmaterialized session has no lease and advertises no
 yield capability until it acquires one (`get_state` reflects that transition).
+The hook follows identity changes, including whole-session forks and
+persistence-conflict recovery into a sibling session. The outgoing capability
+is revoked before its final lease release, even if the process continues under
+another session ID. Rich TUI asks and approvals, including queued dialogs and
+answers reopened outside an agent turn, count as outstanding work.
 Metadata is bounded below 4096 bytes, preserves unrelated fields, and never
 replaces or unlinks the OS lease inode. The marker alone is not proof of ownership.
 Requests and acceptance records beside the lease are fenced by holder identity,

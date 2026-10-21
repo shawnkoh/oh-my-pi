@@ -55,6 +55,9 @@ function makeHarness() {
 		},
 		editorContainer,
 		session: {
+			assertAdmissionOpen: vi.fn(),
+			noteActivity: vi.fn(),
+			registerWorkSource: vi.fn(() => vi.fn()),
 			extensionRunner: undefined,
 			setUsageFallbackConfirmer: vi.fn(),
 			getQueuedMessages: () => ({ steering: [...steering], followUp: [], liveSteered: 0 }),

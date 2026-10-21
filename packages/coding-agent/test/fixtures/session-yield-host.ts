@@ -10,7 +10,8 @@ import { runRpcMode } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { requestSessionYield } from "@oh-my-pi/pi-coding-agent/session/session-yield";
+import { requestSessionYield, startSessionYieldHolder } from "@oh-my-pi/pi-coding-agent/session/session-yield";
+import { tryAcquireSessionLease } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { Composer } from "@oh-my-pi/pi-tui/prompt/composer";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { ProcessTerminal } from "@oh-my-pi/pi-tui/terminal";
@@ -21,6 +22,19 @@ if (process.argv[2] === "request") {
 	process.exit(await requestSessionYield(process.argv[3]!, Number(process.argv[4])));
 }
 
+// Simulate an older writer: it holds the real lease but never advertises a yield hook.
+if (process.env.YIELD_FIXTURE_MODE === "legacy") {
+	const lease = tryAcquireSessionLease(process.env.YIELD_FIXTURE_LEGACY_ID!);
+	if (!lease) throw new Error("Legacy successor could not acquire lease");
+	process.stdout.write(`${JSON.stringify({ type: "fixture_ready" })}\n`);
+	try {
+		await new Response(Bun.stdin.stream()).text();
+	} finally {
+		lease.release();
+	}
+	process.exit(0);
+}
+
 await Settings.init({ inMemory: true, cwd: process.cwd() });
 const authStorage = await AuthStorage.create(path.join(process.cwd(), "auth.db"));
 authStorage.keys.setRuntime("anthropic", "fixture-only-key");
@@ -29,6 +43,14 @@ const mock = createMockModel({
 	handler: async context => {
 		if (JSON.stringify(context.messages.at(-1)).includes("hold")) {
 			while (!fs.existsSync(path.join(process.cwd(), "release"))) await Bun.sleep(10);
+		}
+		if (process.env.YIELD_FIXTURE_REWRITE === "1") {
+			// Signal after prompt entries land; the parent then replaces the transcript
+			// and releases a real full rewrite, as compaction/entry discard would.
+			await sessionManager.flush();
+			process.stdout.write(`${JSON.stringify({ type: "fixture_rewrite_ready" })}\n`);
+			while (!fs.existsSync(path.join(process.cwd(), "rewrite"))) await Bun.sleep(10);
+			await sessionManager.rewriteEntries();
 		}
 		return { content: ["done"] };
 	},
@@ -50,6 +72,25 @@ const session = new AgentSession({
 	settings: Settings.isolated({ "compaction.enabled": false }),
 	modelRegistry,
 });
+if (process.env.YIELD_FIXTURE_MODE === "release") {
+	const dispose = startSessionYieldHolder({
+		sessionId: session.sessionId,
+		isIdle: () => false,
+		yield: async () => {
+			throw new Error("Busy predecessor must never accept yield");
+		},
+	});
+	process.stdout.write(`${JSON.stringify({ type: "fixture_ready", sessionId: session.sessionId })}\n`);
+	try {
+		for await (const _chunk of Bun.stdin.stream()) {
+			await sessionManager.close();
+			process.stdout.write(`${JSON.stringify({ type: "fixture_released" })}\n`);
+		}
+	} finally {
+		dispose();
+	}
+	process.exit(0);
+}
 if (process.env.YIELD_FIXTURE_MODE !== "tui") {
 	await runRpcMode(session, {
 		setToolUIContext: ui => {
@@ -101,6 +142,10 @@ if (process.env.YIELD_FIXTURE_MODE !== "tui") {
 			buffer = buffer.slice(newline + 1);
 			if (line) {
 				const command: unknown = JSON.parse(line);
+				if (command && typeof command === "object" && "fork" in command && command.fork === true) {
+					await session.fork();
+					process.stdout.write(`${JSON.stringify({ type: "fixture_forked", sessionId: session.sessionId })}\n`);
+				}
 				if (command && typeof command === "object" && "text" in command && typeof command.text === "string") {
 					terminal.sendInput(command.text);
 				}

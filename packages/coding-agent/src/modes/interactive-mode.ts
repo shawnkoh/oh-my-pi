@@ -142,7 +142,7 @@ import { USER_INTERRUPT_LABEL } from "../session/messages";
 import { resolveMarkdownLinkHrefs } from "../internal-urls/hyperlink-targets";
 import type { ResolveContext } from "../internal-urls/index";
 import { type GoalContinuationReservation, QUIESCE_EXIT_DEADLINE_MS } from "../session/quiescence";
-import { startSessionYieldHolder } from "../session/session-yield";
+import { followSessionYieldHolder } from "../session/session-yield";
 import { displaySessionYield, fenceSessionYield, isSessionYieldIdle } from "./session-yield-host";
 import { modelMentionDisplayName } from "@oh-my-pi/pi-tui/prompt/model-mention-syntax";
 import { modelMentionChipLabel, shiftImageMarkers } from "@oh-my-pi/pi-tui/prompt/composer-attachments";
@@ -7113,11 +7113,9 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	#bindSessionYieldHolder(): void {
 		this.#disposeSessionYield?.();
-		const sessionId = this.session.sessionId;
-		this.#disposeSessionYield = startSessionYieldHolder({
-			sessionId,
+		this.#disposeSessionYield = followSessionYieldHolder({
+			sessionManager: this.sessionManager,
 			isIdle: () =>
-				this.session.sessionId === sessionId &&
 				!this.#isShuttingDown &&
 				!this.hasPendingSubmission() &&
 				!this.hookSelector &&
