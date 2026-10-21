@@ -37,6 +37,48 @@ This document describes operator-visible behavior for session export, sharing, c
 | `/restart`                              | Interactive slash command    | Yes (process relaunches)                      | Keeps configuration flags; resumes a materialized session, otherwise starts fresh          | None                                                                                |
 | `--continue`                            | CLI startup                  | Yes after session creation                    | Opens terminal breadcrumb or most-recent session; creates new one if none exists           | None                                                                                |
 
+## Yield a live session holder
+
+`omp session yield <sessionId> [--timeout S]` asks the process holding the exact
+session ID to exit at its own idle point. The default timeout is 10 seconds.
+The command neither launches a replacement nor signals or kills the holder.
+
+The holder waits for streams, tools, approval/ask dialogs, queued input, and
+other registered work to finish. Once idle, it closes admission before teardown.
+The TUI preserves its unsent draft in the existing resume sidecar and displays
+the draft plus `This Thread continues in another Session` after stopping terminal
+rendering, before releasing the lease and exiting. RPC emits the existing
+`notice` frame; client-local unsent text remains the client's responsibility and
+is not cleared by the holder.
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | The matching holder accepted the request, exited, and released its OS lease. |
+| `3` | No live holder was found. |
+| `4` | The idle-wait deadline expired; an expired request cannot trigger a later yield. |
+| `5` | The live holder does not advertise a supported yield hook. |
+| `1` | Invalid arguments or a runtime failure. After acceptance, `yield accepted but exit/release unconfirmed` means the bounded client wait expired, not that shutdown was cancelled. |
+
+A holder that has accepted may finish shutdown after its client exits. Never
+interpret a timeout or error as permission to kill it or start a conflicting
+writer. Recheck actual lease ownership before taking over.
+
+Supporting holders publish `capabilities: ["session-yield/1"]` in the existing
+`~/.omp/run/session-owners/<sessionId>.lock` JSON and advertise the capability in
+RPC `ready`/`get_state`. An unmaterialized session has no lease and advertises no
+yield capability until it acquires one (`get_state` reflects that transition).
+The hook follows identity changes, including whole-session forks and
+persistence-conflict recovery into a sibling session, and remains available if
+an attempted switch fails while retaining the original lease. The outgoing capability
+is revoked before its final lease release, even if the process continues under
+another session ID. Rich TUI asks and approvals, including queued dialogs and
+answers reopened outside an agent turn, count as outstanding work.
+Metadata is bounded below 4096 bytes, preserves unrelated fields, and never
+replaces or unlinks the OS lease inode. The marker alone is not proof of ownership.
+Requests and acceptance records beside the lease are fenced by holder identity,
+request identity, and deadline. Already-running older builds cannot acquire this
+hook through an upgrade; wait for their normal exit.
+
 ## Export and dump
 
 ### `/export [--themes] [outputPath]` (slash command)

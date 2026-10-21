@@ -84,6 +84,12 @@ import {
 import { RpcSessionEventForwarder } from "./rpc-session-events";
 import { isRpcSessionSettled, RpcSessionSettleWatcher, watchedScheduledTurnProbe } from "./rpc-session-settle";
 import { QUIESCE_EXIT_DEADLINE_MS, quiesceEndsProcess, quiesceExitCode } from "../../session/quiescence";
+import {
+	SESSION_YIELD_CAPABILITY,
+	type SessionYieldHolder,
+	followSessionYieldHolder,
+} from "../../session/session-yield";
+import { fenceSessionYield, isSessionYieldIdle, SESSION_YIELD_NOTICE } from "../session-yield-host";
 import { RpcSubagentRegistry, readRpcSubagentTranscript, resolveOwnedLiveSubagent } from "./rpc-subagents";
 import { RICH_ASK_CAPABILITY, RPC_ENGINE_CAPABILITIES } from "./rpc-types";
 import type {
@@ -1509,8 +1515,32 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	// breaks JSON.parse. In RPC mode stdout is the JSON protocol channel — nothing else
 	// may write there.
 	process.env.PI_NOTIFICATIONS = "off";
-	// Rich ask reaches a host only through the tool UI context.
-	const capabilities = [...RPC_ENGINE_CAPABILITIES, ...(setToolUIContext ? [RICH_ASK_CAPABILITY] : [])];
+	let yieldHostReady = false;
+	let disposeSessionYield: SessionYieldHolder | undefined;
+	const bindSessionYieldHolder = (): void => {
+		disposeSessionYield?.();
+		disposeSessionYield = followSessionYieldHolder({
+			sessionManager: session.sessionManager,
+			isIdle: () =>
+				yieldHostReady &&
+				!shutdownState.requested &&
+				pendingExtensionRequests.size === 0 &&
+				isSessionYieldIdle(session),
+			yield: async () => {
+				fenceSessionYield(session);
+				shutdownState.requested = true;
+				output({ type: "notice", level: "info", message: SESSION_YIELD_NOTICE });
+				await shutdownCoordinator.checkShutdownRequested();
+			},
+		});
+	};
+	bindSessionYieldHolder();
+	// Rich ask requires the tool UI context; yield requires an actual leased holder hook.
+	const capabilities = [
+		...RPC_ENGINE_CAPABILITIES,
+		...(setToolUIContext ? [RICH_ASK_CAPABILITY] : []),
+		...(disposeSessionYield?.active ? [SESSION_YIELD_CAPABILITY] : []),
+	];
 
 	const frameEncoder = new RpcFrameEncoder();
 	// Bun on Windows writes a piped process.stdout with a blocking WriteFile on the
@@ -1862,6 +1892,8 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	 * rejection with no latched store failure still surfaces to the caller.
 	 */
 	const disposeAndExit = async (): Promise<never> => {
+		yieldHostReady = false;
+		disposeSessionYield?.();
 		try {
 			// The process ends regardless; report an unsaved side answer instead of skipping dispose.
 			await btw.close().catch(btwError => {
@@ -2310,7 +2342,10 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 						liveSteered: queuedMessages.liveSteered,
 					},
 					todoPhases: session.getTodoPhases(),
-					capabilities,
+					capabilities: [
+						...capabilities.filter(capability => capability !== SESSION_YIELD_CAPABILITY),
+						...(disposeSessionYield?.active ? [SESSION_YIELD_CAPABILITY] : []),
+					],
 					externalDeliveries: session.listExternalDeliveries(),
 					fastModeEnabled: session.isFastModeEnabled(),
 					tokensPerSecond: calculateTokensPerSecond(session.messages, session.isStreaming),
@@ -3004,6 +3039,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		kind: "queuedInput",
 		count: () => inputDispatcher.pendingCount + shutdownCoordinator.pendingCount + inputGate.pendingCount,
 	});
+	yieldHostReady = true;
 
 	// Keep the stdin reader moving: side-channel frames dispatch immediately,
 	// ordinary commands serialize through inputDispatcher, and bash remains

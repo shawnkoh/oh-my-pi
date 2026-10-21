@@ -415,6 +415,7 @@ export const APPROVAL_STEER_DENY_CAPABILITY = "approval-steer-deny/1";
  * Capabilities the engine always supports, one versioned name per feature
  * (`name/major`). Features that change what a host receives also require the
  * host to opt in; the entry only says the engine supports them.
+ * `session-yield/1` is added by the host only when its real session lease has a yield hook.
  */
 export const RPC_ENGINE_CAPABILITIES: readonly string[] = [
 	LITERAL_INPUT_CAPABILITY,

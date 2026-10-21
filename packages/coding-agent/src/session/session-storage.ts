@@ -517,7 +517,8 @@ function isPidAlive(pid: number): boolean {
  * session and only ever contend with other processes. The OS reclaims a lease
  * when its process exits, so a crashed owner never blocks a later claim.
  */
-const sessionLeases = new Map<string, { lease: FileLockHandle; holders: number }>();
+const sessionLeases = new Map<string, { lease: FileLockHandle; holders: number; identity: string }>();
+const sessionLeaseListeners = new Map<string, Set<(identity: string | undefined) => void>>();
 
 const TEST_SESSION_OWNERS_DIR_ENV = "PI_TEST_SESSION_OWNERS_DIR";
 
@@ -576,6 +577,52 @@ function readSessionHeaderIdSync(sessionPath: string): string | undefined {
 	return undefined;
 }
 
+/** Resolve an untrusted session id beneath a verified private owner directory. */
+export function getSessionOwnerPath(sessionId: string): string {
+	const name = /^[A-Za-z0-9_-]{1,128}$/.test(sessionId)
+		? sessionId
+		: `h-${Bun.hash.wyhash(sessionId).toString(16).padStart(16, "0")}`;
+	const dir = sessionOwnersDir();
+	fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+	const st = fs.lstatSync(dir);
+	const uid = process.getuid?.();
+	if (
+		!st.isDirectory() ||
+		(uid !== undefined && st.uid !== uid) ||
+		(process.platform !== "win32" && (st.mode & 0o077) !== 0)
+	) {
+		throw new Error(`Session ownership lease directory ${dir} is not a private directory owned by this user`);
+	}
+	return path.join(dir, name);
+}
+
+/** A fresh fence for the actual lease held by this process, not metadata ownership. */
+export function getHeldSessionLeaseIdentity(sessionId: string): string | undefined {
+	return sessionLeases.get(sessionId)?.identity;
+}
+
+/** Observe acquisition and revoke hooks before the actual last lease release. */
+export function onSessionLeaseChanged(sessionId: string, listener: (identity: string | undefined) => void): () => void {
+	let listeners = sessionLeaseListeners.get(sessionId);
+	if (!listeners) {
+		listeners = new Set();
+		sessionLeaseListeners.set(sessionId, listeners);
+	}
+	listeners.add(listener);
+	const identity = getHeldSessionLeaseIdentity(sessionId);
+	if (identity) {
+		try {
+			listener(identity);
+		} catch (error) {
+			logger.warn("Session ownership hook unavailable", { sessionId, error: toError(error).message });
+		}
+	}
+	return () => {
+		listeners.delete(listener);
+		if (listeners.size === 0) sessionLeaseListeners.delete(sessionId);
+	};
+}
+
 /**
  * Take a session's ownership lease without waiting, or `null` while another
  * process holds it. A process writing the session holds it (see
@@ -588,27 +635,8 @@ function readSessionHeaderIdSync(sessionPath: string): string | undefined {
  * probed.
  */
 export function tryAcquireSessionLease(sessionId: string): FileLockHandle | null {
-	const name = /^[A-Za-z0-9_-]{1,128}$/.test(sessionId)
-		? sessionId
-		: `h-${Bun.hash.wyhash(sessionId).toString(16).padStart(16, "0")}`;
-	const lockPath = path.join(sessionOwnersDir(), name);
-	// Linux (abstract socket) and Windows (named mutex) locks never touch the
-	// filesystem; elsewhere the lock is a `flock` sidecar in that directory. The
-	// sidecars are empty and never removed: unlinking a flock file can split one
-	// lease between a holder of the old inode and a creator of a new one.
-	if (process.platform !== "linux" && process.platform !== "win32") {
-		const dir = path.dirname(lockPath);
-		fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-		// The test-run dir sits in the shared OS temp dir, where another local
-		// user could pre-create it or plant a symlink: refuse anything but a
-		// directory this user owns that nobody else can enter.
-		const st = fs.lstatSync(dir);
-		const uid = process.getuid?.();
-		if (!st.isDirectory() || (uid !== undefined && st.uid !== uid) || (st.mode & 0o077) !== 0) {
-			throw new Error(`Session ownership lease directory ${dir} is not a private directory owned by this user`);
-		}
-	}
-	return tryAcquireFileLock(lockPath);
+	// Never unlink or replace the .lock inode: flock ownership follows that inode.
+	return tryAcquireFileLock(getSessionOwnerPath(sessionId));
 }
 
 /** Approximate size (UTF-16 units synchronously, bytes through a sink) buffered per staging-file write when streaming a body. */
@@ -1265,8 +1293,15 @@ export class FileSessionStorage implements SessionStorage {
 				return () => {};
 			}
 			if (!lease) return null;
-			held = { lease, holders: 0 };
+			held = { lease, holders: 0, identity: crypto.randomUUID() };
 			sessionLeases.set(sessionId, held);
+			for (const listener of sessionLeaseListeners.get(sessionId) ?? []) {
+				try {
+					listener(held.identity);
+				} catch (error) {
+					logger.warn("Session ownership hook unavailable", { sessionId, error: toError(error).message });
+				}
+			}
 		}
 		const claim = held;
 		claim.holders++;
@@ -1275,6 +1310,13 @@ export class FileSessionStorage implements SessionStorage {
 			if (released) return;
 			released = true;
 			if (--claim.holders > 0) return;
+			for (const listener of sessionLeaseListeners.get(sessionId) ?? []) {
+				try {
+					listener(undefined);
+				} catch (error) {
+					logger.warn("Session ownership hook unavailable", { sessionId, error: toError(error).message });
+				}
+			}
 			sessionLeases.delete(sessionId);
 			claim.lease.release();
 		};

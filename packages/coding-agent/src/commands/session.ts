@@ -1,5 +1,5 @@
 /**
- * Hand a session to another machine.
+ * Transfer a session or ask its live holder to yield when idle.
  *
  * `omp session pack <session> <out.tar>` writes a self-contained archive,
  * `omp session unpack <archive.tar> --cwd <dir>` lands it in `<dir>`'s session
@@ -19,14 +19,16 @@ import {
 	unpackSession,
 	type UnpackMode,
 } from "../session/session-transfer";
+import { requestSessionYield } from "../session/session-yield";
 
-const ACTIONS = ["pack", "unpack", "moved"] as const;
+const ACTIONS = ["pack", "unpack", "moved", "yield"] as const;
 type SessionAction = (typeof ACTIONS)[number];
 
 const USAGE: Record<SessionAction, string> = {
 	pack: "omp session pack <session> <out.tar>",
 	unpack: "omp session unpack <archive.tar> --cwd <dir>",
 	moved: "omp session moved <session> --to <label>",
+	yield: "omp session yield <sessionId> [--timeout S]",
 };
 
 const UNPACK_NOTE: Record<UnpackMode, string> = {
@@ -44,12 +46,12 @@ export default class Session extends Command {
 
 	static args = {
 		action: Args.string({
-			description: "pack, unpack, or moved",
+			description: "pack, unpack, moved, or yield",
 			required: true,
 			options: ACTIONS,
 		}),
 		source: Args.string({
-			description: "Session .jsonl path or id (pack, moved); archive path (unpack)",
+			description: "Session .jsonl path or id (pack, moved); archive path (unpack); exact session id (yield)",
 			required: false,
 		}),
 		output: Args.string({
@@ -61,12 +63,14 @@ export default class Session extends Command {
 	static flags = {
 		cwd: Flags.string({ description: "Directory the session continues in on this machine (unpack)" }),
 		to: Flags.string({ description: "Where the session went, e.g. a machine name (moved)" }),
+		timeout: Flags.string({ description: "Seconds to wait for the holder to yield (yield; default 10)" }),
 	};
 
 	static examples = [
 		"# Pack a session with its artifacts and image blobs\n  omp session pack ~/.omp/agent/sessions/<project>/<file>.jsonl /tmp/session.tar",
 		"# Unpack it on another machine; prints the session file path\n  omp session unpack /tmp/session.tar --cwd ~/src/project",
 		"# Mark the local copy stale; resuming it later forks it\n  omp session moved <file>.jsonl --to cloud",
+		"# Ask the live holder to exit when idle\n  omp session yield <sessionId> --timeout 10",
 	];
 
 	async run(): Promise<void> {
@@ -85,9 +89,21 @@ export default class Session extends Command {
 		if (action !== "moved" && flags.to !== undefined) {
 			throw new CliUsageError(`--to only applies to moved. Usage: ${usage}`);
 		}
+		if (action !== "yield" && flags.timeout !== undefined) {
+			throw new CliUsageError(`--timeout only applies to yield. Usage: ${usage}`);
+		}
 
 		try {
 			switch (action) {
+				case "yield": {
+					const seconds = flags.timeout ?? "10";
+					const timeoutMs = Math.ceil(Number(seconds) * 1000);
+					if (!/^\d+(?:\.\d+)?$/.test(seconds) || !Number.isSafeInteger(timeoutMs)) {
+						throw new CliUsageError(`--timeout must be a finite non-negative number of seconds. Usage: ${usage}`);
+					}
+					process.exitCode = await requestSessionYield(source, timeoutMs);
+					return;
+				}
 				case "pack": {
 					if (!args.output) throw new CliUsageError(`Missing output archive path. Usage: ${usage}`);
 					const result = await packSession(await this.#resolveSession(source), args.output);
@@ -113,6 +129,11 @@ export default class Session extends Command {
 				}
 			}
 		} catch (error) {
+			if (action === "yield" && !(error instanceof CliUsageError)) {
+				process.stderr.write(`error: ${error instanceof Error ? error.message : String(error)}\n`);
+				process.exitCode = 1;
+				return;
+			}
 			if (error instanceof SessionTransferError || error instanceof SessionMoveRefusedError) {
 				process.stderr.write(`${chalk.red(`error: ${error.message}`)}\n`);
 				process.exitCode = 1;

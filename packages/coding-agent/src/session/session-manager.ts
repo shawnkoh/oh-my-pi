@@ -1007,6 +1007,7 @@ export class SessionManager {
 	 */
 	#breadcrumbFresh = false;
 	#sessionNameChangedCallbacks = new Set<() => void>();
+	#sessionIdentityChangedCallbacks = new Set<() => void>();
 	#persistenceErrorCallbacks = new Set<(error: Error) => void>();
 	#persistenceNoticeCallbacks = new Set<(notice: SessionPersistenceNotice) => void>();
 	/** Every notice raised so far, replayed to each later subscriber. */
@@ -1277,7 +1278,7 @@ export class SessionManager {
 		const previousSessionId = this.#sessionId;
 		const timestamp = nowIso();
 		this.#siblingLineage.push(previousSessionId);
-		this.#sessionId = mintSessionId();
+		this.#setSessionId(mintSessionId());
 		const to = path.join(path.dirname(from), `${fileSafeTimestamp(timestamp)}_${this.#sessionId}.jsonl`);
 		this.#header = {
 			...this.#header,
@@ -3211,6 +3212,24 @@ export class SessionManager {
 		return this.#sessionId;
 	}
 
+	/** Follow every identity change, including persistence-driven sibling recovery. */
+	onSessionIdentityChanged(listener: () => void): () => void {
+		this.#sessionIdentityChangedCallbacks.add(listener);
+		return () => this.#sessionIdentityChangedCallbacks.delete(listener);
+	}
+
+	#setSessionId(sessionId: string): void {
+		if (sessionId === this.#sessionId) return;
+		this.#sessionId = sessionId;
+		for (const listener of this.#sessionIdentityChangedCallbacks) {
+			try {
+				listener();
+			} catch (error) {
+				logger.warn("Session identity hook unavailable", { sessionId, error: toError(error).message });
+			}
+		}
+	}
+
 	/**
 	 * True when the current session is `sessionId`, or continues it through sibling moves
 	 * only: a move to a fresh file after a write conflict (see {@link SessionPersistenceNotice})
@@ -3223,7 +3242,7 @@ export class SessionManager {
 	/** Every id change except a sibling move: a different id ends the sibling lineage. */
 	#adoptSessionId(sessionId: string): void {
 		if (sessionId !== this.#sessionId) this.#siblingLineage = [];
-		this.#sessionId = sessionId;
+		this.#setSessionId(sessionId);
 	}
 
 	getSessionFile(): string | undefined {

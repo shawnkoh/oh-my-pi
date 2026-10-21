@@ -76,6 +76,11 @@ function createControllerContext() {
 		editor,
 		editorContainer,
 		ui,
+		session: {
+			assertAdmissionOpen: vi.fn(),
+			noteActivity: vi.fn(),
+			registerWorkSource: vi.fn(() => vi.fn()),
+		},
 		hookEditor: undefined,
 	} as unknown as TestContext;
 

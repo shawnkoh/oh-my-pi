@@ -198,6 +198,9 @@ async function makeHarness(opts?: { readOnly?: boolean }): Promise<GuestUiHarnes
 			getCwd: () => "/local",
 		},
 		session: {
+			assertAdmissionOpen: () => {},
+			noteActivity: () => {},
+			registerWorkSource: () => () => {},
 			messages: [],
 			switchSession: () => Promise.resolve(),
 			newSession: () => Promise.resolve(),
@@ -465,6 +468,9 @@ function makeHostContext(): InteractiveModeContext {
 			onEntryAppended: undefined,
 		},
 		session: {
+			assertAdmissionOpen: () => {},
+			noteActivity: () => {},
+			registerWorkSource: () => () => {},
 			isStreaming: false,
 			queuedMessageCount: 0,
 			sessionName: "proto test",

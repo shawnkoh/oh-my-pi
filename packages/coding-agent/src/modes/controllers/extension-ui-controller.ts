@@ -1469,6 +1469,14 @@ export class ExtensionUiController {
 		signal: AbortSignal | undefined,
 		present: (settle: (value: T | undefined) => void) => () => void,
 	): Promise<T | undefined> {
+		if (signal?.aborted) return Promise.resolve(undefined);
+		const session = this.ctx.session;
+		session.assertAdmissionOpen("dialog");
+		session.noteActivity();
+		// Standalone tool UI (notably /tree ask re-answer) has no agent turn to
+		// keep the session busy. Each request owns work even while queued, and
+		// releases it on settlement rather than relying on legacy hook fields.
+		const unregisterWork = session.registerWorkSource({ kind: "queuedInput", count: () => 1 });
 		const { promise, resolve, reject } = Promise.withResolvers<T | undefined>();
 		let settled = false;
 		let started = false;
@@ -1481,6 +1489,7 @@ export class ExtensionUiController {
 		const settle = (value: T | undefined): void => {
 			if (settled) return;
 			settled = true;
+			unregisterWork();
 			signal?.removeEventListener("abort", onAbort);
 			if (started) {
 				hide?.();
@@ -1502,6 +1511,7 @@ export class ExtensionUiController {
 				hide = present(settle);
 			} catch (error) {
 				settled = true;
+				unregisterWork();
 				signal?.removeEventListener("abort", onAbort);
 				this.#dialogActive = false;
 				reject(error);
@@ -1509,10 +1519,6 @@ export class ExtensionUiController {
 			}
 		};
 
-		if (signal?.aborted) {
-			resolve(undefined);
-			return promise;
-		}
 		signal?.addEventListener("abort", onAbort, { once: true });
 
 		if (this.#dialogActive) {

@@ -57,6 +57,14 @@ a destructive command. Rich ask requires explicit opt-in. `approval-steer-deny/1
 means a user steer, or a delivery sent with `mode: "steer"`, denies a pending tool
 approval and cancels its dialog (see [Approval mode](approval-mode.md)).
 
+`session-yield/1` is additionally advertised while this host has an active yield
+hook for its actual session lease. Lazy sessions can acquire that capability
+after `ready`; `get_state.capabilities` reflects the current holder. The external
+[`omp session yield`](session-operations-export-share-fork-resume.md#yield-a-live-session-holder)
+command waits for idle and asks the holder to release and exit. Before exit the
+host emits `{ "type": "notice", "level": "info", "message": "This Thread continues in another Session" }`.
+Unsent text owned by the remote client is not sent to or cleared by this command.
+
 Clients that support protocol v2 SHOULD immediately send:
 
 ```json

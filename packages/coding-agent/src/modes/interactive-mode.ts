@@ -142,6 +142,8 @@ import { USER_INTERRUPT_LABEL } from "../session/messages";
 import { resolveMarkdownLinkHrefs } from "../internal-urls/hyperlink-targets";
 import type { ResolveContext } from "../internal-urls/index";
 import { type GoalContinuationReservation, QUIESCE_EXIT_DEADLINE_MS } from "../session/quiescence";
+import { followSessionYieldHolder } from "../session/session-yield";
+import { displaySessionYield, fenceSessionYield, isSessionYieldIdle } from "./session-yield-host";
 import { modelMentionDisplayName } from "@oh-my-pi/pi-tui/prompt/model-mention-syntax";
 import { modelMentionChipLabel, shiftImageMarkers } from "@oh-my-pi/pi-tui/prompt/composer-attachments";
 import type { SessionContext } from "../session/session-context";
@@ -1462,6 +1464,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	lastLeftTapTime = 0;
 	shutdownRequested = false;
 	#isShuttingDown = false;
+	#disposeSessionYield: (() => void) | undefined;
 	/**
 	 * Set once a graceful {@link shutdown} teardown threw. The teardown is
 	 * promise-memoized (and the session manager latches its disk error), so
@@ -2408,7 +2411,9 @@ export class InteractiveMode implements InteractiveModeContext {
 			await this.#liveCommandController.stop();
 			await this.#quiesceVibeForSessionSwitch();
 		});
-		this.session.setSessionSwitchReconciler?.(() => this.#reconcileModeFromSession({ preserveActiveGoal: true }));
+		this.session.setSessionSwitchReconciler?.(async () => {
+			await this.#reconcileModeFromSession({ preserveActiveGoal: true });
+		});
 		await logger.time("InteractiveMode.init:reconcileMode", () => this.#reconcileModeFromSession());
 
 		// Brand-new sessions optionally start in plan mode when the user has made it
@@ -2570,6 +2575,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.editor.disableSubmit = false;
 		// Publish native send readiness even when no user input triggers another frame.
 		this.ui.requestRender();
+		this.#bindSessionYieldHolder();
 	}
 
 	/** Reload the title-generation system prompt override for the provided working
@@ -7026,6 +7032,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	stop(): void {
+		this.#disposeSessionYield?.();
+		this.#disposeSessionYield = undefined;
 		this.#hidePlanReview();
 		this.#appearanceRefreshRequest = undefined;
 		// Settle any pending approval prompt as dismissed (deny). The
@@ -7097,6 +7105,36 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.isInitialized = false;
 	}
 
+	#bindSessionYieldHolder(): void {
+		this.#disposeSessionYield?.();
+		this.#disposeSessionYield = followSessionYieldHolder({
+			sessionManager: this.sessionManager,
+			isIdle: () =>
+				!this.#isShuttingDown &&
+				!this.hasPendingSubmission() &&
+				!this.hookSelector &&
+				!this.hookInput &&
+				!this.hookEditor &&
+				!this.#planReviewPick &&
+				!this.#vibeSkillInFlight &&
+				!this.#loopConditionAbort &&
+				isSessionYieldIdle(this.session),
+			yield: async () => {
+				fenceSessionYield(this.session);
+				this.editor.disableSubmit = true;
+				const draft = this.#inputController.getDraftText();
+				await this.exitAfterQuiesce(0, async () => {
+					// Terminal restoration/final paint must finish before writing a durable shell-visible notice.
+					// Keep the session (and its OS lease) alive until the notice has been flushed.
+					this.ui.closeNative();
+					await this.ui.terminal.drainInput(1000);
+					this.stop();
+					await displaySessionYield(draft);
+				});
+			},
+		});
+	}
+
 	async shutdown(): Promise<void> {
 		if (this.#isShuttingDown) return;
 		// The previous graceful teardown failed AT the memoized session.dispose()
@@ -7140,7 +7178,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	/** See {@link InteractiveModeContext.exitAfterQuiesce}. */
-	async exitAfterQuiesce(code: number): Promise<void> {
+	async exitAfterQuiesce(code: number, beforeTeardown?: () => Promise<void>): Promise<void> {
 		if (this.#exitAfterQuiesce !== undefined) return;
 		this.#exitAfterQuiesce = code;
 		// Whatever teardown does (hangs, or a restart in flight that would exec a new image),
@@ -7156,7 +7194,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#isShuttingDown = true;
 		let exitCode = code;
 		try {
-			await this.#teardown();
+			try {
+				await beforeTeardown?.();
+			} finally {
+				await this.#teardown();
+			}
 		} catch (error) {
 			logger.error("Teardown after a quiesce failed; exiting anyway", { error: String(error) });
 			exitCode = 1;
@@ -7291,6 +7333,8 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	/** Shared `shutdown()`/`restart()` teardown: dispose the session and hand the terminal back. */
 	async #teardown(): Promise<void> {
+		this.#disposeSessionYield?.();
+		this.#disposeSessionYield = undefined;
 		// An in-flight loop condition (or a deferred auto-submit timer) must not
 		// outlive session disposal: an unaborted `sleep 30`-style condition can
 		// resolve mid-teardown and drive `#passesLoopCondition` into invoking the
