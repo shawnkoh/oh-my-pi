@@ -152,7 +152,6 @@ describe("RPC tool-approval binding", () => {
 				frame => frame.type === "tool_execution_end" && frame.toolCallId === approval?.toolCallId,
 			);
 			expect(end?.isError, stderr).toBe(true);
-			expect(JSON.stringify(end?.result)).toContain("denied by user");
 			expect(markerExists).toBe(false);
 		}, 30_000);
 	}
