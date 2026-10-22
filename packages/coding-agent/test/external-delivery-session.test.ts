@@ -148,6 +148,43 @@ describe("external delivery (session)", () => {
 		return { handle, accepted, settled };
 	}
 
+	it.each(["none", "steer", "followUp"] as const)(
+		"settles an owned tail steer while ACP keeps %s user input deferred",
+		async queuedMode => {
+			const { session: s, agent, mock } = makeSession();
+			s.setClientBridge({ capabilities: {}, deferAgentInitiatedTurns: true });
+			const deferred: AgentMessage = {
+				role: "user",
+				content: [{ type: "text", text: "client-owned deferred input" }],
+				timestamp: Date.now(),
+			};
+			if (queuedMode !== "none") agent[queuedMode](deferred);
+			let tail: DeliveryHandle | undefined;
+			const unsubscribe = agent.subscribe(event => {
+				if (event.type === "agent_end" && !tail) {
+					tail = s.deliverExternalMessage(card("tail steer"), { mode: "steer" });
+				}
+			});
+			try {
+				const first = s.deliverExternalMessage(card("initial wake"), { mode: "aside" });
+				await first.settled;
+				expect(tail).toBeDefined();
+				await tail!.accepted;
+				await tail!.settled;
+				await s.waitForIdle();
+				expect(mock.calls.map((_, index) => userTexts(mock, index))).toEqual([
+					["initial wake"],
+					["initial wake", "tail steer"],
+				]);
+				expect(agent.peekSteeringQueue()).toEqual(queuedMode === "steer" ? [deferred] : []);
+				expect(agent.peekFollowUpQueue()).toEqual(queuedMode === "followUp" ? [deferred] : []);
+				expect(s.getWorkCounts().queuedInput).toBe(queuedMode === "none" ? 0 : 1);
+			} finally {
+				unsubscribe();
+			}
+		},
+	);
+
 	describe("receipts and mechanisms", () => {
 		it("busy + aside is accepted as a mid-work aside at COMMIT, not when queued", async () => {
 			const slow = slowTool();

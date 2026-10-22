@@ -114,7 +114,7 @@ describe.skipIf(process.platform === "win32")("standalone rich TUI dialogs block
 			expect(host.frames.some(frame => frame.type === "settled")).toBe(false);
 			await host.request({ type: "key", text: "\x1b" });
 			const settled = await host.waitFor(frame => frame.type === "settled" && frame.dialogId === "first");
-			expect(settled.value).toBe(kind === "ask" ? null : false);
+			expect(settled.value).toBe(kind === "ask" ? null : "deny");
 			expect(settled.work).toMatchObject({ queuedInput: 0 });
 			expect(await host.yield(sessionId)).toBe(0);
 			expect(await host.child.exited).toBe(0);

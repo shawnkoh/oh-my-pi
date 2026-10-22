@@ -1502,7 +1502,7 @@ export class AgentSession implements SettingsScope {
 	 *  the agent responds to the peer. Skip only when a queued steer/follow-up will itself drive a
 	 *  resume turn whose aside poll already consumes these (no double-wake). */
 	#resumeStrandedIrcAsides(): void {
-		if (this.#modeExitDrainSuppressionDepth > 0 || this.#isDisposed || this.isStreaming || !this.#irc.hasPending()) {
+		if (this.#modeExitDrainSuppressionDepth > 0 || this.#isDisposed || this.isStreaming) {
 			return;
 		}
 		// A pooled yield contract means a pool turn owns this worker (installed,
@@ -1518,6 +1518,18 @@ export class AgentSession implements SettingsScope {
 		// non-streaming session, so without this guard it would wake/fold into the still-old context
 		// and race the transition's own reset — same rationale as #drainStrandedQueuedMessages.
 		if (this.#unsubscribeAgent === undefined) return;
+		if (this.#clientDefersQueuedTurns()) {
+			const steering = this.agent.peekSteeringQueue();
+			const owned = steering.filter(record => this.#externalDeliveries.ownerOf(record)?.mode === "steer");
+			if (owned.length > 0) {
+				this.agent.replaceQueues(
+					steering.filter(record => this.#externalDeliveries.ownerOf(record)?.mode !== "steer"),
+					[...this.agent.peekFollowUpQueue()],
+				);
+				this.#irc.queueAside(owned);
+			}
+		}
+		if (!this.#irc.hasPending()) return;
 		if (this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages()) return;
 		// A prompt in its dispatch window owns the next turn; the parked owned
 		// records fold into it (or resume once the window closes). The re-offer
@@ -1688,17 +1700,18 @@ export class AgentSession implements SettingsScope {
 			this.#deferWakeBehindRunningTurn(records);
 			return;
 		}
-		// Park only a *blocked* follow-up (one a user interrupt is intentionally holding); an
-		// already-resumable follow-up can ride the wake turn normally without reordering.
+		// A client-owned queue cannot ride an autonomous wake. Otherwise park only
+		// a blocked follow-up, preserving the ordinary interrupt-resume behavior.
+		const clientDeferred = this.#clientDefersQueuedTurns();
+		const parkedSteers = clientDeferred ? [...this.agent.peekSteeringQueue()] : [];
 		const parkedFollowUps =
-			this.agent.peekSteeringQueue().length === 0 &&
-			this.agent.peekFollowUpQueue().length > 0 &&
-			!this.#canAutoContinueForFollowUp()
+			clientDeferred || (this.agent.peekSteeringQueue().length === 0 && !this.#canAutoContinueForFollowUp())
 				? [...this.agent.peekFollowUpQueue()]
 				: [];
-		const parkedQueueDrainBlocked = parkedFollowUps.length > 0 && this.#queuedMessageDrainBlocked;
-		if (parkedFollowUps.length > 0) {
-			this.agent.replaceQueues([...this.agent.peekSteeringQueue()], []);
+		const hasParkedInput = parkedSteers.length > 0 || parkedFollowUps.length > 0;
+		const parkedQueueDrainBlocked = hasParkedInput && this.#queuedMessageDrainBlocked;
+		if (hasParkedInput) {
+			this.agent.replaceQueues(clientDeferred ? [] : [...this.agent.peekSteeringQueue()], []);
 			if (parkedQueueDrainBlocked) this.#queuedMessageDrainBlocked = false;
 		}
 		// The wake observer is attached only once prompt ownership is won below: a
@@ -1772,9 +1785,9 @@ export class AgentSession implements SettingsScope {
 					turnError ??= error;
 					logger.warn("IRC wake turn recovery failed", { error: String(error) });
 				}
-				if (parkedFollowUps.length > 0) {
+				if (hasParkedInput) {
 					this.agent.replaceQueues(
-						[...this.agent.peekSteeringQueue()],
+						[...parkedSteers, ...this.agent.peekSteeringQueue()],
 						[...parkedFollowUps, ...this.agent.peekFollowUpQueue()],
 					);
 					this.#queuedMessageDrainBlocked ||= parkedQueueDrainBlocked;
@@ -2139,18 +2152,27 @@ export class AgentSession implements SettingsScope {
 			restoreThinkingLevel: level => this.#models.restoreThinkingLevel(level),
 			resolveDefaultPrewalk: () => this.#resolveDefaultPrewalk(),
 			resolveAutoPrewalkTarget: () => this.#resolveAutoPrewalkTarget(),
-			classifyAutoPrewalk: (request, signal) =>
-				classifyAutoPrewalk(
-					{ request, history: this.agent.state.messages },
-					{
-						settings: this.settings,
-						registry: this.#modelRegistry,
-						sessionId: this.sessionId,
-						signal,
-						onUsage: journalJudgmentUsage(this.sessionManager),
-						telemetry: this.agent.telemetry,
-					},
-				),
+			classifyAutoPrewalk: async (request, signal) => {
+				// Judgment usage can settle after prompt setup fails or is aborted.
+				// Keep that work visible until its journal callback has completed.
+				const release = this.registerWorkSource({ kind: "asyncJobs", count: () => 1 });
+				this.#activityEpoch++;
+				try {
+					return await classifyAutoPrewalk(
+						{ request, history: this.agent.state.messages },
+						{
+							settings: this.settings,
+							registry: this.#modelRegistry,
+							sessionId: this.sessionId,
+							signal,
+							onUsage: journalJudgmentUsage(this.sessionManager),
+							telemetry: this.agent.telemetry,
+						},
+					);
+				} finally {
+					release();
+				}
+			},
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
 			setModelTemporary: (model, thinkingLevel, options) =>
 				this.#models.setModelTemporary(model, thinkingLevel, options, "automatic"),
@@ -3693,11 +3715,13 @@ export class AgentSession implements SettingsScope {
 		return this.#admittedSubmissionsSettled.promise;
 	}
 
-	async #admitSubmission<T>(input: string, work: () => Promise<T>): Promise<T> {
+	async #admitSubmission(input: string, work: () => Promise<boolean>, onDrop?: () => boolean): Promise<boolean> {
 		this.#admitInput(input);
+		const generation = this.#promptGeneration;
 		this.#admittedSubmissionCount++;
 		try {
 			if (this.hasPendingDeferredExtensions) await this.loadDeferredExtensions();
+			if (generation !== this.#promptGeneration) return onDrop?.() ?? false;
 			return await work();
 		} finally {
 			if (--this.#admittedSubmissionCount === 0 && this.#admittedSubmissionsSettled) {
@@ -8797,7 +8821,15 @@ export class AgentSession implements SettingsScope {
 	 * {@link PromptDroppedError} instead.
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<boolean> {
-		return this.#admitSubmission("prompt", () => this.#prompt(text, options));
+		return this.#admitSubmission(
+			"prompt",
+			() => this.#prompt(text, options),
+			() => {
+				this.#promptDropped?.({ text, images: options?.images });
+				if (options?.throwOnDrop) throw new PromptDroppedError();
+				return true;
+			},
+		);
 	}
 
 	async #prompt(text: string, options?: PromptOptions): Promise<boolean> {
@@ -10467,6 +10499,14 @@ export class AgentSession implements SettingsScope {
 		});
 	}
 
+	#clientDefersQueuedTurns(): boolean {
+		return (
+			this.#clientBridge?.deferAgentInitiatedTurns === true &&
+			!this.#allowAcpAgentInitiatedTurns &&
+			this.#clientPromptInFlightCount === 0
+		);
+	}
+
 	/**
 	 * Gate for idle-path queued-message auto-continue (see `#scheduleQueuedMessageDrain`).
 	 */
@@ -10484,11 +10524,7 @@ export class AgentSession implements SettingsScope {
 		// #allowAcpAgentInitiatedTurns. Inside a client bracket the ordinary
 		// gates below still apply (not streaming, user-interrupt suppression,
 		// provider-valid tail for follow-up-only resumes).
-		if (
-			this.#clientBridge?.deferAgentInitiatedTurns === true &&
-			!this.#allowAcpAgentInitiatedTurns &&
-			this.#clientPromptInFlightCount === 0
-		) {
+		if (this.#clientDefersQueuedTurns()) {
 			return false;
 		}
 		if (this.isStreaming) return false;

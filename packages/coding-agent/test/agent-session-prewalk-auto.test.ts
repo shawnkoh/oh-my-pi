@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
+import { setImmediate } from "node:timers/promises";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import { type Api, type Context, Effort, type Model, type SimpleStreamOptions } from "@oh-my-pi/pi-ai";
@@ -249,6 +250,54 @@ describe("AgentSession auto-prewalk", () => {
 			ctx,
 		};
 	}
+
+	it("keeps failed-setup judgment work visible until its usage is journaled", async () => {
+		const hold = Promise.withResolvers<void>();
+		const requested = Promise.withResolvers<void>();
+		const journaled = Promise.withResolvers<void>();
+		stubJudge([DIRECT], { hold: hold.promise, requested: requested.resolve });
+		const f = createFixture([done("must not run")], { auto: "on" });
+		const getApiKey = f.session.modelRegistry.getApiKey.bind(f.session.modelRegistry);
+		vi.spyOn(f.session.modelRegistry, "getApiKey").mockImplementation(async (model, ...rest) => {
+			if (model.provider === "anthropic") {
+				await requested.promise;
+				return undefined;
+			}
+			return getApiKey(model, ...rest);
+		});
+		const manager = f.session.sessionManager;
+		const append = manager.appendModelUsage.bind(manager);
+		vi.spyOn(manager, "appendModelUsage").mockImplementation((...args) => {
+			const result = append(...args);
+			journaled.resolve();
+			return result;
+		});
+		try {
+			await expect(f.session.prompt("failed setup while judging")).rejects.toThrow();
+			expect(f.requested).toEqual([]);
+			expect(f.session.getWorkCounts().asyncJobs).toBe(1);
+			const attested = f.session.attest("prewalk-setup", "nonce");
+			expect(
+				f.session.quiesceForExit({
+					operationId: "prewalk-setup",
+					attempt: 1,
+					epoch: attested.epoch,
+					instanceId: attested.instanceId,
+					sessionId: attested.session.id,
+					deadline: Date.now() + 60_000,
+					completeness: "attested",
+				}),
+			).toMatchObject({ status: "refused", reason: "work_active" });
+		} finally {
+			hold.resolve();
+		}
+		await journaled.promise;
+		await setImmediate();
+		expect(f.session.getWorkCounts().asyncJobs).toBe(0);
+		expect(manager.getBranch().filter(entry => entry.type === "model_usage")).toEqual([
+			expect.objectContaining({ purpose: "auto-prewalk", role: "typesafe" }),
+		]);
+	});
 
 	describe("modes", () => {
 		it("does nothing and asks the judge nothing while prewalk.auto is off, the default", async () => {

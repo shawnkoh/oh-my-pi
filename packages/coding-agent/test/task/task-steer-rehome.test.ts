@@ -8,6 +8,7 @@
  *
  * 1. A steer during a single inline spawn returns a steered notice; the same run
  *    continues as a job, survives the turn's abort, and delivers its result once.
+ *    Its inline wait hold ends on handoff so the child can await a parent reply.
  * 2. In a fan-out, spawns that finished before the steer keep their inline result;
  *    only the unsettled ones move.
  * 3. Cancelling the job cancels the subagent.
@@ -18,14 +19,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import { SpawnRun } from "@oh-my-pi/pi-coding-agent/task/spawn-run";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { WaitTool } from "@oh-my-pi/pi-coding-agent/tools/wait";
 import type { SingleResult, TaskParams, TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
 
 const taskAgent: AgentDefinition = {
@@ -143,6 +147,7 @@ describe("task honours steer in blocking mode", () => {
 	beforeEach(() => {
 		AgentRegistry.resetGlobalForTests();
 		AgentLifecycleManager.resetGlobalForTests();
+		IrcBus.resetGlobalForTests();
 		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
 			agents: [taskAgent, scoutAgent],
 			projectAgentsDir: null,
@@ -155,11 +160,27 @@ describe("task honours steer in blocking mode", () => {
 		for (const manager of managers.splice(0)) await manager.dispose({ timeoutMs: 1000 });
 		AgentLifecycleManager.resetGlobalForTests();
 		AgentRegistry.resetGlobalForTests();
+		IrcBus.resetGlobalForTests();
 	});
 
 	it("moves a running single spawn to a job on steer and keeps it past the turn's abort", async () => {
 		const subagents = gatedSubagents();
 		const manager = createManager();
+		const registry = AgentRegistry.global();
+		const liveSession = {
+			isStreaming: true,
+			runStartedAt: 0,
+			deliverIrcMessage: async () => "injected",
+			waitForIrcReplies: async () => {},
+			subscribe: () => () => {},
+		} as unknown as AgentSession;
+		registry.register({
+			id: "Main",
+			displayName: "Main",
+			kind: "main",
+			session: liveSession,
+			status: "running",
+		});
 		const tool = await TaskTool.create(createSession(manager));
 		const turn = new AbortController();
 		const steer = new AbortController();
@@ -172,6 +193,15 @@ describe("task honours steer in blocking mode", () => {
 			steerContext(steer),
 		);
 		await subagents.started("Solo");
+		registry.register({
+			id: "Solo",
+			displayName: "Solo",
+			kind: "sub",
+			parentId: "Main",
+			session: liveSession,
+			status: "running",
+		});
+		expect(registry.awaits.blocksOn("Main", "Solo", Date.now())).toBe(true);
 		steer.abort();
 		const result = await call;
 
@@ -180,10 +210,31 @@ describe("task honours steer in blocking mode", () => {
 		expect(text).toContain("`Solo` (job `Solo`)");
 		expect(text).not.toContain("Solo output.");
 		expect(manager.getJob("Solo")?.status).toBe("running");
+		expect(registry.awaits.blocksOn("Main", "Solo", Date.now())).toBe(false);
 
 		// The turn ends after the steer; the moved subagent must not die with it.
 		turn.abort();
 		expect(subagents.signals.get("Solo")?.aborted).toBe(false);
+
+		// The same still-running child can ask its active parent and wait for the reply.
+		await IrcBus.global().send({ from: "Solo", to: "Main", body: "Which codeword?" });
+		const childSession = {
+			...createSession(manager),
+			// This tests in-process replies, not the daemon broker refresh that precedes waiting.
+			settings: Settings.isolated({ "launch.enabled": false }),
+			agentRegistry: registry,
+			getAgentId: () => "Solo",
+		} as ToolSession;
+		let replied = false;
+		const waiting = new WaitTool(childSession).execute("solo-wait", {}).then(result => {
+			replied = true;
+			return result;
+		});
+		await flushTurns();
+		expect(replied).toBe(false);
+		await IrcBus.global().send({ from: "Main", to: "Solo", body: "heliotrope" });
+		expect((await waiting).details?.waited).toMatchObject({ from: "Main", body: "heliotrope" });
+		expect(manager.getJob("Solo")?.status).toBe("running");
 
 		subagents.gates.get("Solo")!.resolve();
 		await manager.getJob("Solo")!.promise;
@@ -313,13 +364,16 @@ describe("task honours steer in blocking mode", () => {
 				settled = true;
 			});
 		await subagents.started("Kept");
+		expect(AgentRegistry.global().awaits.blocksOn("Main", "Kept", Date.now())).toBe(true);
 		steer.abort();
 		await flushTurns();
 		expect(settled).toBe(false);
 		expect(manager.getJob("Kept")).toBeUndefined();
+		expect(AgentRegistry.global().awaits.blocksOn("Main", "Kept", Date.now())).toBe(true);
 
 		subagents.gates.get("Kept")!.resolve();
 		const result = await call;
+		expect(AgentRegistry.global().awaits.blocksOn("Main", "Kept", Date.now())).toBe(false);
 		filler.resolve("done");
 		expect(firstText(result)).toContain("Kept output.");
 	});

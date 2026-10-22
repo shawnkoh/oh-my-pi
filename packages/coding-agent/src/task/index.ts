@@ -993,6 +993,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					run.timing,
 					retainArtifacts ? run.onArtifactsRetained : undefined,
 					run.tools,
+					run.onInlineHold,
 				),
 			{ agentId: spawn.agentId, detached: spawn.detached },
 		);
@@ -1637,6 +1638,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					detached: true,
 				}));
 				activeRun.attach({
+					detached: true,
 					signal: runSignal,
 					onUpdate: forwardSyncProgress,
 					onArtifactsRetained: cleanup => {
@@ -2020,6 +2022,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		launchTiming?: { invokedAt: number; acquiredAt: number },
 		onArtifactsRetained?: (cleanup: () => Promise<void>) => void,
 		tools?: TextTap,
+		onInlineHold?: (release: () => void) => void,
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		const startTime = Date.now();
 		const assignment = (params.task ?? "").trim();
@@ -2051,6 +2054,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				index: spawnIndex,
 				parentToolCallId: toolCallId,
 				detached,
+				onInlineHold,
 				// Spawns that may deliver as a background job advertise `agent://<id>`
 				// handles in the eventual async-result delivery, which can land well
 				// after this call returns. Without this, a temporary (in-memory session)

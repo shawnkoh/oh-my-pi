@@ -132,6 +132,8 @@ export interface StructuredSubagentRequest {
 	index?: number;
 	parentToolCallId?: string;
 	detached?: boolean;
+	/** Let a task run release its inline wait hold when a background job adopts it. */
+	onInlineHold?: (release: () => void) => void;
 	invokedAt?: number;
 	acquiredAt?: number;
 	isolation?: StructuredSubagentIsolationControls;
@@ -864,8 +866,8 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 				);
 			}
 		}
-		// An inline (`detached: false`) spawn keeps its parent's tool call open
-		// until the child finishes: no message to the parent lands before then.
+		// Inline ownership keeps the parent's tool call open. A successful background
+		// handoff ends that block even though the same child continues running.
 		const releaseHold =
 			request.detached === false
 				? (request.session.agentRegistry ?? AgentRegistry.global()).awaits.hold(
@@ -876,6 +878,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 				: undefined;
 		let result: SingleResult;
 		try {
+			if (releaseHold) request.onInlineHold?.(releaseHold);
 			if (!isolationContext) {
 				result = await runSubprocess(baseOptions);
 				onSubprocessResult?.(result);

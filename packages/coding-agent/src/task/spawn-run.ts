@@ -32,6 +32,8 @@ export interface SpawnRunBody {
 	timing: SpawnLaunchTiming;
 	onUpdate: AgentToolUpdateCallback<TaskToolDetails>;
 	onArtifactsRetained: (cleanup: () => Promise<void>) => void;
+	/** Bind the inline parent's wait hold to this run's current ownership. */
+	onInlineHold: (release: () => void) => void;
 	/** The run's {@link SpawnRun.tools} tap. */
 	tools: TextTap;
 }
@@ -47,6 +49,8 @@ export interface SpawnRunOwner {
 	signal?: AbortSignal;
 	onUpdate?: AgentToolUpdateCallback<TaskToolDetails>;
 	onArtifactsRetained?: (cleanup: () => Promise<void>) => void;
+	/** A background job owns the run; release any inline parent's wait hold. */
+	detached?: boolean;
 }
 
 export class SpawnRun {
@@ -57,6 +61,8 @@ export class SpawnRun {
 	#retainedCleanup: (() => Promise<void>) | undefined;
 	/** Unbinds the current owner's abort signal; replaced on every {@link attach}. */
 	#detachOwnerSignal: (() => void) | undefined;
+	#releaseInlineHold: (() => void) | undefined;
+	#detached: boolean;
 	#discarded = false;
 	/**
 	 * The subagent's finished tool calls with their results, as the `tools`
@@ -74,6 +80,7 @@ export class SpawnRun {
 		body: (run: SpawnRunBody) => Promise<AgentToolResult<TaskToolDetails>>,
 		readonly identity: SpawnIdentity,
 	) {
+		this.#detached = identity.detached;
 		const invokedAt = Date.now();
 		this.started = permit.acquire(this.#controller.signal).then(() => ({ invokedAt, acquiredAt: Date.now() }));
 		this.result = this.started.then(async timing => {
@@ -90,6 +97,10 @@ export class SpawnRun {
 						else if (this.#discarded) void cleanup();
 						else this.#retainedCleanup = cleanup;
 					},
+					onInlineHold: release => {
+						if (this.#detached) release();
+						else this.#releaseInlineHold = release;
+					},
 					tools: this.tools,
 				});
 			} finally {
@@ -99,7 +110,10 @@ export class SpawnRun {
 		// Close the tap once the run settles. The rejection handler also keeps an
 		// unadopted run quiet: owners await `result` only after adoption, and a
 		// discarded run is never awaited.
-		const closeTools = () => this.tools.close();
+		const closeTools = () => {
+			this.#releaseInlineHold = undefined;
+			this.tools.close();
+		};
 		void this.result.then(closeTools, closeTools);
 	}
 
@@ -111,6 +125,11 @@ export class SpawnRun {
 	attach(owner: SpawnRunOwner): void {
 		this.#detachOwnerSignal?.();
 		this.#detachOwnerSignal = undefined;
+		if (owner.detached) {
+			this.#detached = true;
+			this.#releaseInlineHold?.();
+			this.#releaseInlineHold = undefined;
+		}
 		const signal = owner.signal;
 		if (signal?.aborted) this.#controller.abort(signal.reason);
 		else if (signal) {

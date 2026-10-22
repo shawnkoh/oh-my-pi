@@ -2642,52 +2642,55 @@ describe("ExtensionRunner", () => {
 			settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
 		});
 
-		it.each(["Approve", "Approve dangerous_tool for this session"])("rejects a late %s after abort without granting approval", async answer => {
-			const resolved: Array<{ approved: boolean; reason?: string }> = [];
-			const globalState = globalThis as typeof globalThis & { __lateApproval?: typeof resolved };
-			globalState.__lateApproval = resolved;
-			fs.writeFileSync(
-				path.join(extensionsDir, "late-approval.ts"),
-				`export default function(pi) {
+		it.each(["Approve", "Approve dangerous_tool for this session"])(
+			"rejects a late %s after abort without granting approval",
+			async answer => {
+				const resolved: Array<{ approved: boolean; reason?: string }> = [];
+				const globalState = globalThis as typeof globalThis & { __lateApproval?: typeof resolved };
+				globalState.__lateApproval = resolved;
+				fs.writeFileSync(
+					path.join(extensionsDir, "late-approval.ts"),
+					`export default function(pi) {
 					pi.on("tool_approval_resolved", async (event) => {
 						globalThis.__lateApproval.push({ approved: event.approved, reason: event.reason });
 					});
 				}`,
-			);
-			const result = await loadTestExtensions();
-			const runner = new ExtensionRunner(
-				result.extensions,
-				result.runtime,
-				tempDir.path(),
-				sessionManager,
-				modelRegistry,
-			);
-			const controller = new AbortController();
-			const grantSessionApproval = vi.spyOn(runner, "grantSessionApproval");
-			// A UI that ignores the signal and answers after the abort.
-			initializeRunner(runner, async () => {
-				controller.abort();
-				return answer;
-			});
-			const execute = vi.fn(approvalTool.execute);
-			const wrapper = new ExtensionToolWrapper({ ...approvalTool, execute }, runner);
-			try {
-				await expect(
-					(wrapper as ExtensionToolWrapper<any>).execute(
-						"call-late",
-						{},
-						controller.signal,
-						undefined,
-						abortContext(),
-					),
-				).rejects.toBeInstanceOf(ToolAbortError);
-				expect(execute).not.toHaveBeenCalled();
-				expect(resolved).toEqual([{ approved: false, reason: "aborted" }]);
-				expect(grantSessionApproval).not.toHaveBeenCalled();
-			} finally {
-				delete globalState.__lateApproval;
-			}
-		});
+				);
+				const result = await loadTestExtensions();
+				const runner = new ExtensionRunner(
+					result.extensions,
+					result.runtime,
+					tempDir.path(),
+					sessionManager,
+					modelRegistry,
+				);
+				const controller = new AbortController();
+				const grantSessionApproval = vi.spyOn(runner, "grantSessionApproval");
+				// A UI that ignores the signal and answers after the abort.
+				initializeRunner(runner, async () => {
+					controller.abort();
+					return answer;
+				});
+				const execute = vi.fn(approvalTool.execute);
+				const wrapper = new ExtensionToolWrapper({ ...approvalTool, execute }, runner);
+				try {
+					await expect(
+						(wrapper as ExtensionToolWrapper<any>).execute(
+							"call-late",
+							{},
+							controller.signal,
+							undefined,
+							abortContext(),
+						),
+					).rejects.toBeInstanceOf(ToolAbortError);
+					expect(execute).not.toHaveBeenCalled();
+					expect(resolved).toEqual([{ approved: false, reason: "aborted" }]);
+					expect(grantSessionApproval).not.toHaveBeenCalled();
+				} finally {
+					delete globalState.__lateApproval;
+				}
+			},
+		);
 
 		it("never executes when an abort lands while approval handlers run", async () => {
 			const controller = new AbortController();
@@ -2772,6 +2775,44 @@ describe("ExtensionRunner", () => {
 			await sessionManager.newSession();
 			await run(approvalTool, "call-new-session");
 			expect(select).toHaveBeenCalledTimes(5);
+		});
+
+		it("does not execute a session-approved call aborted during preflight", async () => {
+			const runner = new ExtensionRunner([], new ExtensionRuntime(), tempDir.path(), sessionManager, modelRegistry);
+			const select = vi.fn(async () => "Approve dangerous_tool for this session");
+			initializeRunner(runner, select);
+			const controller = new AbortController();
+			const cancel = vi.fn();
+			runner.setToolCallPreflight({
+				before: async toolCallId => {
+					if (toolCallId === "call-aborted") controller.abort();
+				},
+				cancel,
+			});
+			const sideEffects: string[] = [];
+			const wrapper = new ExtensionToolWrapper(
+				{
+					...approvalTool,
+					execute: async (toolCallId: string) => {
+						sideEffects.push(toolCallId);
+						return { content: [{ type: "text" as const, text: "ok" }] };
+					},
+				},
+				runner,
+			) as ExtensionToolWrapper<any>;
+
+			await wrapper.execute("call-grant", {}, undefined, undefined, abortContext());
+			await expect(
+				wrapper.execute("call-aborted", {}, controller.signal, undefined, abortContext()),
+			).rejects.toBeInstanceOf(ToolAbortError);
+			expect(sideEffects).toEqual(["call-grant"]);
+			expect(cancel).toHaveBeenCalledWith("call-aborted");
+			expect(select).toHaveBeenCalledTimes(1);
+
+			// Cancellation does not revoke the remembered approval for a later, live call.
+			await wrapper.execute("call-still-approved", {}, undefined, undefined, abortContext());
+			expect(sideEffects).toEqual(["call-grant", "call-still-approved"]);
+			expect(select).toHaveBeenCalledTimes(1);
 		});
 		it("runs bridged preflight before approval and cancels denied state", async () => {
 			const runner = new ExtensionRunner([], new ExtensionRuntime(), tempDir.path(), sessionManager, modelRegistry);

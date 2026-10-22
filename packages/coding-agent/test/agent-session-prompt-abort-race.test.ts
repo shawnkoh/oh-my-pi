@@ -87,6 +87,39 @@ describe("AgentSession prompt admission racing abort", () => {
 		return { started: started.promise, release: () => release.resolve() };
 	}
 
+	it.each([false, true])(
+		"drops input aborted during deferred extension loading (throwOnDrop=%s)",
+		async throwOnDrop => {
+			let calls = 0;
+			const { session, dropped } = await createSession([
+				() => {
+					calls++;
+					return { content: ["must not run"] };
+				},
+			]);
+			const loading = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			session.setDeferredExtensionLoader(async () => {
+				loading.resolve();
+				await release.promise;
+			});
+			const pending = session.prompt("cancel during startup", { throwOnDrop });
+			const outcome = pending.then(
+				value => value,
+				error => error,
+			);
+			await loading.promise;
+			await session.abort({ reason: USER_INTERRUPT_LABEL });
+			release.resolve();
+			const result = await outcome;
+			if (throwOnDrop) expect(result).toMatchObject({ name: "PromptDroppedError" });
+			else expect(result).toBe(true);
+			expect(calls).toBe(0);
+			expect(session.agent.hasQueuedMessages()).toBe(false);
+			expect(dropped).toEqual(["cancel during startup"]);
+		},
+	);
+
 	it("drops an idle prompt instead of dispatching it when abort lands mid-normalization", async () => {
 		const streamCalls: string[] = [];
 		const { session, dropped } = await createSession([

@@ -10,8 +10,14 @@
 ### Fixed
 
 - Fixed background RPC Sessions hanging indefinitely on tool approval prompts: unanswered approvals now deny after 60 seconds, record the reason in the Session, and let the agent continue without running the command.
+- Kept fork session ownership, external delivery, remote-frontend, goal opt-in, and owned-process contracts when integrating upstream 18.12.6.
+- Tool calls cancelled during preflight no longer execute through a previously remembered approval.
+- Background handoff releases a blocking subagent's inline await hold, allowing it to wait for a reply from its parent.
+- Cancelling a prompt during deferred extension loading now drops that prompt; unfinished automatic judgment remains visible to session quiescence until its usage is recorded.
+- External steering receipts now settle under client-deferred turns without resuming the client's queued input.
 - Fixed goal mode completing open-ended objectives ("speed up X", "improve Y") after the first verified gain: the completion audit now requires an opportunity ledger in which every evidence-backed candidate is applied and measured or rejected with evidence, and forbids completing when a known candidate remains or the next step awaits a user decision (the goal stays active and the agent asks instead)
 - Fixed a blocking `task` call (async off, or a `blocking: true` agent) holding a queued steer until every subagent finished; the subagents still running now continue as background jobs and the call returns at once
+
 ## [18.12.6] - 2026-10-21
 
 ### Added

@@ -26,6 +26,7 @@ import {
 	getApprovalGrants,
 } from "@oh-my-pi/pi-coding-agent/tools/approval-cache";
 import { approvalTargetKey } from "@oh-my-pi/pi-coding-agent/tools/approval-targets";
+import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 import { getAgentDir, isRecord, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 
@@ -407,6 +408,42 @@ describe("always-ask-cached wrapper cycle", () => {
 			context(third),
 		);
 		expect(never).not.toHaveBeenCalled();
+	});
+
+	it("does not execute a cached-allowed call aborted during preflight", async () => {
+		const cwd = path.join(agentDir, "work");
+		const session = SessionManager.inMemory(cwd);
+		const select = vi.fn(async () => "Approve File");
+		const runner = runnerWith(session, select);
+		const controller = new AbortController();
+		const cancel = vi.fn();
+		runner.setToolCallPreflight({
+			before: async toolCallId => {
+				if (toolCallId === "cached-aborted") controller.abort();
+			},
+			cancel,
+		});
+		const sideEffects: string[] = [];
+		const tool: AgentTool = {
+			...pathTool("write", "write", cwd),
+			execute: async toolCallId => {
+				sideEffects.push(toolCallId);
+				return { content: [{ type: "text" as const, text: "executed" }] };
+			},
+		};
+		const wrapper = new ExtensionToolWrapper(tool, runner);
+		await wrapper.execute("cached-grant", { path: "a.txt" }, undefined, undefined, context(session));
+		await expect(
+			wrapper.execute("cached-aborted", { path: "a.txt" }, controller.signal, undefined, context(session)),
+		).rejects.toBeInstanceOf(ToolAbortError);
+		expect(sideEffects).toEqual(["cached-grant"]);
+		expect(cancel).toHaveBeenCalledWith("cached-aborted");
+		expect(select).toHaveBeenCalledTimes(1);
+
+		// The interrupted call leaves the existing target grant intact.
+		await wrapper.execute("cached-still-approved", { path: "a.txt" }, undefined, undefined, context(session));
+		expect(sideEffects).toEqual(["cached-grant", "cached-still-approved"]);
+		expect(select).toHaveBeenCalledTimes(1);
 	});
 
 	it("records nothing for Approve Once or Deny", async () => {

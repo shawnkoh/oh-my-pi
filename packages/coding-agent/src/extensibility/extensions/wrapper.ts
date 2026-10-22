@@ -518,8 +518,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				}
 				context.providerSafetyApproved = true;
 			}
-			// Approval handlers above may await; an abort that landed meanwhile must not reach
-			// execute, whether or not the tool checks its signal. No await follows this check.
+			// Approval handlers above may await; reject their aborts before remembering grants.
 			if (signal?.aborted) {
 				cancelPreflight();
 				throw new ToolAbortError();
@@ -530,6 +529,13 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			if (typeof answer === "object" && approvalGrants) {
 				recordApprovalGrant(this.tool, resolvedArgs, approvalGrants, resolved.tier, answer);
 			}
+		}
+
+		// Preflight and tool-call handlers can abort even when remembered approval skips the gate.
+		// Never rely on the tool itself to check the signal before causing side effects.
+		if (signal?.aborted) {
+			cancelPreflight();
+			throw new ToolAbortError();
 		}
 
 		// Execute the actual tool
