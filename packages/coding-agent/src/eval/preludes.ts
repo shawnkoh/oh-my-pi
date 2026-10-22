@@ -116,15 +116,21 @@ async function approvePreludeInvocation(
 	try {
 		if (!steerWatch?.signal.aborted) {
 			approved = await untilAborted(dialogSignal, () =>
-				requestApproval(ui, subject, parameters, resolved.reason, [], {
-					signal: dialogSignal,
-					approval: {
-						toolCallId: context.toolCallId,
-						toolName: definition.name,
-						arguments: parameters,
-						...(resolved.reason ? { reason: resolved.reason } : {}),
+				requestApproval(
+					ui,
+					subject,
+					parameters,
+					{ reason: resolved.reason },
+					{
+						signal: dialogSignal,
+						approval: {
+							toolCallId: context.toolCallId,
+							toolName: definition.name,
+							arguments: parameters,
+							...(resolved.reason ? { reason: resolved.reason } : {}),
+						},
 					},
-				}),
+				).then(answer => answer !== "deny"),
 			);
 		}
 	} catch (error) {

@@ -2555,6 +2555,7 @@ describe("ExtensionRunner", () => {
 					editor: async () => undefined,
 					addAutocompleteProvider: () => {},
 					setEditorComponent: () => {},
+					getEditorComponent: () => undefined,
 					get theme() {
 						return {} as never;
 					},
@@ -2624,7 +2625,7 @@ describe("ExtensionRunner", () => {
 			]);
 			expect(select).toHaveBeenCalledWith(
 				expect.stringContaining("Allow tool: dangerous_tool"),
-				["Approve", "Deny"],
+				["Approve", "Approve dangerous_tool for this session", "Deny"],
 				expect.objectContaining({
 					approval: { toolCallId: "call-approval", toolName: "dangerous_tool", arguments: {} },
 				}),
@@ -2641,7 +2642,7 @@ describe("ExtensionRunner", () => {
 			settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
 		});
 
-		it("never executes, and records no approval, when an answer ignoring the signal arrives after abort", async () => {
+		it.each(["Approve", "Approve dangerous_tool for this session"])("rejects a late %s after abort without granting approval", async answer => {
 			const resolved: Array<{ approved: boolean; reason?: string }> = [];
 			const globalState = globalThis as typeof globalThis & { __lateApproval?: typeof resolved };
 			globalState.__lateApproval = resolved;
@@ -2662,10 +2663,11 @@ describe("ExtensionRunner", () => {
 				modelRegistry,
 			);
 			const controller = new AbortController();
+			const grantSessionApproval = vi.spyOn(runner, "grantSessionApproval");
 			// A UI that ignores the signal and answers after the abort.
 			initializeRunner(runner, async () => {
 				controller.abort();
-				return "Approve";
+				return answer;
 			});
 			const execute = vi.fn(approvalTool.execute);
 			const wrapper = new ExtensionToolWrapper({ ...approvalTool, execute }, runner);
@@ -2681,6 +2683,7 @@ describe("ExtensionRunner", () => {
 				).rejects.toBeInstanceOf(ToolAbortError);
 				expect(execute).not.toHaveBeenCalled();
 				expect(resolved).toEqual([{ approved: false, reason: "aborted" }]);
+				expect(grantSessionApproval).not.toHaveBeenCalled();
 			} finally {
 				delete globalState.__lateApproval;
 			}
@@ -2724,6 +2727,51 @@ describe("ExtensionRunner", () => {
 			} finally {
 				delete globalState.__abortApproval;
 			}
+		});
+
+		it("approving for this session skips later mode prompts of that tool and tier, until the session changes", async () => {
+			const runner = new ExtensionRunner([], new ExtensionRuntime(), tempDir.path(), sessionManager, modelRegistry);
+			const select = vi.fn(async (_title: string, options: string[]) => options[1]);
+			initializeRunner(runner, select);
+			const context = () => ({
+				sessionManager,
+				modelRegistry,
+				model: undefined,
+				isIdle: () => true,
+				hasQueuedMessages: () => false,
+				abort: () => {},
+				settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
+			});
+			const run = (tool: typeof approvalTool | AgentTool, id: string) =>
+				(new ExtensionToolWrapper(tool, runner) as ExtensionToolWrapper<any>).execute(
+					id,
+					{},
+					undefined,
+					undefined,
+					context(),
+				);
+			await run(approvalTool, "call-grant");
+			await run(approvalTool, "call-granted");
+			expect(select).toHaveBeenCalledTimes(1);
+			// The grant covers that tool at that tier only: its write-tier calls and other tools still ask.
+			await run({ ...approvalTool, approval: "write" as const }, "call-write-tier");
+			await run({ ...approvalTool, name: "other_tool" }, "call-other");
+			expect(select).toHaveBeenCalledTimes(3);
+			// A critical override asks every time and never offers the session choice.
+			const critical = { ...approvalTool, approval: () => ({ tier: "exec" as const, override: true }) };
+			select.mockImplementationOnce(async () => "Approve");
+			await run(critical, "call-critical");
+			expect(select).toHaveBeenLastCalledWith(
+				expect.any(String),
+				["Approve", "Deny"],
+				expect.objectContaining({
+					approval: { toolCallId: "call-critical", toolName: "dangerous_tool", arguments: {} },
+				}),
+			);
+			// A new session starts without the grant.
+			await sessionManager.newSession();
+			await run(approvalTool, "call-new-session");
+			expect(select).toHaveBeenCalledTimes(5);
 		});
 		it("runs bridged preflight before approval and cancels denied state", async () => {
 			const runner = new ExtensionRunner([], new ExtensionRuntime(), tempDir.path(), sessionManager, modelRegistry);

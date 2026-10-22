@@ -16,18 +16,21 @@ import nativeDelegationTemplate from "../../prompts/tools/native-delegation.md" 
 import { ApprovalSteerDenial, approvalSteerDenialMessage } from "../../session/approval-steer";
 import {
 	denyError,
+	recordApprovalGrant,
 	requestApproval,
 	resolveApproval,
 	resolveApprovalFromContext,
+	sessionApprovalScope,
 	truncateForPrompt,
 } from "../../tools/approval";
+import { getApprovalGrants } from "../../tools/approval-cache";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import { withFileMutationSession } from "../../tools/file-write-fallback";
 import { ToolAbortError } from "../../tools/tool-errors";
 import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
 import { applyToolProxy } from "../tool-proxy";
 import type { ExtensionRunner } from "./runner";
-import type { ExtensionAgentIdentity, RegisteredTool, ToolCallEventResult } from "./types";
+import type { ExtensionAgentIdentity, ExtensionApprovalAnswer, RegisteredTool, ToolCallEventResult } from "./types";
 
 /**
  * Second `renderCall` argument that satisfies both the omp and the upstream-pi
@@ -256,7 +259,22 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		const { approvalMode, userPolicies } = resolveApprovalFromContext(
 			context ?? (this.runner.sessionSettings ? { settings: this.runner.sessionSettings } : undefined),
 		);
-		const preResolved = resolveApproval(this.tool, approvalArgs(params, context), approvalMode, userPolicies);
+		// `always-ask-cached` grants for this conversation, shared by the pre-check, the full gate,
+		// and the record after an approval.
+		const approvalGrants =
+			approvalMode === "always-ask-cached"
+				? getApprovalGrants(
+						(context?.settings ?? this.runner.sessionSettings)?.getAgentDir(),
+						this.runner.sessionId,
+					)
+				: undefined;
+		const preResolved = resolveApproval(
+			this.tool,
+			approvalArgs(params, context),
+			approvalMode,
+			userPolicies,
+			approvalGrants,
+		);
 		if (preResolved.policy === "deny") {
 			throw denyError(preResolved, this.tool.name);
 		}
@@ -328,7 +346,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		// input that newly resolves to `deny` is caught here even though the original passed the
 		// short-circuit above.
 		const resolvedArgs = approvalArgs(effectiveParams, context);
-		const resolved = resolveApproval(this.tool, resolvedArgs, approvalMode, userPolicies);
+		const resolved = resolveApproval(this.tool, resolvedArgs, approvalMode, userPolicies, approvalGrants);
 		context?.xdevTierResolved?.(resolved.tier);
 		if (resolved.policy === "deny") {
 			cancelPreflight();
@@ -346,10 +364,23 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			context !== undefined &&
 			Object.hasOwn(context, "acpApprovedArgs") &&
 			Bun.deepEquals(effectiveParams, context.acpApprovedArgs);
+		// Only a prompt `always-ask-cached` itself raised can be remembered by target; provider safety
+		// checks are per-call, so they never offer a grant of any kind.
+		const grantable =
+			approvalGrants !== undefined &&
+			resolved.policy === "prompt" &&
+			resolved.source === "mode" &&
+			pendingSafetyChecks.length === 0;
+		const cacheTargets = grantable ? (this.tool.approvalCacheTargets?.(resolvedArgs)?.length ?? 0) > 0 : false;
+		// A prompt the approval mode raised can be approved for the rest of the session — unless the call
+		// can be remembered by target instead, which keeps the grant to what it touches.
+		const sessionScope =
+			pendingSafetyChecks.length === 0 && !cacheTargets ? sessionApprovalScope(resolved, this.tool.name) : undefined;
+		const sessionApproved = sessionScope !== undefined && this.runner.hasSessionApproval(sessionScope.key);
 		const approvalCheck = {
 			required:
 				pendingSafetyChecks.length > 0 ||
-				(resolved.policy === "prompt" && !acpBypass && (explicitPrompt || !xdevBypass)),
+				(resolved.policy === "prompt" && !acpBypass && !sessionApproved && (explicitPrompt || !xdevBypass)),
 			reason: resolved.reason,
 		};
 
@@ -418,17 +449,22 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			const dialogSignal =
 				steerWatch && signal ? AbortSignal.any([signal, steerWatch.signal]) : (steerWatch?.signal ?? signal);
 			let approved = false;
+			let answer: ExtensionApprovalAnswer = "deny";
 			let approvalError: unknown;
 			try {
 				// The signal lets an interrupt close the pending dialog (RPC hosts get a
 				// `cancel` for it); `approval` binds the answer to exactly this call.
-				if (!steerWatch?.signal.aborted) {
-					approved = await requestApproval(
+				if (!dialogSignal?.aborted) {
+					answer = await requestApproval(
 						uiContext,
 						this.tool,
 						resolvedArgs,
-						approvalCheck.reason,
-						safetyAppendix,
+						{
+							reason: approvalCheck.reason,
+							appendix: safetyAppendix,
+							sessionSubject: sessionScope?.subject,
+							grants: cacheTargets,
+						},
 						{
 							signal: dialogSignal,
 							approval: {
@@ -439,6 +475,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 							},
 						},
 					);
+					approved = answer !== "deny";
 				}
 			} catch (err) {
 				approvalError = err;
@@ -486,6 +523,12 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			if (signal?.aborted) {
 				cancelPreflight();
 				throw new ToolAbortError();
+			}
+			// Remember grants only after late answers, steers, and handler-triggered aborts
+			// have been rejected; a denied call must not authorize future calls.
+			if (answer === "session" && sessionScope) this.runner.grantSessionApproval(sessionScope.key);
+			if (typeof answer === "object" && approvalGrants) {
+				recordApprovalGrant(this.tool, resolvedArgs, approvalGrants, resolved.tier, answer);
 			}
 		}
 

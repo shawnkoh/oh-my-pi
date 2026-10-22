@@ -31,6 +31,8 @@ export interface ServiceStart {
 	ready?: ServiceReady;
 	/** The service may keep running while the owning session is suspended. Recorded at start; never changed later. */
 	sleepable?: boolean;
+	/** Overlay on the configured shell env; wins over it. */
+	env?: Record<string, string>;
 }
 
 const serviceStateKey = Symbol("ownedServices");
@@ -241,7 +243,7 @@ export async function startService(
 		application: shell.shell,
 		args: [...shell.args, `${shell.prefix ? `${shell.prefix} ` : ""}${params.command}`],
 		// The broker is shared, so the owner marker travels in the service's own environment.
-		env: { ...shell.env, ...ownerMarkerEnv() },
+		env: { ...shell.env, ...params.env, ...ownerMarkerEnv() },
 		cwd: resolveToCwd(params.cwd ?? session.cwd, session.cwd),
 		pty: params.pty ?? true,
 		ready: ready
