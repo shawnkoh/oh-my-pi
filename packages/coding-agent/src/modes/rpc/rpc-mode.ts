@@ -1374,6 +1374,15 @@ export function requestRpcEditor(
 	return promise;
 }
 
+/** An unanswered tool approval must not strand a background RPC session. */
+export const RPC_TOOL_APPROVAL_TIMEOUT_MS = 60_000;
+class RpcApprovalTimeoutError extends Error {
+	constructor() {
+		super("no approver in RPC Session; use an allowed command or ask Ops");
+		this.name = "RpcApprovalTimeoutError";
+	}
+}
+
 /** Sends an RPC extension dialog and cancels the remote presentation when its signal aborts. */
 export function requestRpcDialog<T>(
 	pendingRequests: Map<string, PendingExtensionRequest>,
@@ -1388,6 +1397,10 @@ export function requestRpcDialog<T>(
 	const id = Snowflake.next() as string;
 	const { promise, resolve, reject } = Promise.withResolvers<T>();
 	let timeoutId: NodeJS.Timeout | undefined;
+	const approvalTimeout = opts?.approval !== undefined;
+	const timeout = approvalTimeout
+		? Math.min(opts?.timeout ?? RPC_TOOL_APPROVAL_TIMEOUT_MS, RPC_TOOL_APPROVAL_TIMEOUT_MS)
+		: opts?.timeout;
 
 	const cleanup = () => {
 		clearTimeout(timeoutId);
@@ -1410,27 +1423,42 @@ export function requestRpcDialog<T>(
 	};
 	opts?.signal?.addEventListener("abort", onAbort, { once: true });
 
-	if (opts?.timeout !== undefined) {
+	if (timeout !== undefined) {
 		timeoutId = setTimeout(() => {
-			opts.onTimeout?.();
 			cancelHostDialog();
 			cleanup();
+			if (approvalTimeout) {
+				reject(new RpcApprovalTimeoutError());
+				return;
+			}
+			opts?.onTimeout?.();
 			resolve(defaultValue);
-		}, opts.timeout);
+		}, timeout);
 	}
 
 	pendingRequests.set(id, {
 		resolve: response => {
 			cleanup();
 			try {
+				if (approvalTimeout && "cancelled" in response && response.cancelled && response.timedOut) {
+					throw new RpcApprovalTimeoutError();
+				}
 				resolve(parseResponse(response));
 			} catch (err) {
 				reject(err);
 			}
 		},
-		reject,
+		reject: error => {
+			cleanup();
+			reject(error);
+		},
 	});
-	output({ type: "extension_ui_request", id, ...request } as RpcExtensionUIRequest);
+	output({
+		type: "extension_ui_request",
+		id,
+		...request,
+		...(approvalTimeout ? { timeout } : {}),
+	} as RpcExtensionUIRequest);
 	return promise;
 }
 /**
@@ -1603,12 +1631,24 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				requestRpcAskDialog(this.pendingRequests, this.output, questions, dialogOptions, this.richAsk);
 		}
 
-		select(
+		async select(
 			title: string,
 			options: ExtensionUISelectItem[],
 			dialogOptions?: ExtensionUIDialogOptions,
 		): Promise<string | undefined> {
-			return requestRpcSelect(this.pendingRequests, this.output, title, options, dialogOptions);
+			try {
+				return await requestRpcSelect(this.pendingRequests, this.output, title, options, dialogOptions);
+			} catch (error) {
+				if (error instanceof RpcApprovalTimeoutError) {
+					session.sessionManager.appendCustomEntry("rpc-approval-denied", {
+						toolCallId: dialogOptions?.approval?.toolCallId,
+						toolName: dialogOptions?.approval?.toolName,
+						decision: "deny",
+						reason: error.message,
+					});
+				}
+				throw error;
+			}
 		}
 
 		confirm(title: string, message: string, dialogOptions?: ExtensionUIDialogOptions): Promise<boolean> {

@@ -1853,6 +1853,16 @@ If a dialog has a timeout, RPC mode resolves to a default value when timeout/abo
 (omp's timer or a host `cancelled: true, timedOut: true` reply) answers every question with its recommended
 option, else its first.
 
+Tool approvals are an exception: a dialog carrying an `approval` binding has a
+maximum wait of 60 seconds (`RPC_TOOL_APPROVAL_TIMEOUT_MS`), advertised in its
+`timeout` field. An explicit answer received before the deadline wins. Otherwise
+RPC cancels the dialog and rejects the tool call with
+`no approver in RPC Session; use an allowed command or ask Ops`; late answers are
+ignored. Passive viewers do not extend this deadline. The Session records a
+`rpc-approval-denied` custom prompt event with the tool call ID, tool name,
+decision and reason, without retaining command arguments in that event.
+Ordinary questions and interactive terminal approvals retain their existing behavior.
+
 `answers` must list one entry per question in request order, with each `id` equal to that question's `id`.
 `selectedOptions` holds exact option labels without duplicates; a multi-select may be empty. A single-select
 (`multi` absent or false) takes at most one option and not both an option and `customInput`. `customInput`
