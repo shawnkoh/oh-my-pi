@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- Bash approval bindings now pin the live session's effective absolute cwd (or preserve a virtual cwd URL) and execute with that same directory, including after `/move` or resume and movement while awaiting approval.
 - Fixed background RPC Sessions hanging indefinitely on tool approval prompts: unanswered approvals now deny after 60 seconds, record the reason in the Session, and let the agent continue without running the command.
 - Kept fork session ownership, external delivery, remote-frontend, goal opt-in, and owned-process contracts when integrating upstream 18.12.6.
 - Tool calls cancelled during preflight no longer execute through a previously remembered approval.

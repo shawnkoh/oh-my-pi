@@ -32,6 +32,11 @@ import type {
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
 import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
+import type { ClientBridge } from "@oh-my-pi/pi-coding-agent/session/client-bridge";
+import { BashTool, type BashToolInput } from "@oh-my-pi/pi-coding-agent/tools/bash";
+import type { BashToolDetails } from "@oh-my-pi/pi-tui/tools/bash";
+import { wrapToolWithMetaNotice } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
+import { releaseShellSessions } from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { getProjectAgentDir, logger, TempDir } from "@oh-my-pi/pi-utils";
@@ -2640,6 +2645,278 @@ describe("ExtensionRunner", () => {
 			hasQueuedMessages: () => false,
 			abort: () => {},
 			settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
+		});
+
+		const nativeBashProbe = (output = "native execution") => {
+			const shellPath = tempDir.join(process.platform === "win32" ? "bash.exe" : "bash");
+			fs.writeFileSync(shellPath, "");
+			const createTerminal = vi.fn(async (_params: Parameters<NonNullable<ClientBridge["createTerminal"]>>[0]) => ({
+				terminalId: "cwd-terminal",
+				waitForExit: async () => ({ exitCode: 0, signal: null }),
+				currentOutput: async () => ({ output, truncated: false }),
+				kill: async () => {},
+				release: async () => {},
+			}));
+			const tool = new BashTool({
+				get cwd() {
+					return sessionManager.getCwd();
+				},
+				hasUI: false,
+				getSessionFile: () => null,
+				getSessionId: () => sessionManager.getSessionId(),
+				getSessionSpawns: () => null,
+				settings: Settings.isolated({
+					shellPath,
+					"bash.direnv": "off",
+					"bash.autoBackground.enabled": false,
+					"bashInterceptor.enabled": false,
+				}),
+				getClientBridge: () => ({ capabilities: { terminal: true }, createTerminal }),
+			});
+			return { tool: wrapToolWithMetaNotice(tool), createTerminal };
+		};
+
+		it.each([
+			"omitted",
+			"resumed",
+			"null",
+			"empty",
+			"relative",
+			"absolute",
+			"leading cd",
+			"leading cd root alias",
+			"unicode default",
+			"filesystem root",
+		])("pins native bash's %s cwd through movement during approval", async kind => {
+			const launchedCwd = tempDir.join("launched");
+			const movedCwd =
+				kind === "filesystem root"
+					? path.parse(tempDir.path()).root
+					: tempDir.join(kind === "unicode default" ? "moved\u00a0directory" : "moved");
+			const laterCwd = tempDir.join("later");
+			const childCwd = path.join(movedCwd, "child");
+			const overrideCwd = tempDir.join("override");
+			for (const dir of [launchedCwd, movedCwd, laterCwd, overrideCwd]) fs.mkdirSync(dir, { recursive: true });
+			if (kind === "relative" || kind === "leading cd") fs.mkdirSync(childCwd, { recursive: true });
+			sessionManager = SessionManager.inMemory(kind === "resumed" ? movedCwd : launchedCwd);
+			const loaded = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				loaded.extensions,
+				loaded.runtime,
+				launchedCwd,
+				sessionManager,
+				modelRegistry,
+			);
+			await sessionManager.moveTo(movedCwd);
+			const input: BashToolInput = { command: "pwd" };
+			// Exercise nullable RPC input despite the native schema's optional string.
+			const nullCwd = null as unknown as string;
+			if (kind === "null") input.cwd = nullCwd;
+			if (kind === "empty") input.cwd = "";
+			if (kind === "relative") input.cwd = "child";
+			if (kind === "absolute") input.cwd = overrideCwd;
+			if (kind === "leading cd") input.command = "cd child && pwd";
+			if (kind === "leading cd root alias") input.command = "cd / && pwd";
+			const expectedCwd =
+				kind === "relative" || kind === "leading cd" ? childCwd : kind === "absolute" ? overrideCwd : movedCwd;
+			const originalInput = { ...input };
+			const select = vi.fn(async () => {
+				await sessionManager.moveTo(laterCwd);
+				return "Approve";
+			});
+			initializeRunner(runner, select);
+			const { tool, createTerminal } = nativeBashProbe();
+			const result = await new ExtensionToolWrapper<typeof tool.parameters, BashToolDetails>(tool, runner).execute(
+				"cwd-bound",
+				input,
+				undefined,
+				undefined,
+				abortContext(),
+			);
+			expect(result.isError).not.toBe(true);
+			expect(select).toHaveBeenCalledWith(
+				expect.any(String),
+				expect.any(Array),
+				expect.objectContaining({
+					approval: {
+						toolCallId: "cwd-bound",
+						toolName: "bash",
+						arguments: { ...input, command: "pwd", cwd: expectedCwd },
+					},
+				}),
+			);
+			// Real BashTool has consumed the prepared invocation: the terminal sees
+			// the same directory byte-for-byte, without expansion or a second cd.
+			expect(createTerminal).toHaveBeenCalledTimes(1);
+			expect(createTerminal).toHaveBeenCalledWith(
+				expect.objectContaining({ cwd: expectedCwd, args: ["-l", "-c", "pwd"] }),
+			);
+			expect(input).toEqual(originalInput);
+		});
+
+		it.each(["ACP", "xd", "yolo"])("leaves native bash's unchanged %s approval path alone", async kind => {
+			sessionManager = SessionManager.inMemory(tempDir.path());
+			const loaded = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				loaded.extensions,
+				loaded.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const select = vi.fn(async () => "Deny");
+			initializeRunner(runner, select);
+			const { tool, createTerminal } = nativeBashProbe();
+			const bind = vi.spyOn(tool, "bindApprovalInput");
+			const input = { command: "pwd" };
+			const context = {
+				...abortContext(),
+				...(kind === "ACP" ? { acpApprovedArgs: { ...input } } : {}),
+				...(kind === "xd" ? { xdevApproved: true } : {}),
+				...(kind === "yolo" ? { settings: Settings.isolated({ "tools.approvalMode": "yolo" }) } : {}),
+			};
+			const result = await new ExtensionToolWrapper<typeof tool.parameters, BashToolDetails>(tool, runner).execute(
+				"already-approved",
+				input,
+				undefined,
+				undefined,
+				context,
+			);
+			expect(result.isError).not.toBe(true);
+			expect(select).not.toHaveBeenCalled();
+			expect(bind).not.toHaveBeenCalled();
+			expect(createTerminal).toHaveBeenCalledTimes(1);
+		});
+
+		it("keeps production metadata spilling and notices on prompted native bash", async () => {
+			sessionManager = SessionManager.inMemory(tempDir.path());
+			const loaded = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				loaded.extensions,
+				loaded.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const select = vi.fn(async () => "Approve");
+			initializeRunner(runner, select);
+			const { tool, createTerminal } = nativeBashProbe("line\n".repeat(10_000));
+			const saveArtifact = vi.spyOn(sessionManager, "saveArtifact");
+			const result = await new ExtensionToolWrapper<typeof tool.parameters, BashToolDetails>(tool, runner).execute(
+				"cwd-spill",
+				{ command: "pwd" },
+				undefined,
+				undefined,
+				{
+					...abortContext(),
+					sessionManager,
+					settings: Settings.isolated({
+						"tools.approvalMode": "always-ask",
+						"tools.artifactSpillThreshold": 20,
+						"tools.artifactHeadBytes": 8,
+						"tools.artifactTailBytes": 8,
+					}),
+				},
+			);
+			expect(select).toHaveBeenCalledTimes(1);
+			expect(createTerminal).toHaveBeenCalledTimes(1);
+			expect(saveArtifact).toHaveBeenCalledTimes(1);
+			expect(result.details?.meta?.truncation?.artifactId).toBeDefined();
+			const text = result.content.map(block => (block.type === "text" ? block.text : "")).join("\n");
+			expect(text.length).toBeLessThan(20 * 1024);
+			expect(text).toContain(result.details!.meta!.truncation!.artifactId!);
+		});
+
+		it.skipIf(process.platform === "win32")(
+			"keeps production capture-failure notices on prompted native bash",
+			async () => {
+				sessionManager = SessionManager.inMemory(tempDir.path());
+				const loaded = await loadTestExtensions();
+				const runner = new ExtensionRunner(
+					loaded.extensions,
+					loaded.runtime,
+					tempDir.path(),
+					sessionManager,
+					modelRegistry,
+				);
+				const settings = Settings.isolated({
+					"tools.approvalMode": "always-ask",
+					"tools.outputMaxColumns": 8,
+					"tools.artifactSpillThreshold": 1,
+					"tools.artifactTailBytes": 1,
+					"tools.artifactHeadBytes": 0,
+					"bash.autoBackground.enabled": false,
+					"bashInterceptor.enabled": false,
+					"bash.direnv": "off",
+				});
+				initializeRunner(runner, async () => "Approve");
+				const shellKey = sessionManager.getSessionId();
+				const tool = wrapToolWithMetaNotice(
+					new BashTool({
+						cwd: tempDir.path(),
+						hasUI: false,
+						getSessionFile: () => null,
+						getSessionId: () => shellKey,
+						getSessionSpawns: () => null,
+						// A directory cannot be opened as an output file; exercise the
+						// native sink's real failed-capture path without mocking execute.
+						allocateOutputArtifact: async () => ({ path: tempDir.path(), id: "failed-capture" }),
+						settings,
+					}),
+				);
+				const saveArtifact = vi.spyOn(sessionManager, "saveArtifact");
+				try {
+					const result = await new ExtensionToolWrapper<typeof tool.parameters, BashToolDetails>(
+						tool,
+						runner,
+					).execute(
+						"cwd-capture-failure",
+						{ command: "printf '%060000d\\n' 0" },
+						undefined,
+						undefined,
+						{ ...abortContext(), settings, sessionManager },
+					);
+					expect(result.isError).not.toBe(true);
+					expect(result.details?.meta?.artifactError).toBeDefined();
+					const text = result.content.map(block => (block.type === "text" ? block.text : "")).join("\n");
+					expect(text).toContain("not saved completely");
+					expect(text).not.toContain("artifact://");
+					expect(saveArtifact).not.toHaveBeenCalled();
+				} finally {
+					releaseShellSessions(shellKey);
+				}
+			},
+		);
+
+		it("preserves a virtual cwd in native bash's bound approval arguments", () => {
+			const { tool } = nativeBashProbe();
+			expect(tool.bindApprovalInput({ command: "pwd", cwd: "local://workspace/" })).toEqual({
+				command: "pwd",
+				cwd: "local://workspace/",
+			});
+		});
+
+		it("does not execute native bash when its cwd-bound approval is denied", async () => {
+			const loaded = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				loaded.extensions,
+				loaded.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			initializeRunner(runner, async () => "Deny");
+			const { tool, createTerminal } = nativeBashProbe();
+			await expect(
+				new ExtensionToolWrapper<typeof tool.parameters, BashToolDetails>(tool, runner).execute(
+					"cwd-denied",
+					{ command: "pwd" },
+					undefined,
+					undefined,
+					abortContext(),
+				),
+			).rejects.toThrow();
+			expect(createTerminal).not.toHaveBeenCalled();
 		});
 
 		it.each(["Approve", "Approve dangerous_tool for this session"])(
