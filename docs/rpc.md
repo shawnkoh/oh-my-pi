@@ -1820,6 +1820,16 @@ Use `--mode rpc --no-ui` for a host without a tool UI surface; use `--mode rpc-u
     call's id; `(toolCallId, toolName)` identifies the decision. An interrupt
     cancels the pending dialog and a late answer never runs the aborted call.
     Under protocol v1, elided arguments are not exact; negotiate v2 to review them.
+    For native `bash` prompts, the tool prepares the invocation once: its
+    leading `cd <path> && ...` transformation is reflected in `arguments.command`
+    and `arguments.cwd`. Otherwise omitted, `null`, or empty cwd uses the live
+    session working directory (including after `/move` or resume); explicit
+    relative overrides resolve against that directory. Execution consumes that
+    exact prepared cwd without expansion or re-resolution even if the session
+    moves while approval is pending. Filesystem directories are absolute;
+    supported virtual cwd URLs remain URLs, not filesystem paths. Calls already
+    approved by ACP, an outer `xd://` gate, or a remembered grant retain their
+    existing execution path and do not acquire another prompt.
 - `notify`, `setStatus`, `setWidget`, `setTitle`, `set_editor_text`
 - `open_url` (emitted by RPC login flows): includes `url`, optional `launchUrl`, and optional `instructions`. When present, `launchUrl` is a short loopback redirect and is the recommended copy target so terminal truncation cannot corrupt OAuth query parameters.
 

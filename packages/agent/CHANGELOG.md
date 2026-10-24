@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `AgentTool.bindApprovalInput` optionally binds an approval prompt's exact arguments to a prepared invocation consumed by ordinary decorated execution, allowing tools to freeze mutable defaults without changing already-approved calls.
+
 ## [18.12.4] - 2026-10-20
 
 ### Fixed

@@ -1313,6 +1313,14 @@ export interface AgentTool<
 	/** The main execution callback for this tool. */
 	execute: AgentToolExecFn<TParameters, TDetails, TTheme>;
 
+	/**
+	 * Bind execution defaults immediately before an approval prompt. The returned
+	 * arguments must identify a prepared invocation consumed by ordinary execute,
+	 * without re-reading mutable defaults or bypassing execution decorators.
+	 * Never called for approvals satisfied by an outer gate or remembered grant.
+	 */
+	bindApprovalInput?: (args: Static<TParameters>) => Static<TParameters>;
+
 	/** Optional custom rendering for tool call display (returns UI component) */
 	renderCall?: (args: Static<TParameters>, options: RenderResultOptions, theme: TTheme) => unknown;
 

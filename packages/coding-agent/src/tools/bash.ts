@@ -394,6 +394,12 @@ export interface BashToolInput {
 	sleepable?: boolean;
 }
 
+interface PreparedBashInput {
+	command: string;
+	commandCwd: string;
+	virtualCwd?: string;
+}
+
 /**
  * Treats a blank string as an unset field.
  *
@@ -999,34 +1005,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		};
 	}
 
-	async execute(
-		toolCallId: string,
-		{
-			command: rawCommand,
-			timeout: rawTimeout,
-			cwd,
-			name: rawName,
-			ready: rawReady,
-			async: rawAsync,
-			pty,
-			sleepable,
-		}: BashToolInput,
-		signal?: AbortSignal,
-		onUpdate?: AgentToolUpdateCallback<BashToolDetails>,
-		ctx?: AgentToolContext,
-	): Promise<AgentToolResult<BashToolDetails>> {
-		let command = rawCommand;
-		// The session this call belongs to, captured before any await: a session
-		// change while the call waits must not move it into the new session's
-		// shell, nor hand it the new session's identity.
-		const sessionId = this.session.getSessionId?.() ?? undefined;
-		const sessionEnv = this.#sessionEnv();
+	readonly #approvalInputs = new WeakMap<BashToolInput, { input: BashToolInput; prepared: PreparedBashInput }>();
 
-		// Extract a leading `cd <path> && ...` into cwd when the model ignores the
-		// cwd parameter. The scanner captures only a single path token and defers
-		// to the shell for anything else (redirects, extra args, shell expansion),
-		// so it never absorbs shell syntax like `cd /tmp 2>/dev/null && ...` into
-		// the structured cwd. Constrained to a top-level `&&` on the first line.
+	#prepareInput({ command, cwd }: BashToolInput): PreparedBashInput {
+		// Keep the native leading-cd transformation shared by ordinary execution
+		// and approval binding, including its direnv and workspace-alias semantics.
 		if (!cwd) {
 			const cd = extractLeadingCdTarget(command);
 			if (cd) {
@@ -1034,6 +1017,67 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				command = cd.rest;
 			}
 		}
+		const router = InternalUrlRouter.instance();
+		const virtualCwd = cwd && router.canHandle(cwd) ? router.normalize(cwd) : undefined;
+		// A session default is already an effective directory, not user path syntax:
+		// expanding it would change literal Unicode spaces or a filesystem root.
+		const commandCwd = virtualCwd ?? (cwd ? resolveToCwd(cwd, this.session.cwd) : this.session.cwd);
+		return { command, commandCwd, virtualCwd };
+	}
+
+	bindApprovalInput(params: BashToolInput): BashToolInput {
+		const input = { ...params };
+		const prepared = this.#prepareInput(input);
+		const boundInput = { ...input, command: prepared.command, cwd: prepared.commandCwd };
+		// The private snapshot is opaque: ordinary (possibly decorated) execute
+		// consumes it without treating the approved cwd as user path syntax again.
+		this.#approvalInputs.set(boundInput, { input, prepared });
+		return boundInput;
+	}
+
+	async execute(
+		toolCallId: string,
+		params: BashToolInput,
+		signal?: AbortSignal,
+		onUpdate?: AgentToolUpdateCallback<BashToolDetails>,
+		ctx?: AgentToolContext,
+	): Promise<AgentToolResult<BashToolDetails>> {
+		const binding = this.#approvalInputs.get(params);
+		if (binding) this.#approvalInputs.delete(params);
+		return this.#execute(
+			toolCallId,
+			binding?.input ?? params,
+			binding?.prepared ?? this.#prepareInput(params),
+			signal,
+			onUpdate,
+			ctx,
+		);
+	}
+
+	async #execute(
+		toolCallId: string,
+		{
+			command: rawCommand,
+			timeout: rawTimeout,
+			name: rawName,
+			ready: rawReady,
+			async: rawAsync,
+			pty,
+			sleepable,
+		}: BashToolInput,
+		prepared: PreparedBashInput,
+		signal?: AbortSignal,
+		onUpdate?: AgentToolUpdateCallback<BashToolDetails>,
+		ctx?: AgentToolContext,
+	): Promise<AgentToolResult<BashToolDetails>> {
+		let { command } = prepared;
+		const { commandCwd, virtualCwd } = prepared;
+		// The session this call belongs to, captured before any await: a session
+		// change while the call waits must not move it into the new session's
+		// shell, nor hand it the new session's identity.
+		const sessionId = this.session.getSessionId?.() ?? undefined;
+		const sessionEnv = this.#sessionEnv();
+
 		// Mode selection runs on normalized fields: a caller that materializes
 		// every optional argument with empty or placeholder values still asked
 		// for a plain command. Only `async: true` is an async request, a blank
@@ -1094,9 +1138,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// terminal) never run there.
 		const approval = this.approval({ command: rawCommand });
 		const approvalTier = typeof approval === "string" ? approval : approval.tier;
-		const router = InternalUrlRouter.instance();
-		const virtualCwd = cwd && router.canHandle(cwd) ? router.normalize(cwd) : undefined;
-		const commandCwd = virtualCwd ?? (cwd ? resolveToCwd(cwd, this.session.cwd) : this.session.cwd);
 		if (virtualCwd !== undefined) {
 			if (name !== undefined || canUseInteractiveBashPty(pty === true, ctx)) {
 				throw new ToolError(

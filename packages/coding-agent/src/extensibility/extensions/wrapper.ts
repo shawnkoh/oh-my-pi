@@ -345,7 +345,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		// policy and prompts on `effectiveParams`, so the user approves exactly what executes. A revised
 		// input that newly resolves to `deny` is caught here even though the original passed the
 		// short-circuit above.
-		const resolvedArgs = approvalArgs(effectiveParams, context);
+		let resolvedArgs = approvalArgs(effectiveParams, context);
 		const resolved = resolveApproval(this.tool, resolvedArgs, approvalMode, userPolicies, approvalGrants);
 		context?.xdevTierResolved?.(resolved.tier);
 		if (resolved.policy === "deny") {
@@ -385,6 +385,15 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		};
 
 		if (approvalCheck.required) {
+			if (this.tool.bindApprovalInput) {
+				effectiveParams = this.tool.bindApprovalInput(effectiveParams);
+				resolvedArgs = approvalArgs(effectiveParams, context);
+				const boundResolved = resolveApproval(this.tool, resolvedArgs, approvalMode, userPolicies, approvalGrants);
+				if (boundResolved.policy === "deny") {
+					cancelPreflight();
+					throw denyError(boundResolved, this.tool.name);
+				}
+			}
 			const scheduledCall = context?.toolCall?.toolCalls[context.toolCall.index];
 			if (
 				scheduledCall?.id === toolCallId &&
